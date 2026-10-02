@@ -1,0 +1,9 @@
+node_modules/
+data/
+downloads/
+config/vumovie.json
+config/sessions/
+*.log
+.DS_Store
+.env
+coverage/

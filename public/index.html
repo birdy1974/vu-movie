@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vu-movie</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2338bdf8'/><text x='5' y='23' font-size='18' font-family='sans-serif' font-weight='bold' fill='%2304121c'>vu</text></svg>">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">vu</div>
+      <div><b>vu-movie</b><small>movie → stream proxy</small></div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-p="dash" class="on">▤ Dashboard</button>
+      <button data-p="find">⌕ Search &amp; scrape</button>
+      <button data-p="stream">▶ Stream</button>
+      <button data-p="subs">▭ Subtitles</button>
+      <button data-p="e2">☰ Enigma2</button>
+      <button data-p="logs">≡ Logs</button>
+      <button data-p="set">⚙ Settings</button>
+    </nav>
+    <div class="sidefoot" id="side-status">
+      <div class="row" style="gap:4px">
+        <span class="pill"><i class="dot" id="h-ffmpeg"></i>ffmpeg</span>
+        <span class="pill"><i class="dot" id="h-hw"></i>VAAPI</span>
+        <span class="pill"><i class="dot" id="h-db"></i>DB</span>
+        <span class="pill"><i class="dot" id="h-box"></i>Box</span>
+      </div>
+      <div id="side-info" class="mono" style="margin-top:8px">connecting…</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ============ DASHBOARD ============ -->
+    <section id="p-dash">
+      <h1>Dashboard</h1>
+      <p class="sub">Health of the container, the hardware path and the receiver. Click a card for details in the log.</p>
+      <div class="grid g4" id="dash-cards"></div>
+      <div class="gl" style="margin-top:14px">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Jobs</h2>
+            <button class="btn sm ghost" onclick="App.loadJobs()">refresh</button></div>
+          <div id="dash-jobs"><div class="meta" style="padding:14px">loading…</div></div>
+        </div>
+        <div class="card">
+          <h2>Sources</h2>
+          <div id="dash-sources"><div class="meta">loading…</div></div>
+          <h2 style="margin-top:14px">Live sessions</h2>
+          <div id="dash-sessions"><div class="meta">none</div></div>
+        </div>
+      </div>
+      <div class="card pad0" style="margin-top:14px">
+        <div class="cardhead"><h2 style="margin:0">Streams</h2>
+          <span class="mut" id="dash-stream-count"></span></div>
+        <div id="dash-streams"><div class="meta" style="padding:14px">loading…</div></div>
+      </div>
+    </section>
+
+    <!-- ============ SEARCH & SCRAPE ============ -->
+    <section id="p-find" class="hide">
+      <h1>Search &amp; scrape</h1>
+      <p class="sub">Search the enabled sites, or paste the URL of the movie/series page you already have open.</p>
+      <div class="card">
+        <div class="tabs" id="find-tabs">
+          <button class="on" data-t="title">Search by title</button>
+          <button data-t="url">Paste URL</button>
+          <button data-t="browse">Open a source</button>
+        </div>
+
+        <div id="tab-title">
+          <div class="f2" style="grid-template-columns:2fr 1fr">
+            <div class="field"><label>Title</label><input id="q" placeholder="e.g. dune part two"></div>
+            <div class="field"><label>Type</label>
+              <select id="q-type"><option value="">both</option><option value="movie">movie</option><option value="series">series</option></select></div>
+          </div>
+          <div class="field"><label>Sources (click to toggle)</label><div id="source-chips" class="row"><span class="meta">loading…</span></div></div>
+          <div class="row">
+            <button class="btn pri" id="btn-search">⌕ Search</button>
+            <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="q-moviebox" checked> include MovieBox</label>
+            <span class="mut" id="find-hint"></span>
+          </div>
+        </div>
+
+        <div id="tab-url" class="hide">
+          <div class="field"><label>Movie / series page URL (any enabled source, or an embed/player URL)</label>
+            <input id="u-url" class="mono" placeholder="https://cinejoy.pk/movie/..."></div>
+          <div class="f2" style="grid-template-columns:1fr 1fr 1fr">
+            <div class="field"><label>Title (optional, helps find it on other sites)</label><input id="u-title"></div>
+            <div class="field"><label>Year</label><input id="u-year" type="number" placeholder="2024"></div>
+            <div class="field"><label>Kind</label><select id="u-kind"><option value="movie">movie</option><option value="series">series</option></select></div>
+          </div>
+          <div class="f2" style="grid-template-columns:1fr 1fr">
+            <div class="field"><label>Season (series)</label><input id="u-season" type="number" min="0" placeholder="1"></div>
+            <div class="field"><label>Episode (series)</label><input id="u-episode" type="number" min="0" placeholder="1"></div>
+          </div>
+          <div class="row">
+            <button class="btn pri" id="btn-resolve">⚡ Scrape stream</button>
+            <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="u-browser" checked> use the headless browser (recommended)</label>
+            <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="u-probe" checked> probe candidates with ffprobe</label>
+          </div>
+        </div>
+
+        <div id="tab-browse" class="hide">
+          <p class="sub" style="margin:6px 0 10px">Open a source, find your title, copy the URL from the address bar and paste it in the “Paste URL” tab.</p>
+          <div class="row" id="browse-links"></div>
+        </div>
+      </div>
+
+      <div class="gl" style="margin-top:14px">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Results</h2><span class="mut" id="results-count"></span></div>
+          <div id="results" style="padding:14px"><div class="meta">No search yet.</div></div>
+        </div>
+        <div class="card">
+          <h3>Selected title</h3>
+          <div id="sel-title" class="row" style="align-items:flex-start;gap:12px">
+            <div class="poster small" id="sel-poster"><b>—</b></div>
+            <div style="flex:1;min-width:0">
+              <div id="sel-name" style="font-weight:600">nothing selected</div>
+              <div class="meta" id="sel-meta">search or paste a URL, then pick a candidate below</div>
+            </div>
+          </div>
+          <div style="margin-top:12px" id="candidates"><div class="meta">No candidates yet.</div></div>
+          <div class="row" style="margin-top:12px" id="sel-actions"></div>
+          <div class="note" id="sel-note">Every candidate is probed with ffprobe before it is offered: dead mirrors, expired tokens and geo-blocks are filtered out instead of failing later in VLC.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ STREAM ============ -->
+    <section id="p-stream" class="hide">
+      <h1>Stream &amp; transcode</h1>
+      <p class="sub">One stable URL per title. VLC, the browser and the VU+ Duo2 can all use the same URL at once.</p>
+      <div class="card" id="stream-empty"><div class="meta">No stream selected — create one from Search &amp; scrape, or pick one on the dashboard.</div></div>
+
+      <div id="stream-body" class="hide">
+        <div class="card" style="margin-bottom:14px">
+          <div class="spread">
+            <div><h2 id="st-title" style="margin:0">—</h2><div class="meta" id="st-meta"></div></div>
+            <div class="row" id="st-tags"></div>
+          </div>
+          <div class="row" style="margin-top:12px" id="st-client-urls"></div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn pri" id="btn-vlc">▶ open in VLC</button>
+            <button class="btn" id="btn-session-start">⧗ start session</button>
+            <button class="btn" id="btn-session-stop">■ stop session</button>
+            <button class="btn" id="btn-download">⤓ download to NAS</button>
+            <button class="btn" id="btn-playlist">⤓ .m3u playlist</button>
+            <button class="btn ghost" id="btn-direct">⇱ direct link (302)</button>
+            <button class="btn ghost" id="btn-refresh-stream">⟳ refresh</button>
+          </div>
+        </div>
+
+        <div class="gl">
+          <div class="card">
+            <div class="spread"><h2 style="margin:0">Transcode profile</h2>
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="pf-always"> always transcode</label></div>
+            <p class="sub" style="margin:8px 0 12px">Left untouched when the source already fits the target — it is then remuxed at ~0 % CPU.</p>
+            <div class="f2">
+              <div class="field"><label>Encoder / mode</label>
+                <select id="pf-mode">
+                  <option value="auto">auto (copy when possible)</option>
+                  <option value="vaapi">VAAPI hardware → H.264</option>
+                  <option value="x264">software x264</option>
+                  <option value="h265">software H.265 (slow)</option>
+                  <option value="copy">copy only (never encode)</option>
+                </select></div>
+              <div class="field"><label>Resolution</label>
+                <select id="pf-res"><option value="480">480p</option><option value="720">720p</option><option value="1080">1080p</option></select></div>
+              <div class="field"><label>Aspect ratio</label>
+                <select id="pf-aspect"><option value="source">keep source</option><option value="169">16:9</option><option value="43">4:3</option></select></div>
+              <div class="field"><label>Container</label>
+                <select id="pf-container">
+                  <option value="mpegts">MPEG-TS (best for VLC + Enigma2)</option>
+                  <option value="matroska">MATROSKA / MKV (best for downloads)</option>
+                  <option value="hls">HLS (segments, browser/seekable)</option>
+                </select></div>
+              <div class="field"><label>Video bitrate <span class="mut" id="pf-vbr-l">2500 kbps</span></label>
+                <input type="range" id="pf-vbr" min="400" max="12000" step="100" value="2500"></div>
+              <div class="field"><label>Audio bitrate <span class="mut" id="pf-abr-l">128 kbps</span></label>
+                <input type="range" id="pf-abr" min="64" max="320" step="32" value="128"></div>
+              <div class="field"><label>Audio channels</label>
+                <select id="pf-ac"><option value="2">2 (stereo, safe everywhere)</option><option value="6">6 (keep surround)</option></select></div>
+              <div class="field"><label>Frame rate</label>
+                <select id="pf-fps"><option value="source">keep source (no judder)</option><option value="25">force 25</option><option value="30">force 30</option></select></div>
+              <div class="field"><label>Subtitles</label>
+                <select id="pf-subs">
+                  <option value="none">none</option>
+                  <option value="soft">mux as a track (MPEG-TS → DVB subs)</option>
+                  <option value="burn">burn in (re-encode)</option>
+                </select></div>
+              <div class="field"><label>Deinterlace (old DVD/TS sources)</label>
+                <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="pf-deint"> enable yadif</label></div>
+            </div>
+            <div class="note" id="pf-note"></div>
+            <div class="row">
+              <button class="btn pri" id="btn-profile-apply">save profile</button>
+              <button class="btn ghost" id="btn-profile-reset">reset</button>
+            </div>
+            <h3 style="margin-top:14px">Generated ffmpeg command (live)</h3>
+            <pre id="cmd-preview">…</pre>
+          </div>
+
+          <div>
+            <div class="card" style="margin-bottom:14px">
+              <h2>Live monitor</h2>
+              <div id="st-monitor"><div class="meta">no session running</div></div>
+            </div>
+            <div class="card pad0" style="margin-bottom:14px">
+              <div class="cardhead"><h2 style="margin:0">Probe of the source</h2></div>
+              <div id="st-probe" style="padding:12px"><div class="meta">no probe data</div></div>
+            </div>
+            <div class="card">
+              <h2>Hardware</h2>
+              <div id="st-hw"><div class="meta">unknown</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SUBTITLES ============ -->
+    <section id="p-subs" class="hide">
+      <h1>Subtitles</h1>
+      <p class="sub">Dutch first, English second. Keyless providers work out of the box; add API keys or your own sources where you need more.</p>
+      <div class="gl">
+        <div>
+          <div class="card pad0" style="margin-bottom:14px">
+            <div class="cardhead"><h2 style="margin:0">Providers</h2>
+              <button class="btn sm ghost" id="btn-providers-refresh">refresh</button></div>
+            <div id="sub-providers"><div class="meta" style="padding:14px">loading…</div></div>
+          </div>
+
+          <div class="card">
+            <h2>Add your own subtitle source</h2>
+            <p class="sub">Templates use <code>{query} {lang} {imdb} {tmdb} {sxx} {exx} {year}</code>. Works for any site that returns a list of links or JSON.</p>
+            <div class="f2">
+              <div class="field"><label>id (no spaces)</label><input id="cp-id" placeholder="mysource"></div>
+              <div class="field"><label>name</label><input id="cp-name" placeholder="My source"></div>
+            </div>
+            <div class="field"><label>search URL template</label><input id="cp-search" class="mono" placeholder="https://example.com/api?q={query}&lang={lang}"></div>
+            <div class="f2">
+              <div class="field"><label>response type</label><select id="cp-kind"><option value="html">HTML (regex)</option><option value="json">JSON</option></select></div>
+              <div class="field"><label>JSON items path / HTML regex</label><input id="cp-parse" class="mono" placeholder="data.items  or  &lt;a href=&quot;(?&lt;url&gt;[^&quot;]+)&quot;&gt;(?&lt;title&gt;[^&lt;]+)&lt;/a&gt;"></div>
+            </div>
+            <div class="field"><label>download URL template (optional, <code>{url}</code> = the found link)</label><input id="cp-download" class="mono"></div>
+            <div class="row"><button class="btn pri" id="btn-cp-save">save provider</button>
+              <span class="mut">then use the Test button in the table above</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Search</h2>
+            <div class="f2">
+              <div class="field"><label>Title</label><input id="sub-title"></div>
+              <div class="field"><label>Year</label><input id="sub-year" type="number"></div>
+              <div class="field"><label>Languages (comma separated)</label><input id="sub-langs" value="nl,en"></div>
+              <div class="field"><label>IMDb id (optional)</label><input id="sub-imdb" placeholder="tt1160419"></div>
+            </div>
+            <div class="row">
+              <button class="btn pri" id="btn-sub-search">⌕ search subtitles</button>
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="sub-autostream" checked> attach to the selected stream</label>
+            </div>
+          </div>
+          <div class="card pad0">
+            <div class="cardhead"><h2 style="margin:0">Results</h2><span class="mut" id="sub-count"></span></div>
+            <div id="sub-results"><div class="meta" style="padding:14px">no search yet</div></div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <h2>Attach / push</h2>
+            <div class="kv"><span>subtitle stored for stream</span><span id="sub-attached">—</span></div>
+            <div class="field"><label>Timing offset (ms)</label><input id="sub-offset" type="number" value="0" step="100"></div>
+            <div class="row">
+              <button class="btn" id="btn-sub-push">☁ push .srt to receiver</button>
+              <span class="mut">requires FTP or a mounted share (Settings → Enigma2)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ ENIGMA2 ============ -->
+    <section id="p-e2" class="hide">
+      <h1>Enigma2 bouquet</h1>
+      <p class="sub">Build a userbouquet for the VU+ Duo2 and push it over OpenWebif. Service type 4097 (GStreamer) is the safe default.</p>
+      <div class="gl">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Preview</h2>
+            <div class="row"><button class="btn sm" id="btn-e2-preview">⟳ regenerate</button></div></div>
+          <div style="padding:12px">
+            <div class="row" style="margin-bottom:8px">
+              <span class="tag info" id="e2-file">userbouquet.vu-movie.tv</span>
+              <span class="tag" id="e2-count">0 entries</span>
+              <span class="tag alt" id="e2-status">unknown</span>
+            </div>
+            <pre id="e2-preview">—</pre>
+            <div class="row" style="margin-top:10px">
+              <button class="btn" id="btn-e2-copy">copy</button>
+              <button class="btn" id="btn-e2-download">download .tv</button>
+              <button class="btn ghost" id="btn-e2-dry">dry run (no change)</button>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Receiver</h2>
+            <div class="f2">
+              <div class="field"><label>Host</label><input id="e2-host" class="mono" placeholder="192.168.1.50"></div>
+              <div class="field"><label>WebIF port</label><input id="e2-port" class="mono" value="80"></div>
+              <div class="field"><label>user</label><input id="e2-user" value="root"></div>
+              <div class="field"><label>password</label><input id="e2-pass" type="password" placeholder="(empty if none)"></div>
+              <div class="field"><label>bouquet name</label><input id="e2-name" value="vu-movie"></div>
+              <div class="field"><label>service type</label>
+                <select id="e2-service">
+                  <option value="4097">4097 — GStreamer / exteplayer3</option>
+                  <option value="5001">5001 — GStreamer (OpenPLi)</option>
+                  <option value="5002">5002 — exteplayer3</option>
+                  <option value="1">1 — DVB/TS</option>
+                </select></div>
+            </div>
+            <div class="row">
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="e2-ftp"> enable FTP fallback for uploads/subtitles</label>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn" id="btn-e2-save">save settings</button>
+              <button class="btn" id="btn-e2-test">test connection</button>
+              <button class="btn pri" id="btn-e2-push">☁ push bouquet now</button>
+            </div>
+            <div class="log" id="e2-log" style="margin-top:12px;max-height:220px">—</div>
+          </div>
+          <div class="card">
+            <h2>Which streams go in?</h2>
+            <div class="row"><label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="all" checked> all streams</label>
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="selected"> only the selected stream</label></div>
+            <div class="note">Stream URLs point at this NAS, so the box keeps working after the upstream token expired — vu-movie re-resolves the source on demand.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ LOGS ============ -->
+    <section id="p-logs" class="hide">
+      <h1>Logs</h1>
+      <p class="sub">Structured, levelled, greppable. When a site changes its player, the log says which stage broke and why.</p>
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <select id="log-level" style="width:auto"><option value="debug">debug</option><option value="info" selected>info+</option><option value="warn">warn+</option><option value="error">error</option></select>
+          <select id="log-component" style="width:auto"><option value="">all components</option></select>
+          <input id="log-search" placeholder="filter text…" style="flex:1">
+          <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="log-live" checked> live tail</label>
+          <button class="btn sm" id="btn-log-refresh">refresh</button>
+          <button class="btn sm ghost" id="btn-log-clear">clear view</button>
+        </div>
+        <div class="log" id="log-view">—</div>
+      </div>
+    </section>
+
+    <!-- ============ SETTINGS ============ -->
+    <section id="p-set" class="hide">
+      <h1>Settings</h1>
+      <p class="sub">Stored in <code>/config/vumovie.json</code> (mounted volume). Environment variables always win.</p>
+      <div class="grid g2" id="settings-grid"></div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn pri" id="btn-save-settings">save settings</button>
+        <button class="btn" id="btn-reload-settings">reload</button>
+        <button class="btn" id="btn-hw-test">re-test hardware</button>
+        <span class="mut" id="settings-hint"></span>
+      </div>
+      <div class="card pad0" style="margin-top:16px">
+        <div class="cardhead"><h2 style="margin:0">Custom source</h2><span class="mut">add a site with its own search URL</span></div>
+        <div style="padding:14px">
+          <div class="f2">
+            <div class="field"><label>id</label><input id="cs-id" placeholder="mysite"></div>
+            <div class="field"><label>name</label><input id="cs-name" placeholder="MySite"></div>
+            <div class="field"><label>home URL</label><input id="cs-home" class="mono" placeholder="https://example.com"></div>
+            <div class="field"><label>search URL template</label><input id="cs-search" class="mono" placeholder="https://example.com/search/{query}"></div>
+          </div>
+          <button class="btn pri" id="btn-cs-save">save source</button>
+          <div class="note">Resolving uses the headless browser (network sniffing), so a custom source works even when the site obfuscates its player — the search URL is all you need.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+{
+  "_comment": "Example of /config/vumovie.json. Copy to config/vumovie.json (or set CONFIG_FILE) and edit. Environment variables always win over this file.",
+  "app": {
+    "port": 8080,
+    "baseUrl": "",
+    "logLevel": "info",
+    "username": "",
+    "password": "",
+    "tokenTtlMinutes": 4320
+  },
+  "db": {
+    "url": "postgres://vu-movie:vumovie@db:5432/vumovie",
+    "required": false,
+    "waitForDbMs": 60000
+  },
+  "transcode": {
+    "mode": "auto",
+    "alwaysTranscode": false,
+    "maxConcurrent": 1,
+    "hardware": true,
+    "device": "/dev/dri/renderD128",
+    "resolution": 1080,
+    "aspect": "source",
+    "videoBitrate": 2500,
+    "audioBitrate": 128,
+    "audioChannels": 2,
+    "fps": "source",
+    "container": "mpegts",
+    "idleStopSeconds": 45
+  },
+  "subtitles": {
+    "languages": ["nl", "en"],
+    "autoSearch": true,
+    "pushToReceiver": false,
+    "receiverDir": "/media/hdd/movie/vumovie",
+    "keys": {
+      "opensubtitlesCom": "",
+      "subdl": ""
+    },
+    "credentials": {
+      "opensubtitlesOrgUser": "",
+      "opensubtitlesOrgPass": "",
+      "addic7edUser": "",
+      "addic7edPass": ""
+    },
+    "customProviders": [
+      {
+        "_comment": "Example of a user-defined subtitle source. Works for any site returning links or JSON.",
+        "id": "example",
+        "name": "Example source",
+        "enabled": false,
+        "searchUrl": "https://example.org/search?q={query}&lang={lang}",
+        "downloadUrl": "",
+        "parse": {
+          "kind": "html",
+          "regex": "<a[^>]+href=\"(?<url>[^\"]+)\"[^>]*>(?<title>[^<]{2,120})<"
+        }
+      }
+    ],
+    "disabledProviders": []
+  },
+  "enigma2": {
+    "host": "192.168.1.50",
+    "port": 80,
+    "username": "root",
+    "password": "",
+    "bouquetName": "vu-movie",
+    "rootDir": "/etc/enigma2",
+    "serviceType": 4097,
+    "ftpEnabled": false,
+    "ftpPort": 21,
+    "autoPush": false
+  },
+  "scraper": {
+    "browserConcurrency": 1,
+    "browserIdleSeconds": 180,
+    "resolveTimeoutMs": 45000,
+    "probeCandidates": true,
+    "maxCandidates": 12,
+    "flaresolverrUrl": "",
+    "externalExtractorUrl": "",
+    "customSources": []
+  }
+}

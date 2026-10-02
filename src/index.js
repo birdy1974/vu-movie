@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+/**
+ * vu-movie — entry point.
+ *
+ * Boot order matters and is deliberately explicit:
+ *   1. configuration (file + env)      — nothing else can be trusted before this
+ *   2. directories                     — /downloads, /config, /tmp/vumovie
+ *   3. database (lazy pool) + migrations  → tables exist BEFORE we serve traffic
+ *   4. ffmpeg/ffprobe + hardware self-test  → know what this NAS can actually do
+ *   5. HTTP server (UI + API + streams)
+ *
+ * Any step that fails logs what happened and what the fallback is; only a failure
+ * in step 5 is fatal, because without HTTP there is no product.
+ */
+
+import { log, logError, errorText } from './core/log.js';
+import { loadConfig, getConfig, ensureDirs, publicConfig } from './core/config.js';
+import { initDatabase, closeDatabase, dbState } from './core/db.js';
+import { checkBinaries, hardware } from './core/media.js';
+import { startServer } from './http/server.js';
+import relay from './streams/relay.js';
+import browser from './scrapers/browser.js';
+import { loadSources } from './scrapers/registry.js';
+
+process.env.APP_VERSION = process.env.APP_VERSION || '1.0.0';
+
+const banner = `
+                       _                 
+ __   ___   _  ______ _(_)___  _____   __
+ \\ \\ / / | | |/ / __ \`/ / __ \\/ _ \\ \\ / /
+  \\ V /| |_| | / /_/ / / /_/ /  __/\\ V / 
+   \\_/  \\__,_|_\\__,_/_/\\____/\\___| \\_/   movie → stream proxy
+`;
+
+async function main() {
+  console.log(banner);
+  const startedAt = Date.now();
+
+  // 1 ── configuration
+  loadConfig();
+  const cfg = getConfig();
+  log.info('app', `vu-movie ${process.env.APP_VERSION} starting`, {
+    node: process.version, pid: process.pid, logLevel: cfg.app.logLevel,
+    configFile: process.env.CONFIG_FILE || '/config/vumovie.json',
+  });
+  log.debug('app', 'effective configuration', { config: publicConfig() });
+
+  // 2 ── directories
+  ensureDirs();
+
+  // 3 ── database (lazy; memory fallback unless REQUIRE_DB=true)
+  let dbInfo = { mode: 'memory' };
+  try {
+    dbInfo = await initDatabase();
+  } catch (err) {
+    logError('app', 'database initialisation failed', err);
+    if (cfg.db.required) throw err;
+    log.warn('app', 'continuing without Postgres (memory mode)');
+  }
+
+  // 4 ── binaries + hardware capability
+  const binaries = checkBinaries();
+  if (!binaries.ffmpeg.ok) {
+    log.error('app', 'ffmpeg is missing — scanning works, but NOTHING can be streamed or transcoded', {});
+  }
+  const hw = await hardware();
+  if (!hw.available) {
+    log.warn('app', 'hardware transcoding unavailable — software encoding will be used', { reason: hw.reason });
+  } else {
+    log.info('app', 'hardware transcoding ready', { encoder: hw.encoder, device: hw.device, fpsVariant: hw.fpsVariant });
+  }
+
+  // sources are loaded eagerly so config errors show up at boot, not on first use
+  const sources = loadSources({ force: true });
+  log.info('app', `scraper registry: ${sources.filter((s) => s.enabled).length}/${sources.length} sites enabled`);
+
+  // 5 ── HTTP
+  const server = await startServer();
+  log.info('app', `ready in ${Date.now() - startedAt} ms`, {
+    db: dbInfo.mode, hwaccel: hw.available ? 'vaapi' : 'software',
+    url: `http://<nas-ip>:${cfg.app.port}`,
+  });
+
+  // ---- graceful shutdown ----
+  const shutdown = async (signal) => {
+    log.info('app', `received ${signal} — shutting down`, { sessions: relay.listSessions().length });
+    server.close(() => log.debug('app', 'http server closed'));
+    relay.stopAll('shutdown');
+    await browser.closeBrowser('shutdown').catch(() => {});
+    await closeDatabase().catch(() => {});
+    setTimeout(() => process.exit(0), 500).unref();
+  };
+  ['SIGINT', 'SIGTERM'].forEach((sig) => process.on(sig, () => { shutdown(sig).catch(() => process.exit(1)); }));
+
+  process.on('unhandledRejection', (reason) => {
+    logError('app', 'unhandled promise rejection (this is a bug — please report it with the log)', reason instanceof Error ? reason : new Error(String(reason)));
+  });
+  process.on('uncaughtException', (err) => {
+    logError('app', 'uncaught exception — the process will keep running, but this is a bug', err);
+  });
+}
+
+main().catch((err) => {
+  logError('app', 'fatal startup error — the container will exit now', err);
+  console.error(`\nvu-movie could not start: ${errorText(err)}\n`);
+  process.exit(1);
+});

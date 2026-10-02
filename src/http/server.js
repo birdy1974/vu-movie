@@ -1,0 +1,293 @@
+/**
+ * vu-movie — HTTP server.
+ *
+ * Serves three things:
+ *   1. the web UI (static files from /app/public)
+ *   2. the JSON API (see api.js)
+ *   3. the *playable* endpoints:  /s/<token>/<name>.ts|.mkv|.m3u8|.m3u|direct
+ *                                 /hls/<token>/index.m3u8 + segments
+ *                                 /dl/<token>/<name>   (with Content-Disposition)
+ *
+ * The playable endpoints are deliberately NOT behind the UI password: VLC and the
+ * VU+ Duo2 cannot authenticate comfortably, so access is protected by a random
+ * 96-bit token per stream instead (see streams/store.js). Everything that can
+ * change state stays on /api/* and *is* password protected when a password is set.
+ */
+
+import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import http from 'node:http';
+import { fileURLToPath } from 'node:url';
+import { log, logError, truncate } from '../core/log.js';
+import { getConfig } from '../core/config.js';
+import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand } from '../core/media.js';
+import { FFMPEG } from '../core/media.js';
+import { spawn } from 'node:child_process';
+import * as store from '../streams/store.js';
+import * as relay from '../streams/relay.js';
+import * as exporter from '../streams/export.js';
+import apiRouter from './api.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.resolve(__dirname, '../../public');
+
+/** Resolve a stream by token and attach it to the relay session. */
+async function streamByToken(token) {
+  const stream = await store.getStream(token);
+  if (!stream) log.warn('http', 'unknown stream token requested', { token: truncate(token, 20) });
+  return stream;
+}
+
+function extensionOf(reqPath) {
+  const m = /\.([a-z0-9]+)$/i.exec(reqPath.split('?')[0]);
+  return m ? m[1].toLowerCase() : '';
+}
+
+export function createApp() {
+  const app = express();
+  const cfg = getConfig();
+  app.disable('x-powered-by');
+  app.set('trust proxy', true);
+  app.use(express.json({ limit: '2mb' }));
+
+  // ---- request logging (debug level: keeps the log page usable at info) ----
+  app.use((req, res, next) => {
+    const started = Date.now();
+    res.on('finish', () => {
+      const ms = Date.now() - started;
+      const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'debug';
+      log[level]('http', `${req.method} ${req.originalUrl} → ${res.statusCode}`, {
+        ms, ip: req.ip, bytes: res.getHeader('content-length') || undefined,
+      });
+    });
+    next();
+  });
+
+  // ---- optional password on the UI/API (stream endpoints stay token-only) ----
+  app.use((req, res, next) => {
+    const { username, password } = cfg.app;
+    if (!username) return next();
+    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path === '/api/health') return next();
+    const header = req.headers.authorization || '';
+    const [scheme, encoded] = header.split(' ');
+    if (scheme === 'Basic' && encoded) {
+      const [user, pass] = Buffer.from(encoded, 'base64').toString('utf8').split(':');
+      if (user === username && pass === password) return next();
+    }
+    log.warn('http', 'unauthorised request rejected', { path: req.path, ip: req.ip });
+    res.set('WWW-Authenticate', 'Basic realm="vu-movie"');
+    return res.status(401).send('vu-movie: authentication required');
+  });
+
+  app.use('/api', apiRouter);
+
+  // ---- HLS segments produced by an "hls" container session ----
+  app.get('/hls/:token/:file', async (req, res) => {
+    const cfgNow = getConfig();
+    const dir = path.join(cfgNow.storage.tmp, 'hls', req.params.token);
+    const file = path.basename(req.params.file);
+    const full = path.join(dir, file);
+    if (!full.startsWith(dir) || !fs.existsSync(full)) {
+      return res.status(404).send('not found');
+    }
+    if (file.endsWith('.m3u8')) res.type('application/vnd.apple.mpegurl');
+    else res.type('video/mp2t');
+    res.setHeader('Cache-Control', 'no-cache');
+    log.debug('http', 'serving HLS file', { file });
+    return res.sendFile(full);
+  });
+
+  /* ---------------- playable endpoints ---------------- */
+
+  app.get('/s/:token/:name', async (req, res) => {
+    const stream = await streamByToken(req.params.token);
+    if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
+    const ext = extensionOf(req.params.name);
+
+    // direct redirect (hybrid mode from decision D2) — zero load on the NAS
+    if (ext === 'direct' || req.path.endsWith('/direct')) {
+      log.info('http', `redirecting to upstream (direct mode)`, { stream: stream.id });
+      return res.redirect(302, stream.upstream?.url);
+    }
+
+    // playlist files
+    if (ext === 'm3u' || ext === 'm3u8') {
+      const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+      if (ext === 'm3u8' && (stream.profile?.container === 'hls')) {
+        const session = await relay.ensureSession(stream, { container: 'hls' });
+        if (session.kind === 'hls') {
+          log.info('http', 'client asked for the HLS playlist', { stream: stream.id });
+          return res.redirect(302, `/hls/${stream.token}/index.m3u8`);
+        }
+      }
+      const csv = exporter.buildM3U([{
+        title: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
+        url: urls.ts,
+        logo: stream.poster,
+        quality: stream.upstream?.quality,
+        group: 'vu-movie',
+        subtitle: stream.profile?.subtitlePath && fs.existsSync(stream.profile.subtitlePath) ? stream.profile.subtitlePath : undefined,
+      }], { name: stream.title });
+      res.type(ext === 'm3u8' ? 'application/vnd.apple.mpegurl' : 'audio/x-mpegurl');
+      log.info('http', `serving playlist for "${stream.title}"`, { ext });
+      return res.send(csv);
+    }
+
+    if (!['ts', 'mkv', 'mp4', 'mpegts', 'matroska'].includes(ext)) {
+      log.warn('http', 'unsupported stream extension requested', { ext, name: req.params.name });
+      return res.status(400).send(`vu-movie: unsupported extension ".${ext}" (use .ts, .mkv, .m3u8 or .m3u)`);
+    }
+
+    const container = ext === 'mkv' || ext === 'matroska' ? 'matroska' : 'mpegts';
+    const hw = await hardware();
+    let session;
+    try {
+      session = await relay.ensureSession(stream, { container });
+    } catch (err) {
+      logError('http', 'could not start the stream session', err, { stream: stream.id });
+      return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
+    }
+
+    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    if (req.method === 'HEAD') return res.end();
+
+    log.info('http', `client is playing "${stream.title}"`, {
+      ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
+      mode: session.mode, encoder: session.encoder, container, hw: hw.available ? 'vaapi' : 'software',
+    });
+    const { finish } = relay.attachClient(session, req, res);
+    res.on('close', () => finish('socket closed'));
+    return undefined;
+  });
+
+  /* ---------------- download endpoint (attachment, single client) ---------------- */
+
+  app.get('/dl/:token/:name', async (req, res) => {
+    const stream = await streamByToken(req.params.token);
+    if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
+    const ext = extensionOf(req.params.name);
+    const container = ext === 'mkv' ? 'matroska' : 'mpegts';
+    const hw = await hardware();
+    const profile = normaliseProfile({ ...(stream.profile || {}), container }, stream.upstream?.probe || null);
+    const args = buildFfmpegArgs({
+      source: {
+        url: stream.upstream?.url, headers: stream.upstream?.headers || {},
+        kind: stream.upstream?.kind || undefined, container: stream.upstream?.probe?.container || null,
+      },
+      profile, hw, mode: 'file', output: { container, target: 'pipe:1' },
+    });
+    log.info('http', `download started for "${stream.title}"`, { container, command: truncate(argsToCommand(args), 300) });
+    res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${ext}"`);
+    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.pipe(res);
+    child.stderr.on('data', (d) => log.debug('http', `download ffmpeg: ${truncate(String(d).trim(), 160)}`));
+    child.on('error', (err) => {
+      logError('http', 'download ffmpeg failed to start', err);
+      if (!res.headersSent) res.status(500).end();
+    });
+    child.on('close', (code) => {
+      log.info('http', 'download finished', { stream: stream.id, code });
+      res.end();
+    });
+    req.on('close', () => {
+      log.warn('http', 'download cancelled by the client', { stream: stream.id });
+      child.kill('SIGTERM');
+    });
+  });
+
+  /* ---------------- watch page (tiny player for the browser) ---------------- */
+
+  app.get('/watch/:token', async (req, res) => {
+    const stream = await streamByToken(req.params.token);
+    if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
+    const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+    res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<title>${escapeHtml(stream.title)} — vu-movie</title>
+<style>body{background:#0b0f16;color:#e6edf7;font:14px system-ui;margin:0;padding:24px}
+video{width:100%;max-width:1100px;background:#000;border-radius:12px}
+a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px}</style></head>
+<body><h1>${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}</h1>
+<video controls autoplay src="${urls.raw}"></video>
+<p>Direct link: <code>${urls.raw}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>
+</body></html>`);
+  });
+
+  /* ---------------- static UI ---------------- */
+
+  if (!fs.existsSync(PUBLIC_DIR)) {
+    log.error('http', `public directory ${PUBLIC_DIR} is missing — the UI will not be available`, {});
+    fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(path.join(PUBLIC_DIR, 'index.html'))) {
+    log.warn('http', `no index.html in ${PUBLIC_DIR} — serving a placeholder page instead of failing`, {
+      hint: 'the repository ships public/index.html; a missing file means a broken checkout or a bad COPY in the Dockerfile',
+    });
+  } else {
+    log.info('http', `serving static UI from ${PUBLIC_DIR}`);
+  }
+
+  app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '5m' }));
+  app.get('/', (req, res) => {
+    const index = path.join(PUBLIC_DIR, 'index.html');
+    if (fs.existsSync(index)) return res.sendFile(index);
+    return res.type('html').send('<h1>vu-movie</h1><p>The web UI is not installed in this container (public/index.html missing).</p>');
+  });
+
+  // ---- 404 + error handling ----
+  app.use((req, res) => {
+    if (req.path.startsWith('/api/')) return res.status(404).json({ ok: false, error: `no such endpoint: ${req.method} ${req.path}` });
+    log.debug('http', 'not found', { path: req.path });
+    return res.status(404).send('vu-movie: not found');
+  });
+
+  app.use((err, req, res, next) => {
+    logError('http', `unhandled error on ${req.method} ${req.originalUrl}`, err);
+    if (res.headersSent) return next(err);
+    return res.status(err.status || 500).json({ ok: false, error: err.message });
+  });
+
+  return app;
+}
+
+function baseUrlFrom(req, cfg) {
+  if (cfg.app.baseUrl) return String(cfg.app.baseUrl).replace(/\/$/, '');
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  return `${proto}://${req.get('host')}`;
+}
+
+function escapeHtml(text) {
+  return String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+export function startServer() {
+  const cfg = getConfig();
+  const app = createApp();
+  const server = http.createServer(app);
+
+  // Long-lived streams: never let a proxy or the socket timeout kill playback.
+  server.keepAliveTimeout = 0;
+  server.headersTimeout = 0;
+  server.requestTimeout = 0;
+
+  return new Promise((resolve, reject) => {
+    server.on('error', (err) => {
+      logError('http', `server could not listen on ${cfg.app.host}:${cfg.app.port}`, err);
+      reject(err);
+    });
+    server.listen(cfg.app.port, cfg.app.host, () => {
+      const addr = server.address();
+      log.info('http', `vu-movie listening on http://${cfg.app.host}:${addr.port}`, {
+        publicDir: PUBLIC_DIR,
+        baseUrl: cfg.app.baseUrl || '(derived from the request Host header)',
+        auth: cfg.app.username ? 'basic auth enabled' : 'open on the LAN (no password set)',
+      });
+      resolve(server);
+    });
+  });
+}
+
+export default { createApp, startServer };

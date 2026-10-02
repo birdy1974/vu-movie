@@ -1,0 +1,143 @@
+# vu-movie — docker-compose for Synology DS918+ (DSM 7 Container Manager)
+# =============================================================================
+# Quick start
+#   1. put this folder somewhere on the NAS (e.g. /volume1/docker/vu-movie)
+#   2. edit .env (copy .env.example) — at minimum set ENIGMA2_HOST
+#   3. Container Manager → Project → Create → select this folder → Build
+#      (or from a shell:  docker compose up -d --build)
+#
+# Hardware transcoding requires the /dev/dri device to be passed through; on DSM
+# that is the `devices:` line below plus the Intel GPU driver being loaded on the
+# host (it is, on a DS918+ — check with:  ls -l /dev/dri)
+# =============================================================================
+name: vu-movie
+
+services:
+  # ---------------------------------------------------------------- vu-movie app
+  vu-movie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vu-movie:1.0.0
+    container_name: vu-movie
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      # --- database: lazy pool, migrations run automatically at startup ---
+      DATABASE_URL: postgres://${POSTGRES_USER:-vu-movie}:${POSTGRES_PASSWORD:-vumovie}@db:5432/${POSTGRES_DB:-vumovie}
+      # Set to true to make the container refuse to start when Postgres is down
+      # (default false: it degrades to an in-memory store and keeps streaming).
+      REQUIRE_DB: "${REQUIRE_DB:-false}"
+      TZ: "${TZ:-Europe/Amsterdam}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # LAN URL handed to VLC / the Duo2. Leave empty to auto-detect from the
+      # request (works when you open the UI via the NAS IP).
+      BASE_URL: "${BASE_URL:-}"
+      # --- transcoding (DS918+ / HD Graphics 500) ---
+      TRANSCODE_MODE: "${TRANSCODE_MODE:-auto}"          # auto|copy|vaapi|x264|h265
+      ALWAYS_TRANSCODE: "${ALWAYS_TRANSCODE:-false}"
+      MAX_CONCURRENT_TRANSCODES: "${MAX_CONCURRENT_TRANSCODES:-1}"
+      HWACCEL: "${HWACCEL:-true}"
+      VAAPI_DEVICE: "${VAAPI_DEVICE:-/dev/dri/renderD128}"
+      DEFAULT_RESOLUTION: "${DEFAULT_RESOLUTION:-1080}"
+      DEFAULT_VIDEO_BITRATE: "${DEFAULT_VIDEO_BITRATE:-2500}"
+      DEFAULT_AUDIO_BITRATE: "${DEFAULT_AUDIO_BITRATE:-128}"
+      DEFAULT_CONTAINER: "${DEFAULT_CONTAINER:-mpegts}"  # mpegts|matroska|hls
+      LIBVA_DRIVER_NAME: "${LIBVA_DRIVER_NAME:-iHD}"     # iHD (non-free) or i965
+      # --- VU+ Duo2 ---
+      ENIGMA2_HOST: "${ENIGMA2_HOST:-}"
+      ENIGMA2_PORT: "${ENIGMA2_PORT:-80}"
+      ENIGMA2_USER: "${ENIGMA2_USER:-root}"
+      ENIGMA2_PASSWORD: "${ENIGMA2_PASSWORD:-}"
+      ENIGMA2_BOUQUET: "${ENIGMA2_BOUQUET:-vu-movie}"
+      ENIGMA2_SERVICE_TYPE: "${ENIGMA2_SERVICE_TYPE:-4097}"
+      ENIGMA2_FTP: "${ENIGMA2_FTP:-false}"
+      # --- subtitles ---
+      SUBTITLE_LANGUAGES: "${SUBTITLE_LANGUAGES:-nl,en}"
+      SUBTITLE_PUSH: "${SUBTITLE_PUSH:-false}"
+      OPENSUBTITLES_API_KEY: "${OPENSUBTITLES_API_KEY:-}"
+      SUBDL_API_KEY: "${SUBDL_API_KEY:-}"
+      # --- scraping (raise these only on a stronger NAS) ---
+      BROWSER_CONCURRENCY: "${BROWSER_CONCURRENCY:-1}"
+      RESOLVE_TIMEOUT_MS: "${RESOLVE_TIMEOUT_MS:-45000}"
+      FLARESOLVERR_URL: "${FLARESOLVERR_URL:-}"
+      EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
+      # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
+      APP_USERNAME: "${APP_USERNAME:-}"
+      APP_PASSWORD: "${APP_PASSWORD:-}"
+    devices:
+      # This single line is what enables VAAPI transcoding on the DS918+.
+      - /dev/dri:/dev/dri
+    volumes:
+      # Config, sessions and per-site cookies survive container upgrades.
+      - ./data/config:/config
+      - ./data/downloads:/downloads
+      - ./data/tmp:/tmp/vumovie
+    # Chromium needs more shared memory than Docker's 64 MB default.
+    shm_size: 512m
+    # Keep ffmpeg + chromium + node inside the NAS memory budget.
+    mem_limit: "${MEM_LIMIT:-2500m}"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [vu-movie]
+
+  # ------------------------------------------------------------------ postgres
+  db:
+    image: postgres:16-alpine
+    container_name: vu-movie-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vu-movie}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vumovie}
+      POSTGRES_DB: ${POSTGRES_DB:-vumovie}
+      # modest settings: this database stores a few hundred rows, not a data lake
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vu-movie} -d ${POSTGRES_DB:-vumovie}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+    networks: [vu-movie]
+
+  # ------------------------------- optional: Cloudflare solver (profile: cf) --
+  # Only needed if one of your sites starts serving Cloudflare challenges to the
+  # headless browser. Enable with:  docker compose --profile cf up -d
+  # and set FLARESOLVERR_URL=http://flaresolverr:8191
+  flaresolverr:
+    image: flaresolverr/flaresolverr:latest
+    container_name: vu-movie-flaresolverr
+    profiles: ["cf"]
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      TZ: "${TZ:-Europe/Amsterdam}"
+    mem_limit: 800m
+    networks: [vu-movie]
+
+volumes:
+  pgdata:
+    name: vu-movie-pgdata
+
+networks:
+  vu-movie:
+    name: vu-movie
