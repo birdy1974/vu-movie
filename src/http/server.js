@@ -21,8 +21,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand } from '../core/media.js';
-import { FFMPEG } from '../core/media.js';
+import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv } from '../core/media.js';
 import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -140,7 +139,8 @@ export function createApp() {
     }
 
     const container = ext === 'mkv' || ext === 'matroska' ? 'matroska' : 'mpegts';
-    const hw = await hardware();
+    // Bounded wait so a slow GPU self-test cannot hold a playback request open.
+    const hw = await hardware({ waitMs: 15000 });
     let session;
     try {
       session = await relay.ensureSession(stream, { container });
@@ -170,7 +170,7 @@ export function createApp() {
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const ext = extensionOf(req.params.name);
     const container = ext === 'mkv' ? 'matroska' : 'mpegts';
-    const hw = await hardware();
+    const hw = await hardware({ waitMs: 15000 });
     const profile = normaliseProfile({ ...(stream.profile || {}), container }, stream.upstream?.probe || null);
     const args = buildFfmpegArgs({
       source: {
@@ -182,7 +182,7 @@ export function createApp() {
     log.info('http', `download started for "${stream.title}"`, { container, command: truncate(argsToCommand(args), 300) });
     res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${ext}"`);
     res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
-    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
     child.stdout.pipe(res);
     child.stderr.on('data', (d) => log.debug('http', `download ffmpeg: ${truncate(String(d).trim(), 160)}`));
     child.on('error', (err) => {

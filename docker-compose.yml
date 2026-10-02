@@ -44,7 +44,16 @@ services:
       DEFAULT_VIDEO_BITRATE: "${DEFAULT_VIDEO_BITRATE:-2500}"
       DEFAULT_AUDIO_BITRATE: "${DEFAULT_AUDIO_BITRATE:-128}"
       DEFAULT_CONTAINER: "${DEFAULT_CONTAINER:-mpegts}"  # mpegts|matroska|hls
-      LIBVA_DRIVER_NAME: "${LIBVA_DRIVER_NAME:-iHD}"     # iHD (non-free) or i965
+      # Empty = auto-detect: the app tries iHD and then i965 and passes the
+      # driver that really encoded the test pattern to ffmpeg. On a DS918+
+      # (Apollo Lake) that is usually i965 even though iHD installs fine, so
+      # hard-coding iHD is what silently disables hardware transcoding.
+      LIBVA_DRIVER_NAME: "${LIBVA_DRIVER_NAME:-}"
+      # How long `ffmpeg -version` may take before it counts as failed. A
+      # timeout is NOT "ffmpeg missing" (that bug disabled all transcoding and
+      # was then cached for a week) — failures are retried in the background.
+      FFMPEG_PROBE_TIMEOUT_MS: "${FFMPEG_PROBE_TIMEOUT_MS:-30000}"
+      FFMPEG_RECHECK_MS: "${FFMPEG_RECHECK_MS:-60000}"
       # --- VU+ Duo2 ---
       ENIGMA2_HOST: "${ENIGMA2_HOST:-}"
       ENIGMA2_PORT: "${ENIGMA2_PORT:-80}"

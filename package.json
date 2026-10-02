@@ -2,7 +2,7 @@
   "name": "vu-movie",
   "version": "1.0.0",
   "private": true,
-  "description": "vu-movie — scrapes a movie/series URL into one playable video stream (VLC), with VAAPI transcoding for Synology DS918+ and Enigma2 bouquet push for a VU+ Duo2",
+  "description": "vu-movie \u2014 scrapes a movie/series URL into one playable video stream (VLC), with VAAPI transcoding for Synology DS918+ and Enigma2 bouquet push for a VU+ Duo2",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -15,7 +15,8 @@
     "test": "node --test \"test/*.test.js\"",
     "check": "node scripts/check-syntax.mjs",
     "lock": "npm install --package-lock-only --ignore-scripts",
-    "bootstrap": "npm install --omit=dev"
+    "bootstrap": "npm install --omit=dev",
+    "doctor": "sh scripts/doctor.sh"
   },
   "dependencies": {
     "express": "^4.21.2",

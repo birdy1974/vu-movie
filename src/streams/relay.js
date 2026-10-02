@@ -29,7 +29,7 @@ import { spawn } from 'node:child_process';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
-  FFMPEG, hardware, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
+  hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
 } from '../core/media.js';
 
 /** streamId → session */
@@ -98,7 +98,15 @@ export async function ensureSession(stream, opts = {}) {
   const container = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
   const profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
   const profile = normaliseProfile(profileInput, stream.upstream?.probe || null);
-  const hw = await hardware();
+  // Bounded wait: a slow GPU self-test must not stall playback forever. The
+  // placeholder reports available:false, so we fall back to software encoding
+  // for this session and use the (soon to be known) VAAPI result on the next one.
+  const hw = await hardware({ waitMs: 15000 });
+  if (hw.pending) {
+    log.warn('relay', 'hardware detection is still running — starting this session with software encoding', {
+      reason: hw.reason,
+    });
+  }
 
   const wantsHls = container === 'hls';
   // Segment length: 2 s keeps the VU+ zapping latency low, browsers happy and the
@@ -165,7 +173,10 @@ function hlsDirFor(stream) {
 
 function spawnFfmpeg(session) {
   const cfg = getConfig();
-  const child = spawn(FFMPEG, session.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // ffmpegEnv() pins LIBVA_DRIVER_NAME to the driver the self-test proved to
+  // work (iHD on some NAS, i965 on the DS918+) — without it ffmpeg would retry
+  // the driver that failed on every session.
+  const child = spawn(ffmpegPath(), session.args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(session.hw) });
   session.child = child;
   session.alive = true;
 

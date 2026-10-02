@@ -397,7 +397,7 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
     log.warn('scraper', 'candidate probing is disabled in settings — VLC may meet dead mirrors');
     return list.map((c) => ({ ...c, ok: c.ok !== false, unverified: true }));
   }
-  const binaries = checkBinaries();
+  const binaries = await checkBinaries();
   if (!binaries.ffprobe.ok) {
     log.warn('scraper', 'ffprobe is not installed — offering candidates unverified', { error: binaries.ffprobe.error });
     return rankCandidates(list.map((c) => ({ ...c, ok: c.ok !== false, unverified: true, probe: c.probe || null })));

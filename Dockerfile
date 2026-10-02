@@ -84,9 +84,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # --- memory tuning for a 4 GB NAS (Chromium + ffmpeg + node in one box) ---
     MALLOC_ARENA_MAX=2 \
     NODE_OPTIONS=--max-old-space-size=512 \
-    # Prefer the modern iHD driver for Apollo Lake; the app falls back to i965
-    # automatically when iHD is not installable in the base image.
-    LIBVA_DRIVER_NAME=iHD
+    # Where the VA-API driver modules live (Debian path; both iHD and i965 are
+    # installed below). LIBVA_DRIVER_NAME is deliberately NOT set here: on a
+    # DS918+ iHD installs but fails to initialise, so the app self-tests iHD and
+    # i965 and pins the driver that actually encodes. Set it in .env to override.
+    LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
 
 # System packages.
 #   ffmpeg/ffprobe      → probing, remuxing and (with vaapi) transcoding

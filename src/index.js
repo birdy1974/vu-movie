@@ -16,7 +16,7 @@
 import { log, logError, errorText } from './core/log.js';
 import { loadConfig, getConfig, ensureDirs, publicConfig } from './core/config.js';
 import { initDatabase, closeDatabase, dbState } from './core/db.js';
-import { checkBinaries, hardware } from './core/media.js';
+import { checkBinaries, hardware, hardwarePending, hardwareStatus } from './core/media.js';
 import { startServer } from './http/server.js';
 import relay from './streams/relay.js';
 import browser from './scrapers/browser.js';
@@ -58,17 +58,31 @@ async function main() {
     log.warn('app', 'continuing without Postgres (memory mode)');
   }
 
-  // 4 ── binaries + hardware capability
-  const binaries = checkBinaries();
-  if (!binaries.ffmpeg.ok) {
-    log.error('app', 'ffmpeg is missing — scanning works, but NOTHING can be streamed or transcoded', {});
-  }
-  const hw = await hardware();
-  if (!hw.available) {
-    log.warn('app', 'hardware transcoding unavailable — software encoding will be used', { reason: hw.reason });
-  } else {
-    log.info('app', 'hardware transcoding ready', { encoder: hw.encoder, device: hw.device, fpsVariant: hw.fpsVariant });
-  }
+  // 4 ── binaries + hardware capability, kicked off but NOT awaited.
+  //      The vaapi self-test encodes a short test pattern and the binary probe
+  //      may be slow on a cold volume; the HTTP server must come up regardless
+  //      (its healthcheck has a 10 s timeout) and both results are logged when
+  //      they arrive. Everything that needs them awaits the same promises.
+  checkBinaries().then((b) => {
+    if (b.ffmpeg.ok) return;
+    log.error('app', 'ffmpeg is not usable — scanning may work, streaming cannot start yet', {
+      kind: b.ffmpeg.kind,
+      error: b.ffmpeg.error,
+      hint: b.ffmpeg.kind === 'timeout'
+        ? 'a timeout is retried automatically in the background — no action needed'
+        : 'run "sh scripts/doctor.sh" on the NAS for a full report',
+    });
+  }).catch((err) => logError('app', 'binary check failed', err));
+
+  hardware().then((hw) => {
+    if (!hw.available) {
+      log.warn('app', 'hardware transcoding unavailable — software encoding will be used', { reason: hw.reason, attempts: hw.attempts });
+    } else {
+      log.info('app', 'hardware transcoding ready', {
+        encoder: hw.encoder, device: hw.device, driver: hw.libvaDriver, fpsVariant: hw.fpsVariant,
+      });
+    }
+  }).catch((err) => logError('app', 'hardware detection failed', err));
 
   // sources are loaded eagerly so config errors show up at boot, not on first use
   const sources = loadSources({ force: true });
@@ -77,7 +91,8 @@ async function main() {
   // 5 ── HTTP
   const server = await startServer();
   log.info('app', `ready in ${Date.now() - startedAt} ms`, {
-    db: dbInfo.mode, hwaccel: hw.available ? 'vaapi' : 'software',
+    db: dbInfo.mode,
+    hwaccel: hardwarePending() ? 'detecting…' : (hardwareStatus().available ? 'vaapi' : 'software'),
     url: `http://<nas-ip>:${cfg.app.port}`,
   });
 
