@@ -11,7 +11,9 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { FFMPEG, buildFfmpegArgs, argsToCommand, hardware, normaliseProfile, parseProgressLine } from '../core/media.js';
+import {
+  buildFfmpegArgs, argsToCommand, hardware, ffmpegPath, ffmpegEnv, normaliseProfile, parseProgressLine,
+} from '../core/media.js';
 import { JobQueue } from '../core/jobs.js';
 import { urlsFor, slugify } from './store.js';
 
@@ -68,7 +70,9 @@ export function startDownload(stream, { profile = {}, filename = null, baseUrl =
   return downloadQueue.submit(
     { type: 'download', title: stream.title || name, meta: { streamId: stream.id, target, container } },
     async (ctx) => {
-      const hw = await hardware();
+      // Bounded wait: a download falls back to software encoding rather than
+      // queueing forever behind a slow GPU self-test.
+      const hw = await hardware({ waitMs: 15000 });
       const normalised = normaliseProfile({ ...(stream.profile || {}), ...profile, container }, stream.upstream?.probe || null);
       const args = buildFfmpegArgs({
         source: {
@@ -86,7 +90,7 @@ export function startDownload(stream, { profile = {}, filename = null, baseUrl =
       ctx.log(`ffmpeg → ${target}`);
       ctx.progress(1, 'starting');
 
-      const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'ignore', 'pipe'], env: ffmpegEnv(hw) });
       ctx.setHandle(child);
       const durationSec = stream.upstream?.probe?.durationSec || null;
       let buffer = '';

@@ -63,13 +63,24 @@ The hardware encoder lives at `/dev/dri/renderD128`. Three things must line up:
    A `chmod` does not survive DSM updates/reboots on all models; the root default
    exists precisely to avoid that.
 
-3. **The right driver is used.** The image installs the non-free `intel-media-va-driver`
-   (iHD, best for Apollo Lake) and falls back to `i965-va-driver`. Select with
-   `LIBVA_DRIVER_NAME=iHD` (default) or `LIBVA_DRIVER_NAME=i965` in `.env`.
+3. **The right driver is used.** The image installs both VA-API drivers
+   (`intel-media-va-driver-non-free` → iHD and `i965-va-driver`). Leave
+   `LIBVA_DRIVER_NAME` **empty** in `.env` (the default): the app runs its
+   self-test with every installed driver, keeps the one that actually encoded a
+   test pattern and passes it to every ffmpeg process.
 
-Check from inside the container:
+   This matters because on a DS918+ iHD *installs* fine but often fails to
+   initialise against Synology's kernel (`libva error: … iHD_drv_video.so init
+   failed`). In that case the app falls back to i965 automatically and logs
+   `vaapi self-test ok (variant …, LIBVA_DRIVER_NAME=i965)`. Set
+   `LIBVA_DRIVER_NAME=i965` only to force a driver (libva itself does *not* fall
+   back once a driver's `.so` opens but fails to init).
+
+Check from inside the container — or let one command do all of it:
 
 ```bash
+sh scripts/doctor.sh                                       # container + /dev/dri + drivers + a 2 s encode
+curl -s localhost:8080/api/diagnostics/ffmpeg              # the same, timed, from the app itself
 docker compose exec vu-movie vainfo
 docker compose exec vu-movie ffmpeg -hwaccels
 curl -s localhost:8080/api/health | grep -A6 hwaccel
@@ -167,10 +178,20 @@ the new profile on the next request.
 | Stream plays but stops after a while | `relay` logs: most upstream URLs expire. Increase `TOKEN_TTL_MINUTES`, or use *Transcode* so the app owns the connection and re-fetches |
 | VLC shows a black screen | Copy the ffmpeg command from the Stream page and run it inside the container: `docker compose exec vu-movie sh -c '<command> > /tmp/x.ts'` — the error message is always in the last lines |
 | `permission denied /dev/dri/renderD128` | Section 2 above |
+| `ERROR hwaccel /usr/bin/ffmpeg not available … {"error":"spawnSync /usr/bin/ffmpeg ETIMEDOUT"}` | That was the app timing out its own `ffmpeg -version` probe on a cold/busy volume and then caching "ffmpeg missing" for a week — fixed: the ceiling is 30 s (`FFMPEG_PROBE_TIMEOUT_MS`), a timeout is reported as a timeout, failed checks are retried in the background, and a negative result is never reused. Nothing to do; if it persists, run `sh scripts/doctor.sh` |
+| `hardware transcoding unavailable … {"reason":"ffmpeg is not usable in the container"}` | ffmpeg is genuinely missing from the image → `docker compose build --no-cache && docker compose up -d` |
+| `vainfo failed with iHD … init failed` / `iHD cannot encode on this box` | Expected on Apollo Lake. Leave `LIBVA_DRIVER_NAME` empty so the app pins i965, or set `LIBVA_DRIVER_NAME=i965` in `.env` |
+| `no vaapi encode pipeline worked — using software encoding` | The container sees `/dev/dri` but no driver encodes: check the device permissions (Section 2) and run `sh scripts/doctor.sh` |
+| `/dev/dri device: missing` in the UI while the NAS has it | The compose `devices:` mapping did not apply to the running container: `docker compose up -d --force-recreate` |
 | Emoji/CP1252 subtitles show as `Ã©` | The app converts to UTF-8 on download; if a file still looks wrong, re-download with the *force UTF-8* switch |
 | Bouquet push fails | The app falls back to FTP/SCP; check `ENIGMA2_FTP=true` and that FTP is enabled on the box. WebIF's upload endpoint is disabled on some images |
 | Container restarts in a loop | `docker compose logs vu-movie` — the first lines name the missing piece (usually the database, if you set `REQUIRE_DB=true`) |
 | UI reachable but "database: memory" | Postgres is not up; the app still works but forgets streams on restart. `docker compose ps` and check the `db` healthcheck |
+
+The hardware capability is cached in `data/config/hwaccel.json`. A *negative*
+entry is ignored on purpose (so a transient problem can never disable
+transcoding permanently); if you want to force a fresh probe anyway, press
+**re-test hardware** in the UI, or delete the file and restart.
 
 Log level: `.env` → `LOG_LEVEL=debug`, then `docker compose up -d`. The UI's Logs
 page streams the same entries live, so you rarely need `docker logs`.

@@ -82,22 +82,32 @@ async function loadHealth() {
     $('#h-box').className = `dot ${h.enigma2?.configured ? dot(h.enigma2.ok) : 'warn'}`;
     $('#side-info').innerHTML = `v${h.version} · up ${h.uptimeSec}s<br>${escapeHtml(h.hwaccel?.available ? `${h.hwaccel.driver || 'vaapi'} (H.264 enc)` : (h.hwaccel?.reason || 'no hardware accel'))}<br>${h.postgres ? 'postgres connected' : 'in-memory store'}`;
 
+    // While the first hardware self-test is still running, say so instead of
+    // showing an alarming "unavailable" — a slow GPU is not a broken GPU.
+    const hwPending = Boolean(h.hwaccelPending || h.hwaccel?.pending);
+    const ffmpegRow = h.ffmpeg?.ok
+      ? `${h.ffmpeg.version}${h.ffmpeg.elapsedMs >= 1000 ? ` (${h.ffmpeg.elapsedMs} ms)` : ''}`
+      : h.ffmpeg?.pending ? 'checking…'
+        : h.ffmpeg?.kind === 'timeout'
+          ? `not answering (timeout — retrying automatically; ${h.ffmpeg.error || ''})`
+          : `MISSING (${h.ffmpeg?.error || 'not found'})`;
+
     const cards = [
       {
         title: 'Hardware transcode',
         rows: [
-          ['/dev/dri device', h.hwaccel?.devicePresent ? 'present' : 'missing', h.hwaccel?.devicePresent],
-          ['vaapi', h.hwaccel?.available ? `yes (variant ${h.hwaccel.fpsVariant})` : (h.hwaccel?.reason || 'unavailable'), h.hwaccel?.available],
+          ['/dev/dri device', hwPending ? 'checking…' : (h.hwaccel?.devicePresent ? 'present' : 'missing'), hwPending ? null : h.hwaccel?.devicePresent],
+          ['vaapi', hwPending ? 'self-test running…' : (h.hwaccel?.available ? `yes (variant ${h.hwaccel.fpsVariant})` : (h.hwaccel?.reason || 'unavailable')), hwPending ? null : h.hwaccel?.available],
           ['H.264 encode', h.hwaccel?.h264Encode ? 'yes' : 'unknown', h.hwaccel?.h264Encode],
           ['HEVC encode', h.hwaccel?.hevcEncode ? 'yes' : 'no (decode only)', h.hwaccel?.hevcEncode],
-          ['driver', h.hwaccel?.driver || '—', null],
+          ['libva driver', h.hwaccel?.libvaDriver || h.hwaccel?.driver || '—', null],
         ],
       },
       {
         title: 'Runtime',
         rows: [
-          ['ffmpeg', h.ffmpeg?.ok ? h.ffmpeg.version : `MISSING (${h.ffmpeg?.error})`, h.ffmpeg?.ok],
-          ['ffprobe', h.ffprobe?.ok ? 'ok' : 'missing', h.ffprobe?.ok],
+          ['ffmpeg', ffmpegRow, h.ffmpeg?.pending ? null : h.ffmpeg?.ok],
+          ['ffprobe', h.ffprobe?.ok ? 'ok' : (h.ffprobe?.pending ? 'checking…' : 'missing'), h.ffprobe?.pending ? null : h.ffprobe?.ok],
           ['chromium', h.browser?.available ? `running (${h.browser.activePages} page)` : (h.browser?.executable ? 'idle, ready' : 'not installed'), h.browser?.executable ? true : false],
           ['external extractor', h.externalExtractor ? 'configured' : 'not used', null],
           ['node', h.node, null],
@@ -885,8 +895,34 @@ function wire() {
   $('#btn-hw-test').addEventListener('click', async () => {
     toast('Re-testing the VAAPI pipelines (this runs a 2 s encode)…', 'info');
     const res = await api('/api/config/hwaccel/test', { method: 'POST' });
-    toast(res.hwaccel.available ? `VAAPI ok: ${res.hwaccel.driver} (variant ${res.hwaccel.fpsVariant})` : `VAAPI unavailable: ${res.hwaccel.reason}`, res.hwaccel.available ? 'ok' : 'warn', 12000);
+    const hw = res.hwaccel;
+    toast(hw.available
+      ? `VAAPI ok: ${hw.driver || 'driver'} via ${hw.libvaDriver || 'libva default'} (variant ${hw.fpsVariant})`
+      : `VAAPI unavailable: ${hw.reason}`, hw.available ? 'ok' : 'warn', 12000);
     loadHealth();
+  });
+
+  // "ffmpeg is not working" button: timed probes, driver by driver, no guessing.
+  $('#btn-diag').addEventListener('click', async () => {
+    const out = $('#diag-out');
+    out.textContent = 'Running diagnostics: ffmpeg -version, /dev/dri, vainfo and a 2 s VAAPI encode per driver…';
+    try {
+      const res = await api('/api/diagnostics/ffmpeg');
+      const r = res.report;
+      const lines = [
+        `ffmpeg: ${r.ffmpeg.ok ? `${r.ffmpeg.version} — answered in ${r.ffmpeg.elapsedMs} ms (${r.ffmpeg.path})` : `${r.ffmpeg.kind}: ${r.ffmpeg.error}`}`,
+        `ffprobe: ${r.ffprobe.ok ? `ok (${r.ffprobe.version})` : `${r.ffprobe.kind}: ${r.ffprobe.error}`}`,
+        `/dev/dri: ${r.devicePresent ? `${r.config.device} present` : `${r.config.device} MISSING${r.driEntries.length ? ` (container sees: ${r.driEntries.join(', ')})` : ' (container sees no /dev/dri at all — pass it through in docker-compose.yml)'}`}`,
+        ...r.drivers.map((d) => `driver ${d.driver}: vainfo ${d.vainfo.ok ? `ok (${d.vainfo.version})` : `failed (${d.vainfo.error})`} · encode ${d.encode.ok ? 'WORKS' : `failed (${d.encode.error})`}`),
+      ];
+      out.innerHTML = `<b>${r.ok ? (r.hardwareOk ? 'Result: hardware transcoding is usable' : 'Result: ffmpeg works, software transcoding only') : 'Result: ffmpeg is not usable'}</b>`
+        + `<br>${lines.map((l) => escapeHtml(String(l))).join('<br>')}`
+        + `<br><span class="mut">finished in ${r.elapsedMs} ms · ${escapeHtml(r.hint || '')}</span>`;
+      toast(r.hardwareOk ? 'VAAPI works — details under the buttons' : 'No VAAPI — details under the buttons', r.hardwareOk ? 'ok' : 'warn', 10000);
+      loadHealth();
+    } catch (err) {
+      out.textContent = `Diagnostics failed: ${err.message}`;
+    }
   });
   $('#btn-cs-save').addEventListener('click', async () => {
     const id = $('#cs-id').value.trim();

@@ -15,7 +15,10 @@ import { spawnSync } from 'node:child_process';
 import { log, logError, errorText, getRecentLogs, knownComponents, getLogLevel, setLogLevel, subscribeLogs } from '../core/log.js';
 import { getConfig, publicConfig, saveConfig, cfg } from '../core/config.js';
 import { dbState, isPostgres } from '../core/db.js';
-import { hardware, probe, buildFfmpegArgs, normaliseProfile, argsToCommand, checkBinaries } from '../core/media.js';
+import {
+  hardware, hardwareStatus, hardwarePending, binariesStatus, checkBinaries,
+  diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand,
+} from '../core/media.js';
 import { jobs, transcodeQueue, jobEvents, findJob, listAllJobs, jobStats, cancelJob } from '../core/jobs.js';
 import * as registry from '../scrapers/registry.js';
 import * as moviebox from '../scrapers/moviebox.js';
@@ -53,8 +56,12 @@ function parseStreamIds(input) {
 /* ---------- health / logs / config ---------- */
 
 router.get('/health', wrap(async (req, res) => {
-  const hw = await hardware().catch(() => ({ available: false, reason: 'detection failed' }));
-  const binaries = checkBinaries();
+  // Make sure a detection run exists, but never *wait* for it: this endpoint is
+  // the container healthcheck and a slow vaapi self-test must not time it out.
+  // Callers get the `pending` placeholder until the result is in.
+  hardware();
+  const hw = hardwareStatus();
+  const binaries = binariesStatus() || { ffmpeg: { ok: false, pending: true }, ffprobe: { ok: false, pending: true } };
   const enigma = cfg('enigma2.host') ? await enigma2.status({ timeoutMs: 3000 }).catch((e) => ({ ok: false, message: errorText(e) })) : { configured: false };
   res.json({
     ok: true,
@@ -66,6 +73,7 @@ router.get('/health', wrap(async (req, res) => {
     ffmpeg: binaries.ffmpeg,
     ffprobe: binaries.ffprobe,
     hwaccel: hw,
+    hwaccelPending: hardwarePending(),
     browser: browser.browserInfo(),
     externalExtractor: external.isConfigured(),
     enigma2: enigma,
@@ -133,7 +141,24 @@ router.put('/config', wrap(async (req, res) => {
 
 router.post('/config/hwaccel/test', wrap(async (req, res) => {
   const hw = await hardware({ force: true });
+  log.info('api', 'hardware self-test requested from the UI', {
+    available: hw.available, driver: hw.libvaDriver, fpsVariant: hw.fpsVariant, reason: hw.reason,
+  });
   res.json({ ok: true, hwaccel: hw });
+}));
+
+/**
+ * "Why is ffmpeg not working?" — one request that answers it with timings and
+ * no guessing: which binary answered, how long it took, what the container can
+ * see, and which VA-API driver encodes. The same report is produced by
+ * `GET /api/diagnostics/ffmpeg` and by scripts/doctor.sh on the NAS.
+ */
+router.get('/diagnostics/ffmpeg', wrap(async (req, res) => {
+  const report = await diagnoseFfmpeg({ device: req.query.device ? String(req.query.device) : null });
+  log.info('api', 'ffmpeg diagnostics requested', {
+    ok: report.ok, hardwareOk: report.hardwareOk, devicePresent: report.devicePresent, elapsedMs: report.elapsedMs,
+  });
+  res.json({ ok: true, report });
 }));
 
 /* ---------- sources ---------- */
@@ -261,7 +286,9 @@ router.post('/streams/:id/profile', wrap(async (req, res) => {
 router.get('/streams/:id/command', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const hw = await hardware();
+  // Bounded wait: the command preview must render even while the GPU self-test
+  // is still running (it falls back to the software shape with a clear note).
+  const hw = await hardware({ waitMs: 15000 });
   const overrides = req.query.resolution || req.query.container || req.query.container === undefined
     ? {
       ...(req.query.resolution ? { resolution: Number(req.query.resolution) } : {}),

@@ -369,8 +369,10 @@
         <button class="btn pri" id="btn-save-settings">save settings</button>
         <button class="btn" id="btn-reload-settings">reload</button>
         <button class="btn" id="btn-hw-test">re-test hardware</button>
+        <button class="btn" id="btn-diag">ffmpeg diagnostics</button>
         <span class="mut" id="settings-hint"></span>
       </div>
+      <div class="note" id="diag-out" style="margin-top:12px">“ffmpeg diagnostics” times <code>ffmpeg -version</code>, shows what the container sees under <code>/dev/dri</code> and runs a 2 s VAAPI encode per installed driver (iHD, i965) — that is the fastest way to tell a slow disk from a missing binary from a broken driver.</div>
       <div class="card pad0" style="margin-top:16px">
         <div class="cardhead"><h2 style="margin:0">Custom source</h2><span class="mut">add a site with its own search URL</span></div>
         <div style="padding:14px">

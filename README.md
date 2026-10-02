@@ -195,13 +195,31 @@ docker compose exec vu-movie ffmpeg -hwaccels
 ## Verifying your NAS's hardware after deployment
 
 ```bash
+sh scripts/doctor.sh                                      # ← start here: one command, every check
 docker compose exec vu-movie vainfo                       # driver + codecs
+curl -s localhost:8080/api/diagnostics/ffmpeg             # timed report (also a button in the UI)
 curl -s localhost:8080/api/health | jq .health.hwaccel    # what the app detected
 curl -s "localhost:8080/api/config/hwaccel/test" -X POST  # runs a 2 s VAAPI self-test
 ```
 
+`scripts/doctor.sh` checks the container, `/dev/dri` on the NAS *and* in the
+container, how long `ffmpeg -version` takes, which VA-API driver (iHD/i965)
+really encodes, and prints what the app itself reports.
+
 If `vaapi` shows `false`, check `docs/SYNO.md` → *VAAPI permissions*. The app
-keeps working either way (software encoding).
+keeps working either way (software encoding) — unless the log says ffmpeg is
+unusable, in which case nothing can be transcoded *or* copied:
+
+| Log line | Meaning | What to do |
+|---|---|---|
+| `ffmpeg did not answer in time — this is a TIMEOUT, not a missing binary` | the binary exists but a cold/busy NAS volume was too slow for the probe (30 s ceiling, `FFMPEG_PROBE_TIMEOUT_MS`) | nothing: the check is retried automatically and hardware detection re-runs. Never cached as "missing" |
+| `ffmpeg is not usable … (ENOENT)` | the binary really is absent from the image | `docker compose build --no-cache && docker compose up -d` |
+| `iHD cannot encode on this box — trying the next driver` | normal on a DS918+: iHD installs but does not initialise on Apollo Lake | nothing: the app self-tests i965 and pins it (`LIBVA_DRIVER_NAME` may stay empty) |
+| `no vaapi encode pipeline worked — using software encoding` | no driver could encode | `sh scripts/doctor.sh`, then check permissions on `/dev/dri` in `docs/SYNO.md` §2 |
+
+A failed ffmpeg check is **never** written into `/config/hwaccel.json` as the
+truth: negative results are re-tested (and ignored on startup), positive ones are
+cached for a week.
 
 ---
 
