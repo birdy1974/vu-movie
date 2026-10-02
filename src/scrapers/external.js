@@ -22,13 +22,23 @@ import { log, logError } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { request } from './http.js';
 
+export function extractorEndpoint(value = getConfig().scraper.externalExtractorUrl) {
+  const endpoint = String(value || '').trim();
+  if (!endpoint || endpoint.startsWith('#')) return null;
+  try {
+    const parsed = new URL(endpoint);
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+    return parsed.toString();
+  } catch { return null; }
+}
+
 export function isConfigured() {
-  return Boolean(getConfig().scraper.externalExtractorUrl);
+  return Boolean(extractorEndpoint());
 }
 
 export async function extract({ url, title, year, kind, season = 0, episode = 0 }) {
-  const endpoint = getConfig().scraper.externalExtractorUrl;
-  if (!endpoint) return { ok: false, providers: [], error: 'no external extractor configured' };
+  const endpoint = extractorEndpoint();
+  if (!endpoint) return { ok: false, providers: [], error: 'no valid HTTP(S) external extractor URL configured' };
 
   log.info('external', 'asking external extractor', { endpoint, url, title });
   try {

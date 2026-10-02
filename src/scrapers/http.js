@@ -115,17 +115,37 @@ export function sleep(ms) {
  * @param {number} [opts.retries=2]
  * @param {CookieJar} [opts.jar]
  * @param {'text'|'json'|'buffer'|'none'} [opts.as='text']
+ * @param {boolean} [opts.json] Compatibility alias for `as: 'json'`; object bodies are JSON encoded.
+ * @param {boolean} [opts.binary] Compatibility alias for `as: 'buffer'`.
+ * @param {boolean} [opts.allowFailure] Return a structured HTTP error for non-2xx responses.
  * @param {AbortSignal} [opts.signal]
  */
 export async function request(url, opts = {}) {
   const {
-    method = 'GET', headers = {}, body = undefined, timeoutMs = DEFAULT_TIMEOUT_MS,
-    retries = 2, jar = null, as = 'text', signal = null, redirect = 'follow',
+    method = 'GET', headers = {}, body: inputBody = undefined, timeoutMs = DEFAULT_TIMEOUT_MS,
+    retries = 2, jar = null, as: requestedAs = null, json = false, binary = false,
+    allowFailure = false, signal = null, redirect = 'follow',
   } = opts;
+  // The original helper API used `as`; older providers in this app use `json`
+  // and `binary`. Support both so a caller asking for JSON actually receives
+  // parsed data instead of silently treating the response as text.
+  const as = requestedAs || (binary ? 'buffer' : json ? 'json' : 'text');
+  let body = inputBody;
 
   const finalHeaders = { ...headers };
+  const hasHeader = (name) => Object.keys(finalHeaders).some((key) => key.toLowerCase() === name.toLowerCase());
   if (!finalHeaders['User-Agent'] && !finalHeaders['user-agent']) {
     finalHeaders['User-Agent'] = getConfig().scraper.userAgent;
+  }
+  if (as === 'json') {
+    if (!hasHeader('Accept')) finalHeaders.Accept = 'application/json';
+    if (body !== undefined && body !== null && typeof body === 'object' && !Buffer.isBuffer(body)
+        && !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body) && !(body instanceof URLSearchParams)) {
+      body = JSON.stringify(body);
+    }
+    if (body !== undefined && body !== null && !hasHeader('Content-Type')) {
+      finalHeaders['Content-Type'] = 'application/json';
+    }
   }
   if (jar) {
     const cookie = jar.header(url);
@@ -154,23 +174,46 @@ export async function request(url, opts = {}) {
       if (jar) jar.absorb(res.url || url, res.headers.getSetCookie ? res.headers.getSetCookie() : []);
 
       let payload = null;
+      let textBody = null;
+      let parseError = null;
       if (as !== 'none') {
         if (as === 'buffer') payload = Buffer.from(await res.arrayBuffer());
         else {
-          const text = await res.text();
-          payload = text.length > MAX_BYTES ? text.slice(0, MAX_BYTES) : text;
+          textBody = await res.text();
+          payload = textBody.length > MAX_BYTES ? textBody.slice(0, MAX_BYTES) : textBody;
           if (as === 'json') {
-            try { payload = JSON.parse(text); } catch {
-              throw Object.assign(new Error(`expected JSON from ${safeHost(url)} but got ${text.slice(0, 120)}`), { status: res.status });
+            try {
+              payload = JSON.parse(textBody);
+            } catch (err) {
+              parseError = `expected JSON from ${safeHost(url)} but got ${textBody.slice(0, 120)}`;
+              // A non-JSON error page is common for rate limits and proxy
+              // failures. When the caller opted into allowFailure, preserve the
+              // HTTP status/error rather than obscuring it with a parse error.
+              if (res.ok || !allowFailure) {
+                throw Object.assign(new Error(parseError), { status: res.status, cause: err });
+              }
+              payload = null;
             }
           }
         }
       }
+      const statusError = !res.ok
+        ? String(payload?.error || payload?.message || (as === 'text' ? payload : '')
+          || `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`).slice(0, 240)
+        : null;
+      const error = statusError || parseError || null;
       return {
-        ok: res.ok, status: res.status, headers: Object.fromEntries(res.headers),
-        url: res.url || url, text: as === 'text' ? payload : null,
-        json: as === 'json' ? payload : null, buffer: as === 'buffer' ? payload : null,
+        ok: res.ok,
+        status: res.status,
+        statusText: res.statusText,
+        headers: Object.fromEntries(res.headers),
+        url: res.url || url,
+        text: as === 'text' ? payload : null,
+        json: as === 'json' ? payload : null,
+        data: as === 'json' ? payload : null,
+        buffer: as === 'buffer' ? payload : null,
         payload,
+        error,
       };
     } catch (err) {
       lastErr = err;

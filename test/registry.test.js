@@ -25,6 +25,7 @@ test('a pasted page URL is matched to its recipe', () => {
   const source = matchSourceByUrl('https://flixhub.studio/watch/movie/tt1234');
   assert.equal(source?.id, 'flixhub');
   assert.equal(getSource('cinejoy')?.name, 'Cinejoy');
+  assert.equal(getSource('cinejoy')?.resolve?.playerPathPrefix, '/watch');
   assert.equal(matchSourceByUrl('https://unknown.example/x'), null);
 });
 

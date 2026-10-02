@@ -140,25 +140,46 @@ export async function searchSource(source, query) {
   const started = Date.now();
   try {
     if (source.search?.kind === 'api') {
-      const url = String(source.search.url).replace('{query}', encodeURIComponent(query));
+      const search = source.search;
+      const url = String(search.url).replace(/\{(?:query|q)\}/g, encodeURIComponent(query));
       const res = await request(url, {
-        method: source.search.method || 'GET',
-        headers: source.search.headers || {},
+        method: search.method || 'GET',
+        headers: search.headers || {},
         json: true,
         allowFailure: true,
         retries: 1,
       });
       if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
-      const items = pickPath(res.data, source.search.items) || [];
-      const rows = (Array.isArray(items) ? items : []).map((item) => ({
-        title: pickPath(item, source.search.map?.title) || item.title || item.name,
-        year: Number(pickPath(item, source.search.map?.year) || item.year) || null,
-        kind: /tv|serie/i.test(String(pickPath(item, source.search.map?.kind) || item.type || '')) ? 'series' : 'movie',
-        poster: pickPath(item, source.search.map?.poster) || item.poster || null,
-        url: resolveUrl(source.home, pickPath(item, source.search.map?.url) || item.url || ''),
-        sourceId: source.id,
-        sourceName: source.name,
-      })).filter((r) => r.url && r.title);
+      const items = pickPath(res.data, search.items) || [];
+      const rows = (Array.isArray(items) ? items : []).map((item) => {
+        const map = search.map || {};
+        const rawKind = String(pickPath(item, map.kind) || item.type || item.mediaType || '');
+        const kind = /tv|serie|show/i.test(rawKind) ? 'series' : 'movie';
+        const typeMap = search.typeMap || {};
+        const mappedType = typeMap[rawKind.toLowerCase()] ?? rawKind;
+        const id = pickPath(item, map.id) ?? item.id ?? item.subjectId ?? '';
+        const values = { ...item, id, type: mappedType, mediaType: rawKind, kind };
+        const urlTemplate = search.resultUrl;
+        const rawUrl = urlTemplate
+          ? String(urlTemplate).replace(/\{([\w.-]+)\}/g, (_match, key) => encodeURIComponent(String(pickPath(values, key) ?? '')))
+          : pickPath(item, map.url) || item.url || '';
+        const rawPoster = pickPath(item, map.poster) || item.poster || null;
+        const poster = rawPoster
+          ? /^https?:\/\//i.test(String(rawPoster))
+            ? String(rawPoster)
+            : resolveUrl(`${String(search.posterBaseUrl || source.home).replace(/\/?$/, '/')}`, String(rawPoster).replace(/^\/+/, ''))
+          : null;
+        const rawYear = pickPath(item, map.year) || item.year;
+        return {
+          title: pickPath(item, map.title) || item.title || item.name || '',
+          year: Number(rawYear) || null,
+          kind,
+          poster,
+          url: rawUrl ? resolveUrl(source.home, rawUrl) : '',
+          sourceId: source.id,
+          sourceName: source.name,
+        };
+      }).filter((r) => r.url && r.title);
       noteHealth(source.id, rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
       log.info('scraper', `${source.id}: api search → ${rows.length} results`, { ms: Date.now() - started });
       return rows;
@@ -175,9 +196,9 @@ export async function searchSource(source, query) {
     });
     const rows = (res.results || []).map((r) => ({
       title: r.title,
-      year: Number((/(19|20)\d{2}/.exec(r.title) || [])[0]) || null,
-      kind: /(season|s\d{1,2}e\d{1,2}|series)/i.test(r.title) ? 'series' : 'movie',
-      poster: null,
+      year: Number(r.year || (/(19|20)\d{2}/.exec(r.title) || [])[0]) || null,
+      kind: r.kind || (/(season|s\d{1,2}e\d{1,2}|series)/i.test(r.title) ? 'series' : 'movie'),
+      poster: r.poster || null,
       url: r.url,
       sourceId: source.id,
       sourceName: source.name,
@@ -195,7 +216,7 @@ export async function searchSource(source, query) {
 /** Search every enabled source (plus MovieBox). Runs with a small pool to spare the NAS. */
 export async function searchAll(query, { sources = null, type = null, limitPerSource = 12, includeMoviebox = true } = {}) {
   const all = loadSources().filter((s) => s.enabled);
-  const chosen = sources?.length ? all.filter((s) => sources.includes(s.id)) : all;
+  const chosen = sources == null ? all : all.filter((s) => sources.includes(s.id));
   log.info('scraper', `searching ${chosen.length} source(s) for "${query}"`, { sources: chosen.map((s) => s.id).join(',') });
 
   const jobs = chosen.map((s) => () => searchSource(s, query));
@@ -303,7 +324,12 @@ export async function resolveTarget(input) {
     const source = getSource(sourceId) || matchSourceByUrl(url);
     if (useBrowser) {
       const t0 = Date.now();
-      const sniff = await browser.sniff({ url, timeoutMs: getConfig().scraper.resolveTimeoutMs });
+      const sniff = await browser.sniff({
+        url,
+        session: source?.id || 'default',
+        playerPathPrefix: source?.resolve?.playerPathPrefix || null,
+        timeoutMs: getConfig().scraper.resolveTimeoutMs,
+      });
       timeline.browser = Date.now() - t0;
       for (const m of sniff.media || []) {
         candidates.push({
@@ -311,13 +337,27 @@ export async function resolveTarget(input) {
           sourceId: source?.id || 'browser',
           label: qualityFromUrl(m.url) || 'source',
           quality: qualityFromUrl(m.url),
-          headers: { Referer: m.referer || url, 'User-Agent': getConfig().scraper.userAgent },
-          kind: streamKind(m.url),
+          headers: {
+            ...Object.fromEntries(Object.entries(m.headers || {}).filter(([name]) => {
+              const key = name.toLowerCase();
+              return !['host', 'connection', 'content-length', 'accept-encoding', 'referer', 'user-agent'].includes(key)
+                && !key.startsWith('sec-');
+            })),
+            Referer: m.referer || url,
+            'User-Agent': getConfig().scraper.userAgent,
+          },
+          kind: ['hls', 'dash'].includes(m.kind) ? m.kind : streamKind(m.url),
           via: m.via,
         });
       }
       if (source) noteHealth(source.id, candidates.length > 0, sniff.error || `${candidates.length} media urls`);
-      if (!sniff.ok) log.warn('scraper', 'browser sniff produced no media', { url: truncate(url, 120), error: sniff.error });
+      if (!sniff.ok) log.warn('scraper', 'browser sniff produced no media', {
+        url: truncate(url, 120),
+        finalUrl: truncate(sniff.finalUrl || '', 160),
+        pageTitle: sniff.title,
+        note: sniff.note,
+        error: sniff.error,
+      });
     } else {
       log.info('scraper', 'browser sniff disabled for this request — using the URL directly');
       candidates.push({
