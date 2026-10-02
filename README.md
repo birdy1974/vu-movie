@@ -174,9 +174,14 @@ The ones that matter most on a DS918+:
 * `Dockerfile` — multi-stage, `node:22-bookworm-slim`, **system Chromium**
   (`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`, so no 300 MB browser download), ffmpeg,
   VA-API drivers (iHD with i965 fallback), `vainfo`, `tini`, `unzip`/`7z`/`unrar`.
-  The build **fails loudly if `public/` is missing** and falls back to
-  `npm install` with a warning if `package-lock.json` is absent; `package-lock.json`
-  is committed, so `npm ci` is the normal path.
+  contrib + non-free are enabled in both apt source formats (`debian.sources` and
+  classic `*.list`), which is what makes the non-free iHD driver and the
+  RAR4/RAR5-capable `unrar` installable; optional packages are installed through a
+  tolerant helper so a package rename cannot break the build, and the build then
+  **verifies** `ffmpeg`/`ffprobe`/`chromium`/`tini` are present. The build also
+  **fails loudly if `public/` is missing** and falls back to `npm install` with a
+  warning if `package-lock.json` is absent; `package-lock.json` is committed, so
+  `npm ci` is the normal path.
 * `docker-compose.yml` — the app, `postgres:16-alpine`, an optional
   `flaresolverr` (profile `cf`) and the `/dev/dri` device passthrough.
 * Health: `GET /api/health` (also wired into the container healthcheck).
