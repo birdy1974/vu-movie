@@ -19,11 +19,11 @@ transcoding functionality:
 video resolution should be preferable 1080p, but 720p is acceptable. in case of higher resolution from the original stream, the original stream should be transcode (decoding and encoding) by synology nas ds918+ making use of the hardware transcoding.
 ffmpeg command for transcoding should look like:
 ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -i <url> -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25 -map 0:v:0 -map 0:a:0? -sn -dn -c:v h264_vaapi -b:v 1000k -maxrate 1200k -bufsize 1800k -profile:v high -level 4.1 -g 50 -r 25 -c:a aac -b:a 128k -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers pipe:1
-where user must be able to select resolution (480p, 720p, 1080p), ratio (3:4, 9:16), audio bitrate, video bitrate. there should also be an option to always use transcoding, independent of the resolution of the original stream.
+where user must be able to select resolution (480p, 720p, 1080p), ratio (4:3, 16:9), audio bitrate, video bitrate. there should also be an option to always use transcoding, independent of the resolution of the original stream.
 more information about ffmpeg can be found here: https://ffmpeg.org/ffmpeg.html
 
 subtitle functionality:
-when user has selected an URL, the application should search for a Dutch and/or English subtitle for this movie. subtitle should be in .rst format. possible sources needs to be entered by user. please check on internet if api's are available and how subtitles can be downloaded possible subtitle sources:
+when user has selected an URL, the application should search for a Dutch and/or English subtitle for this movie. subtitle should be in .srt format. possible sources needs to be entered by user. please check on internet if api's are available and how subtitles can be downloaded possible subtitle sources:
 https://dl.opensubtitles.org/
 https://www.justsubtitles.com/
 https://www.addic7ed.com
