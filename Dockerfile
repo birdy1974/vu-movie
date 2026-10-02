@@ -96,6 +96,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   unzip/7z/unrar      → subtitle archives
 #   tini                → PID 1, reaps ffmpeg/chromium children properly
 RUN set -eux; \
+    # Enable contrib/non-free repos FIRST so chromium and VA-API drivers can be found
+    sed -i 's/^\(deb .*main\)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ffmpeg chromium vainfo libva-utils libva2 libva-drm2 \
@@ -107,8 +109,7 @@ RUN set -eux; \
     (apt-get install -y --no-install-recommends unrar-free || apt-get install -y --no-install-recommends unrar || true); \
     # VA-API drivers: try the non-free iHD driver first (best for Apollo Lake),
     # fall back to the free i965 driver, and never fail the build over it.
-    (sed -i 's/^\(deb .*main\)/\1 contrib non-free non-free-firmware/' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true); \
-    (apt-get update && apt-get install -y --no-install-recommends intel-media-va-driver-non-free) \
+    (apt-get install -y --no-install-recommends intel-media-va-driver-non-free) \
       || echo "[vu-movie] intel-media-va-driver-non-free not available — using i965-va-driver"; \
     (apt-get install -y --no-install-recommends i965-va-driver || true); \
     apt-get clean; \
