@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vu-movie — UI mockup (static, no backend)</title>
+<style>
+:root{
+  --bg:#0b0f16; --bg2:#111826; --card:#151d2c; --card2:#1b2537; --line:#243149;
+  --fg:#e6edf7; --mut:#8ea0bd; --acc:#38bdf8; --acc2:#a78bfa; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:linear-gradient(160deg,#0b0f16,#0e1524 60%,#0b0f16);color:var(--fg);
+     font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--acc);text-decoration:none}
+code,pre{font-family:var(--mono)}
+.app{display:flex;min-height:100vh}
+
+/* ---------- sidebar ---------- */
+.side{width:232px;flex:0 0 232px;background:rgba(10,14,21,.85);border-right:1px solid var(--line);
+      padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto}
+.brand{display:flex;align-items:center;gap:10px;padding:6px 8px 16px}
+.logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(140deg,var(--acc),var(--acc2));
+      display:grid;place-items:center;font-weight:800;color:#04121c;font-size:15px}
+.brand b{font-size:16px;letter-spacing:.3px}
+.brand small{display:block;color:var(--mut);font-size:11px;font-weight:500}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:6px}
+.nav button{all:unset;cursor:pointer;padding:9px 11px;border-radius:9px;color:var(--mut);
+      display:flex;align-items:center;gap:9px;font-size:13.5px}
+.nav button:hover{background:var(--card2);color:var(--fg)}
+.nav button.on{background:linear-gradient(90deg,rgba(56,189,248,.18),rgba(167,139,250,.10));color:#fff;
+      box-shadow:inset 0 0 0 1px rgba(56,189,248,.35)}
+.nav .ic{width:18px;text-align:center;opacity:.9}
+.sidefoot{border-top:1px solid var(--line);margin-top:14px;padding:12px 8px;color:var(--mut);font-size:11.5px}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
+      padding:2px 8px;border-radius:999px;font-size:11px;color:var(--mut)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.w{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+.dot.e{background:var(--err);box-shadow:0 0 8px var(--err)}
+
+/* ---------- main ---------- */
+.main{flex:1;min-width:0;padding:18px 22px 60px}
+.banner{background:linear-gradient(90deg,rgba(251,191,36,.14),rgba(56,189,248,.08));
+        border:1px solid #3b3320;border-radius:12px;padding:10px 14px;font-size:12.5px;color:#f6e3b4;margin-bottom:16px;display:flex;gap:10px;align-items:center}
+.banner b{color:#ffd77a}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:15px;margin:0 0 10px;letter-spacing:.2px}
+h3{font-size:13px;margin:0 0 8px;color:var(--mut);text-transform:uppercase;letter-spacing:.7px}
+.sub{color:var(--mut);font-size:12.5px;margin:0 0 18px}
+.grid{display:grid;gap:14px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(270px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+.card.pad0{padding:0;overflow:hidden}
+.cardhead{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;
+          align-items:center;gap:10px;background:rgba(255,255,255,.015)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed rgba(36,49,73,.7);font-size:13px}
+.kv:last-child{border-bottom:0}
+.kv span:first-child{color:var(--mut)}
+.mono{font-family:var(--mono);font-size:12px}
+.mut{color:var(--mut)}
+.tag{display:inline-block;padding:1.5px 7px;border-radius:6px;font-size:11px;border:1px solid var(--line);background:var(--bg2);color:var(--mut)}
+.tag.ok{color:#9df0cf;border-color:#1d5a44;background:rgba(52,211,153,.10)}
+.tag.w{color:#f8dfa3;border-color:#5a4a1d;background:rgba(251,191,36,.10)}
+.tag.e{color:#ffc7c7;border-color:#5a2020;background:rgba(248,113,113,.10)}
+.tag.i{color:#bfe4ff;border-color:#1d415a;background:rgba(56,189,248,.10)}
+.tag.v{color:#ded0ff;border-color:#3f2b63;background:rgba(167,139,250,.12)}
+button.btn{all:unset;cursor:pointer;padding:8px 13px;border-radius:9px;border:1px solid var(--line);
+      background:var(--card2);color:var(--fg);font-size:13px;display:inline-flex;gap:7px;align-items:center}
+button.btn:hover{border-color:#3a4d70;background:#22304a}
+button.btn.pri{background:linear-gradient(135deg,#0ea5e9,#6366f1);border-color:transparent;color:#fff;font-weight:600}
+button.btn.pri:hover{filter:brightness(1.09)}
+button.btn.ghost{background:transparent}
+button.btn:disabled{opacity:.45;cursor:not-allowed}
+button.btn.sm{padding:5px 9px;font-size:12px}
+input,select,textarea{background:var(--bg2);border:1px solid var(--line);color:var(--fg);border-radius:8px;
+      padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
+input[type=checkbox]{width:auto}
+label{font-size:12.5px;color:var(--mut);display:block;margin-bottom:4px}
+.field{margin-bottom:11px}
+.f2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.6px;
+   padding:9px 12px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.015)}
+td{padding:9px 12px;border-bottom:1px solid rgba(36,49,73,.55);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tr.sel td{background:rgba(56,189,248,.07)}
+pre{background:#080c13;border:1px solid var(--line);border-radius:10px;padding:11px 12px;overflow:auto;
+    font-size:11.8px;line-height:1.55;margin:0;color:#cfe3ff}
+pre .c{color:#7c8db5}
+pre .k{color:#7dd3fc}
+pre .v{color:#fcd34d}
+pre .g{color:#86efac}
+.poster{width:100%;aspect-ratio:2/3;border-radius:10px;display:grid;place-items:end start;padding:10px;
+    background:linear-gradient(150deg,#233a5c,#3b2b5e 55%,#1a2338);border:1px solid var(--line);position:relative;overflow:hidden}
+.poster b{font-size:13.5px;text-shadow:0 2px 8px #000;line-height:1.25;position:relative;z-index:2}
+.poster i{position:absolute;inset:0;background:
+   radial-gradient(120px 120px at 80% 10%,rgba(56,189,248,.35),transparent),radial-gradient(140px 140px at 15% 85%,rgba(167,139,250,.30),transparent)}
+.poster .big{position:absolute;top:8px;left:9px;font-size:11px;z-index:2}
+.moviecard{cursor:pointer;transition:.15s;border-radius:12px;padding:8px;border:1px solid transparent}
+.moviecard:hover{background:var(--card2);border-color:var(--line);transform:translateY(-2px)}
+.meta{font-size:11.5px;color:var(--mut);margin-top:5px}
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:14px}
+.tabs button{all:unset;cursor:pointer;padding:8px 12px;color:var(--mut);border-bottom:2px solid transparent;font-size:13px}
+.tabs button.on{color:#fff;border-bottom-color:var(--acc)}
+.hide{display:none!important}
+.slider{display:flex;align-items:center;gap:10px}
+.slider input[type=range]{padding:0;background:none;border:0}
+.note{font-size:12px;color:var(--mut);background:var(--bg2);border-left:3px solid var(--acc);
+      padding:8px 11px;border-radius:0 8px 8px 0;margin:10px 0}
+.note.warn{border-left-color:var(--warn)}
+.note.err{border-left-color:var(--err)}
+.srcgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}
+.src{border:1px solid var(--line);border-radius:11px;padding:10px;background:var(--card2);display:flex;gap:9px;align-items:center}
+.src:hover{border-color:#3a4d70}
+.src .fav{width:26px;height:26px;border-radius:7px;background:linear-gradient(140deg,#334a70,#4a376e);display:grid;place-items:center;font-size:12px}
+.bars{display:flex;gap:3px;align-items:flex-end;height:34px}
+.bars i{width:5px;background:linear-gradient(180deg,var(--acc),var(--acc2));border-radius:2px;opacity:.85}
+.log{font-family:var(--mono);font-size:11.6px;line-height:1.65;background:#080c13;border:1px solid var(--line);
+     border-radius:10px;padding:10px 12px;max-height:330px;overflow:auto}
+.log .t{color:#5d6b8c}.log .i{color:#8fd6ff}.log .w{color:#fbbf24}.log .e{color:#fca5a5}.log .d{color:#6b7a99}
+.badge-src{font-size:10.5px;padding:1px 6px;border-radius:5px;background:#0d1a2a;border:1px solid #1d415a;color:#9ed8ff}
+.steps{counter-reset:s;display:flex;flex-direction:column;gap:8px}
+.step{display:flex;gap:10px;align-items:flex-start;font-size:13px}
+.step:before{counter-increment:s;content:counter(s);width:20px;height:20px;border-radius:50%;flex:0 0 20px;
+   background:var(--card2);border:1px solid var(--line);display:grid;place-items:center;font-size:11px;color:var(--acc)}
+.gridlines{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}
+@media(max-width:980px){.gridlines{grid-template-columns:1fr}.side{display:none}}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">vu</div>
+      <div><b>vu-movie</b><small>movie → stream proxy · NL</small></div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-p="dash" class="on"><span class="ic">▤</span>Dashboard</button>
+      <button data-p="find"><span class="ic">⌕</span>Search &amp; scrape</button>
+      <button data-p="stream"><span class="ic">▶</span>Stream &amp; transcode</button>
+      <button data-p="subs"><span class="ic">▭</span>Subtitles</button>
+      <button data-p="e2"><span class="ic">☰</span>Enigma2 bouquet</button>
+      <button data-p="logs"><span class="ic">≡</span>Logs</button>
+      <button data-p="set"><span class="ic">⚙</span>Settings</button>
+    </nav>
+    <div class="sidefoot">
+      <div class="row" style="gap:6px;margin-bottom:8px">
+        <span class="pill"><i class="dot"></i>VAAPI</span>
+        <span class="pill"><i class="dot"></i>DB</span>
+        <span class="pill"><i class="dot"></i>Box</span>
+      </div>
+      Docker image <b>vu-movie:1.0</b><br>Node 22 · FFmpeg 6.1 · Chromium 121<br>DS918+ (J3455 / HD&nbsp;500)<br>
+      <span class="mono">http://192.168.1.10:8080</span>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+    <div class="banner">
+      <b>STATIC MOCKUP</b> — click through it. No backend, no real data, posters are placeholders.
+      Confirm or change anything, then I start building.
+    </div>
+
+    <!-- ======================= DASHBOARD ======================= -->
+    <section id="p-dash">
+      <h1>Dashboard</h1>
+      <p class="sub">Health of the container, the NAS hardware path and the VU+ box — everything that usually breaks silently.</p>
+
+      <div class="grid g4" style="margin-bottom:16px">
+        <div class="card">
+          <h3>Hardware transcode</h3>
+          <div class="kv"><span>/dev/dri/renderD128</span><b style="color:var(--ok)">present</b></div>
+          <div class="kv"><span>vaapi driver</span><span class="mono">iHD / Intel HD 500</span></div>
+          <div class="kv"><span>H.264 encode</span><b style="color:var(--ok)">yes</b></div>
+          <div class="kv"><span>HEVC encode</span><b style="color:var(--warn)">no (decode only)</b></div>
+          <div class="kv"><span>max sessions</span><span>1 (J3455)</span></div>
+        </div>
+        <div class="card">
+          <h3>Runtime</h3>
+          <div class="kv"><span>ffmpeg</span><span class="mono">6.1.1 (vaapi)</span></div>
+          <div class="kv"><span>chromium</span><span class="mono">121 headless + playwright</span></div>
+          <div class="kv"><span>postgres</span><b style="color:var(--ok)">connected</b></div>
+          <div class="kv"><span>tables</span><span>9 initialised at boot</span></div>
+          <div class="kv"><span>uptime</span><span>3d 04:12</span></div>
+        </div>
+        <div class="card">
+          <h3>VU+ Duo2 (Enigma2)</h3>
+          <div class="kv"><span>host</span><span class="mono">192.168.1.50:80</span></div>
+          <div class="kv"><span>OpenWebif</span><b style="color:var(--ok)">reachable</b></div>
+          <div class="kv"><span>bouquets</span><span>vu-movie (7 entries)</span></div>
+          <div class="kv"><span>last push</span><span>today 13:02 ✓</span></div>
+          <div class="kv"><span>service type</span><span class="mono">4097 (GStreamer)</span></div>
+        </div>
+        <div class="card">
+          <h3>Jobs</h3>
+          <div class="kv"><span>scraping</span><span>1 running · 12 queued</span></div>
+          <div class="kv"><span>transcoding</span><span>1 running (0.94×)</span></div>
+          <div class="kv"><span>subtitle fetches</span><span>4 today</span></div>
+          <div class="kv"><span>active streams</span><span>2 clients (VLC, Duo2)</span></div>
+          <div class="kv"><span>temp usage</span><span>4.1 GB</span></div>
+        </div>
+      </div>
+
+      <div class="gridlines">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Active jobs</h2><span class="pill"><i class="dot"></i>live</span></div>
+          <table>
+            <thead><tr><th>Job</th><th>Source</th><th>Progress</th><th>State</th><th></th></tr></thead>
+            <tbody>
+              <tr><td>Dune: Part Two (2024)<div class="meta">scrape → resolve stream</div></td>
+                  <td><span class="badge-src">cinejoy.pk</span><div class="meta">server 3 / 5</div></td>
+                  <td><div class="bars"><i style="height:8px"></i><i style="height:14px"></i><i style="height:22px"></i><i style="height:16px"></i><i style="height:11px"></i></div><span class="meta">candidates 2 ok / 3 dead</span></td>
+                  <td><span class="tag i">resolving</span></td><td><button class="btn sm ghost">log</button></td></tr>
+              <tr><td>Shōgun S01E03<div class="meta">VAAPI 720p → MPEG-TS</div></td>
+                  <td><span class="badge-src">overlook.cx</span></td>
+                  <td><div class="mono">speed 0.94× · 1180 kb/s · fps 24</div></td>
+                  <td><span class="tag ok">healthy</span></td><td><button class="btn sm ghost">stop</button></td></tr>
+              <tr><td>Oppenheimer (2023)<div class="meta">4K HEVC source → 1080p H.264 (forced)</div></td>
+                  <td><span class="badge-src">redflix.club</span></td>
+                  <td><div class="mono">waiting for free encoder slot</div></td>
+                  <td><span class="tag w">queued</span></td><td><button class="btn sm ghost">cancel</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Source sites</h2>
+          <p class="sub" style="margin-bottom:10px">One click = open the site in a new tab to browse; the scraper uses the same list.</p>
+          <div class="srcgrid">
+            <a class="src" href="https://overlook.cx/lobby" target="_blank" rel="noreferrer"><span class="fav">O</span><div><b>Overlook</b><div class="meta">flixer API farm</div></div></a>
+            <a class="src" href="https://cinevo.nl" target="_blank" rel="noreferrer"><span class="fav">C</span><div><b>Cinevo</b><div class="meta">TMDB + embed</div></div></a>
+            <a class="src" href="https://cinejoy.pk/" target="_blank" rel="noreferrer"><span class="fav">J</span><div><b>Cinejoy</b><div class="meta">encrypted api</div></div></a>
+            <a class="src" href="https://flixhub.studio/home" target="_blank" rel="noreferrer"><span class="fav">F</span><div><b>Flixhub</b><div class="meta">flixer clone</div></div></a>
+            <a class="src" href="https://redflix.club/" target="_blank" rel="noreferrer"><span class="fav">R</span><div><b>Redflix</b><div class="meta">aggregator</div></div></a>
+            <a class="src" href="https://www.1flex.org/" target="_blank" rel="noreferrer"><span class="fav">1</span><div><b>1flex</b><div class="meta">flixer clone</div></div></a>
+            <a class="src" href="https://cinezo.st/" target="_blank" rel="noreferrer"><span class="fav">Z</span><div><b>Cinezo</b><div class="meta">open api</div></div></a>
+            <a class="src" href="#" onclick="return false"><span class="fav">M</span><div><b>MovieBox</b><div class="meta">native client</div></div></a>
+          </div>
+          <div class="note">Each site gets a <b>health badge</b> after a probe (Cloudflare / DNS / API shape changed). Sites that start blocking fall back to the headless browser automatically.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="spread" style="margin-bottom:12px">
+          <h2 style="margin:0">Recently scraped</h2>
+          <button class="btn sm ghost">clear cache</button>
+        </div>
+        <div class="grid g4">
+          <div class="moviecard" onclick="go('find')"><div class="poster"><i></i><span class="tag ok big">1080p</span><b>Dune: Part Two (2024)</b></div><div class="meta">cinejoy.pk · EN/NL subs ✓</div></div>
+          <div class="moviecard" onclick="go('find')"><div class="poster"><i></i><span class="tag v big">4K src</span><b>Oppenheimer (2023)</b></div><div class="meta">redflix.club · transcode needed</div></div>
+          <div class="moviecard" onclick="go('find')"><div class="poster"><i></i><span class="tag i big">S01E03</span><b>Shōgun</b></div><div class="meta">overlook.cx · NL subs ✓</div></div>
+          <div class="moviecard" onclick="go('find')"><div class="poster"><i></i><span class="tag big w">720p</span><b>Arcane S02E05</b></div><div class="meta">cinezo.st · EN subs ✓</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= SEARCH & SCRAPE ======================= -->
+    <section id="p-find" class="hide">
+      <h1>Search &amp; scrape</h1>
+      <p class="sub">Two ways in: let vu-movie search the sites, or paste the movie URL you already have open in your browser.</p>
+
+      <div class="card" style="margin-bottom:14px">
+        <div class="tabs" id="findtabs">
+          <button class="on" data-t="title">Search by title</button>
+          <button data-t="url">Paste URL</button>
+          <button data-t="browse">Browse source</button>
+        </div>
+
+        <div id="ft-title">
+          <div class="f2" style="grid-template-columns:2fr 1fr 1fr">
+            <div class="field"><label>Title</label><input value="dune part two"></div>
+            <div class="field"><label>Type</label><select><option>Movie</option><option>Series</option><option>Both</option></select></div>
+            <div class="field"><label>Sources</label><select><option>All enabled (8)</option><option>Fast only (flixer API farms)</option><option>Overlook only</option></select></div>
+          </div>
+          <div class="row">
+            <button class="btn pri">⌕ Search sources</button>
+            <label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> Dutch subs only</label>
+            <label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> min 1080p</label>
+            <span class="mut" style="font-size:12px">12 results in 3.4 s (chromium 1×, api 4×)</span>
+          </div>
+        </div>
+
+        <div id="ft-url" class="hide">
+          <div class="field">
+            <label>Movie / series URL (from any enabled source, or the flixer-style URL you copied)</label>
+            <input value="https://cinejoy.pk/movie/dune-part-two-2024-watch-online-free" style="font-family:var(--mono)">
+          </div>
+          <div class="row">
+            <button class="btn pri">⚡ Scrape stream</button>
+            <button class="btn">＋ Add as custom source</button>
+            <span class="mut" style="font-size:12px">Recognised: <span class="tag i">cinejoy.pk</span> → adapter <b>cinejoy-v2</b>, fallback available</span>
+          </div>
+        </div>
+
+        <div id="ft-browse" class="hide">
+          <div class="field"><label>Open a source in a new tab and copy the movie URL</label></div>
+          <div class="srcgrid">
+            <a class="src" href="https://overlook.cx/lobby" target="_blank"><span class="fav">O</span><div><b>Overlook</b></div></a>
+            <a class="src" href="https://cinevo.nl" target="_blank"><span class="fav">C</span><div><b>Cinevo</b></div></a>
+            <a class="src" href="https://cinejoy.pk/" target="_blank"><span class="fav">J</span><div><b>Cinejoy</b></div></a>
+            <a class="src" href="https://flixhub.studio/home" target="_blank"><span class="fav">F</span><div><b>Flixhub</b></div></a>
+            <a class="src" href="https://redflix.club/" target="_blank"><span class="fav">R</span><div><b>Redflix</b></div></a>
+            <a class="src" href="https://www.1flex.org/" target="_blank"><span class="fav">1</span><div><b>1flex</b></div></a>
+            <a class="src" href="https://cinezo.st/" target="_blank"><span class="fav">Z</span><div><b>Cinezo</b></div></a>
+          </div>
+        </div>
+      </div>
+
+      <div class="gridlines">
+        <div>
+          <div class="card pad0">
+            <div class="cardhead">
+              <h2 style="margin:0">Results <span class="tag">8 sources</span></h2>
+              <div class="row"><select style="width:auto"><option>Best quality first</option><option>Best subtitles</option><option>Fastest resolve</option></select></div>
+            </div>
+            <div class="grid g4" style="padding:14px">
+              <div class="moviecard" onclick="pick(this,'Dune: Part Two','2024','Movie')">
+                <div class="poster"><i></i><span class="tag ok big">1080p</span><b>Dune: Part Two</b></div>
+                <div class="meta">2024 · Movie · <span class="badge-src">cinejoy.pk</span></div></div>
+              <div class="moviecard" onclick="pick(this,'Oppenheimer','2023','Movie')">
+                <div class="poster"><i></i><span class="tag v big">4K → 1080p</span><b>Oppenheimer</b></div>
+                <div class="meta">2023 · Movie · <span class="badge-src">redflix.club</span></div></div>
+              <div class="moviecard" onclick="pick(this,'Shōgun S01E03','2024','Series')">
+                <div class="poster"><i></i><span class="tag i big">S01E03</span><b>Shōgun</b></div>
+                <div class="meta">2024 · Series · <span class="badge-src">overlook.cx</span></div></div>
+              <div class="moviecard" onclick="pick(this,'The Batman','2022','Movie')">
+                <div class="poster"><i></i><span class="tag ok big">1080p</span><b>The Batman</b></div>
+                <div class="meta">2022 · Movie · <span class="badge-src">flixhub.studio</span></div></div>
+              <div class="moviecard" onclick="pick(this,'Arcane S02E05','2024','Series')">
+                <div class="poster"><i></i><span class="tag w big">720p</span><b>Arcane S02E05</b></div>
+                <div class="meta">2024 · Series · <span class="badge-src">cinezo.st</span></div></div>
+              <div class="moviecard" onclick="pick(this,'Dune: Part Two','2024','Movie')">
+                <div class="poster"><i></i><span class="tag ok big">1080p</span><b>Dune: Part Two</b></div>
+                <div class="meta">2024 · Movie · <span class="badge-src">1flex.org</span></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="detail">
+          <h3>Selected title</h3>
+          <div class="grid" style="grid-template-columns:120px 1fr;gap:14px">
+            <div class="poster" style="aspect-ratio:2/3"><i></i><span class="tag ok big">1080p</span><b id="d-title">Dune: Part Two</b></div>
+            <div>
+              <div class="row" style="gap:6px;margin-bottom:8px">
+                <span class="tag" id="d-year">2024</span><span class="tag" id="d-type">Movie</span>
+                <span class="tag i">2h 46m</span><span class="tag ok">TMDB 8.2</span>
+              </div>
+              <p style="font-size:12.5px;color:var(--mut);margin:0 0 10px">
+                Paul Atreides unites with the Fremen to wage war against the House Harkonnen. <span class="mut">(fetched from TMDB, cached 30 days)</span>
+              </p>
+              <div class="kv"><span>found on</span><span><span class="badge-src">cinejoy.pk</span> <span class="badge-src">overlook.cx</span> <span class="badge-src">MovieBox</span></span></div>
+              <div class="kv"><span>streams found</span><span>5 servers · 2 alive</span></div>
+              <div class="kv"><span>audio</span><span>EN 2.0 AAC · EN 5.1</span></div>
+              <div class="kv"><span>subs on source</span><span>EN, NL (embedded vtt)</span></div>
+            </div>
+          </div>
+
+          <h3 style="margin-top:16px">Discovered streams</h3>
+          <table>
+            <thead><tr><th>#</th><th>Server</th><th>Quality</th><th>Codec</th><th>Probe</th><th>State</th><th></th></tr></thead>
+            <tbody>
+              <tr class="sel"><td>1</td><td>cinejoy CDN-1</td><td><span class="tag ok">1080p</span></td><td class="mono">H.264 / AAC</td><td class="mono">6400 kb/s · 23.976 fps</td><td><span class="tag ok">alive</span></td><td><button class="btn sm">use</button></td></tr>
+              <tr><td>2</td><td>overlook-vidrock</td><td><span class="tag ok">1080p</span></td><td class="mono">H.264 / AAC</td><td class="mono">5800 kb/s · 24 fps</td><td><span class="tag ok">alive</span></td><td><button class="btn sm ghost">use</button></td></tr>
+              <tr><td>3</td><td>flixer-prime</td><td><span class="tag v">2160p</span></td><td class="mono">HEVC / EAC3</td><td class="mono">18400 kb/s · 23.976 fps</td><td><span class="tag w">needs transcode</span></td><td><button class="btn sm ghost">use</button></td></tr>
+              <tr><td>4</td><td>cinejoy CDN-4</td><td>—</td><td class="mono">—</td><td class="mono">403 / dead mirror</td><td><span class="tag e">failed</span></td><td><button class="btn sm ghost" disabled>use</button></td></tr>
+              <tr><td>5</td><td>MovieBox api6</td><td><span class="tag w">720p</span></td><td class="mono">H.264 / AAC</td><td class="mono">2200 kb/s · 25 fps</td><td><span class="tag ok">alive</span></td><td><button class="btn sm ghost">use</button></td></tr>
+            </tbody>
+          </table>
+          <div class="note">Every candidate URL is <b>probed with ffprobe before it is offered</b> — dead mirrors are skipped, exactly like a player would. Chunked HLS/DASH is detected here and reported as “N chunks → 1 stream”.</div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn pri" onclick="go('stream')">▶ Open stream page</button>
+            <button class="btn" onclick="go('subs')">▭ Find subtitles</button>
+            <button class="btn" onclick="go('e2')">☰ Build bouquet</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= STREAM & TRANSCODE ======================= -->
+    <section id="p-stream" class="hide">
+      <h1>Stream &amp; transcode</h1>
+      <p class="sub">One stable LAN URL per title. VLC, the Duo2 and a browser can all hit the same URL at the same time.</p>
+
+      <div class="card" style="margin-bottom:14px">
+        <div class="spread" style="margin-bottom:10px">
+          <div class="row">
+            <span class="tag ok">selected: server 1 · cinejoy CDN-1</span>
+            <span class="tag">1080p H.264</span><span class="tag">source chunks: 214</span><span class="tag i">unified → MPEG-TS</span>
+          </div>
+          <span class="pill"><i class="dot"></i>2 clients</span>
+        </div>
+        <div class="field"><label>Stable stream URL (LAN, never expires, subtitle track muxed in when available)</label>
+          <div class="row"><input class="mono" value="http://192.168.1.10:8080/s/9f3ab21c/dune-part-two-2024.m3u8" readonly style="flex:1">
+          <button class="btn">copy</button></div></div>
+        <div class="row">
+          <button class="btn pri">▶ Open in VLC</button>
+          <button class="btn">⤓ Playlist .m3u</button>
+          <button class="btn">⤓ Download .ts</button>
+          <button class="btn">⟳ Re-resolve (new URL)</button>
+          <button class="btn ghost">⇱ Open in browser &lt;video&gt;</button>
+        </div>
+        <div class="note">
+          <b>How the “chunks → 1 stream” part works</b> — the app is a real proxy: it pulls the upstream
+          HLS/DASH segments as fast as the client needs them and pushes one continuous MPEG-TS/HLS stream out.
+          Mode: <span class="tag ok">stream-copy when the source is already ≤1080p H.264</span>
+          <span class="tag w">VAAPI transcode when it is 4K / HEVC / when you force it</span>.
+          No CPU is wasted on remuxing, the NAS never has to buffer a whole film, and the upstream URL (which
+          usually expires in minutes) is never exposed to VLC or the Duo2.
+        </div>
+      </div>
+
+      <div class="gridlines">
+        <!-- transcode controls -->
+        <div class="card">
+          <div class="spread"><h2 style="margin:0">Transcode profile</h2>
+            <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="always"> always transcode</label>
+          </div>
+          <p class="sub" style="margin:8px 0 12px">Left untouched when off and the source is already fine — remux only, ~0% CPU.</p>
+
+          <div class="f2">
+            <div class="field"><label>Resolution</label>
+              <select id="res"><option value="480">480p (854×480)</option><option value="720">720p (1280×720)</option><option value="1080" selected>1080p (1920×1080)</option></select></div>
+            <div class="field"><label>Aspect ratio</label>
+              <select id="ar"><option value="169" selected>16:9 (source)</option><option value="43">4:3 (960×720 → pillarbox)</option><option value="keep">keep source</option></select></div>
+            <div class="field"><label>Video codec</label>
+              <select id="vc"><option value="h264" selected>H.264 (VAAPI) — VLC/Duo2 safe</option><option value="copy">copy (no re-encode)</option><option value="h265">H.265 (CPU only — slow)</option></select></div>
+            <div class="field"><label>Encoder</label>
+              <select id="enc"><option value="vaapi" selected>Hardware VAAPI (/dev/dri)</option><option value="x264">Software libx264 (fallback)</option></select></div>
+            <div class="field"><label>Video bitrate <span class="mut" id="vbL">2500 kbps</span></label>
+              <input type="range" id="vb" min="400" max="8000" step="100" value="2500"></div>
+            <div class="field"><label>Audio bitrate <span class="mut" id="abL">128 kbps</span></label>
+              <input type="range" id="ab" min="64" max="320" step="32" value="128"></div>
+            <div class="field"><label>Audio channels</label>
+              <select id="ac"><option>2 (stereo, downmix)</option><option>keep 5.1</option></select></div>
+            <div class="field"><label>Frame rate</label>
+              <select id="fps"><option value="src" selected>keep source (correct speed, no judder)</option><option value="25">force 25</option><option value="30">force 30</option></select></div>
+          </div>
+          <div class="f2">
+            <div class="field"><label>Container</label><select><option>MPEG-TS (best for VLC + Enigma2)</option><option>HLS (m3u8, seekable)</option><option>MP4 (download only)</option></select></div>
+            <div class="field"><label>Subtitles</label><select><option>Mux as track (soft)</option><option>Burn in (hard)</option><option>Sidecar .srt only</option><option>None</option></select></div>
+          </div>
+          <div class="note warn" id="warnbox">1080p on a J3455: H.264 encode at 1080p is possible, but keep <b>one</b> transcode at a time and stay near the bitrates above. H.265 encode is not available in this hardware.</div>
+
+          <h3 style="margin-top:14px">Generated ffmpeg command (live, copy-ready)</h3>
+          <pre id="cmd"></pre>
+          <div class="row" style="margin-top:10px">
+            <button class="btn pri">▶ Start transcode</button>
+            <button class="btn">⧗ Test 10 s</button>
+            <button class="btn ghost">reset to recommended</button>
+          </div>
+        </div>
+
+        <!-- monitor + client urls -->
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Live monitor</h2>
+            <div class="kv"><span>state</span><b style="color:var(--ok)">streaming</b></div>
+            <div class="kv"><span>speed</span><span class="mono">0.94× (real-time budget)</span></div>
+            <div class="kv"><span>encoded fps</span><span class="mono">23.9</span></div>
+            <div class="kv"><span>bitrate out</span><span class="mono">2480 kb/s</span></div>
+            <div class="kv"><span>dropped frames</span><span class="mono">0</span></div>
+            <div class="kv"><span>GPU load</span><span class="mono">62% · render engine</span></div>
+            <div class="kv"><span>clients</span><span class="mono">VLC (192.168.1.44), Duo2</span></div>
+            <div class="bars" style="margin-top:10px"><i style="height:12px"></i><i style="height:20px"></i><i style="height:28px"></i><i style="height:22px"></i><i style="height:30px"></i><i style="height:18px"></i><i style="height:26px"></i><i style="height:14px"></i><i style="height:24px"></i><i style="height:32px"></i><i style="height:20px"></i><i style="height:28px"></i></div>
+          </div>
+
+          <div class="card" style="margin-bottom:14px">
+            <h2>Client URLs</h2>
+            <div class="field"><label>VLC (desktop / Android / Fire TV)</label><input class="mono" value="http://192.168.1.10:8080/s/9f3ab21c/dune-part-two-2024.m3u8" readonly></div>
+            <div class="field"><label>Enigma2 / VU+ Duo2 (raw TS, no playlist)</label><input class="mono" value="http://192.168.1.10:8080/s/9f3ab21c/dune-part-two-2024.ts" readonly></div>
+            <div class="field"><label>Quality override without touching the profile</label><input class="mono" value="…‎/…?q=720&br=1500" readonly></div>
+          </div>
+
+          <div class="card">
+            <h2>Probe result (ffprobe)</h2>
+            <pre><span class="c">$ ffprobe -v error -show_streams -print_format json &lt;resolved-url&gt;</span>
+video <span class="k">h264</span> 1920x1080 · 23.976 fps · <span class="v">6 412 kb/s</span> · yuv420p
+audio <span class="k">aac</span> lc 2ch · 128 kb/s · 48 kHz  <span class="c">(track 1)</span>
+      <span class="k">eac3</span> 6ch · 640 kb/s · 48 kHz  <span class="c">(track 2)</span>
+subs  <span class="k">mov_text</span> eng, nld  <span class="c">(can be lifted out as .srt)</span>
+dur   2:46:12   container <span class="k">hls</span> (214 segments, 6.0 s each)</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= SUBTITLES ======================= -->
+    <section id="p-subs" class="hide">
+      <h1>Subtitles</h1>
+      <p class="sub">Dutch first, English second — from real APIs where they exist and from page scraping where they don’t. You decide which providers are enabled.</p>
+
+      <div class="gridlines">
+        <div>
+          <div class="card pad0" style="margin-bottom:14px">
+            <div class="cardhead">
+              <h2 style="margin:0">Search for <span class="tag i">Dune: Part Two (2024)</span></h2>
+              <div class="row">
+                <label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> Nederlands</label>
+                <label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> English</label>
+                <label class="row" style="gap:6px;margin:0"><input type="checkbox"> Deutsch</label>
+                <button class="btn pri sm">⌕ Search all enabled providers</button>
+              </div>
+            </div>
+            <table>
+              <thead><tr><th>Lang</th><th>Provider</th><th>Release / file</th><th>Match</th><th>Rating</th><th>DLs</th><th></th></tr></thead>
+              <tbody>
+                <tr class="sel"><td><span class="tag ok">NL</span></td><td>OpenSubtitles.org<div class="meta">legacy XML-RPC · no key</div></td>
+                    <td class="mono">Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264</td>
+                    <td><span class="tag ok">hash match</span></td><td>★ 8.6</td><td class="mono">12 431</td>
+                    <td class="row"><button class="btn sm">preview</button><button class="btn sm pri">get .srt</button></td></tr>
+                <tr><td><span class="tag ok">NL</span></td><td>SubDL<div class="meta">REST API · free key</div></td>
+                    <td class="mono">Dune.Part.Two.2024.NL.BluRay</td>
+                    <td><span class="tag w">title+year</span></td><td>★ 7.9</td><td class="mono">2 118</td>
+                    <td class="row"><button class="btn sm">preview</button><button class="btn sm pri">get .srt</button></td></tr>
+                <tr><td><span class="tag i">EN</span></td><td>SubDL</td>
+                    <td class="mono">Dune.Part.Two.2024.1080p.AMZN.WEB-DL</td>
+                    <td><span class="tag ok">release match</span></td><td>★ 8.1</td><td class="mono">5 902</td>
+                    <td class="row"><button class="btn sm">preview</button><button class="btn sm pri">get .srt</button></td></tr>
+                <tr><td><span class="tag i">EN</span></td><td>Podnapisi<div class="meta">no key</div></td>
+                    <td class="mono">dune.part.two.2024.web</td>
+                    <td><span class="tag w">title+year</span></td><td>★ 7.2</td><td class="mono">921</td>
+                    <td class="row"><button class="btn sm">preview</button><button class="btn sm pri">get .srt</button></td></tr>
+                <tr><td><span class="tag i">EN</span></td><td>TVsubtitles<div class="meta">scrape · series only</div></td>
+                    <td class="mono">Shōgun.S01E03</td>
+                    <td><span class="tag ok">episode match</span></td><td>★ 7.6</td><td class="mono">410</td>
+                    <td class="row"><button class="btn sm">preview</button><button class="btn sm pri">get .srt</button></td></tr>
+                <tr><td colspan="7" style="background:rgba(248,113,113,.05)"><span class="tag e">skipped</span> <b>Addic7ed</b> — credentials missing (settings → providers). <span class="tag e">skipped</span> <b>OpenSubtitles.com</b> — API key missing. <span class="tag e">skipped</span> <b>JustSubtitles</b> — page layout changed, adapter marked broken.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <div class="spread"><h2 style="margin:0">Providers</h2><button class="btn sm">＋ Add custom provider</button></div>
+            <p class="sub" style="margin:8px 0 12px">Each provider has a <b>state</b>: works / needs key / needs login / layout changed. When one breaks, the others keep working — and you can add your own source with a URL template.</p>
+            <table>
+              <thead><tr><th>Provider</th><th>Type</th><th>Needs</th><th>NL</th><th>EN</th><th>Series</th><th>State</th><th></th></tr></thead>
+              <tbody>
+                <tr><td>OpenSubtitles.org</td><td><span class="tag">XML-RPC (legacy)</span></td><td>—</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag ok">ok · 12 ms</span></td><td><button class="btn sm ghost">test</button></td></tr>
+                <tr><td>OpenSubtitles.com</td><td><span class="tag i">REST API</span></td><td>API key</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag w">no key</span></td><td><button class="btn sm ghost">key</button></td></tr>
+                <tr><td>SubDL</td><td><span class="tag i">REST API</span></td><td>free key</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag ok">ok</span></td><td><button class="btn sm ghost">key</button></td></tr>
+                <tr><td>Podnapisi</td><td><span class="tag">scrape/XML</span></td><td>—</td><td>✓</td><td>✓</td><td>—</td><td><span class="tag ok">ok</span></td><td><button class="btn sm ghost">test</button></td></tr>
+                <tr><td>TVsubtitles.net</td><td><span class="tag">scrape</span></td><td>—</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag ok">ok</span></td><td><button class="btn sm ghost">test</button></td></tr>
+                <tr><td>Addic7ed</td><td><span class="tag">scrape</span></td><td>login</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag w">no login</span></td><td><button class="btn sm ghost">login</button></td></tr>
+                <tr><td>JustSubtitles.com</td><td><span class="tag">scrape</span></td><td>—</td><td>✓</td><td>✓</td><td>—</td><td><span class="tag e">broken layout</span></td><td><button class="btn sm ghost">fix</button></td></tr>
+                <tr><td>Tvsubs.net</td><td><span class="tag">scrape</span></td><td>—</td><td>✓</td><td>✓</td><td>✓</td><td><span class="tag w">slow</span></td><td><button class="btn sm ghost">test</button></td></tr>
+                <tr><td>My private source</td><td><span class="tag v">user template</span></td><td>—</td><td>?</td><td>?</td><td>?</td><td><span class="tag">disabled</span></td><td><button class="btn sm ghost">edit</button></td></tr>
+              </tbody>
+            </table>
+            <div class="note"><b>Custom provider form</b> (this is how you “enter possible sources”):
+              name · type (API / scrape) · search URL template with <span class="mono">{query} {imdb} {tmdb} {sxx} {exx} {lang}</span> ·
+              download URL template · optional <span class="mono">.srt</span> extraction rule (zip/rar/7z supported) · auth (none / api-key / basic / cookie).
+              A built-in <b>test</b> button runs a query and shows the raw responses, so a broken source is obvious immediately.</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Attach subtitle</h2>
+            <div class="field"><label>Chosen file</label><input class="mono" value="Dune.Part.Two.2024.NL.srt (2 116 cues, UTF-8)" readonly></div>
+            <div class="field"><label>Timing offset</label><div class="row"><input type="range" min="-10000" max="10000" step="100" value="0"><span class="mono">0 ms</span></div></div>
+            <div class="field"><label>Action</label>
+              <select><option>Mux into the live stream (soft track)</option><option>Keep as sidecar next to downloads</option><option>Burn into the video (hard)</option></select></div>
+            <div class="field"><label>Destination</label><select>
+              <option>/downloads/Dune Part Two (2024)/</option><option>Push to VU+ Duo2 media</option><option>Both</option></select></div>
+            <div class="row">
+              <button class="btn pri">Apply</button>
+              <button class="btn">⤓ .srt</button>
+              <button class="btn">⧗ Re-sync by audio</button>
+            </div>
+            <div class="note">Auto-normalised to <span class="mono">UTF-8</span> (CP1252 detected → converted), CRLF fixed, and named to the release so VLC picks it up automatically.</div>
+          </div>
+
+          <div class="card">
+            <h2>Push .srt to the receiver</h2>
+            <div class="row" style="gap:6px;margin-bottom:10px">
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" checked> enabled</label>
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" checked> rename to match stream</label>
+            </div>
+            <div class="field"><label>Method</label><select>
+              <option>OpenWebif “/media/hdd/movie” upload (SFTP under the hood)</option>
+              <option>rsync/scp to mounted share</option>
+              <option>SeaFile / WebDAV folder</option></select></div>
+            <div class="kv"><span>target dir</span><span class="mono">/media/hdd/movie/vumovie</span></div>
+            <div class="kv"><span>last push</span><span>Dune…NL.srt → ok (0.8 s)</span></div>
+            <div class="note warn">Some E2 players ignore sidecar .srt in live streams; there the reliable path is <b>muxed</b> subtitles (the option above). The mockup keeps both, and the stream page tells you which one the box will actually honour.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= ENIGMA2 ======================= -->
+    <section id="p-e2" class="hide">
+      <h1>Enigma2 bouquet</h1>
+      <p class="sub">Generate a userbouquet for the VU+ Duo2 and push it over OpenWebif — Movie entries (4097/GStreamer), series grouped per season.</p>
+
+      <div class="gridlines">
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Generated bouquet</h2>
+            <div class="row" style="gap:6px;margin-bottom:10px">
+              <span class="tag i">userbouquet.vumovie.tv</span><span class="tag">7 entries</span>
+              <span class="tag v">service type 4097</span><span class="tag">refs auto-generated</span>
+            </div>
+<pre><span class="c">#NAME vu-movie (TV)</span>
+<span class="c">#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.vumovie.tv" ORDER BY bouquet</span>
+<span class="k">#SERVICE 4097:0:1:0:0:0:0:0:0:0:http%3a//192.168.1.10%3a8080/s/9f3ab21c/dune-part-two-2024.ts:</span>Dune Part Two (2024) <span class="g">[NL]</span>
+<span class="c">#DESCRIPTION Dune Part Two (2024) — 1080p · NL subs</span>
+<span class="k">#SERVICE 4097:0:1:0:0:0:0:0:0:0:http%3a//192.168.1.10%3a8080/s/2b71ee09/oppenheimer-2023.ts:</span>Oppenheimer (2023) <span class="g">[NL]</span>
+<span class="c">#DESCRIPTION Oppenheimer (2023) — 1080p (VAAPI) · NL subs</span>
+<span class="c">#NAME ── Shōgun (2024) ──</span>
+<span class="k">#SERVICE 4097:0:1:0:0:0:0:0:0:0:http%3a//192.168.1.10%3a8080/s/77c0f1aa/shogun-s01e01.ts:</span>S01E01 — Anjin
+<span class="c">#DESCRIPTION Shōgun S01E01 — 1080p · NL subs</span>
+<span class="k">#SERVICE 4097:0:1:0:0:0:0:0:0:0:http%3a//192.168.1.10%3a8080/s/1de9c2bb/shogun-s01e03.ts:</span>S01E03 — Tomorrow Is Tomorrow</pre>
+            <div class="row" style="margin-top:10px">
+              <button class="btn">⤓ download .tv file</button>
+              <button class="btn">⧉ copy</button>
+              <button class="btn">⟳ regenerate all refs</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Push to VU+ Duo2</h2>
+            <div class="steps">
+              <div class="step">Upload <span class="mono">userbouquet.vumovie.tv</span> to <span class="mono">/etc/enigma2/</span> (WebIF upload or SFTP).</div>
+              <div class="step">Ensure the bouquet is referenced in <span class="mono">bouquets.tv</span> (added once, kept on later pushes).</div>
+              <div class="step">Trigger <span class="mono">GET /web/servicelistreload?mode=2</span> and verify with <span class="mono">/web/getservices</span>.</div>
+              <div class="step">Fallback if WebIF is disabled: write the same two files into a mounted SMB/NFS share and let your box’s script copy them.</div>
+            </div>
+            <div class="row" style="margin-top:12px">
+              <button class="btn pri">☁ Push bouquet now</button>
+              <button class="btn">⟳ test connection</button>
+              <button class="btn ghost">dry run (show diff)</button>
+            </div>
+            <div class="log" style="margin-top:12px;max-height:190px">
+<div><span class="t">13:02:11</span> <span class="i">INFO </span> enigma2: connecting http://192.168.1.50 (timeout 8 s)</div>
+<div><span class="t">13:02:11</span> <span class="i">INFO </span> enigma2: WebIF /web/about ok (OpenPLi 9.0, Duo2)</div>
+<div><span class="t">13:02:11</span> <span class="i">INFO </span> enigma2: upload userbouquet.vumovie.tv (1.9 kB) → 200</div>
+<div><span class="t">13:02:12</span> <span class="i">INFO </span> enigma2: bouquets.tv already references userbouquet.vumovie.tv — left intact</div>
+<div><span class="t">13:02:12</span> <span class="i">INFO </span> enigma2: servicelistreload?mode=2 → 200</div>
+<div><span class="t">13:02:12</span> <span class="w">WARN </span> enigma2: getservices shows 6 of 7 entries — <b>duplicate service ref</b> for “Arcane S02E05”; reassigning a unique ref</div>
+<div><span class="t">13:02:13</span> <span class="i">INFO </span> enigma2: re-pushed, 7 of 7 entries live ✓</div>
+            </div>
+            <div class="note">The push dialog warns before it touches anything if a bouquet with the same name already exists, and the dry-run shows the exact file diff. A wrong bouquet name can hide your whole channel list, so this is deliberately conservative.</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card" style="margin-bottom:14px">
+            <h2>Box settings</h2>
+            <div class="field"><label>Host / port</label><div class="row"><input class="mono" value="192.168.1.50"><input class="mono" value="80" style="width:80px"></div></div>
+            <div class="f2">
+              <div class="field"><label>WebIF user</label><input value="root"></div>
+              <div class="field"><label>password</label><input type="password" value="•••••••"></div>
+            </div>
+            <div class="field"><label>Bouquet name</label><input value="vu-movie"></div>
+            <div class="field"><label>Enigma2 root</label><input class="mono" value="/etc/enigma2"></div>
+            <div class="field"><label>Service type</label><select>
+              <option>4097 — GStreamer / exteplayer3 (best for IPTV, recommended)</option>
+              <option>5001 — GStreamer (OpenPLi)</option>
+              <option>5002 — exteplayer3</option>
+              <option>1 — DVB/TS type (only if your box prefers it)</option>
+            </select></div>
+            <div class="field"><label>Service reference ids</label><select>
+              <option>Auto-generate unique refs (recommended)</option>
+              <option>Fixed ref per title (hash of URL)</option>
+            </select></div>
+            <div class="row"><label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> MPEG-TS output for the box (no playlist)</label></div>
+            <div class="row" style="margin-top:6px"><label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> add “vu-movie” logo + genre folders</label></div>
+          </div>
+
+          <div class="card">
+            <h2>Bouquet options</h2>
+            <div class="kv"><span>scope</span><span>everything scraped · selection only · favourites</span></div>
+            <div class="kv"><span>series layout</span><span>one bouquet, season “#NAME” separators</span></div>
+            <div class="kv"><span>naming</span><span class="mono">Title (Year) [NL]</span></div>
+            <div class="kv"><span>max entries</span><span>500 (E2 list gets slow beyond that)</span></div>
+            <div class="kv"><span>auto-refresh</span><span>re-push after each new scrape</span></div>
+            <div class="note">Stream URLs in the bouquet point at the NAS, so the box keeps working even when the upstream token has expired — the app re-resolves the real source on demand.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= LOGS ======================= -->
+    <section id="p-logs" class="hide">
+      <h1>Logs</h1>
+      <p class="sub">Structured, levelled and greppable — the whole point is that when a site changes its player, the log says exactly which stage broke.</p>
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <select style="width:auto"><option>level: INFO+</option><option>DEBUG</option><option>WARN+</option><option>ERROR only</option></select>
+          <select style="width:auto"><option>component: all</option><option>scraper</option><option>browser</option><option>resolver</option><option>transcode</option><option>subtitles</option><option>enigma2</option><option>db</option></select>
+          <input placeholder="filter text…" style="flex:1">
+          <button class="btn sm">⟳ live tail</button><button class="btn sm ghost">download</button>
+        </div>
+        <div class="log">
+<div><span class="t">13:04:02.114</span> <span class="i">INFO </span> <b>app</b>      vu-movie 1.0.0 starting — node v22.11.0, ffmpeg 6.1.1, chromium 121.0.6167.85</div>
+<div><span class="t">13:04:02.115</span> <span class="i">INFO </span> <b>config</b>   loaded /config/vumovie.yml (sources=8, providers=9, transcode=vaapi)</div>
+<div><span class="t">13:04:02.410</span> <span class="i">INFO </span> <b>db</b>       connecting postgres://vu-movie:***@db:5432/vumovie (lazy pool, size 5)</div>
+<div><span class="t">13:04:02.512</span> <span class="i">INFO </span> <b>db</b>       schema ok — 9 tables verified/created (migration 0004_add_subtitle_offset)</div>
+<div><span class="t">13:04:02.640</span> <span class="i">INFO </span> <b>hwaccel</b>  /dev/dri/renderD128 present → vaapi:Intel HD Graphics 500 (H.264 enc ✓, HEVC enc ✗)</div>
+<div><span class="t">13:04:02.641</span> <span class="w">WARN </span> <b>hwaccel</b>  software fallback armed: libx264 veryfast (used automatically if vaapi init fails)</div>
+<div><span class="t">13:04:03.002</span> <span class="i">INFO </span> <b>public</b>   serving static ui from /app/public (index.html, mockup.html, assets/)</div>
+<div><span class="t">13:04:03.331</span> <span class="i">INFO </span> <b>enigma2</b>  probe 192.168.1.50 → OpenPLi 9.0 Duo2, WebIF ok, bouquet "vu-movie" present (6 entries)</div>
+<div><span class="t">13:04:03.900</span> <span class="d">DEBUG</span> <b>scraper</b>  cinejoy: POST api.wing.st/g → 200 (176 B encrypted), decrypt ok, 3 media candidates</div>
+<div><span class="t">13:04:04.120</span> <span class="w">WARN </span> <b>scraper</b>  overlook: candidate 1 rejected (HTTP 403) → trying candidate 2</div>
+<div><span class="t">13:04:04.700</span> <span class="i">INFO </span> <b>resolver</b> server 1 cinejoy CDN-1 → 1080p H.264 6412 kb/s 23.976 fps · 214 segments · probe 412 ms</div>
+<div><span class="t">13:04:04.702</span> <span class="i">INFO </span> <b>transcode</b>profile auto: source ≤1080p H.264 → <b>stream copy</b> (remux only, no re-encode)</div>
+<div><span class="t">13:04:05.010</span> <span class="i">INFO </span> <b>subtitles</b>opensubtitles.org: 14 candidates (NL 3, EN 11) · subsync score best NL 8.6 (hash match)</div>
+<div><span class="t">13:04:05.220</span> <span class="e">ERROR</span> <b>subtitles</b>justsubtitles: selector “table.subs tr” matched 0 rows — adapter marked BROKEN, source skipped</div>
+<div><span class="t">13:04:05.230</span> <span class="i">INFO </span> <b>app</b>      readiness: all critical subsystems ok in 3.1 s</div>
+        </div>
+        <div class="note">Every stage (browser launch, candidate probe, decrypt, ffmpeg stderr, WebIF call) logs with component + latency, and ffmpeg stderr is mirrored into the log with the failed command line intact. <span class="mono">/api/health</span> exposes the same summary as JSON for Uptime-Kuma-style checks.</div>
+      </div>
+    </section>
+
+    <!-- ======================= SETTINGS ======================= -->
+    <section id="p-set" class="hide">
+      <h1>Settings</h1>
+      <p class="sub">Everything is stored in <span class="mono">/config/vumovie.yml</span> (mounted volume) and overridable by env vars for docker-compose.</p>
+      <div class="grid g2">
+        <div class="card">
+          <h2>Sources (scraping)</h2>
+          <div class="kv"><span>enabled sites</span><span>8 of 8</span></div>
+          <div class="kv"><span>strategy</span><span>recipe per site → headless fallback</span></div>
+          <div class="kv"><span>headless chromium</span><span class="mono">max 1 concurrent, 512 MB cap</span></div>
+          <div class="kv"><span>cloudflare solver</span><span class="mono">FlareSolverr http://flaresolverr:8191 (optional)</span></div>
+          <div class="kv"><span>cookie/session store</span><span class="mono">/config/sessions/*.json</span></div>
+          <div class="kv"><span>resolve timeout</span><span>45 s · 3 retries · mirror rotation</span></div>
+          <div class="field" style="margin-top:12px"><label>Add / edit source</label>
+            <div class="row"><input placeholder="name" value="cinevo.nl"><input placeholder="base url" class="mono" value="https://cinevo.nl">
+            <button class="btn sm">edit recipe</button></div>
+          </div>
+          <div class="note">Recipes live in <span class="mono">/config/sources/*.json</span> — search URL, result selectors, embed patterns. A site change is fixed by editing a file, without rebuilding the image.</div>
+        </div>
+
+        <div class="card">
+          <h2>Transcode</h2>
+          <div class="f2">
+            <div class="field"><label>Default profile</label><select><option>auto (copy if ≤1080p, transcode if higher)</option><option>always VAAPI 1080p</option><option>always VAAPI 720p</option><option>copy only (never transcode)</option></select></div>
+            <div class="field"><label>Max concurrent transcodes</label><input value="1" type="number" min="1" max="4"></div>
+            <div class="field"><label>HW device</label><input class="mono" value="/dev/dri/renderD128"></div>
+            <div class="field"><label>Software fallback</label><input class="mono" value="libx264 -preset veryfast -crf 22"></div>
+          </div>
+          <div class="row" style="margin-top:4px"><label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> validate VLC-compatibility of the source before offering it</label></div>
+          <div class="row" style="margin-top:6px"><label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> auto-detect HEVC/4K sources and pre-select transcode</label></div>
+          <div class="field" style="margin-top:10px"><label>Extra ffmpeg input args (advanced)</label><input class="mono" value="-rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err"></div>
+        </div>
+
+        <div class="card">
+          <h2>Subtitles</h2>
+          <div class="field"><label>Preferred languages (order matters)</label><input value="nl, en"></div>
+          <div class="field"><label>Scoring</label><select><option>hash match &gt; release match &gt; title+year</option><option>most downloaded first</option></select></div>
+          <div class="row"><label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> convert to UTF-8</label>
+            <label class="row" style="gap:6px;margin:0"><input type="checkbox" checked> push .srt to receiver</label></div>
+          <div class="field" style="margin-top:10px"><label>API keys</label>
+            <div class="row"><input placeholder="opensubtitles.com API key" style="font-family:var(--mono)"><input placeholder="subdl API key" style="font-family:var(--mono)"></div>
+          </div>
+          <div class="field"><label>Addic7ed / private trackers</label><input placeholder="username:password (stored in /config only)"></div>
+          <button class="btn sm" style="margin-top:6px">test all providers</button>
+        </div>
+
+        <div class="card">
+          <h2>Enigma2 / storage / app</h2>
+          <div class="f2">
+            <div class="field"><label>Box IP</label><input class="mono" value="192.168.1.50"></div>
+            <div class="field"><label>WebIF port</label><input class="mono" value="80"></div>
+            <div class="field"><label>Bouquet</label><input value="vu-movie"></div>
+            <div class="field"><label>Push path</label><input class="mono" value="/etc/enigma2"></div>
+            <div class="field"><label>Downloads dir</label><input class="mono" value="/downloads"></div>
+            <div class="field"><label>Temp / cache dir</label><input class="mono" value="/tmp/vumovie (4 GB cap)</div>
+            <div class="field"><label>Base URL (LAN name VLC uses)</label><input class="mono" value="http://192.168.1.10:8080"></div>
+            <div class="field"><label>Log level</label><select><option>info</option><option>debug</option><option>warn</option></select></div>
+          </div>
+          <div class="row"><button class="btn sm">download config</button><button class="btn sm">upload config</button><button class="btn sm ghost">reset</button></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+/* ---------- nav ---------- */
+function go(p){
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on', b.dataset.p===p));
+  document.querySelectorAll('main > section').forEach(s=>s.classList.toggle('hide', s.id!=='p-'+p));
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>go(b.dataset.p));
+
+/* ---------- find tabs ---------- */
+document.querySelectorAll('#findtabs button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#findtabs button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  ['title','url','browse'].forEach(t=>document.getElementById('ft-'+t).classList.toggle('hide', t!==b.dataset.t));
+});
+
+/* ---------- pick a title ---------- */
+function pick(el,title,year,type){
+  document.querySelectorAll('.moviecard').forEach(c=>c.style.outline='');
+  el.style.outline='2px solid var(--acc)';
+  document.getElementById('d-title').textContent=title;
+  document.getElementById('d-year').textContent=year;
+  document.getElementById('d-type').textContent=type;
+}
+
+/* ---------- live ffmpeg command builder ---------- */
+const dims={'480':{s:854,t:480},'720':{s:1280,t:720},'1080':{s:1920,t:1080}};
+function buildCmd(){
+  const res=document.getElementById('res').value,
+        ar=document.getElementById('ar').value,
+        vc=document.getElementById('vc').value,
+        enc=document.getElementById('enc').value,
+        vb=document.getElementById('vb').value,
+        ab=document.getElementById('ab').value,
+        fps=document.getElementById('fps').value,
+        always=document.getElementById('always').checked;
+  document.getElementById('vbL').textContent=vb+' kbps';
+  document.getElementById('abL').textContent=ab+' kbps';
+  const d=dims[res];
+  const vf=[];
+  let scale;
+  if(ar==='43'){ scale=`scale_vaapi=w=960:h=${d.t}${enc==='x264'?':format=nv12':':format=nv12'}`; }
+  else { scale=`scale_vaapi=w=${d.s}:h=${d.t}:format=nv12`; }
+  if(enc==='x264'){ scale=scale.replace(/scale_vaapi|:format=nv12/g,'').trim()||''; scale=`scale=w=${ar==='43'?960:d.s}:h=${d.t}`; }
+  vf.push(scale);
+  if(fps!=='src') vf.push(`fps=${fps}`);
+
+  const L=[];
+  L.push('<span class="c"># stream-copy guard: only added when a real encode is needed</span>');
+  L.push('ffmpeg -hide_banner -loglevel info \\');
+  L.push('  -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 \\');
+  L.push('  -fflags +genpts+discardcorrupt -err_detect ignore_err \\');
+  if(enc==='vaapi'&&vc!=='copy'){
+    L.push('  -init_hw_device vaapi=<span class="k">intel</span>:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi \\');
+  }
+  L.push(`  -i <span class="v">&lt;resolved-url&gt;</span> \\`);
+  if(vc==='copy'){
+    L.push(`  -map 0:v:0 -map 0:a:0? -c copy -bsf:v h264_mp4toannexb -f mpegts -mpegts_flags +resend_headers pipe:1`);
+  }else{
+    const codec = (enc==='vaapi'&&vc==='h264')?'h264_vaapi':'libx264';
+    const tail  = (enc==='vaapi'&&vc==='h264')
+      ? `-c:v h264_vaapi -b:v <span class="v">${vb}k</span> -maxrate ${Math.round(vb*1.2)}k -bufsize ${Math.round(vb*1.8)}k -profile:v high -level 4.1 -g 50`
+      : `-c:v libx264 -preset veryfast -crf 22 -maxrate <span class="v">${vb}k</span> -bufsize ${Math.round(vb*1.8)}k`;
+    L.push(`  -vf "<span class="k">${vf.join(',')}</span>" -map 0:v:0 -map 0:a:0? -sn -dn \\`);
+    L.push(`  ${tail} ${fps!=='src'?`-r ${fps}`:''} \\`);
+    L.push(`  -c:a aac -b:a <span class="v">${ab}k</span> -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers pipe:1`);
+  }
+  document.getElementById('cmd').innerHTML=L.join('\n');
+  const warn=document.getElementById('warnbox');
+  if(res==='1080'&&enc==='x264'){ warn.className='note err'; warn.innerHTML='Software 1080p encode on a J3455 runs at roughly <b>0.3–0.5× real time</b> — fine for offline downloads, unusable for live streaming. Use VAAPI, or drop to 720p.'; }
+  else if(res==='1080'){ warn.className='note warn'; warn.innerHTML='1080p on a J3455: H.264 encode at 1080p is possible, but keep <b>one</b> transcode at a time and stay near the bitrates above. H.265 encode is not available in this hardware.'; }
+  else { warn.className='note'; warn.innerHTML='720p/480p VAAPI on HD Graphics 500 is comfortable for real-time streaming'+ (always?' with the always-transcode option on.':'.'); }
+}
+['res','ar','vc','enc','vb','ab','fps'].forEach(id=>document.getElementById(id).addEventListener('input',buildCmd));
+document.getElementById('always').addEventListener('change',buildCmd);
+buildCmd();
+</script>
+</body>
+</html>

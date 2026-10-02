@@ -1,0 +1,20 @@
+# Keep the build context small and reproducible (this runs on a NAS).
+.git
+.gitignore
+node_modules
+npm-debug.log*
+data
+downloads
+*.ts
+*.mkv
+*.mp4
+*.log
+coverage
+.nyc_output
+.DS_Store
+Thumbs.db
+docs
+test
+arena
+*.md
+!README.md
