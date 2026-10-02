@@ -193,7 +193,8 @@ router.get('/find/search', wrap(async (req, res) => {
   if (!q) return res.status(400).json({ ok: false, error: 'q is required' });
   const results = await registry.searchAll(q, {
     type: req.query.type || null,
-    sources: req.query.sources ? String(req.query.sources).split(',') : null,
+    sources: req.query.sources === undefined ? null : String(req.query.sources).split(',').filter(Boolean),
+    includeMoviebox: req.query.moviebox === undefined || String(req.query.moviebox).toLowerCase() !== 'false',
   });
   res.json({ ok: true, query: q, results });
 }));

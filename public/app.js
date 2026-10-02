@@ -229,7 +229,13 @@ async function doSearch() {
   if (!query) return toast('Enter a title first', 'warn');
   $('#find-hint').innerHTML = '<span class="spin"></span> searching…';
   try {
-    const res = await api(`/api/find/search?q=${encodeURIComponent(query)}&type=${encodeURIComponent($('#q-type').value)}&sources=${encodeURIComponent(state.selectedSources.join(','))}`);
+    const params = new URLSearchParams({
+      q: query,
+      type: $('#q-type').value,
+      sources: state.selectedSources.join(','),
+      moviebox: String($('#q-moviebox').checked),
+    });
+    const res = await api(`/api/find/search?${params}`);
     state.results = res.results;
     $('#results-count').textContent = `${res.results.length} results`;
     renderResults();

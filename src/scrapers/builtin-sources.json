@@ -4,29 +4,50 @@
     "name": "Overlook",
     "home": "https://overlook.cx/lobby",
     "enabled": true,
-    "match": ["overlook.cx"],
+    "match": [
+      "overlook.cx"
+    ],
     "kind": "browser",
     "search": {
-      "kind": "browser",
-      "url": "https://overlook.cx/search?q={query}",
-      "linkPattern": "/(movie|tv|watch|title)/"
+      "kind": "api",
+      "url": "https://overlook.cx/api/search?q={query}",
+      "items": "results",
+      "resultUrl": "/{type}/{id}",
+      "typeMap": {
+        "movie": "movies",
+        "tv": "shows"
+      },
+      "posterBaseUrl": "https://image.tmdb.org/t/p/w500/",
+      "map": {
+        "id": "id",
+        "title": "t",
+        "year": "y",
+        "kind": "mediaType",
+        "poster": "posterPath"
+      }
     },
-    "resolve": { "kind": "browser" },
-    "notes": "Flixer-style front-end. Player is loaded from the shared API farms, so the headless network sniffer finds the media URL without site-specific code. Link pattern may need a tweak once we see the rendered search page on your LAN."
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Search uses Overlook’s JSON catalog API; title resolution still uses the browser sniffer."
   },
   {
     "id": "cinevo",
     "name": "Cinevo",
     "home": "https://cinevo.nl",
     "enabled": true,
-    "match": ["cinevo.nl"],
+    "match": [
+      "cinevo.nl"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
-      "url": "https://cinevo.nl/search/{query}",
+      "url": "https://cinevo.nl/search?q={query}",
       "linkPattern": "/(movie|tv|serie|watch)/"
     },
-    "resolve": { "kind": "browser" },
+    "resolve": {
+      "kind": "browser"
+    },
     "notes": "Dutch-oriented front-end; TMDB based. Best treated with the browser sniffer."
   },
   {
@@ -34,29 +55,38 @@
     "name": "Cinejoy",
     "home": "https://cinejoy.pk/",
     "enabled": true,
-    "match": ["cinejoy.pk"],
+    "match": [
+      "cinejoy.pk"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
       "url": "https://cinejoy.pk/search/{query}",
-      "linkPattern": "/(movie|tv|watch)/"
+      "linkPattern": "/(movie|tv|series|watch)/"
     },
-    "resolve": { "kind": "browser" },
-    "notes": "Encrypted player API (POST /g on api.wing.st, decrypted by a WASM blob in the browser). Native decryption is planned as layer 3; until then the browser sniffer reads the URL *after* the site decrypted it, which is the pragmatic path."
+    "resolve": {
+      "kind": "browser",
+      "playerPathPrefix": "/watch"
+    },
+    "notes": "Encrypted player API (POST /g on api.wing.st, decrypted by a WASM blob in the browser). If the detail page hides its CTA, resolution falls back from /movie/... to /watch/movie/...; the browser sniffer then reads the URL after the site decrypts it."
   },
   {
     "id": "flixhub",
     "name": "Flixhub",
     "home": "https://flixhub.studio/home",
     "enabled": true,
-    "match": ["flixhub.studio"],
+    "match": [
+      "flixhub.studio"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
-      "url": "https://flixhub.studio/search/{query}",
-      "linkPattern": "/(movie|tv|watch)/"
+      "url": "https://flixhub.studio/search?q={query}",
+      "linkPattern": "watch\\.html\\?type=|/(movie|film|tv|series?|title|watch)/"
     },
-    "resolve": { "kind": "browser" },
+    "resolve": {
+      "kind": "browser"
+    },
     "notes": "Flixer clone; same farms as Overlook/1flex."
   },
   {
@@ -64,14 +94,18 @@
     "name": "Redflix",
     "home": "https://redflix.club/",
     "enabled": true,
-    "match": ["redflix.club"],
+    "match": [
+      "redflix.club"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
-      "url": "https://redflix.club/search/{query}",
-      "linkPattern": "/(movie|tv|watch)/"
+      "url": "https://redflix.club/browse?q={query}",
+      "linkPattern": "/play\\?id=|/(movie|film|tv|series?|watch|title)/"
     },
-    "resolve": { "kind": "browser" },
+    "resolve": {
+      "kind": "browser"
+    },
     "notes": "Aggregator front-end. If its own search is JS-only, the search page may need selector tuning — the resolve path is unaffected."
   },
   {
@@ -79,14 +113,18 @@
     "name": "1flex",
     "home": "https://www.1flex.org/",
     "enabled": true,
-    "match": ["1flex.org"],
+    "match": [
+      "1flex.org"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
-      "url": "https://www.1flex.org/search/{query}",
+      "url": "https://www.1flex.org/search?q={query}",
       "linkPattern": "/(movie|tv|watch)/"
     },
-    "resolve": { "kind": "browser" },
+    "resolve": {
+      "kind": "browser"
+    },
     "notes": "Flixer clone (same player farm as Overlook/Flixhub)."
   },
   {
@@ -94,14 +132,18 @@
     "name": "Cinezo",
     "home": "https://cinezo.st/",
     "enabled": true,
-    "match": ["cinezo.st"],
+    "match": [
+      "cinezo.st"
+    ],
     "kind": "browser",
     "search": {
       "kind": "browser",
-      "url": "https://cinezo.st/search/{query}",
+      "url": "https://cinezo.st/search?q={query}",
       "linkPattern": "/(movie|tv|watch)/"
     },
-    "resolve": { "kind": "browser" },
+    "resolve": {
+      "kind": "browser"
+    },
     "notes": "Open player API — a native adapter can be added as a fast path (kind:api) once the endpoint shape is confirmed from your network."
   }
 ]

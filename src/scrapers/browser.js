@@ -203,33 +203,24 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   });
   page.on('pageerror', (err) => consoleErrors.push(String(err.message).slice(0, 200)));
 
-  // Catch pop-ups: many players open the stream in a new tab.
-  ctx.on('page', (popup) => {
+  // Catch pop-ups: many players open the stream in a new tab. Remove this
+  // listener after each run so it does not accumulate in the persistent context.
+  const popupPages = new Set();
+  const onPopup = (popup) => {
+    popupPages.add(popup);
     attach(popup);
-  });
-
-  await page.route('**/*', async (route) => {
-    const req = route.request();
-    const u = req.url();
-    if (BLOCK_PATTERNS.some((p) => u.includes(p))) return route.abort();
-    const type = req.resourceType();
-    if (type === 'image' || type === 'font' || type === 'media') {
-      // We do not need the pixels; 'media' is aborted so the site cannot pull
-      // gigabytes through the NAS — we only want the manifest URL.
-      if (type === 'media') return route.abort();
-      return route.continue();
-    }
-    return route.continue();
-  });
+  };
+  ctx.on('page', onPopup);
 
   function attach(p) {
-    p.on('response', (res) => {
+    p.on('response', async (res) => {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
       if (looksLikeMedia(u, ct)) {
         if (!media.has(u)) {
           const req = res.request();
-          const reqHeaders = { ...req.headers() };
+          let reqHeaders;
+          try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }
           const kind = kindOf(u, ct);
           media.set(u, {
             url: u,
@@ -260,22 +251,55 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   };
 
   try {
+    await page.route('**/*', async (route) => {
+      const req = route.request();
+      const u = req.url();
+      if (BLOCK_PATTERNS.some((p) => u.includes(p))) return route.abort();
+      const type = req.resourceType();
+      if (type === 'image' || type === 'font' || type === 'media') {
+        // We do not need the pixels; 'media' is aborted so the site cannot pull
+        // gigabytes through the NAS — we only want the manifest URL.
+        if (type === 'media') return route.abort();
+        return route.continue();
+      }
+      return route.continue();
+    });
+
     log.info('browser', `sniffing ${safeHost(url)}`, { url: url.slice(0, 200), session: opts.session || 'default' });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 30_000) })
       .catch((err) => log.warn('browser', `navigation issue for ${safeHost(url)}: ${err.message}`));
 
-    if (opts.click !== false) await nudgePlay(page);
+    let followedPlayAction = false;
+    if (opts.click !== false) followedPlayAction = await nudgePlay(page);
+
+    // A few sites expose an explicit detail → player route but hide the CTA
+    // until client-side metadata finishes loading. Recipes can supply that
+    // prefix as a fallback when no visible Play/Watch action was found.
+    if (!followedPlayAction && media.size === 0 && opts.playerPathPrefix) {
+      const playerUrl = playerUrlWithPrefix(url, opts.playerPathPrefix);
+      if (playerUrl && playerUrl !== page.url()) {
+        log.info('browser', 'no visible play action found; trying recipe player route', {
+          sourceUrl: page.url().slice(0, 160), playerUrl: playerUrl.slice(0, 160),
+        });
+        await page.goto(playerUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+          .catch((err) => log.warn('browser', `player-route navigation issue: ${err.message}`));
+        if (opts.click !== false) await nudgePlay(page);
+      }
+    }
 
     // Wait until we have media AND the page has been quiet for `quietMs`.
+    // The aggressive click is a single retry; repeating it every 250 ms can
+    // continually reload the player before it has time to initialize.
     let lastCount = 0;
     let lastChange = Date.now();
+    let aggressivePlayRetried = false;
     while (Date.now() - started < timeoutMs) {
       if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
       const count = media.size + apis.size;
       if (count !== lastCount) { lastCount = count; lastChange = Date.now(); }
       if (media.size > 0 && Date.now() - lastChange > quietMs) break;
-      if (media.size === 0 && Date.now() - started > Math.min(timeoutMs, 12_000)) {
-        // one more attempt: click every play control we can find
+      if (!aggressivePlayRetried && media.size === 0 && Date.now() - started > Math.min(timeoutMs, 12_000)) {
+        aggressivePlayRetried = true;
         await nudgePlay(page, true);
       }
       await sleep(250);
@@ -290,13 +314,18 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     result.ok = result.media.length > 0;
     if (!result.ok) {
       result.note = 'no media response observed — the page may need a click, a login, or a different player URL';
-      log.warn('browser', `no media found on ${safeHost(url)} after ${Date.now() - started} ms`,
-        { consoleErrors: consoleErrors.slice(0, 3) });
+      log.warn('browser', `no media found on ${safeHost(url)} after ${Date.now() - started} ms`, {
+        finalUrl: result.finalUrl.slice(0, 200),
+        title: result.title,
+        consoleErrors: consoleErrors.slice(0, 3),
+      });
     }
   } catch (err) {
     result.error = err.message;
     log.error('browser', `sniffer failed on ${safeHost(url)}: ${err.message}`);
   } finally {
+    ctx.off('page', onPopup);
+    for (const popup of popupPages) await popup.close().catch(() => {});
     activePages -= 1;
     result.ms = Date.now() - started;
     await page.close().catch(() => {});
@@ -323,13 +352,203 @@ async function nudgePlay(page, aggressive = false) {
       const el = await page.$(sel);
       if (!el) continue;
       const visible = await el.isVisible().catch(() => false);
-      if (!visible && !aggressive) continue;
-      await el.click({ timeout: 1200, force: true });
+      if (!visible) continue;
+      await el.click({ timeout: 1200, force: aggressive });
       log.debug('browser', `clicked play control: ${sel}`);
       await sleep(aggressive ? 400 : 900);
-      if (!aggressive) return;
+      return true;
     } catch { /* selector not clickable — try the next one */ }
   }
+
+  // Search results frequently open a title-details page first. On these pages
+  // the primary action is a normal “Play”/“Watch now” link, not a player button;
+  // follow it so the sniffer reaches the actual episode/player route.
+  const labels = [/^watch now$/i, /^watch$/i, /^play now$/i, /^play$/i, /^start watching$/i, /^stream now$/i];
+  const exactLabels = ['Watch Now', 'Watch', 'Play Now', 'Play', 'Start Watching', 'Stream Now'];
+  for (const [index, name] of labels.entries()) {
+    for (const role of ['link', 'button']) {
+      try {
+        const control = page.getByRole(role, { name }).first();
+        if (!await control.isVisible().catch(() => false)) continue;
+        const href = await control.getAttribute('href').catch(() => null);
+        const currentUrl = page.url();
+        const targetUrl = href && !/^(?:#|javascript:)/i.test(href) ? resolveUrl(currentUrl, href) : currentUrl;
+        if (targetUrl !== currentUrl) {
+          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+            .catch(() => control.click({ timeout: 1200, force: aggressive }).catch(() => {}));
+        } else {
+          await control.click({ timeout: 1200, force: aggressive });
+        }
+        log.debug('browser', `followed ${role} action “${exactLabels[index]}” to ${page.url().slice(0, 160)}`);
+        await sleep(aggressive ? 400 : 900);
+        return true;
+      } catch { /* try the next exact action label */ }
+    }
+
+    // Some templates render a clickable div/span instead of an accessible link
+    // or button. Clicking its exact visible text still bubbles to that handler.
+    try {
+      const control = page.getByText(exactLabels[index], { exact: true }).first();
+      if (!await control.isVisible().catch(() => false)) continue;
+      const href = await control.evaluate((el) => el.closest('a[href]')?.getAttribute('href') || null).catch(() => null);
+      const currentUrl = page.url();
+      const targetUrl = href && !/^(?:#|javascript:)/i.test(href) ? resolveUrl(currentUrl, href) : currentUrl;
+      if (targetUrl !== currentUrl) {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+          .catch(() => control.click({ timeout: 1200, force: aggressive }).catch(() => {}));
+      } else {
+        await control.click({ timeout: 1200, force: aggressive });
+      }
+      log.debug('browser', `followed text action “${exactLabels[index]}” to ${page.url().slice(0, 160)}`);
+      await sleep(aggressive ? 400 : 900);
+      return true;
+    } catch { /* try the next exact action label */ }
+  }
+  return false;
+}
+
+export function playerUrlWithPrefix(url, prefix) {
+  try {
+    const target = new URL(url);
+    const segments = String(prefix || '').split('/').filter(Boolean);
+    if (!segments.length) return null;
+    const normalizedPrefix = `/${segments.join('/')}`;
+    const originalPath = target.pathname.startsWith('/') ? target.pathname : `/${target.pathname}`;
+    if (originalPath === normalizedPrefix || originalPath.startsWith(`${normalizedPrefix}/`)) return null;
+    target.pathname = `${normalizedPrefix}${originalPath}`;
+    return target.toString();
+  } catch { return null; }
+}
+
+const SEARCH_RESULT_ROUTE = /(?:^|\/)(?:movies?|films?|tv|series?|serie|shows?|watch|titles?|details?|play)(?:\/|\.html|$)/i;
+const GENERIC_RESULT_TITLES = /^(?:home|movies?|films?|tv|series?|shows?|search|browse|login|log in|register|sign up|watch|watch now|play|view details|details|more|next|previous)$/i;
+const QUERY_STOP_WORDS = new Set(['a', 'an', 'and', 'for', 'in', 'of', 'the', 'to']);
+
+function plainText(value) {
+  return String(value || '').replace(/[\s\u00a0]+/g, ' ').trim();
+}
+
+function normalizeForSearch(value) {
+  return plainText(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function titleFromPath(url) {
+  try {
+    let slug = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || '');
+    slug = slug.replace(/\.(?:html?|php)$/i, '')
+      .replace(/^(?:tt)?\d{3,}[-_]/i, '')
+      .replace(/[-_]\d{3,}$/i, '')
+      .replace(/[-_]+/g, ' ');
+    return plainText(slug);
+  } catch { return ''; }
+}
+
+function cleanResultTitle(value) {
+  let title = plainText(value)
+    .replace(/\s*(?:poster|cover|thumbnail)\s*$/i, '')
+    .replace(/^(?:watch|play|open)\s+(?:now\s+)?/i, '')
+    .replace(/\s*[★⭐]\s*\d+(?:[.,]\d+)?/g, ' ')
+    .replace(/\s+(?:HD|4K|1080p|720p|Movie|Series|TV|Anime)\s*$/i, '')
+    .replace(/\s*\(\d{4}\)\s*$/, '')
+    .trim();
+  if (!/^\d{4}$/.test(title)) title = title.replace(/\s+(?:19|20)\d{2}$/, '').trim();
+  return title;
+}
+
+function sameSiteHost(host, baseHost) {
+  return host === baseHost
+    || host.endsWith(`.${baseHost}`)
+    || (host.includes('.') && baseHost.endsWith(`.${host}`));
+}
+
+/**
+ * Turn the small set of DOM fields captured from each card into stable result
+ * rows. A configured linkPattern remains the preferred route filter, but it is
+ * not a hard gate: current sites often change `/movie/...` into routes such as
+ * `/watch.html?id=...`, `/play?id=...`, or `/series/...` without changing their
+ * search page.
+ */
+export function normalizeSearchRows(rows, {
+  pageUrl,
+  baseUrl = pageUrl,
+  query = '',
+  resultPattern = null,
+  siteId = '',
+  siteName = siteId,
+  limit = 40,
+} = {}) {
+  const terms = normalizeForSearch(query).split(/[^a-z0-9]+/).filter((word) => word.length > 1 && !QUERY_STOP_WORDS.has(word));
+  let configuredPattern = null;
+  if (resultPattern) {
+    try { configuredPattern = new RegExp(resultPattern, 'i'); } catch { /* bad custom recipe: use generic route detection */ }
+  }
+  let baseHost = '';
+  try { baseHost = new URL(baseUrl || pageUrl).hostname; } catch { /* bad base URL */ }
+
+  const found = new Map();
+  for (const row of rows || []) {
+    const href = String(row.href || row.url || '').trim();
+    if (!href || href.startsWith('#') || /^(?:javascript|mailto|tel|data):/i.test(href)) continue;
+
+    let target;
+    try { target = new URL(href, pageUrl); } catch { continue; }
+    if (!/^https?:$/.test(target.protocol) || (baseHost && !sameSiteHost(target.hostname, baseHost))) continue;
+    if (/\.(?:jpe?g|png|gif|webp|svg|css|js|woff2?|mp4|m3u8)(?:$|[?#])/i.test(target.href)) continue;
+    target.hash = '';
+
+    const title = cleanResultTitle(row.title || row.cardTitle || row.text || row.cardText || titleFromPath(target.href));
+    if (!title || title.length < 2 || GENERIC_RESULT_TITLES.test(title)) continue;
+    const cardText = plainText(row.cardText || '');
+    const textForMatch = normalizeForSearch(`${title} ${row.text || ''} ${cardText} ${target.pathname}`);
+    const queryMatch = terms.some((word) => textForMatch.includes(word));
+    const routeMatch = SEARCH_RESULT_ROUTE.test(target.pathname)
+      || Boolean(target.searchParams.get('type') && (target.searchParams.get('id') || target.searchParams.get('tmdb')));
+    const explicitMatch = configuredPattern
+      ? configuredPattern.test(href) || configuredPattern.test(`${target.pathname}${target.search}`) || configuredPattern.test(target.href)
+      : routeMatch;
+    const classSignal = Boolean(row.cardLike)
+      || /(?:movie|film|title|poster|result|card|catalog|media|entry|tile|item)/i.test(String(row.classes || ''));
+    const hasImage = Boolean(row.hasImage || row.poster);
+    // Search results should mention at least one query term. Explicit recipe
+    // matches can still be accepted for sites that rewrite titles in the URL.
+    if (!explicitMatch && !(queryMatch && (routeMatch || classSignal || hasImage))) continue;
+    if (!explicitMatch && !queryMatch) continue;
+
+    const yearText = `${row.year || ''} ${row.title || ''} ${row.cardTitle || ''} ${title} ${row.text || ''} ${cardText}`;
+    const yearMatch = /\b((?:19|20)\d{2})\b/.exec(yearText);
+    const typeText = `${target.pathname} ${target.searchParams.get('type') || ''} ${row.kind || ''} ${cardText}`;
+    const kind = /(?:^|[\s\/_-])(?:tv|series?|serie|shows?|anime)(?:[\s\/_-]|$)/i.test(typeText) ? 'series' : 'movie';
+    const posterValue = String(row.poster || '').trim();
+    const poster = posterValue && !/^data:/i.test(posterValue) ? resolveUrl(pageUrl, posterValue) : null;
+    const result = {
+      siteId,
+      site: siteName,
+      title: title.slice(0, 140),
+      year: Number(row.year || yearMatch?.[1]) || null,
+      poster,
+      kind,
+      url: target.toString(),
+    };
+    const score = (Number(row.titleRank) || 0) + (queryMatch ? 2 : 0) + (hasImage ? 1 : 0) + (classSignal ? 1 : 0);
+    const previous = found.get(result.url);
+    if (!previous) {
+      found.set(result.url, { result, score });
+    } else {
+      const preferred = score > previous.score ? result : previous.result;
+      found.set(result.url, {
+        result: {
+          ...previous.result,
+          ...result,
+          title: preferred.title,
+          poster: preferred.poster || previous.result.poster || result.poster,
+          year: preferred.year || previous.result.year || result.year,
+          kind: preferred.kind || previous.result.kind || result.kind,
+        },
+        score: Math.max(previous.score, score),
+      });
+    }
+  }
+  return [...found.values()].slice(0, limit).map((entry) => entry.result);
 }
 
 /**
@@ -365,52 +584,126 @@ export async function searchSite(siteOrOpts, maybeQuery) {
   activePages += 1;
   const results = [];
   let error = null;
+  let status = null;
+  let pageTitle = null;
+  let rawLinkCount = 0;
+  const selector = opts.linkSelector || 'a[href], [data-href], [data-url], [data-link]';
+  const collectRows = async () => page.$$eval(selector, (elements) => {
+    const clean = (value) => String(value || '').replace(/[\s\u00a0]+/g, ' ').trim();
+    const cardSelector = 'article, [data-movie-id], [class*="movie-card" i], [class*="film-card" i], [class*="result" i], [class*="poster" i], [class*="tile" i], [class*="card" i]';
+    const out = [];
+    for (const element of elements) {
+      const link = element.closest('a[href]');
+      const nestedLink = element.querySelector('a[href]');
+      const href = element.getAttribute('href')
+        || element.getAttribute('data-href')
+        || element.getAttribute('data-url')
+        || element.getAttribute('data-link')
+        || link?.getAttribute('href')
+        || nestedLink?.getAttribute('href')
+        || '';
+      if (!href || href.startsWith('#') || /^(?:javascript|mailto|tel|data):/i.test(href)) continue;
+
+      const card = element.closest(cardSelector) || link || element;
+      const image = element.tagName === 'IMG' ? element : element.querySelector('img') || card.querySelector('img');
+      const heading = card.querySelector('h1, h2, h3, h4, h5, h6, [data-title], [class*="title" i], strong, b');
+      const text = clean(element.innerText || element.textContent || '');
+      const cardText = clean(card.innerText || card.textContent || '').slice(0, 700);
+      const titleCandidates = [
+        [element.getAttribute('data-title'), 5],
+        [card.getAttribute('data-title'), 5],
+        [heading?.innerText || heading?.textContent, 4],
+        [element.getAttribute('title'), 3],
+        [image?.getAttribute('alt') || image?.getAttribute('title'), 2],
+        [element.getAttribute('aria-label'), 1],
+        [text, 0],
+        [cardText, 0],
+      ];
+      const plausibleTitles = titleCandidates
+        .map(([value, rank]) => [clean(value), rank])
+        .filter(([candidate]) => candidate.length >= 2
+          && !/^(?:home|movies?|films?|tv|series?|shows?|search|browse|login|register|watch|watch now|play|details|more)$/i.test(candidate));
+      const titleQuality = ([candidate, rank]) => {
+        const words = candidate.toLowerCase().match(/[a-z0-9]+/g) || [];
+        const duplicatedWords = words.length - new Set(words).size;
+        const years = candidate.match(/\b(?:19|20)\d{2}\b/g)?.length || 0;
+        const ratings = candidate.match(/\b\d{1,2}\.\d\b/g)?.length || 0;
+        const badges = candidate.match(/\b(?:HD|4K|1080p|720p|NEW|SOON)\b/gi)?.length || 0;
+        return rank * 100 - candidate.length * 1.4 - years * 60 - ratings * 35 - badges * 20 - duplicatedWords * 30;
+      };
+      plausibleTitles.sort((a, b) => titleQuality(b) - titleQuality(a));
+      const [title, titleRank] = plausibleTitles[0] || ['', 0];
+      const classes = [element, element.parentElement, element.parentElement?.parentElement]
+        .map((node) => typeof node?.className === 'string' ? node.className : '')
+        .join(' ')
+        .slice(0, 400);
+      const poster = image?.getAttribute('data-src')
+        || image?.getAttribute('data-lazy-src')
+        || image?.getAttribute('data-original')
+        || image?.getAttribute('src')
+        || image?.getAttribute('srcset')?.split(',')[0]?.trim().split(/\s+/)[0]
+        || null;
+      const year = (cardText.match(/\b((?:19|20)\d{2})\b/) || [])[1] || null;
+      const kind = element.getAttribute('data-type')
+        || element.getAttribute('data-media-type')
+        || card.getAttribute('data-type')
+        || card.getAttribute('data-media-type')
+        || '';
+      out.push({
+        href,
+        title: clean(title),
+        titleRank,
+        text: text.slice(0, 500),
+        cardText,
+        classes,
+        cardLike: card !== element || /(?:movie|film|title|poster|result|card|tile|item)/i.test(classes),
+        hasImage: Boolean(image),
+        poster,
+        year,
+        kind,
+      });
+      if (out.length >= 1500) break;
+    }
+    return out;
+  }).catch(() => []);
+
   try {
     log.info('browser', `searching ${site.name} for "${query}"`, { url: url.slice(0, 200) });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
-    // Client-side rendered catalogues need a moment; wait for links to appear.
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+    status = response?.status?.() ?? null;
+    // Client-rendered catalogues need a moment after networkidle to hydrate cards.
     await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
     await sleep(1200);
 
-    const pattern = site.resultPattern ? new RegExp(site.resultPattern, 'i') : /\/(movie|film|watch|tv|series?|title)\//i;
-    const selector = opts.linkSelector || 'a[href]';
-    const rows = await page.$$eval(selector, (anchors, patternSource) => {
-      const re = new RegExp(patternSource, 'i');
-      const out = [];
-      for (const a of anchors) {
-        const href = a.getAttribute('href') || '';
-        const text = (a.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!href || href.startsWith('#') || href.startsWith('javascript:')) continue;
-        if (!re.test(href)) continue;
-        const img = a.querySelector('img');
-        out.push({
-          href, text,
-          poster: img?.getAttribute('src') || img?.getAttribute('data-src') || null,
-          year: (text.match(/\b(19|20)\d{2}\b/) || [null])[0],
-        });
-      }
-      return out.slice(0, 120);
-    }, pattern.source).catch(() => []);
+    const rows = await collectRows();
+    rawLinkCount = rows.length;
+    results.push(...normalizeSearchRows(rows, {
+      pageUrl: page.url(),
+      baseUrl: opts.baseUrl || url,
+      query,
+      resultPattern: site.resultPattern,
+      siteId: site.id,
+      siteName: site.name,
+      limit: 40,
+    }));
+    pageTitle = await page.title().catch(() => null);
 
-    const seen = new Set();
-    for (const row of rows) {
-      const abs = resolveUrl(page.url(), row.href);
-      if (seen.has(abs)) continue;
-      seen.add(abs);
-      const title = (row.text || abs.split('/').filter(Boolean).pop() || '')
-        .replace(/\s*\(\d{4}\)\s*$/, '').replace(/\.(html?|php)$/i, '').replace(/[-_]+/g, ' ').trim();
-      if (!title || title.length < 2) continue;
-      results.push({
-        siteId: site.id, site: site.name,
-        title: title.slice(0, 140),
-        year: row.year ? Number(row.year) : null,
-        poster: row.poster ? resolveUrl(page.url(), row.poster) : null,
-        kind: /\/(tv|series|serie|show)/i.test(abs) ? 'series' : 'movie',
-        url: abs,
+    if (results.length) {
+      log.info('browser', `${site.name}: ${results.length} result(s) for "${query}"`, {
+        status, links: rawLinkCount, finalUrl: page.url().slice(0, 180),
       });
-      if (results.length >= 40) break;
+    } else {
+      const bodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
+      const pageLooksUnavailable = status >= 400
+        || /\b404\b|page not found|does not exist|bad gateway|just a moment|verify you are human|access denied|captcha/i.test(`${pageTitle || ''} ${bodyText.slice(0, 500)}`);
+      if (pageLooksUnavailable) {
+        error = `search page unavailable${status ? ` (HTTP ${status})` : ''}${pageTitle ? `: ${pageTitle}` : ''}`;
+      }
+      log.warn('browser', `${site.name}: no usable result links for "${query}"`, {
+        status, title: pageTitle, links: rawLinkCount, finalUrl: page.url().slice(0, 180),
+        preview: bodyText.slice(0, 180).replace(/\s+/g, ' '),
+      });
     }
-    log.info('browser', `${site.name}: ${results.length} result(s) for "${query}"`);
   } catch (err) {
     error = err.message;
     log.error('browser', `search failed on ${site.name}: ${err.message}`);
