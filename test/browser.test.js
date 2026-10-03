@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   isNetworkNavigationError, isSameSiteNavigation, flaresolverrEndpoint, parseFlareSolverrResult, looksLikeMedia,
-  describeFlareSolverrError,
+  describeFlareSolverrError, sanitizeSolverUrl, flaresolverrConfigIssue, describeSolverNotUsable,
+  DEFAULT_FLARESOLVERR_URL,
 } from '../src/scrapers/browser.js';
 
 test('browser navigation reachability errors are recognized as terminal', () => {
@@ -85,4 +86,49 @@ test('FlareSolverr failures are translated into a cause plus a fix', () => {
   // failure still produces a sentence rather than `undefined`.
   assert.match(describeFlareSolverrError({ message: 'Error: Sorry, FlareSolverr has crashed' }), /FlareSolverr failed/);
   assert.match(describeFlareSolverrError(null), /without returning a reason/);
+});
+
+test('a FlareSolverr URL copied from .env with its inline comment still works', () => {
+  // docker compose only strips an inline `# …` in some versions, so a verbatim
+  // copy of .env.example can deliver the comment as part of the value. That
+  // used to throw inside `new URL()` — and a thrown parse was reported as
+  // "FlareSolverr is not configured" even though the operator *had* set it.
+  assert.equal(
+    flaresolverrEndpoint('http://flaresolverr:8192   # container-to-container address, not the host port'),
+    'http://flaresolverr:8192/v1',
+  );
+  assert.equal(flaresolverrEndpoint('http://flaresolverr:8192 # comment'), 'http://flaresolverr:8192/v1');
+  assert.equal(sanitizeSolverUrl('  "http://flaresolverr:8192"  '), 'http://flaresolverr:8192');
+  assert.equal(flaresolverrEndpoint(''), null);
+  assert.equal(flaresolverrEndpoint(null), null);
+  assert.equal(flaresolverrEndpoint('file:///tmp/solver'), null);
+  assert.equal(flaresolverrEndpoint('flaresolverr:8192'), null, 'a bare host:port is not a URL');
+});
+
+test('"not configured" and "set but unusable" are reported as different problems', () => {
+  assert.equal(flaresolverrConfigIssue('  ').kind, 'empty');
+  assert.equal(flaresolverrConfigIssue(null).kind, 'empty');
+  const unusable = flaresolverrConfigIssue('not a url');
+  assert.equal(unusable.kind, 'unusable');
+  assert.match(unusable.message, /not a usable URL/);
+  assert.match(unusable.message, /\.env/);
+  assert.equal(flaresolverrConfigIssue('http://flaresolverr:8192'), null);
+  assert.equal(flaresolverrConfigIssue('http://flaresolverr:8192   # comment'), null);
+});
+
+test('the operator message names which of the three situations this is', () => {
+  // 1. the container is up but the variable is empty.
+  const runningButUnset = describeSolverNotUsable({ configured: false, defaultReachable: true, defaultUrl: DEFAULT_FLARESOLVERR_URL }, 'cinevo.nl');
+  assert.match(runningButUnset, /cinevo\.nl is showing a Cloudflare \/ bot challenge/);
+  assert.match(runningButUnset, /already answering at http:\/\/flaresolverr:8192/);
+  assert.match(runningButUnset, /FLARESOLVERR_URL=http:\/\/flaresolverr:8192/);
+  // 2. the value is broken. (An inline .env comment no longer lands here —
+  //    `sanitizeSolverUrl` strips it, which is the fix above.)
+  const broken = describeSolverNotUsable({ configured: false, issue: flaresolverrConfigIssue('not a url') }, 'cinevo.nl');
+  assert.match(broken, /not a usable URL/);
+  // 3. nothing is running at all.
+  const absent = describeSolverNotUsable({ configured: false, defaultReachable: false, issue: flaresolverrConfigIssue('') }, 'cinevo.nl');
+  assert.match(absent, /start the flaresolverr service/);
+  assert.doesNotMatch(absent, /already answering/);
+  assert.equal(DEFAULT_FLARESOLVERR_URL, 'http://flaresolverr:8192');
 });

@@ -95,6 +95,9 @@ router.get('/health', wrap(async (req, res) => {
     hwaccelPending: hardwarePending(),
     browser: browser.browserInfo(),
     externalExtractor: external.isConfigured(),
+    // Cloudflare-protected sources silently degrade when this is missing, so
+    // report it here rather than only in a scraper log line.
+    flaresolverr: await browser.flaresolverrStatus({ probe: true, maxAgeMs: 300_000 }).catch((e) => ({ configured: false, error: errorText(e) })),
     enigma2: enigma,
     streamSessions: relay.listSessions(),
     jobs: jobStats(),

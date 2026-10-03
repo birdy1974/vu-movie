@@ -88,6 +88,26 @@ async function main() {
   const sources = loadSources({ force: true });
   log.info('app', `scraper registry: ${sources.filter((s) => s.enabled).length}/${sources.length} sites enabled`);
 
+  // Cloudflare-protected sources (cinevo.nl and friends) fail in a way that
+  // looks like "the site has no results", so say out loud at boot whether the
+  // solver is actually usable — a misconfigured FLARESOLVERR_URL is the usual
+  // reason, and it is invisible until the first challenge otherwise.
+  browser.flaresolverrStatus({ probe: true, maxAgeMs: 300_000 })
+    .then((status) => {
+      if (status.configured && status.ok) {
+        log.info('app', `FlareSolverr ready at ${status.url}`, { version: status.version });
+      } else if (status.configured) {
+        log.warn('app', `FlareSolverr is configured at ${status.url} but not answering — Cloudflare-protected sources will be skipped`, { error: status.error });
+      } else if (status.defaultReachable) {
+        log.warn('app', `a FlareSolverr instance is answering at ${status.url || 'the default address'} but FLARESOLVERR_URL is not set — set it and recreate the container`);
+      } else if (status.issue?.kind === 'unusable') {
+        log.warn('app', `FlareSolverr misconfigured: ${status.issue.message}`);
+      } else {
+        log.info('app', 'FlareSolverr is not configured — sources behind Cloudflare will be skipped (set FLARESOLVERR_URL to enable them)');
+      }
+    })
+    .catch((err) => logError('app', 'FlareSolverr status check failed', err));
+
   // 5 ── HTTP
   const server = await startServer();
   log.info('app', `ready in ${Date.now() - startedAt} ms`, {

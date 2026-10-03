@@ -208,6 +208,9 @@ The ones that matter most on a DS918+:
   solved page is parsed as static HTML and its cookies are imported into that
   site's browser context. Do not forward this unauthenticated API to the public
   Internet.
+  If `FLARESOLVERR_URL` is empty or malformed, vu-movie says so at startup and
+  in `GET /api/health` (`flaresolverr`: configured / reachable / version / hint)
+  instead of only complaining on the first Cloudflare page.
   It is a **sidecar, not a dependency**: the app starts without it (only
   Cloudflare-protected sources degrade, with a "FlareSolverr is not reachable"
   log line). The service runs with `shm_size: 512m` and a 1.2 GB memory limit
