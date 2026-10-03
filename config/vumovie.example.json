@@ -88,6 +88,10 @@
       "8.8.8.8",
       "9.9.9.9"
     ],
-    "customSources": []
+    "customSources": [],
+    "proxyUrl": "",
+    "noProxy": "localhost,127.0.0.1,::1",
+    "movieboxExtraHosts": [],
+    "movieboxBrowserFallback": true
   }
 }

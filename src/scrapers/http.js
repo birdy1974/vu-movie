@@ -14,6 +14,96 @@ import { errorText, log } from '../core/log.js';
 const DEFAULT_TIMEOUT_MS = 20000;
 const MAX_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Lazy ProxyAgent cache — one entry per proxy URL. undici.ProxyAgent handles
+ * http/https and respects the proxy's own NO_PROXY list, but we also filter
+ * loopback hosts ourselves so a misconfigured proxy does not break healthchecks.
+ */
+let ProxyAgentCtor = null;
+let proxyAgentCache = new Map(); // proxyUrl → ProxyAgent | null (null = tried and failed)
+let proxyWarningLogged = false;
+
+async function getProxyAgentCtor() {
+  if (ProxyAgentCtor !== null) return ProxyAgentCtor;
+  try {
+    const undici = await import('undici');
+    ProxyAgentCtor = undici.ProxyAgent || null;
+  } catch {
+    ProxyAgentCtor = null;
+  }
+  return ProxyAgentCtor;
+}
+
+function proxyUrlForRequest() {
+  try {
+    const cfg = getConfig?.();
+    const fromCfg = cfg?.scraper?.proxyUrl;
+    if (fromCfg) return String(fromCfg).trim();
+  } catch { /* config not ready (build-time import) */ }
+  return String(
+    process.env.MOVIEBOX_PROXY
+    || process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy
+    || process.env.ALL_PROXY || process.env.all_proxy
+    || '',
+  ).trim();
+}
+
+function noProxyList() {
+  try {
+    const cfg = getConfig?.();
+    if (cfg?.scraper?.noProxy) return String(cfg.scraper.noProxy);
+  } catch { /* ignore */ }
+  return String(process.env.NO_PROXY || process.env.no_proxy || 'localhost,127.0.0.1,::1');
+}
+
+function shouldProxy(targetUrl) {
+  const proxyUrl = proxyUrlForRequest();
+  if (!proxyUrl) return false;
+  let host = '';
+  try { host = new URL(targetUrl).hostname.toLowerCase(); } catch { return false; }
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+  const noProxy = noProxyList().split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const pattern of noProxy) {
+    const p = pattern.replace(/^\./, '');
+    if (host === p || host.endsWith(`.${p}`) || host.endsWith(p)) return false;
+    if (pattern === '*') return false;
+  }
+  return true;
+}
+
+async function dispatcherFor(url) {
+  if (!shouldProxy(url)) return undefined;
+  const proxyUrl = proxyUrlForRequest();
+  if (!proxyUrl) return undefined;
+  if (proxyAgentCache.has(proxyUrl)) return proxyAgentCache.get(proxyUrl) || undefined;
+  const Ctor = await getProxyAgentCtor();
+  if (!Ctor) {
+    if (!proxyWarningLogged) {
+      proxyWarningLogged = true;
+      log.warn('http', 'proxy configured but undici.ProxyAgent is unavailable — requests will go direct; install undici');
+    }
+    proxyAgentCache.set(proxyUrl, null);
+    return undefined;
+  }
+  try {
+    const agent = new Ctor(proxyUrl);
+    proxyAgentCache.set(proxyUrl, agent);
+    log.info('http', `using proxy for ${safeHost(url)}`, { proxy: proxyUrl.replace(/:\/\/[^@]*@/, '://***@') });
+    return agent;
+  } catch (err) {
+    log.warn('http', `could not create proxy agent for ${proxyUrl}: ${err.message}`);
+    proxyAgentCache.set(proxyUrl, null);
+    return undefined;
+  }
+}
+
+/** Test/ops helper: clear proxy cache so a config change takes effect immediately. */
+export function resetProxyCache() {
+  proxyAgentCache.clear();
+  proxyWarningLogged = false;
+}
+
 /** In-memory cookie jar, one per host, optionally persisted to disk. */
 export class CookieJar {
   constructor(name = 'default') {
@@ -172,11 +262,19 @@ export async function request(url, opts = {}) {
       else signal.addEventListener('abort', onAbort, { once: true });
     }
     try {
+      // Avoid an extra microtask when no proxy is configured (preserves the
+      // abort-timing contract the tests rely on: fetch must be called before
+      // the outer signal's abort microtask).
+      let dispatcher;
+      if (shouldProxy(url)) dispatcher = await dispatcherFor(url);
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : Object.assign(new Error('request aborted'), { name: 'AbortError' });
+      if (controller.signal.aborted) throw Object.assign(new Error('request aborted'), { name: 'AbortError', cause: signal?.reason });
       const res = await fetch(url, {
         method, headers: finalHeaders, body, redirect,
         signal: controller.signal,
         // @ts-ignore node-specific option: keep cookies manual for clarity
         compress: true,
+        ...(dispatcher ? { dispatcher } : {}),
       });
       if (!res.ok && res.status >= 500 && attempt < retries) {
         lastErr = new Error(`HTTP ${res.status} from ${safeHost(url)}`);

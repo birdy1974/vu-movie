@@ -110,6 +110,20 @@ export async function getBrowser() {
       '--js-flags=--max-old-space-size=384',
       '--window-size=1280,800',
     ];
+    // When a proxy is configured for SNI-bypass, Chromium must also use it so
+    // page loads + the browser-TLS fallback share the same egress.
+    const proxyForBrowser = (() => {
+      try { return getConfig()?.scraper?.proxyUrl || ''; } catch { return ''; }
+    })() || process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '';
+    if (proxyForBrowser) {
+      try {
+        const u = new URL(proxyForBrowser);
+        const proxyArg = `${u.protocol}//${u.host}`;
+        args.push(`--proxy-server=${proxyArg}`);
+        if (u.username || u.password) log.info('browser', 'Chromium will use proxy with authentication', { proxy: proxyForBrowser.replace(/:\/\/[^@]*@/, '://***@') });
+        else log.info('browser', `Chromium will use proxy ${proxyArg}`);
+      } catch { /* malformed proxy: ignore */ }
+    }
     log.info('browser', `launching Chromium${exe ? ` (${exe})` : ' (playwright build)'}`);
     browser = await playwright.launch({
       headless: true,
@@ -142,6 +156,18 @@ async function getContext(name) {
   const existing = contexts.get(key);
   if (existing) return existing;
   const userAgent = getConfig().scraper.userAgent;
+  const proxyForContext = (() => {
+    try { return getConfig()?.scraper?.proxyUrl || ''; } catch { return ''; }
+  })() || process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '';
+  let proxyOpt = undefined;
+  if (proxyForContext) {
+    try {
+      const u = new URL(proxyForContext);
+      proxyOpt = { server: `${u.protocol}//${u.host}` };
+      if (u.username) proxyOpt.username = decodeURIComponent(u.username);
+      if (u.password) proxyOpt.password = decodeURIComponent(u.password);
+    } catch { /* ignore malformed proxy */ }
+  }
   const ctx = await b.newContext({
     userAgent,
     viewport: { width: 1280, height: 800 },
@@ -150,6 +176,7 @@ async function getContext(name) {
     ignoreHTTPSErrors: true,
     bypassCSP: true,
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8' },
+    ...(proxyOpt ? { proxy: proxyOpt } : {}),
   });
   contexts.set(key, ctx);
   return ctx;
@@ -1335,6 +1362,97 @@ export async function closeBrowser(reason = 'shutdown') {
 }
 
 /** Path of a per-site storage-state file (used by the recipes that need login). */
+/**
+ * Lightweight API fetch via Chromium's network stack (BoringSSL).
+ *
+ * When the container's Node TLS stack is fingerprinted/blocked but the
+ * host is reachable from a browser, this reissues the same signed request
+ * through Chromium. It uses a dedicated browser context with
+ * ignoreHTTPSErrors so a forced HTTP proxy CA can be used, and it avoids
+ * polluting the per-site cookie jars.
+ *
+ * Returns a shape compatible with `request()` from http.js: {ok,status,headers,data,error}
+ * or throws on transport failure. Uses Playwright's APIRequestContext when
+ * available, otherwise falls back to page.evaluate(fetch).
+ */
+export async function fetchViaBrowser(url, { method = 'GET', headers = {}, body = null, timeoutMs = 12000 } = {}) {
+  const started = Date.now();
+  let context = null;
+  let page = null;
+  try {
+    const b = await getBrowser();
+    const proxyUrl = (() => {
+      try { return getConfig()?.scraper?.proxyUrl || ''; } catch { return ''; }
+    })() || process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '';
+    const contextOpts = {
+      ignoreHTTPSErrors: true,
+      extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+    };
+    if (proxyUrl) {
+      try {
+        const u = new URL(proxyUrl);
+        // Chromium expects --proxy-server already, but context-level proxy is more reliable.
+        contextOpts.proxy = { server: `${u.protocol}//${u.host}`, username: decodeURIComponent(u.username || ''), password: decodeURIComponent(u.password || '') };
+        // strip empty creds
+        if (!contextOpts.proxy.username) delete contextOpts.proxy.username;
+        if (!contextOpts.proxy.password) delete contextOpts.proxy.password;
+      } catch { /* ignore malformed proxy */ }
+    }
+    // Try APIRequestContext first (no page, lighter)
+    if (b.request?.newContext) {
+      try {
+        const api = await b.request.newContext({ ...contextOpts, extraHTTPHeaders: headers });
+        const res = await api.fetch(url, { method, headers, data: body || undefined, timeout: timeoutMs });
+        const status = res.status();
+        const rawHeaders = await res.headersArray();
+        const headerMap = Object.fromEntries(rawHeaders.map((h) => [h.name.toLowerCase(), h.value]));
+        const text = await res.text().catch(() => '');
+        let data = null;
+        let error = null;
+        try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+        if (!res.ok()) error = String(data?.error || data?.message || text || `HTTP ${status}`).slice(0, 240);
+        if (status >= 200 && status < 300 && data == null && text && text.trim().startsWith('<')) {
+          // WAF HTML page that slipped through as 2xx
+          return { ok: false, status, headers: headerMap, data: null, error: `HTTP 200 from ${safeHost(url)} but the body was not JSON (browser)` };
+        }
+        log.debug('browser', `API via browser ${method} ${safeHost(url)} → ${status} (${Date.now() - started}ms)`);
+        await api.dispose().catch(() => {});
+        return { ok: res.ok(), status, headers: headerMap, data, text, error: error || (res.ok() ? null : `HTTP ${status}`) };
+      } catch (err) {
+        log.debug('browser', `APIRequestContext path failed for ${safeHost(url)}: ${err.message} — falling back to page.evaluate`);
+        // fall through to page method
+      }
+    }
+    // Fallback: dedicated context + page.evaluate(fetch)
+    context = await b.newContext({ ...contextOpts, viewport: { width: 800, height: 600 } });
+    page = await context.newPage();
+    const result = await page.evaluate(async ({ url: u, method: m, headers: h, body: bdy, timeoutMs: tm }) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), tm);
+      try {
+        const res = await fetch(u, { method: m, headers: h, body: bdy || undefined, signal: controller.signal });
+        const text = await res.text();
+        const headersObj = {};
+        res.headers.forEach((v, k) => { headersObj[k.toLowerCase()] = v; });
+        return { ok: res.ok, status: res.status, statusText: res.statusText, headers: headersObj, text };
+      } finally { clearTimeout(timer); }
+    }, { url, method, headers, body, timeoutMs });
+    const text = result.text || '';
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    let error = null;
+    if (!result.ok) error = String(data?.error || data?.message || text || `HTTP ${result.status}`).slice(0, 240);
+    if (result.ok && data == null && text && text.trim().startsWith('<')) {
+      return { ok: false, status: result.status, headers: result.headers, data: null, error: `HTTP 200 from ${new URL(url).hostname} but the body was not JSON (browser)` };
+    }
+    log.debug('browser', `API via page.evaluate ${method} ${safeHost(url)} → ${result.status} (${Date.now() - started}ms)`);
+    return { ok: result.ok, status: result.status, headers: result.headers, data, text, error: error || (result.ok ? null : `HTTP ${result.status}`) };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+  }
+}
+
 export function sessionFile(siteId) {
   return path.join(getConfig().scraper.sessionDir || getConfig().storage.tmp, `${siteId}.state.json`);
 }

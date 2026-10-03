@@ -38,14 +38,42 @@ import { request, sleep } from './http.js';
 import { diagnoseReachability } from './diagnostics.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
+/** Lazy browser import to avoid circular dependency at load time. */
+let browserModule = null;
+async function getBrowserModule() {
+  if (browserModule) return browserModule;
+  try {
+    browserModule = await import('./browser.js');
+    return browserModule;
+  } catch {
+    return null;
+  }
+}
+function browserFallbackEnabled() {
+  try {
+    const cfg = getConfig?.();
+    if (cfg?.scraper?.movieboxBrowserFallback === false) return false;
+    if (String(process.env.MOVIEBOX_BROWSER_FALLBACK || '').toLowerCase() === 'false') return false;
+  } catch { /* ignore */ }
+  return true;
+}
+
 const API_PREFIX = '/wefeed-mobile-bff';
 /**
  * Host pool — order matters; api*.aoneroom.com are primary, api.inmoviebox.com
  * is the legacy fallback. `api6sg.aoneroom.com` was removed 2026-10 after it
  * stopped resolving (ENOTFOUND); keep the list trim so we don't waste a 12 s
  * timeout per search on a dead NLB.
+ *
+ * 2026-10 extension: several users behind SNI-filtering ISPs reported that the
+ * direct api*.aoneroom.com edge is blocked even though the H5/web BFF mirrors
+ * (h5-api.aoneroom.com, h5.aoneroom.com) and the i-api mirror are still
+ * reachable via a different ALB/certificate. Add those as secondary hosts so
+ * the pool can hop there automatically. Operators can also extend the pool via
+ * MOVIEBOX_EXTRA_HOSTS (comma-separated) without editing code. The web BFF
+ * uses /wefeed-mobile-bff as well, so no prefix change is needed for these.
  */
-const HOST_POOL = [
+const BUILTIN_HOST_POOL = [
   'https://api6.aoneroom.com',
   'https://api5.aoneroom.com',
   'https://api4.aoneroom.com',
@@ -53,6 +81,28 @@ const HOST_POOL = [
   'https://api3.aoneroom.com',
   'https://api.inmoviebox.com',
 ];
+const EXTRA_MIRRORS = [
+  'https://h5-api.aoneroom.com',
+  'https://h5.aoneroom.com',
+  'https://api.aoneroom.com',
+  'https://i-api.aoneroom.com',
+  'https://apii.inmoviebox.com',
+];
+export function getHostPool() {
+  const cfg = (() => { try { return getConfig?.(); } catch { return null; } })();
+  const extra = cfg?.scraper?.movieboxExtraHosts || [];
+  const envExtra = (process.env.MOVIEBOX_EXTRA_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const merged = [...BUILTIN_HOST_POOL, ...EXTRA_MIRRORS, ...extra, ...envExtra];
+  // Deduplicate while preserving order (first occurrence wins)
+  const seen = new Set();
+  return merged.filter((h) => {
+    const key = h.toLowerCase().replace(/\/+$/, '');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+const HOST_POOL = getHostPool();
 const HOST_REQUEST_TIMEOUT_MS = 12_000;
 
 /**
@@ -85,16 +135,17 @@ export function classifyFetchError(err) {
     return { kind: 'dns', detail, host: chain.find((e) => e?.hostname)?.hostname };
   }
   if (codes.has('ECONNREFUSED')) return { kind: 'connection-refused', detail, port: chain.find((e) => e?.port)?.port };
-  if (codes.has('ECONNRESET') || codes.has('EPIPE')) return { kind: 'connection-reset', detail };
-  if (codes.has('ETIMEDOUT') || /timed out|timeout/i.test(all)) return { kind: 'timeout', detail };
+  // A TLS reset often surfaces as ECONNRESET with a TLS message (“Client network
+  // socket disconnected before secure TLS connection was established”). Treat that
+  // as TLS, not generic reset, so diagnostics can report tls-or-ip-block.
   if (/UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT|unable to verify the first certificate|self.signed certificate/i.test(all)) {
     return { kind: 'tls-intercepted', detail };
   }
-  // TLS handshake aborted/reset before ServerHello is common when a reverse
-  // proxy (Alibaba NLB / Cloudflare) drops the connection based on JA3/SNI.
   if (/TLS|ssl|alert|handshake|secure TLS connection|WRONG_VERSION|CERTIFICATE/i.test(all)) {
     return { kind: 'tls', detail };
   }
+  if (codes.has('ECONNRESET') || codes.has('EPIPE')) return { kind: 'connection-reset', detail };
+  if (codes.has('ETIMEDOUT') || /timed out|timeout/i.test(all)) return { kind: 'timeout', detail };
   if (!codes.size && !messages.length) return { kind: 'fetch-failed', detail: 'fetch failed (no cause information — undici could not report why)' };
   return { kind: 'fetch-failed', detail: (messages.length > 1 ? detail : raw).slice(0, 240) };
 }
@@ -384,6 +435,104 @@ function clearSession() {
   catch (err) { log.warn('moviebox', 'could not remove the rejected visitor session', { error: String(err?.message || err) }); }
 }
 
+/**
+ * Browser-TLS fallback: reissue the same signed request through Chromium's
+ * network stack (BoringSSL) when Node's OpenSSL handshake is fingerprinted
+ * or SNI-blocked. Chromium's JA3 is different and, when a proxy is configured,
+ * it tunnels through the same proxy — so a tls-or-ip-block that kills Node
+ * may still succeed from the browser.
+ */
+async function browserSignedRequest(url, { method = 'GET', headers = {}, body = null, timeoutMs = HOST_REQUEST_TIMEOUT_MS, signal = null } = {}) {
+  const mod = await getBrowserModule();
+  if (!mod?.fetchViaBrowser) throw new Error('browser transport not available');
+  if (signal?.aborted) throw abortError(signal);
+  // fetchViaBrowser already handles proxy + ignoreHTTPSErrors internally
+  const res = await mod.fetchViaBrowser(url, { method, headers, body, timeoutMs });
+  // Normalize to the shape `request()` returns (ok, status, data, headers, error)
+  return res;
+}
+
+async function loginViaBrowser({ id, body, signal }) {
+  const pool = getHostPool();
+  let lastErr = null;
+  const breakdown = new Map();
+  const outcome = await loginWithHostFailover({
+    hosts: pool,
+    signal,
+    requestHost: async (base) => {
+      const url = `${base}${API_PREFIX}/user-api/visitor-login`;
+      const headers = signedHeaders({ method: 'POST', url, body, identity: id });
+      const res = await browserSignedRequest(url, { method: 'POST', headers, body, timeoutMs: HOST_REQUEST_TIMEOUT_MS, signal });
+      // Mirror the http path's allowFailure behaviour: non-JSON 2xx is a host failure
+      if (res.ok && res.data == null) {
+        return { ok: false, status: res.status, error: `HTTP 200 from ${base} but the body was not JSON (browser)` };
+      }
+      if (!res.ok) return { ok: false, status: res.status, error: res.error || `HTTP ${res.status}` };
+      return { ok: true, status: res.status, data: res.data, headers: res.headers };
+    },
+    onFailure: ({ host, hop, error }) => {
+      lastErr = errorText(error);
+      const info = classifyFetchError(error);
+      breakdown.set(info.kind, (breakdown.get(info.kind) || 0) + 1);
+      log.warn('moviebox', `browser visitor-login failed on ${host} — trying next host`, {
+        hop: hop + 1, error: lastErr, kind: info.kind, via: 'browser',
+      });
+    },
+  });
+  return { outcome, breakdown, lastErr };
+}
+
+async function apiRequestViaBrowser(pathAndQuery, { method = 'GET', body, authenticated = true, signal = null, id }) {
+  const pool = getHostPool();
+  let reauth = false;
+  let sawHttp = false;
+  const outcome = await requestHostPool({
+    hosts: pool,
+    signal,
+    requestHost: async (base) => {
+      const url = `${base}${API_PREFIX}${pathAndQuery}`;
+      const send = async () => {
+        const headers = signedHeaders({ method, url, body, token: authenticated ? session?.token : null, identity: id });
+        const res = await browserSignedRequest(url, { method, headers, body, timeoutMs: HOST_REQUEST_TIMEOUT_MS, signal });
+        // Handle 401/403 re-login once, same as the http path
+        if ([401, 403].includes(res.status) && authenticated && !reauth) {
+          reauth = true;
+          clearSession();
+          try { await ensureSession({ signal }); } catch (err) { throw Object.assign(err, { terminal: true }); }
+          const retryHeaders = signedHeaders({ method, url, body, token: authenticated ? session?.token : null, identity: id });
+          const retry = await browserSignedRequest(url, { method, headers: retryHeaders, body, timeoutMs: HOST_REQUEST_TIMEOUT_MS, signal });
+          if (retry.headers) absorbXUser(retry.headers);
+          if (retry.ok && retry.data == null) return { ...retry, ok: false, error: `HTTP 200 from ${base} but the body was not JSON (browser)` };
+          absorbXUser(retry.headers || {});
+          return retry;
+        }
+        if (res.headers) absorbXUser(res.headers);
+        if (res.ok && res.data == null) return { ...res, ok: false, error: `HTTP 200 from ${base} but the body was not JSON (browser)` };
+        return res;
+      };
+      const res = await send();
+      if (res.ok) return res;
+      // Signal host-pool to continue to next host
+      const err = new Error(res.error || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    },
+    onFailure: ({ host, hop, error, result }) => {
+      const status = result?.status || error?.status;
+      if (status) sawHttp = true;
+      log.warn('moviebox', `${status ? `host ${host} answered ${status} (browser) — trying next host` : `request failed on ${host} via browser — trying next host`}`, {
+        path: pathAndQuery, hop: hop + 1, error: errorText(error), via: 'browser',
+      });
+    },
+  });
+  // requestHostPool returns {ok, result, error}; adapt
+  if (outcome.ok) {
+    // outcome.result is the raw browser response shape; convert to data
+    return { ok: true, data: outcome.result.data, headers: outcome.result.headers, index: outcome.index };
+  }
+  return { ok: false, error: outcome.error, sawHttp };
+}
+
 async function login({ signal = null } = {}) {
   if (Date.now() < disabledUntil) {
     const waitSec = Math.round((disabledUntil - Date.now()) / 1000);
@@ -391,9 +540,11 @@ async function login({ signal = null } = {}) {
   }
   const id = identity();
   const body = '{}';
-  log.info('moviebox', 'requesting a visitor token', { startHost: HOST_POOL[hostIndex % HOST_POOL.length] });
+  const pool = getHostPool();
+  log.info('moviebox', 'requesting a visitor token', { startHost: pool[hostIndex % pool.length] });
   const failureBreakdown = new Map(); // kind → count (for a useful aggregated log line)
-  const outcome = await loginWithHostFailover({
+  let outcome = await loginWithHostFailover({
+    hosts: pool,
     startIndex: hostIndex,
     signal,
     requestHost: async (base) => {
@@ -419,6 +570,40 @@ async function login({ signal = null } = {}) {
     },
   });
 
+  // Direct Node fetch failed on every host with a TLS/SNI block → retry via
+  // Chromium's BoringSSL stack (different JA3, plus proxy support) before we
+  // declare the service dead. This is the user-visible fix for
+  // `tls-or-ip-block` when the container sits behind an ISP that filters
+  // api*.aoneroom.com at the SNI layer.
+  if (!outcome.ok && browserFallbackEnabled() && !signal?.aborted) {
+    const breakdownKinds = [...failureBreakdown.keys()];
+    const looksLikeTlsBlock = breakdownKinds.includes('tls') || breakdownKinds.includes('tls-intercepted');
+    // We also check the diagnosis verdict — but don't wait for it if we already suspect TLS.
+    let verdictIsTlsBlock = looksLikeTlsBlock;
+    if (!verdictIsTlsBlock) {
+      try {
+        const diag = await diagnoseReachability({ hosts: pool, signal }).catch(() => null);
+        verdictIsTlsBlock = diag?.verdict === 'tls-or-ip-block' || diag?.verdict === 'tls-intercepted';
+      } catch { /* ignore */ }
+    }
+    if (verdictIsTlsBlock) {
+      log.info('moviebox', 'direct TLS failed on every host — retrying visitor-login via browser transport (Chromium BoringSSL)', { breakdown: [...failureBreakdown.entries()].map(([k, v]) => `${k}:${v}`).join(',') });
+      try {
+        const browserAttempt = await loginViaBrowser({ id, body, signal });
+        if (browserAttempt.outcome?.ok) {
+          log.info('moviebox', 'visitor-login via browser transport succeeded', { host: pool[browserAttempt.outcome.index] });
+          // Merge browser breakdown into the main one for logging
+          for (const [k, v] of browserAttempt.breakdown) failureBreakdown.set(k, (failureBreakdown.get(k) || 0) + v);
+          outcome = browserAttempt.outcome;
+        } else {
+          log.warn('moviebox', 'browser transport also failed for visitor-login', { breakdown: [...browserAttempt.breakdown.entries()].map(([k, v]) => `${k}:${v}`).join(',') });
+        }
+      } catch (err) {
+        log.warn('moviebox', `browser fallback for visitor-login threw: ${errorText(err)}`);
+      }
+    }
+  }
+
   if (!outcome.ok) {
     consecutiveFailures += 1;
     const tier = Math.min(consecutiveFailures, FAILURE_BACKOFF.length - 1);
@@ -429,8 +614,22 @@ async function login({ signal = null } = {}) {
     // A wall of identical `fetch failed` lines is not a diagnosis. Probe a
     // control host + compare DNS answers so the log says whether this is the
     // network, DNS filtering, a TLS-interception proxy, or MovieBox itself.
-    const diagnosis = await diagnoseReachability({ hosts: HOST_POOL, signal }).catch(() => null);
-    const hint = diagnosis ? ` (${diagnosis.verdict}: ${diagnosis.hint})` : '';
+    const diagnosis = await diagnoseReachability({ hosts: pool, signal }).catch(() => null);
+    let hint = diagnosis ? ` (${diagnosis.verdict}: ${diagnosis.hint})` : '';
+    // Append actionable proxy hint for the SNI-block case — the most common
+    // fix on filtered ISPs is to route through a proxy/VPN outside the filter.
+    const proxyConfigured = (() => {
+      try {
+        const cfg = getConfig?.();
+        if (cfg?.scraper?.proxyUrl) return true;
+      } catch { /* ignore */ }
+      return Boolean(process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY);
+    })();
+    if (diagnosis?.verdict === 'tls-or-ip-block' && !proxyConfigured) {
+      hint += ' — fix: set MOVIEBOX_PROXY / HTTP_PROXY (e.g. http://proxy:3128) or route the container through a VPN; alternatively ensure MOVIEBOX_BROWSER_FALLBACK=true (default) and that Chromium is available.';
+    } else if (diagnosis?.verdict === 'tls-intercepted') {
+      hint += ' — fix: install the intercepting proxy CA via NODE_EXTRA_CA_CERTS or set HTTP_PROXY to bypass it.';
+    }
     logError('moviebox', `visitor-login failed on every API host [${breakdown}]${hint}`, outcome.error);
     if (diagnosis) log.warn('moviebox', 'MovieBox reachability diagnosis', { verdict: diagnosis.verdict, summary: diagnosis.summary });
     throw new Error(`MovieBox visitor-login failed: ${lastError}${hint}`, { cause: outcome.error });
@@ -448,8 +647,9 @@ async function login({ signal = null } = {}) {
   };
   lastError = null;
   saveSession(session);
+  const poolForLog = getHostPool();
   log.info('moviebox', 'visitor token acquired', {
-    uid: session.uid, host: HOST_POOL[hostIndex], expiresAt: session.expiresAt || null,
+    uid: session.uid, host: poolForLog[hostIndex % poolForLog.length] || poolForLog[hostIndex], expiresAt: session.expiresAt || null,
   });
   return session;
 }
@@ -493,7 +693,10 @@ export async function apiRequest(pathAndQuery, {
 
   let reauthenticationAttempted = false;
   let sawHttpStatus = false;
-  const outcome = await requestHostPool({
+  const failureKinds = new Map();
+  const pool = getHostPool();
+  let outcome = await requestHostPool({
+    hosts: pool,
     startIndex: hostIndex,
     signal,
     requestHost: async (base) => {
@@ -533,6 +736,7 @@ export async function apiRequest(pathAndQuery, {
       const status = result?.status;
       if (status) sawHttpStatus = true;
       const info = !status ? classifyFetchError(error) : null;
+      if (info) failureKinds.set(info.kind, (failureKinds.get(info.kind) || 0) + 1);
       log.warn('moviebox', status
         ? `host ${host} answered ${status} — trying next host`
         : `request failed on ${host} — trying next host`, {
@@ -541,6 +745,35 @@ export async function apiRequest(pathAndQuery, {
       });
     },
   });
+
+  // Direct Node fetch failed with transport errors (no HTTP status) and the
+  // failure looks like SNI/JA3 filtering → retry the same signed request via
+  // Chromium (BoringSSL) before we surface the error to the operator.
+  if (!outcome.ok && !sawHttpStatus && browserFallbackEnabled() && !signal?.aborted) {
+    const hasTlsHint = [...failureKinds.keys()].some((k) => ['tls', 'tls-intercepted'].includes(k));
+    let verdictIsTlsBlock = hasTlsHint;
+    if (!verdictIsTlsBlock) {
+      try {
+        const diag = await diagnoseReachability({ hosts: pool, signal }).catch(() => null);
+        verdictIsTlsBlock = diag?.verdict === 'tls-or-ip-block' || diag?.verdict === 'tls-intercepted';
+      } catch { /* ignore */ }
+    }
+    if (verdictIsTlsBlock) {
+      log.info('moviebox', `direct TLS failed for ${pathAndQuery} — retrying via browser transport`, { breakdown: [...failureKinds.entries()].map(([k, v]) => `${k}:${v}`).join(',') });
+      try {
+        const browserOutcome = await apiRequestViaBrowser(pathAndQuery, { method, body, authenticated, signal, id });
+        if (browserOutcome.ok) {
+          log.info('moviebox', `apiRequest via browser succeeded for ${pathAndQuery}`, { host: pool[browserOutcome.index] });
+          hostIndex = browserOutcome.index;
+          lastError = null;
+          return browserOutcome.data;
+        }
+        log.warn('moviebox', `browser transport also failed for ${pathAndQuery}`, { error: errorText(browserOutcome.error) });
+      } catch (err) {
+        log.warn('moviebox', `browser fallback for ${pathAndQuery} threw: ${errorText(err)}`);
+      }
+    }
+  }
 
   if (!outcome.ok) {
     lastError = errorText(outcome.error);
@@ -908,11 +1141,17 @@ export async function findStreamsByTitle(title, { year = null, kind = null, seas
 }
 
 export function status() {
+  const pool = getHostPool();
+  const proxy = (() => { try { return getConfig()?.scraper?.proxyUrl || ''; } catch { return ''; } })() || process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '';
   return {
     session: session ? { uid: session.uid, savedAt: session.savedAt, expiresAt: session.expiresAt || null } : null,
     identity: deviceIdentity ? { userAgent: deviceIdentity.userAgent.slice(0, 60), spoofedIp: deviceIdentity.spoofedIp } : null,
-    host: HOST_POOL[hostIndex % HOST_POOL.length],
-    hostsTotal: HOST_POOL.length,
+    host: pool[hostIndex % pool.length],
+    hostsTotal: pool.length,
+    hosts: pool,
+    proxy: proxy ? proxy.replace(/:\/\/[^@]*@/, '://***@') : null,
+    proxyConfigured: Boolean(proxy),
+    browserFallback: browserFallbackEnabled(),
     lastError,
     consecutiveFailures,
     backoffUntilMs: disabledUntil > Date.now() ? disabledUntil : null,
@@ -930,5 +1169,5 @@ export function resetBackoff() {
 export default {
   search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle,
   releasesFromPlayInfo, releasesFromResources, status, resetBackoff, resetIdentity,
-  classifyFetchError, parseJwtClaims, sessionIsValid, HOST_POOL,
+  classifyFetchError, parseJwtClaims, sessionIsValid, HOST_POOL, getHostPool,
 };

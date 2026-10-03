@@ -80,6 +80,33 @@ export const DEFAULTS = {
     diagnoseOnFailure: String(process.env.DIAGNOSE_ON_FAILURE || 'true').toLowerCase() !== 'false',
     dnsCheckServers: (process.env.DNS_CHECK_SERVERS || '1.1.1.1,8.8.8.8,9.9.9.9')
       .split(',').map((s) => s.trim()).filter(Boolean),
+    /**
+     * Outbound proxy for scrapers (MovieBox, etc.). When the MovieBox API edge
+     * closes the TLS handshake with `tls-or-ip-block` the usual fix is to route
+     * the container through a proxy/VPN outside the blocking ISP. Any of these
+     * vars is honoured (first non-empty wins): MOVIEBOX_PROXY, HTTPS_PROXY,
+     * https_proxy, HTTP_PROXY, http_proxy, ALL_PROXY. The value is a normal
+     * proxy URL: http://proxy:3128 or socks5://proxy:1080 — forwarded to Node's
+     * fetch via undici.ProxyAgent (which also handles NO_PROXY/ no_proxy).
+     * Leave empty for direct egress (default).
+     */
+    proxyUrl: (process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy || '').trim(),
+    noProxy: (process.env.NO_PROXY || process.env.no_proxy || 'localhost,127.0.0.1,::1').trim(),
+    /**
+     * Alternative MovieBox hosts the operator can add when the built-in pool is
+     * blocked. Comma-separated list is appended to HOST_POOL. Useful for the
+     * H5/web BFF mirrors (h5-api.aoneroom.com, h5.aoneroom.com) or a self-hosted
+     * mirror/proxy.
+     */
+    movieboxExtraHosts: (process.env.MOVIEBOX_EXTRA_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    /**
+     * When Node's TLS stack is blocked (JA3/SNI filter) but the host is
+     * reachable via a normal browser, retry MovieBox API calls through the
+     * headless Chromium (its BoringSSL fingerprint is different). Enabled by
+     * default; disable with MOVIEBOX_BROWSER_FALLBACK=false if you prefer to
+     * fail fast instead of spending ~8s on the fallback.
+     */
+    movieboxBrowserFallback: String(process.env.MOVIEBOX_BROWSER_FALLBACK || 'true').toLowerCase() !== 'false',
     /** Persisted cookies/session per source (Cloudflare handshakes). */
     sessionDir: process.env.SESSION_DIR || path.join(path.dirname(CONFIG_FILE), 'sessions'),
     userAgent: process.env.USER_AGENT
@@ -184,6 +211,9 @@ function envOverrides() {
   if (process.env.OPENSUBTITLES_API_KEY) set('subtitles.keys.opensubtitlesCom', process.env.OPENSUBTITLES_API_KEY);
   if (process.env.SUBDL_API_KEY) set('subtitles.keys.subdl', process.env.SUBDL_API_KEY);
   if (process.env.FLARESOLVERR_URL) set('scraper.flaresolverrUrl', process.env.FLARESOLVERR_URL);
+  if (process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY) set('scraper.proxyUrl', (process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || '').trim());
+  if (process.env.MOVIEBOX_EXTRA_HOSTS) set('scraper.movieboxExtraHosts', process.env.MOVIEBOX_EXTRA_HOSTS.split(',').map((s) => s.trim()).filter(Boolean));
+  if (process.env.MOVIEBOX_BROWSER_FALLBACK) set('scraper.movieboxBrowserFallback', String(process.env.MOVIEBOX_BROWSER_FALLBACK).toLowerCase() !== 'false');
   return o;
 }
 
