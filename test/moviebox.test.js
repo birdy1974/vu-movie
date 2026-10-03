@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import {
   generateXClientToken, generateXTrSignature, canonicalUrl, buildCanonicalString,
   dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo,
+  releasesFromResources, parseJwtClaims, sessionIsValid, findStreamsByTitle, search,
   buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool,
   classifyFetchError, HOST_POOL,
 } from '../src/scrapers/moviebox.js';
@@ -171,21 +172,148 @@ test('play-info payload becomes ranked 1080p/720p/480p candidates', () => {
   assert.ok(releases[0].sizeBytes >= releases[1].sizeBytes, 'smaller renditions get a scaled size estimate');
 });
 
-test('streams without a playable manifest are skipped, deprecation URLs ignored', () => {
+test('placeholder/notice URLs are skipped exactly like the reference client', () => {
   const payload = {
     data: {
       streams: [
+        // macdn's `/other/` bucket is where MovieBox puts its "not available"
+        // clips — the reference client filters the whole bucket out.
         { id: '1', url: 'https://macdn.aoneroom.com/other/x.mp4' },
-        { id: '2', url: 'https://sportslive.wine/deprecation-notice' },
+        { id: '2', url: 'https://macdn.aoneroom.com/dash/realmovie.mp4' },
+        { id: '3', url: 'https://cdn.example/notice.mp4' },
+        // A real file whose *name* happens to contain "notice" must survive:
+        // the old regex `deprecat|notice|unavailable` dropped these.
+        { id: '4', url: 'https://cdn.example/notices-from-the-court.mp4' },
       ],
     },
   };
   const releases = releasesFromPlayInfo(payload);
-  // One candidate per advertised resolution (default 1080/720/480) — all pointing at
-  // the same manifest, exactly like the reference client. The registry dedupes by URL.
-  assert.equal(releases.length, 3);
-  assert.ok(releases.every((r) => r.url === 'https://macdn.aoneroom.com/other/x.mp4'));
-  assert.deepEqual(releases.map((r) => r.quality), ['1080p', '720p', '480p']);
+  const byUrl = new Set(releases.map((r) => r.url));
+  assert.ok(!byUrl.has('https://macdn.aoneroom.com/other/x.mp4'), 'macdn /other/ is a placeholder');
+  assert.ok(!byUrl.has('https://cdn.example/notice.mp4'), '/notice.mp4 is a placeholder');
+  assert.ok(byUrl.has('https://macdn.aoneroom.com/dash/realmovie.mp4'), 'a real stream survives');
+  assert.ok(byUrl.has('https://cdn.example/notices-from-the-court.mp4'), 'a real title containing “notice” survives');
+  // One candidate per advertised resolution (default 1080/720/480) per stream,
+  // exactly like the reference client; the registry dedupes by URL afterwards.
+  assert.deepEqual([...new Set(releases.map((r) => r.quality))], ['1080p', '720p', '480p']);
+  assert.equal(releases.filter((r) => r.url === 'https://cdn.example/notices-from-the-court.mp4').length, 3);
+});
+
+test('resource items map to candidates with the reference field fallbacks', () => {
+  const releases = releasesFromResources({ data: { list: [
+    {
+      fileName: 'The Runner 2025 1080p', resourceId: 'res-1', resolution: 1080, codecName: 'h264',
+      size: '1682353414', resourceLink: 'https://cdn.example/dash/abc/index.mp4', uploadBy: 'Cloud', se: 0, ep: 0,
+    },
+    {
+      fileName: 'The Runner 720p', id: 42, resolution: '720', codec: 'hevc', size: 900000,
+      url: 'https://cdn.example/hls/master.m3u8', source: 'Server-2',
+    },
+    { fileName: 'placeholder', resourceId: 'res-3', resourceLink: 'https://macdn.aoneroom.com/other/9a0461bc39da389663bf3dbb17091d3f.mp4' },
+  ] } }, {});
+  assert.equal(releases.length, 2, 'placeholder links are dropped');
+  assert.equal(releases[0].url, 'https://cdn.example/dash/abc/index.mp4');
+  assert.equal(releases[0].quality, '1080p');
+  assert.equal(releases[0].height, 1080);
+  assert.equal(releases[0].sizeBytes, 1682353414);
+  assert.equal(releases[0].label, 'Cloud 1080p');
+  assert.equal(releases[1].meta.resourceId, '42', 'resourceId falls back to id');
+  assert.equal(releases[1].kind, 'hls');
+  assert.equal(releases[1].label, 'Server-2 720p');
+});
+
+test('resource listings are filtered to the requested episode', () => {
+  const payload = { data: { list: [
+    { fileName: 'S01E01', resourceId: 'a', resolution: 1080, resourceLink: 'https://cdn.example/e1.mp4', se: 1, ep: 1 },
+    { fileName: 'S01E02', resourceId: 'b', resolution: 1080, resourceLink: 'https://cdn.example/e2.mp4', se: 1, ep: 2 },
+  ] } };
+  assert.deepEqual(releasesFromResources(payload, { season: 1, episode: 2 }).map((r) => r.url), ['https://cdn.example/e2.mp4']);
+  // No season/episode requested → everything is offered (movies have se=ep=0).
+  assert.equal(releasesFromResources(payload, {}).length, 2);
+});
+
+test('visitor JWTs decide session validity (exp claim, then a 7-day ceiling)', () => {
+  const future = Buffer.from(JSON.stringify({ userId: 'u-9', exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url');
+  const past = Buffer.from(JSON.stringify({ userId: 'u-9', exp: Math.floor(Date.now() / 1000) - 5 })).toString('base64url');
+  const claims = parseJwtClaims(`header.${future}.sig`);
+  assert.equal(claims.userId, 'u-9');
+  assert.ok(claims.exp > Math.floor(Date.now() / 1000));
+  assert.equal(parseJwtClaims('not-a-jwt').exp, null);
+  assert.equal(sessionIsValid({ token: `header.${future}.sig`, expiresAt: claims.exp }), true);
+  assert.equal(sessionIsValid({ token: `header.${past}.sig`, expiresAt: parseJwtClaims(`header.${past}.sig`).exp }), false);
+  assert.equal(sessionIsValid({ token: 'opaque', savedAt: new Date().toISOString() }), true);
+  assert.equal(sessionIsValid({ token: 'opaque', savedAt: new Date(Date.now() - 8 * 24 * 3600_000).toISOString() }), false);
+  assert.equal(sessionIsValid({ token: '' }), false);
+});
+
+test('findStreamsByTitle unions play-info and resource listings and dedupes by manifest path', async () => {
+  const calls = [];
+  const fakeFetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    calls.push({ path, method: init.method || 'GET' });
+    const json = (body, status = 200) => new Response(JSON.stringify(body), {
+      status, headers: { 'content-type': 'application/json' },
+    });
+    if (path.endsWith('/user-api/visitor-login')) return json({ data: { token: 'visitor', uid: 'u-1' } });
+    if (path.endsWith('/subject-api/search/v2')) {
+      return json({ data: { results: [{ subjects: [{ subjectId: '42', title: 'The Runner', subjectType: 1, releaseDate: '2025-01-01' }] }] } });
+    }
+    if (path.endsWith('/subject-api/play-info/v2')) {
+      return json({ data: { title: 'The Runner', streams: [{
+        id: 's1', format: 'MP4', codecName: 'hevc', resolutions: '1080',
+        signCookie: `Edge-Cache-Cookie=urlprefix=${Buffer.from('https://cdn.example/dash/42_1080/').toString('base64')}:sign=x:t=1`,
+      }] } });
+    }
+    if (path.endsWith('/subject-api/resource')) {
+      return json({ data: { list: [
+        // Same manifest as play-info (must be deduped) + one extra mirror.
+        { fileName: 'dup', resourceId: 'd', resolution: 1080, resourceLink: 'https://cdn.example/dash/42_1080/index.mpd' },
+        { fileName: 'mirror', resourceId: 'e', resolution: 480, resourceLink: 'https://cdn.example/dash/42_480/index.mpd' },
+      ] } });
+    }
+    return json({ error: 'unexpected path' }, 404);
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    const { item, candidates } = await findStreamsByTitle('The Runner', { year: 2025, kind: 'movie' });
+    assert.equal(item.subjectId, '42');
+    const urls = candidates.map((c) => c.url).sort();
+    assert.deepEqual(urls, ['https://cdn.example/dash/42_1080/index.mpd', 'https://cdn.example/dash/42_480/index.mpd']);
+    assert.ok(calls.some((c) => c.path.endsWith('/subject-api/play-info/v2')), 'play-info is queried');
+    assert.ok(calls.some((c) => c.path.endsWith('/subject-api/resource')), 'resource listing is queried too');
+    // The play-info candidate keeps the signed-cookie headers; the resource one has none.
+    const signed = candidates.find((c) => c.url.includes('42_1080'));
+    assert.ok(signed.headers.Cookie.startsWith('Edge-Cache-Cookie=urlprefix='));
+    assert.equal(candidates.find((c) => c.url.includes('42_480')).headers.Cookie, undefined);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('a 200 with a non-JSON body is a host failure, not an empty result', async () => {
+  const attempted = [];
+  const fakeFetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    attempted.push(new URL(url).host);
+    if (path.endsWith('/user-api/visitor-login')) {
+      return new Response(JSON.stringify({ data: { token: 'visitor' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // Host 1 answers with a WAF/HTML page and a 2xx status — the reference
+    // client treats an unparseable body as a host failure and moves on.
+    if (new URL(url).host.startsWith('api6.')) return new Response('<html>Just a moment…</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    return new Response(JSON.stringify({ data: { results: [{ subjects: [{ subjectId: '7', title: 'Ok', subjectType: 1 }] }] } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    const results = await search('ok');
+    assert.equal(results.length, 1);
+    assert.ok(attempted.some((h) => h.startsWith('api6.')), 'the primary host was tried first');
+    assert.ok(attempted.some((h) => !h.startsWith('api6.')), 'a later host was used after the parse failure');
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test('classifyFetchError distinguishes DNS, TLS, reset and timeout failures', () => {

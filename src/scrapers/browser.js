@@ -222,6 +222,11 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   const pendingJsonSettles = []; // promises mining JSON bodies for m3u8 URLs (awaited at end)
   const consoleErrors = [];
   const failedDocumentRequests = [];
+  /**
+   * Main-frame navigations we abort ourselves (pop-unders → about:blank/ads).
+   * Tracked so our own block is not reported as a network error of the site.
+   */
+  const blockedNavigations = new Set();
 
   page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 200));
@@ -241,9 +246,22 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     p.on('requestfailed', (request) => {
       if (failedDocumentRequests.length >= 12) return;
       try {
-        if (!request.isNavigationRequest() || request.frame() !== p.mainFrame()) return;
-        const failure = request.failure() || 'document request failed';
-        failedDocumentRequests.push({ host: safeHost(request.url()), error: String(failure).slice(0, 180) });
+        if (blockedNavigations.has(request.url())) return;
+        const failure = String(request.failure() || 'request failed');
+        const isFrameDocument = request.isNavigationRequest() || request.resourceType() === 'subdocument';
+        // Sub-frame failures matter as much as the main frame: when the movie
+        // page loads but its embedded player is refused, the *only* evidence is
+        // the refused iframe. Naming that host turns "no media found" into an
+        // actionable "embed host X is unreachable".
+        if (!isFrameDocument && !isNetworkNavigationError(failure)) return;
+        const frame = request.frame();
+        const isMainFrame = frame === p.mainFrame();
+        failedDocumentRequests.push({
+          host: safeHost(request.url()),
+          url: String(request.url()).slice(0, 160),
+          kind: isMainFrame ? 'main-frame' : 'embed',
+          error: failure.slice(0, 180),
+        });
       } catch { /* a closed popup may no longer have a frame */ }
     });
     p.on('response', async (res) => {
@@ -316,6 +334,13 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   };
   let navigationError = null;
 
+  // Flixer-clone pages (Overlook, 1flex, cinezo, redflix …) fire ad pop-unders
+  // that navigate the *main frame* to `about:blank` or to a random lander a few
+  // hundred ms after load. The player then never starts, the DOM we are watching
+  // disappears, and the sniff times out reporting `finalUrl: about:blank` — with
+  // no hint that the page was hijacked. We block those navigations instead (the
+  // search path already does exactly this) and remember the destination.
+  let hijackedTo = null;
   try {
     await page.route('**/*', async (route) => {
       const req = route.request();
@@ -328,6 +353,17 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
         if (type === 'media') return route.abort();
         return route.continue();
       }
+      try {
+        if (req.isNavigationRequest() && req.frame() === page.mainFrame()
+            && (u === 'about:blank' || !isSameSiteNavigation(u, url))) {
+          hijackedTo ||= u;
+          blockedNavigations.add(u);
+          log.warn('browser', `blocked an off-site / blank main-frame navigation on ${safeHost(url)} (pop-under?)`, {
+            destination: safeHost(u),
+          });
+          return route.abort('blockedbyclient');
+        }
+      } catch { /* frame may be detached while the pop-under fires */ }
       return route.continue();
     });
 
@@ -373,19 +409,40 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     // Wait until we have media AND the page has been quiet for `quietMs`.
     // The aggressive click is a single retry; repeating it every 250 ms can
     // continually reload the player before it has time to initialize.
-    let lastCount = 0;
-    let lastChange = Date.now();
-    let aggressivePlayRetried = false;
-    while (Date.now() - started < timeoutMs) {
-      if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-      const count = media.size + apis.size;
-      if (count !== lastCount) { lastCount = count; lastChange = Date.now(); }
-      if (media.size > 0 && Date.now() - lastChange > quietMs) break;
-      if (!aggressivePlayRetried && media.size === 0 && Date.now() - started > Math.min(timeoutMs, 12_000)) {
-        aggressivePlayRetried = true;
-        await nudgePlay(page, true);
+    const waitForMedia = async (nudgeAtMs) => {
+      let lastCount = 0;
+      let lastChange = Date.now();
+      let aggressivePlayRetried = false;
+      while (Date.now() - started < timeoutMs) {
+        if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        const count = media.size + apis.size;
+        if (count !== lastCount) { lastCount = count; lastChange = Date.now(); }
+        if (media.size > 0 && Date.now() - lastChange > quietMs) break;
+        if (!aggressivePlayRetried && media.size === 0 && Date.now() - started > nudgeAtMs) {
+          aggressivePlayRetried = true;
+          await nudgePlay(page, true);
+        }
+        await sleep(250);
       }
-      await sleep(250);
+    };
+    await waitForMedia(Math.min(timeoutMs, 12_000));
+
+    // If the tab was replaced anyway (a same-site rewrite to about:blank, a
+    // renderer crash, `window.close()`), the page is gone and nothing further
+    // can be observed. Reload once: ad pop-unders here fire on the first load of
+    // a fresh tab, which is also what the search path relies on.
+    const pageWasReplaced = () => {
+      const current = page.url();
+      return !current || current.startsWith('about:') || !isSameSiteNavigation(current, url);
+    };
+    if (media.size === 0 && pageWasReplaced()) {
+      log.warn('browser', `${safeHost(url)} replaced the tab (now ${String(page.url()).slice(0, 120)}) — reloading it once`, {
+        blockedRedirect: hijackedTo ? safeHost(hijackedTo) : null,
+      });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 20_000) })
+        .catch((err) => log.warn('browser', `reload after tab replacement failed: ${err.message}`));
+      if (opts.click !== false) await nudgePlay(page);
+      await waitForMedia(Date.now() - started + 4_000);
     }
 
     // Give in-flight JSON API response bodies a moment to settle so the
@@ -418,7 +475,18 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
         // Page loaded but the player iframe / API host refused connections —
         // almost always means the source's CDN/embed is dead, geo-blocked,
         // or blocked by the container's network (DNS/proxy/firewall).
-        result.note = 'page loaded but the embedded player is unreachable (connection refused / failed) — the CDN/embed host may be dead, geo-blocked, or blocked by DNS';
+        // Name the actual hosts: with several embeds per page the operator
+        // otherwise cannot tell which one is dead.
+        const refused = [...new Set(result.networkErrors
+          .filter((e) => /ERR_(CONNECTION|NAME|ADDRESS|INTERNET|PROXY)/i.test(String(e.error)))
+          .map((e) => e.host))]
+          .filter(Boolean);
+        result.note = refused.length
+          ? `page loaded but its embedded player/CDN is unreachable — refused host(s): ${refused.join(', ')} (dead, geo-blocked, or blocked by DNS/firewall/proxy)`
+          : 'page loaded but the embedded player is unreachable (connection refused / failed) — the CDN/embed host may be dead, geo-blocked, or blocked by DNS';
+        result.refusedHosts = refused;
+      } else if (hijackedTo) {
+        result.note = `the page was replaced by an off-site/ad redirect to ${safeHost(hijackedTo)} — the site is likely parked, ad-hijacked, or requires a captcha`;
       } else if (navigationError) {
         result.note = `page navigation did not complete: ${navigationError}`;
       } else {

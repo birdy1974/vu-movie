@@ -71,6 +71,15 @@ export const DEFAULTS = {
     /** Optional FlareSolverr / external extractor (see docs). */
     flaresolverrUrl: process.env.FLARESOLVERR_URL || '',
     externalExtractorUrl: process.env.EXTERNAL_EXTRACTOR_URL || '',
+    /**
+     * When a resolve produces nothing, probe a control host and cross-check DNS
+     * (system resolver vs these public ones) so the log/UI says whether the
+     * container has no egress, filtered DNS, a TLS-intercepting proxy, or a
+     * genuinely dead service. Costs ~4 s, once per minute (cached).
+     */
+    diagnoseOnFailure: String(process.env.DIAGNOSE_ON_FAILURE || 'true').toLowerCase() !== 'false',
+    dnsCheckServers: (process.env.DNS_CHECK_SERVERS || '1.1.1.1,8.8.8.8,9.9.9.9')
+      .split(',').map((s) => s.trim()).filter(Boolean),
     /** Persisted cookies/session per source (Cloudflare handshakes). */
     sessionDir: process.env.SESSION_DIR || path.join(path.dirname(CONFIG_FILE), 'sessions'),
     userAgent: process.env.USER_AGENT
