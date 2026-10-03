@@ -21,6 +21,7 @@ import path from 'node:path';
 import { log, logError } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { sleep, safeHost, resolveUrl } from './http.js';
+import { normalizeSearchMetadata } from './metadata.js';
 
 let playwright = null;
 let browser = null;
@@ -62,6 +63,16 @@ const PLAY_SELECTORS = [
 
 function chromiumPath() {
   return process.env.CHROMIUM_PATH || process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || null;
+}
+
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return Object.assign(new Error('browser request aborted'), { name: 'AbortError' });
+}
+
+export function isNetworkNavigationError(error) {
+  const message = typeof error === 'string' ? error : String(error?.message || error || '');
+  return /ERR_(?:CONNECTION_(?:REFUSED|RESET|CLOSED|ABORTED|TIMED_OUT)|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|NETWORK_CHANGED|NETWORK_ACCESS_DENIED|PROXY_CONNECTION_FAILED)/i.test(message);
 }
 
 export function browserInfo() {
@@ -189,14 +200,20 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   const quietMs = opts.quietMs ?? 2500;
   const captureJson = opts.captureJson !== false;
   const started = Date.now();
+  if (opts.signal?.aborted) throw abortError(opts.signal);
 
   const ctx = await getContext(opts.session);
+  if (opts.signal?.aborted) throw abortError(opts.signal);
   const page = await ctx.newPage();
   activePages += 1;
+  const closeOnAbort = () => { page.close().catch(() => {}); };
+  opts.signal?.addEventListener('abort', closeOnAbort, { once: true });
+  if (opts.signal?.aborted) closeOnAbort();
 
   const media = new Map(); // url → record
   const apis = new Map();
   const consoleErrors = [];
+  const failedDocumentRequests = [];
 
   page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 200));
@@ -213,6 +230,14 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   ctx.on('page', onPopup);
 
   function attach(p) {
+    p.on('requestfailed', (request) => {
+      if (failedDocumentRequests.length >= 12) return;
+      try {
+        if (!request.isNavigationRequest() || request.frame() !== p.mainFrame()) return;
+        const failure = request.failure() || 'document request failed';
+        failedDocumentRequests.push({ host: safeHost(request.url()), error: String(failure).slice(0, 180) });
+      } catch { /* a closed popup may no longer have a frame */ }
+    });
     p.on('response', async (res) => {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
@@ -247,8 +272,9 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
 
   const result = {
     ok: false, url, finalUrl: url, title: null, media: [], apis: [], candidates: [],
-    consoleErrors, ms: 0, note: null,
+    consoleErrors, networkErrors: [], ms: 0, note: null,
   };
+  let navigationError = null;
 
   try {
     await page.route('**/*', async (route) => {
@@ -267,7 +293,24 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
 
     log.info('browser', `sniffing ${safeHost(url)}`, { url: url.slice(0, 200), session: opts.session || 'default' });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 30_000) })
-      .catch((err) => log.warn('browser', `navigation issue for ${safeHost(url)}: ${err.message}`));
+      .catch((err) => {
+        navigationError = err.message;
+        log.warn('browser', `navigation issue for ${safeHost(url)}: ${err.message}`);
+      });
+    if (opts.signal?.aborted) throw abortError(opts.signal);
+    result.networkErrors = failedDocumentRequests.slice(0, 8);
+    if (navigationError && isNetworkNavigationError(navigationError)) {
+      result.finalUrl = page.url();
+      result.title = await page.title().catch(() => null);
+      result.error = `cannot connect to ${safeHost(url)}: ${navigationError}`;
+      result.note = 'The page could not be reached from the app container; check outbound internet, DNS, firewall/proxy settings, or whether the site is available.';
+      log.warn('browser', `target page is unreachable on ${safeHost(url)}`, {
+        finalUrl: result.finalUrl,
+        navigationError,
+        failedRequests: result.networkErrors,
+      });
+      return result;
+    }
 
     let followedPlayAction = false;
     if (opts.click !== false) followedPlayAction = await nudgePlay(page);
@@ -309,21 +352,29 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     result.title = await page.title().catch(() => null);
     result.media = [...media.values()];
     result.apis = [...apis.values()];
+    result.networkErrors = failedDocumentRequests.slice(0, 8);
     result.hls = result.media.filter((m) => m.kind === 'hls');
     result.html = opts.withHtml ? await page.content().catch(() => '') : null;
     result.ok = result.media.length > 0;
     if (!result.ok) {
-      result.note = 'no media response observed — the page may need a click, a login, or a different player URL';
+      result.error = navigationError ? `navigation issue: ${navigationError}` : undefined;
+      result.note = navigationError
+        ? `page navigation did not complete: ${navigationError}`
+        : 'no media response observed — the page may need a click, a login, or a different player URL';
       log.warn('browser', `no media found on ${safeHost(url)} after ${Date.now() - started} ms`, {
         finalUrl: result.finalUrl.slice(0, 200),
         title: result.title,
+        navigationError,
+        failedRequests: result.networkErrors,
         consoleErrors: consoleErrors.slice(0, 3),
       });
     }
   } catch (err) {
+    if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
     result.error = err.message;
     log.error('browser', `sniffer failed on ${safeHost(url)}: ${err.message}`);
   } finally {
+    opts.signal?.removeEventListener('abort', closeOnAbort);
     ctx.off('page', onPopup);
     for (const popup of popupPages) await popup.close().catch(() => {});
     activePages -= 1;
@@ -514,7 +565,8 @@ export function normalizeSearchRows(rows, {
     if (!explicitMatch && !(queryMatch && (routeMatch || classSignal || hasImage))) continue;
     if (!explicitMatch && !queryMatch) continue;
 
-    const yearText = `${row.year || ''} ${row.title || ''} ${row.cardTitle || ''} ${title} ${row.text || ''} ${cardText}`;
+    const metadata = normalizeSearchMetadata(row, `${row.text || ''} ${cardText}`);
+    const yearText = `${row.year || ''} ${metadata.releaseDate || ''} ${row.title || ''} ${row.cardTitle || ''} ${title} ${row.text || ''} ${cardText}`;
     const yearMatch = /\b((?:19|20)\d{2})\b/.exec(yearText);
     const typeText = `${target.pathname} ${target.searchParams.get('type') || ''} ${row.kind || ''} ${cardText}`;
     const kind = /(?:^|[\s\/_-])(?:tv|series?|serie|shows?|anime)(?:[\s\/_-]|$)/i.test(typeText) ? 'series' : 'movie';
@@ -528,6 +580,7 @@ export function normalizeSearchRows(rows, {
       poster,
       kind,
       url: target.toString(),
+      ...metadata,
     };
     const score = (Number(row.titleRank) || 0) + (queryMatch ? 2 : 0) + (hasImage ? 1 : 0) + (classSignal ? 1 : 0);
     const previous = found.get(result.url);
@@ -535,14 +588,21 @@ export function normalizeSearchRows(rows, {
       found.set(result.url, { result, score });
     } else {
       const preferred = score > previous.score ? result : previous.result;
+      const other = preferred === result ? previous.result : result;
       found.set(result.url, {
         result: {
-          ...previous.result,
-          ...result,
-          title: preferred.title,
-          poster: preferred.poster || previous.result.poster || result.poster,
-          year: preferred.year || previous.result.year || result.year,
-          kind: preferred.kind || previous.result.kind || result.kind,
+          ...other,
+          ...preferred,
+          title: preferred.title || other.title,
+          poster: preferred.poster || other.poster,
+          year: preferred.year || other.year,
+          kind: preferred.kind || other.kind,
+          rating: preferred.rating ?? other.rating,
+          genres: preferred.genres?.length ? preferred.genres : (other.genres || []),
+          runtime: preferred.runtime ?? other.runtime,
+          description: preferred.description || other.description,
+          releaseDate: preferred.releaseDate || other.releaseDate,
+          language: preferred.language || other.language,
         },
         score: Math.max(previous.score, score),
       });
@@ -579,9 +639,14 @@ export async function searchSite(siteOrOpts, maybeQuery) {
     ? template.replace(/\{(query|q)\}/g, encodeURIComponent(query))
     : `${template}${template.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`;
 
+  if (opts.signal?.aborted) throw abortError(opts.signal);
   const ctx = await getContext(site.id);
+  if (opts.signal?.aborted) throw abortError(opts.signal);
   const page = await ctx.newPage();
   activePages += 1;
+  const closeOnAbort = () => { page.close().catch(() => {}); };
+  opts.signal?.addEventListener('abort', closeOnAbort, { once: true });
+  if (opts.signal?.aborted) closeOnAbort();
   const results = [];
   let error = null;
   let status = null;
@@ -609,6 +674,48 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       const heading = card.querySelector('h1, h2, h3, h4, h5, h6, [data-title], [class*="title" i], strong, b');
       const text = clean(element.innerText || element.textContent || '');
       const cardText = clean(card.innerText || card.textContent || '').slice(0, 700);
+      const dataValue = (names) => {
+        for (const node of [element, card]) {
+          for (const name of names) {
+            const value = node?.getAttribute(name);
+            if (value) return value;
+          }
+        }
+        return null;
+      };
+      const ratingNode = card.querySelector('[data-rating], [class*="rating" i], [aria-label*="rating" i], [class*="score" i]');
+      const rating = dataValue(['data-rating', 'data-vote-average', 'data-imdb-rating'])
+        || ratingNode?.getAttribute('data-rating')
+        || ratingNode?.getAttribute('aria-label')
+        || ratingNode?.innerText
+        || null;
+      const genreNodes = [...card.querySelectorAll('[data-genre], [data-genres], [data-category], [class*="genre" i]')].slice(0, 8);
+      const genres = genreNodes.map((node) => node.getAttribute('data-genres')
+        || node.getAttribute('data-genre')
+        || node.getAttribute('data-category')
+        || node.innerText
+        || node.textContent
+        || '').filter(Boolean);
+      const descriptionNode = card.querySelector('[data-overview], [data-description], [data-synopsis], [class*="overview" i], [class*="synopsis" i], [class*="description" i]');
+      const description = dataValue(['data-overview', 'data-description', 'data-synopsis'])
+        || descriptionNode?.getAttribute('data-overview')
+        || descriptionNode?.getAttribute('data-description')
+        || descriptionNode?.getAttribute('data-synopsis')
+        || descriptionNode?.innerText
+        || null;
+      const runtimeNode = card.querySelector('[data-runtime], [data-duration], [class*="runtime" i], [class*="duration" i]');
+      const runtime = dataValue(['data-runtime', 'data-duration'])
+        || runtimeNode?.getAttribute('data-runtime')
+        || runtimeNode?.getAttribute('data-duration')
+        || runtimeNode?.innerText
+        || null;
+      const releaseNode = card.querySelector('time[datetime], [data-release-date], [data-air-date]');
+      const releaseDate = dataValue(['data-release-date', 'data-air-date'])
+        || releaseNode?.getAttribute('datetime')
+        || releaseNode?.getAttribute('data-release-date')
+        || releaseNode?.getAttribute('data-air-date')
+        || null;
+      const language = dataValue(['data-language', 'data-original-language']);
       const titleCandidates = [
         [element.getAttribute('data-title'), 5],
         [card.getAttribute('data-title'), 5],
@@ -637,12 +744,26 @@ export async function searchSite(siteOrOpts, maybeQuery) {
         .map((node) => typeof node?.className === 'string' ? node.className : '')
         .join(' ')
         .slice(0, 400);
-      const poster = image?.getAttribute('data-src')
-        || image?.getAttribute('data-lazy-src')
-        || image?.getAttribute('data-original')
-        || image?.getAttribute('src')
-        || image?.getAttribute('srcset')?.split(',')[0]?.trim().split(/\s+/)[0]
-        || null;
+      const explicitPoster = [element, card]
+        .flatMap((node) => ['data-poster', 'data-image', 'data-thumbnail', 'data-thumb', 'data-src', 'data-lazy-src']
+          .map((name) => node?.getAttribute(name)))
+        .find((value) => value && !/^(?:data|blob):/i.test(value));
+      const imageUrls = [
+        image?.getAttribute('data-src'),
+        image?.getAttribute('data-lazy-src'),
+        image?.getAttribute('data-original'),
+        image?.getAttribute('src'),
+        image?.currentSrc,
+        image?.getAttribute('srcset')?.split(',')[0]?.trim().split(/\s+/)[0],
+      ].filter((value) => value && !/^(?:data|blob):/i.test(value));
+      const backgroundNode = [image, element, card].find((node) => {
+        if (!node) return false;
+        return /url\(/i.test(getComputedStyle(node).backgroundImage);
+      });
+      const backgroundImage = backgroundNode
+        ? [...getComputedStyle(backgroundNode).backgroundImage.matchAll(/url\((?:["']?)(.*?)["']?\)/gi)][0]?.[1]
+        : null;
+      const poster = explicitPoster || imageUrls[0] || backgroundImage || null;
       const year = (cardText.match(/\b((?:19|20)\d{2})\b/) || [])[1] || null;
       const kind = element.getAttribute('data-type')
         || element.getAttribute('data-media-type')
@@ -661,6 +782,12 @@ export async function searchSite(siteOrOpts, maybeQuery) {
         poster,
         year,
         kind,
+        rating,
+        genres,
+        runtime,
+        description: description ? clean(description).slice(0, 700) : null,
+        releaseDate,
+        language,
       });
       if (out.length >= 1500) break;
     }
@@ -670,12 +797,16 @@ export async function searchSite(siteOrOpts, maybeQuery) {
   try {
     log.info('browser', `searching ${site.name} for "${query}"`, { url: url.slice(0, 200) });
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     status = response?.status?.() ?? null;
     // Client-rendered catalogues need a moment after networkidle to hydrate cards.
     await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     await sleep(1200);
+    if (opts.signal?.aborted) throw abortError(opts.signal);
 
     const rows = await collectRows();
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     rawLinkCount = rows.length;
     results.push(...normalizeSearchRows(rows, {
       pageUrl: page.url(),
@@ -705,9 +836,11 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       });
     }
   } catch (err) {
+    if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
     error = err.message;
     log.error('browser', `search failed on ${site.name}: ${err.message}`);
   } finally {
+    opts.signal?.removeEventListener('abort', closeOnAbort);
     activePages -= 1;
     await page.close().catch(() => {});
     scheduleIdleClose();

@@ -6,11 +6,80 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { generateXClientToken, generateXTrSignature, canonicalUrl, buildCanonicalString, dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo } from '../src/scrapers/moviebox.js';
+import {
+  generateXClientToken, generateXTrSignature, canonicalUrl, buildCanonicalString,
+  dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo,
+  buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool,
+} from '../src/scrapers/moviebox.js';
 
 test('canonicalUrl sorts query parameters like the reference client', () => {
   assert.equal(canonicalUrl('https://api6.aoneroom.com/x/y?b=2&a=1'), '/x/y?a=1&b=2');
   assert.equal(canonicalUrl('https://api6.aoneroom.com/wefeed-mobile-bff/subject-api/get?subjectId=42'), '/wefeed-mobile-bff/subject-api/get?subjectId=42');
+});
+
+test('MovieBox searches request all subject types and map the reference subjects envelope', () => {
+  assert.deepEqual(buildSearchRequest('Dune', { page: 2, perPage: 8 }), {
+    keyword: 'Dune', page: 2, perPage: 8, subjectType: 0,
+  });
+  const results = mapSearchResults({ data: { results: [{ subjects: [
+    {
+      subjectId: 'series-42', title: 'Dune: Prophecy', subjectType: 2,
+      releaseDate: '2024-11-17', cover: { url: 'https://images.example/dune.jpg' },
+      season: 1, imdbRatingValue: '7.2', genreList: [{ name: 'Sci-Fi' }],
+    },
+    { subjectId: 'movie-42', title: 'Dune', subjectType: 1, releaseDate: '2021-09-03' },
+  ] }] } });
+  assert.equal(results.length, 2);
+  assert.equal(results[0].kind, 'series');
+  assert.equal(results[0].subjectType, 2);
+  assert.equal(results[0].poster, 'https://images.example/dune.jpg');
+  assert.equal(results[0].rating, 7.2);
+  assert.deepEqual(results[0].genres, ['Sci-Fi']);
+  assert.equal(results[1].kind, 'movie');
+  assert.equal(results[1].subjectType, 1);
+  assert.equal(results[1].year, 2021);
+});
+
+test('visitor login fails over transport and authentication failures, requiring a token to succeed', async () => {
+  const attempted = [];
+  const outcome = await loginWithHostFailover({
+    hosts: ['api-a', 'api-b', 'api-c'],
+    requestHost: async (host) => {
+      attempted.push(host);
+      if (host === 'api-a') throw new Error('fetch failed');
+      if (host === 'api-b') return { ok: false, status: 401, error: 'unauthorized' };
+      return { ok: true, status: 200, data: { data: { token: 'visitor-token', uid: 'u-1' } } };
+    },
+  });
+  assert.deepEqual(attempted, ['api-a', 'api-b', 'api-c']);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.result.session.token, 'visitor-token');
+  assert.equal(outcome.result.session.uid, 'u-1');
+  assert.equal(outcome.index, 2);
+
+  const missingToken = await loginWithHostFailover({
+    hosts: ['api-no-token'],
+    requestHost: async () => ({ ok: true, status: 200, data: { data: {} } }),
+  });
+  assert.equal(missingToken.ok, false);
+  assert.match(missingToken.error.message, /no token/i);
+});
+
+test('request host pool advances after thrown transport errors and returns the first successful host', async () => {
+  const attempts = [];
+  const outcome = await requestHostPool({
+    hosts: ['one', 'two', 'three'],
+    requestHost: async (host) => {
+      attempts.push(host);
+      if (host === 'one') throw new Error('fetch failed');
+      if (host === 'two') return { ok: false, status: 503, error: 'unavailable' };
+      return { ok: true, data: 'response' };
+    },
+  });
+  assert.deepEqual(attempts, ['one', 'two', 'three']);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.index, 2);
+  assert.equal(outcome.result.data, 'response');
 });
 
 test('x-client-token is timestamp + md5 of the reversed timestamp', () => {

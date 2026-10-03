@@ -23,7 +23,13 @@
         "title": "t",
         "year": "y",
         "kind": "mediaType",
-        "poster": "posterPath"
+        "poster": "posterPath",
+        "rating": "vote_average",
+        "genres": "genres",
+        "description": "overview",
+        "runtime": "runtime",
+        "releaseDate": "release_date",
+        "language": "original_language"
       }
     },
     "resolve": {

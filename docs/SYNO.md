@@ -174,7 +174,8 @@ the new profile on the next request.
 
 | Symptom | Where to look |
 |---|---|
-| "no media found" while scraping | Logs page → filter `browser`. The site may need a click, a login, or a Cloudflare cookie — enable the `flaresolverr` profile (`docker compose --profile cf up -d`) and set `FLARESOLVERR_URL=http://flaresolverr:8191` |
+| "no media found" while scraping | Logs page → filter `browser`. FlareSolverr starts with the project and its API is published on NAS port `8192` (container port `8191`); inspect it with `docker compose logs -f flaresolverr`. Note: the current scraper does not yet submit requests to the FlareSolverr API, so starting the service alone does not change scrape behavior. |
+| Resolve ends with zero candidates; browser reports `ERR_CONNECTION_REFUSED` and MovieBox reports `fetch failed` | These are outbound HTTPS failures from the app container, separate from Enigma2 reachability. Check DNS and HTTPS from inside `vu-movie` using the commands below; if both providers fail, check NAS/Docker egress, DNS, firewall, or proxy configuration. A reachable FlareSolverr container does not by itself provide a general proxy. |
 | Stream plays but stops after a while | `relay` logs: most upstream URLs expire. Increase `TOKEN_TTL_MINUTES`, or use *Transcode* so the app owns the connection and re-fetches |
 | VLC shows a black screen | Copy the ffmpeg command from the Stream page and run it inside the container: `docker compose exec vu-movie sh -c '<command> > /tmp/x.ts'` — the error message is always in the last lines |
 | `permission denied /dev/dri/renderD128` | Section 2 above |
@@ -187,6 +188,23 @@ the new profile on the next request.
 | Bouquet push fails | The app falls back to FTP/SCP; check `ENIGMA2_FTP=true` and that FTP is enabled on the box. WebIF's upload endpoint is disabled on some images |
 | Container restarts in a loop | `docker compose logs vu-movie` — the first lines name the missing piece (usually the database, if you set `REQUIRE_DB=true`) |
 | UI reachable but "database: memory" | Postgres is not up; the app still works but forgets streams on restart. `docker compose ps` and check the `db` healthcheck |
+
+For the outbound scraper check, run these on the NAS from the folder with
+`docker-compose.yml`. A DNS result proves name lookup; `curl` should show
+`Connected` and a TLS/HTTP response (even an HTTP 403/404 proves the socket and
+TLS connection worked):
+
+```bash
+docker compose exec vu-movie node --input-type=module -e "import dns from 'node:dns/promises'; for (const host of ['overlook.cx','api6.aoneroom.com']) console.log(host, await dns.lookup(host).catch(e => e.code + ': ' + e.message))"
+docker compose exec vu-movie curl -sSv --connect-timeout 8 -o /dev/null https://overlook.cx/
+docker compose exec vu-movie curl -sSv --connect-timeout 8 -o /dev/null https://api6.aoneroom.com/
+```
+
+If these fail in the container but equivalent `curl` commands work on the NAS
+host, inspect Docker's outbound network/DNS or any NAS firewall/proxy rules. If
+only one host fails, it may be provider-side availability or a provider-specific
+block. Newer scraper logs include nested `fetch failed` causes to distinguish
+DNS, refused connections, TLS, and timeouts.
 
 The hardware capability is cached in `data/config/hwaccel.json`. A *negative*
 entry is ignored on purpose (so a transient problem can never disable

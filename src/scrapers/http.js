@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig } from '../core/config.js';
-import { log } from '../core/log.js';
+import { errorText, log } from '../core/log.js';
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const MAX_BYTES = 25 * 1024 * 1024;
@@ -153,11 +153,24 @@ export async function request(url, opts = {}) {
   }
 
   let lastErr = null;
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : Object.assign(new Error('request aborted'), { name: 'AbortError' });
+  }
   for (let attempt = 0; attempt <= retries; attempt += 1) {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : Object.assign(new Error('request aborted'), { name: 'AbortError' });
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const onAbort = () => controller.abort();
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
     try {
       const res = await fetch(url, {
         method, headers: finalHeaders, body, redirect,
@@ -217,9 +230,10 @@ export async function request(url, opts = {}) {
       };
     } catch (err) {
       lastErr = err;
+      if (signal?.aborted) throw err;
       const isLast = attempt >= retries;
       if (!isLast) {
-        log.warn('http', `${method} ${safeHost(url)} failed (${err.message}) — retry ${attempt + 1}/${retries}`);
+        log.warn('http', `${method} ${safeHost(url)} failed — retry ${attempt + 1}/${retries}`, { error: errorText(err) });
         await sleep(500 * (attempt + 1));
         continue;
       }
@@ -228,7 +242,7 @@ export async function request(url, opts = {}) {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
   }
-  log.error('http', `${method} ${safeHost(url)} failed permanently: ${lastErr?.message}`);
+  log.error('http', `${method} ${safeHost(url)} failed permanently`, { error: errorText(lastErr) });
   throw lastErr || new Error(`request failed: ${url}`);
 }
 
