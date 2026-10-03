@@ -123,6 +123,42 @@ test('browser search accepts current detail URL shapes and normalizes card metad
   assert.equal(results[1].kind, 'series');
 });
 
+test('search normalization accepts matching results that use an id query instead of a title route', () => {
+  const results = normalizeSearchRows([
+    {
+      href: '/?subjectId=12345',
+      title: 'Unabomber: The True Story',
+      text: 'Unabomber: The True Story 1996 6.1',
+      cardText: 'Unabomber: The True Story 1996 6.1',
+    },
+    {
+      href: '/catalog/special-2022',
+      title: 'Unabomber: In His Own Words',
+      text: 'Unabomber: In His Own Words 2022 6.5',
+    },
+    {
+      href: '/search?q=unabomber',
+      title: 'Search for unabomber',
+      text: 'Search for unabomber',
+    },
+  ], {
+    pageUrl: 'https://cinejoy.pk/search/unabomber',
+    baseUrl: 'https://cinejoy.pk/',
+    query: 'unabomber',
+    resultPattern: '/(movie|tv|series|watch)/',
+    siteId: 'cinejoy',
+    siteName: 'Cinejoy',
+  });
+
+  assert.equal(results.length, 2);
+  assert.equal(results[0].title, 'Unabomber: The True Story');
+  assert.equal(results[0].url, 'https://cinejoy.pk/?subjectId=12345');
+  assert.equal(results[0].year, 1996);
+  assert.equal(results[1].title, 'Unabomber: In His Own Words');
+  assert.equal(results[1].url, 'https://cinejoy.pk/catalog/special-2022');
+  assert.equal(results[1].year, 2022);
+});
+
 test('search results inherit poster artwork from matching titles across sources', () => {
   const poster = 'https://image.tmdb.org/t/p/w500/dune.jpg';
   const rows = fillMissingPosters([

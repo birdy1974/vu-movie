@@ -108,14 +108,27 @@ export const log = {
 export function errorText(err) {
   if (!err) return 'unknown error';
   const parts = [];
-  let cur = err;
   const seen = new Set();
-  while (cur && !seen.has(cur)) {
-    seen.add(cur);
-    const code = cur.code ? ` [${cur.code}]` : '';
-    parts.push(`${cur.name || 'Error'}${code}: ${cur.message || cur}`);
-    cur = cur.cause;
-  }
+  const append = (current, depth = 0) => {
+    if (!current || depth > 6) return;
+    if (typeof current !== 'object' && typeof current !== 'function') {
+      parts.push(typeof current === 'string' ? `Error: ${current}` : String(current));
+      return;
+    }
+    if (seen.has(current)) return;
+    seen.add(current);
+    const code = current.code ? ` [${current.code}]` : '';
+    parts.push(`${current.name || 'Error'}${code}: ${current.message || current}`);
+    if (current.cause) append(current.cause, depth + 1);
+    if (Array.isArray(current.errors)) {
+      const nested = current.errors.slice(0, 4);
+      for (const cause of nested) append(cause, depth + 1);
+      if (current.errors.length > nested.length) {
+        parts.push(`… ${current.errors.length - nested.length} additional nested error(s)`);
+      }
+    }
+  };
+  append(err);
   return parts.join(' <- ');
 }
 
