@@ -81,7 +81,12 @@ router.get('/health', wrap(async (req, res) => {
   hardware();
   const hw = hardwareStatus();
   const binaries = binariesStatus() || { ffmpeg: { ok: false, pending: true }, ffprobe: { ok: false, pending: true } };
-  const enigma = cfg('enigma2.host') ? await enigma2.status({ timeoutMs: 3000 }).catch((e) => ({ ok: false, message: errorText(e) })) : { configured: false };
+  // Cached: this endpoint answers the container healthcheck every 30 s and the
+  // dashboard every 15 s, and a receiver should not be woken up that often for
+  // a value that almost never changes.
+  const enigma = cfg('enigma2.host')
+    ? await enigma2.status({ timeoutMs: 3000, maxAgeMs: 60_000 }).catch((e) => ({ ok: false, message: errorText(e) }))
+    : { configured: false };
   res.json({
     ok: true,
     version: process.env.APP_VERSION || '1.0.0',
@@ -158,6 +163,7 @@ router.put('/config', wrap(async (req, res) => {
   log.info('api', 'config update requested', { sections: Object.keys(patch).join(',') });
   const next = saveConfig(patch);
   if (patch.app?.logLevel) setLogLevel(patch.app.logLevel);
+  if (patch.enigma2) enigma2.resetStatusCache();
   res.json({ ok: true, config: publicConfig(), changed: Object.keys(patch) });
 }));
 
@@ -612,7 +618,9 @@ function spawnUpload(localFile, remoteName, remoteDir) {
 /* ---------- enigma2 ---------- */
 
 router.get('/enigma2/status', wrap(async (req, res) => {
-  res.json({ ok: true, status: await enigma2.status() });
+  // Explicit "is the box there?" from the UI: always ask the receiver for real,
+  // never serve the cached answer.
+  res.json({ ok: true, status: await enigma2.status({ force: true }) });
 }));
 
 router.post('/enigma2/preview', wrap(async (req, res) => {
