@@ -287,3 +287,12 @@ docker compose exec vu-movie curl -sS -i --max-time 20 -X POST \
 * connection reset / timeout here too → both MovieBox backends are filtered on this egress; use
   `MOVIEBOX_PROXY` or a VPN.
 * `404` → right host group, wrong prefix (that is the bug this section documents).
+
+
+### One caveat when you set a proxy
+
+A proxy is for *outbound* traffic only. `src/scrapers/http.js` therefore bypasses it for internal
+service names — hostnames without a dot, i.e. Docker Compose and Kubernetes service names such as
+`flaresolverr`, `db` or `vu-movie` (plus loopback and anything in `NO_PROXY`). Without that, setting
+`MOVIEBOX_PROXY` to reach MovieBox would also send the container-to-container FlareSolverr call out
+through the proxy, where `flaresolverr` cannot resolve.

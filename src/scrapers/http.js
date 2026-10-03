@@ -57,12 +57,21 @@ function noProxyList() {
   return String(process.env.NO_PROXY || process.env.no_proxy || 'localhost,127.0.0.1,::1');
 }
 
-function shouldProxy(targetUrl) {
+export function shouldProxy(targetUrl) {
   const proxyUrl = proxyUrlForRequest();
   if (!proxyUrl) return false;
   let host = '';
   try { host = new URL(targetUrl).hostname.toLowerCase(); } catch { return false; }
   if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+  // Internal service names — Docker Compose (`flaresolverr`, `db`) and
+  // Kubernetes (`flaresolverr.default.svc` aside, most are single-label) —
+  // resolve through local cluster DNS only. A forward proxy cannot resolve
+  // them, and the whole point of the proxy is *outbound* traffic, so they
+  // bypass it even when NO_PROXY does not list them. Without this, setting
+  // MOVIEBOX_PROXY / HTTP_PROXY (which this project recommends for the
+  // MovieBox TLS block) silently breaks container-to-container calls such as
+  // the FlareSolverr request.
+  if (host && !host.includes('.')) return false;
   const noProxy = noProxyList().split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   for (const pattern of noProxy) {
     const p = pattern.replace(/^\./, '');
