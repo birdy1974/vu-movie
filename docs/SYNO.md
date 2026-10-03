@@ -174,7 +174,7 @@ the new profile on the next request.
 
 | Symptom | Where to look |
 |---|---|
-| "no media found" while scraping | Logs page → filter `browser`. FlareSolverr starts with the project, listens on container port `8192`, and is published on NAS port `8192` by default; inspect it with `docker compose logs -f flaresolverr`. Challenged searches retry through its API; outbound DNS/network failures still need to be fixed separately. |
+| "no media found" while scraping | Logs page → filter `browser`. FlareSolverr starts with the project, listens on container port `8192`, and is published on NAS port `8193` by default (`FLARESOLVERR_HOST_PORT`); inspect it with `docker compose logs -f flaresolverr`. Challenged searches retry through its API; outbound DNS/network failures still need to be fixed separately. |
 | Resolve ends with zero candidates; browser reports `ERR_CONNECTION_REFUSED` and MovieBox reports `fetch failed` | These are outbound HTTPS failures from the app container, separate from Enigma2 reachability. Check DNS and HTTPS from inside `vu-movie` using the commands below; if both providers fail, check NAS/Docker egress, DNS, firewall, or proxy configuration. A reachable FlareSolverr container does not by itself provide a general proxy. |
 | Stream plays but stops after a while | `relay` logs: most upstream URLs expire. Increase `TOKEN_TTL_MINUTES`, or use *Transcode* so the app owns the connection and re-fetches |
 | VLC shows a black screen | Copy the ffmpeg command from the Stream page and run it inside the container: `docker compose exec vu-movie sh -c '<command> > /tmp/x.ts'` — the error message is always in the last lines |
