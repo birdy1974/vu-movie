@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   isNetworkNavigationError, isSameSiteNavigation, flaresolverrEndpoint, parseFlareSolverrResult, looksLikeMedia,
+  describeFlareSolverrError,
 } from '../src/scrapers/browser.js';
 
 test('browser navigation reachability errors are recognized as terminal', () => {
@@ -51,4 +52,37 @@ test('FlareSolverr endpoint and solved page responses are validated', () => {
     status: 'ok', solution: { url: 'https://youtube.com/', response: '<html></html>' },
   }, 'https://cinevo.nl/search?q=dune'), /redirected the search off-site/i);
   assert.throws(() => parseFlareSolverrResult({ status: 'error', message: 'blocked' }, 'https://cinevo.nl/'), /blocked/);
+});
+
+test('FlareSolverr failures are translated into a cause plus a fix', () => {
+  // The crash loop from `docker compose logs flaresolverr`: FlareSolverr tests
+  // its own Chromium on boot and exits when the test fails, so every request
+  // afterwards fails. Naming the fix (shm_size / memory) is the whole point.
+  const bootFailure = describeFlareSolverrError(
+    'Error getting browser User-Agent. HTTPConnectionPool(host=\'localhost\', port=43339): Read timed out. (read timeout=120)',
+    { endpoint: 'http://flaresolverr:8192/v1' },
+  );
+  assert.match(bootFailure, /Chromium did not start/);
+  assert.match(bootFailure, /crash-looping/);
+  assert.match(bootFailure, /shm_size: 512m/);
+  assert.match(bootFailure, /flaresolverr:8192/);
+
+  assert.match(describeFlareSolverrError('Message: session not created: cannot connect to chrome at 127.0.0.1:39814'), /Chromium did not start/);
+  assert.match(describeFlareSolverrError('Message: Can not connect to the Service /app/chromedriver'), /Chromium did not start/);
+
+  // A solver that is up but slow is a different problem with a different fix.
+  const timeout = describeFlareSolverrError('Error solving the challenge. Timeout after 30.0 seconds.');
+  assert.match(timeout, /timed out solving the challenge/);
+  assert.doesNotMatch(timeout, /crash-looping/);
+
+  // Transport vs HTTP: "is the container up" vs "is the URL right".
+  assert.match(describeFlareSolverrError('connect ECONNREFUSED 172.20.0.4:8192'), /not reachable/);
+  assert.match(describeFlareSolverrError('HTTP 500'), /HTTP 500/);
+  assert.match(describeFlareSolverrError('HTTP 500'), /logs flaresolverr/);
+  assert.match(describeFlareSolverrError('HTTP 404'), /FLARESOLVERR_URL/);
+
+  // FlareSolverr's own message field is used when present, and an empty
+  // failure still produces a sentence rather than `undefined`.
+  assert.match(describeFlareSolverrError({ message: 'Error: Sorry, FlareSolverr has crashed' }), /FlareSolverr failed/);
+  assert.match(describeFlareSolverrError(null), /without returning a reason/);
 });

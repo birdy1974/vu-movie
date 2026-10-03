@@ -79,7 +79,9 @@ site-specific path. **Recommendation: (b) by default, (a) as an optimisation lat
 
 **Optional Layer 4 — external extractor hook.** A Stremio addon endpoint or cinepro-style API can be
 configured as a provider in settings. FlareSolverr is a separate service that Compose starts automatically
-and listens on container port 8192, published on host port 8193 by default. Challenged searches retry through its API.
+and listens on container port 8192, published on host port 8193 by default. Challenged searches retry through
+its API; when the solver is down (its own Chromium failing to start, for instance) the app keeps running and
+logs "FlareSolverr is not reachable / its Chromium did not start" with the fix instead of returning 0 results.
 
 **MovieBox (you explicitly asked for this one):** implemented natively — visitor-login token + HMAC-MD5
 signed requests + host-pool retry, exactly as the reference client does it, in TypeScript against the same
@@ -187,7 +189,7 @@ and the UI tells you which one the box will actually use.
 | Your requirement | How it is handled |
 |---|---|
 | Complete Dockerfile with Chromium, FFmpeg, VAAPI | multi-stage `node:22-bookworm-slim`; contrib/non-free enabled in *both* source formats (`debian.sources` deb822 + classic `*.list`); apt: `ffmpeg`, `chromium`, `libva2`, `libva-drm2`, `vainfo`, `intel-media-va-driver-non-free` (iHD) with `i965-va-driver` fallback, `p7zip-full` (provides `/usr/bin/7z`, with the `7zip` package as fallback), `unrar` (non-free, RAR4/RAR5) with `unrar-free` fallback, `unzip`, `ca-certificates`; optional packages go through a tolerant installer, so a renamed package (e.g. bookworm's `libva-utils` → `vainfo`) no longer fails the build, while `ffmpeg`/`ffprobe`/`chromium`/`tini` are verified at build time; `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` + `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` (system Chromium — no 300 MB download) |
-| `docker-compose.yml` with PostgreSQL + app, `/dev/dri` | 3 services (`vu-movie`, `db`, always-on `flaresolverr` published on host port 8193), `devices: [/dev/dri:/dev/dri]`, healthchecks, `depends_on: service_healthy`, named volumes for `pgdata`, `/downloads`, `/config`, `/cache` |
+| `docker-compose.yml` with PostgreSQL + app, `/dev/dri` | 3 services (`vu-movie`, `db`, always-on `flaresolverr` published on host port 8193), `devices: [/dev/dri:/dev/dri]`, healthchecks with `start_period`, `depends_on: service_healthy` for the database only (FlareSolverr is an optional sidecar: `service_started`, so a crash-looping solver can never stop the app), `shm_size` + ~1.2 GB for the solver's Chromium, log rotation on every service, named volumes for `pgdata`, `/downloads`, `/config`, `/cache` |
 | Optimised for J3455 / HD Graphics 500 | 1 browser + 1 transcode concurrency by default, `shm_size: 512mb` for Chromium, memory limits, `LIBVA_DRIVER_NAME` auto-detected at boot, `MALLOC_ARENA_MAX=2` |
 | Detailed logging & comments | `pino` structured logs, per component (`scraper`, `browser`, `resolver`, `transcode`, `subtitles`, `enigma2`, `db`, `hwaccel`), every stage logs latency + reason for rejection, ffmpeg stderr mirrored, `/api/health` JSON, log viewer page with filters |
 | `package-lock.json` / failing Docker build | `npm ci` **needs** the lockfile → the repo ships a committed `package-lock.json` (generated with `npm install --package-lock-only`); Dockerfile falls back to `npm install` with a clear warning if a lockfile is ever missing, so a build never dies on that |

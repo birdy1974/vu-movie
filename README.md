@@ -204,6 +204,14 @@ The ones that matter most on a DS918+:
   solved page is parsed as static HTML and its cookies are imported into that
   site's browser context. Do not forward this unauthenticated API to the public
   Internet.
+  It is a **sidecar, not a dependency**: the app starts without it (only
+  Cloudflare-protected sources degrade, with a "FlareSolverr is not reachable"
+  log line). The service runs with `shm_size: 512m` and a 1.2 GB memory limit
+  because Chromium cannot start in Docker's 64 MB `/dev/shm` default — the
+  symptom when it can't is `Error getting browser User-Agent … Read timed out`
+  and a container that restart-loops. `sh scripts/doctor.sh` section 6 checks
+  all of that (restart count, `/dev/shm` size, reachable API) for you; to pin a
+  known-good image set `FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21`.
 * Health: `GET /api/health` (also wired into the container healthcheck).
 
 ```bash

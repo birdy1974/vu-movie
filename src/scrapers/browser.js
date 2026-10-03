@@ -795,6 +795,50 @@ export function parseFlareSolverrResult(payload, requestedUrl) {
   };
 }
 
+/**
+ * Turn a FlareSolverr failure into a hint an operator can act on.
+ *
+ * From out here every solver failure used to look the same ("FlareSolverr
+ * could not recover <site> search"), even though the underlying causes are
+ * completely different and have completely different fixes:
+ *
+ *   - Chromium inside the solver never started. FlareSolverr tests its browser
+ *     on boot (`test_browser_installation()`), and when that test fails it
+ *     *exits* — so the container restart-loops and every `request.get` fails.
+ *     The log says "Error getting browser User-Agent …". In Docker the cause is
+ *     nearly always the 64 MB `/dev/shm` default (Chrome hangs or dies in it)
+ *     or a memory limit below ~1 GB.
+ *   - The challenge page timed out (slow NAS, starved container, real
+ *     challenge) — nothing is broken, it just needs more time/CPU.
+ *   - A plain HTTP status — wrong URL/port, or the solver really is down.
+ */
+export function describeFlareSolverrError(error, { endpoint = null } = {}) {
+  const message = String(error?.message ?? error ?? '').replace(/\s+/g, ' ').trim();
+  if (!message) return 'FlareSolverr failed without returning a reason';
+  const where = endpoint ? ` at ${endpoint}` : '';
+  const short = (limit = 160) => message.slice(0, limit);
+
+  if (/error getting browser user-agent|test_browser_installation|can not connect to the service|session not created|unexpectedly exited|chrome(?:driver)? (?:failed|is not reachable)|unable to (?:start|open) (?:the )?browser/i.test(message)) {
+    return `FlareSolverr's own Chromium did not start${where} — its container is crash-looping (${short()}). `
+      + 'Run `docker compose logs flaresolverr`; in Docker this is almost always /dev/shm still at the 64 MB default '
+      + '(add `shm_size: 512m` to the flaresolverr service) or a memory limit below ~1 GB';
+  }
+  if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|socket hang up|fetch failed|terminated/i.test(message)) {
+    return `FlareSolverr is not reachable${where} (${short(120)}) — start the flaresolverr container (\`docker compose up -d flaresolverr\`) or fix FLARESOLVERR_URL`;
+  }
+  if (/timed out|timeout|maxtimeout|readtimeout/i.test(message)) {
+    return `FlareSolverr timed out solving the challenge${where} (${short(120)}) — the solver container is slow or starved of CPU/RAM; see \`docker compose logs flaresolverr\``;
+  }
+  const httpStatus = message.match(/HTTP\s+(\d{3})/i)?.[1];
+  if (httpStatus) {
+    if (Number(httpStatus) >= 500) {
+      return `FlareSolverr answered HTTP ${httpStatus}${where} — its browser or API is failing internally (${short(120)}); check \`docker compose logs flaresolverr\``;
+    }
+    return `FlareSolverr answered HTTP ${httpStatus}${where} — check FLARESOLVERR_URL (container-to-container, e.g. http://flaresolverr:8192) and the published port`;
+  }
+  return `FlareSolverr failed${where}: ${short(200)}`;
+}
+
 function flareSolverrCookies(cookies, pageUrl) {
   const out = [];
   for (const cookie of cookies || []) {
@@ -830,7 +874,13 @@ async function requestFlareSolverr(url, { signal = null } = {}) {
     retries: 0,
     signal,
   });
-  if (!response.ok) throw new Error(response.error || `FlareSolverr HTTP ${response.status}`);
+  if (!response.ok) {
+    // Prefer FlareSolverr's own `message` (it explains *why* it failed) but
+    // always fall back to the transport error, then translate both into a
+    // cause+named fix instead of a bare "FlareSolverr HTTP 500".
+    const reason = response.data?.message || response.error || `HTTP ${response.status}`;
+    throw new Error(describeFlareSolverrError(reason, { endpoint }));
+  }
   return parseFlareSolverrResult(response.data, url);
 }
 
@@ -1160,9 +1210,9 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       const probe = await request(healthUrl, { method: 'GET', timeoutMs: 3000, retries: 0, json: true, allowFailure: true });
       if (probe.ok) return { configured: true, ok: true, version: probe.data?.version || probe.data?.message || 'ok' };
       if (probe.status === 404) return { configured: true, ok: true, version: 'unknown (no /health endpoint)' };
-      return { configured: true, ok: false, error: `HTTP ${probe.status}` };
+      return { configured: true, ok: false, error: describeFlareSolverrError(probe.data?.message || `HTTP ${probe.status}`, { endpoint: healthUrl }) };
     } catch (err) {
-      return { configured: true, ok: false, error: errorText(err) };
+      return { configured: true, ok: false, error: describeFlareSolverrError(errorText(err), { endpoint }) };
     }
   }
 
@@ -1223,7 +1273,9 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       if (challengePage()) {
         const solverProbe = await probeFlareSolverr();
         if (solverProbe.configured && !solverProbe.ok) {
-          flareSolverrError = `FlareSolverr is configured at ${flaresolverrEndpoint()} but unreachable (${solverProbe.error}) — start the flaresolverr container or fix FLARESOLVERR_URL`;
+          // solverProbe.error is already a full "cause + what to do" sentence
+          // (see describeFlareSolverrError) — don't wrap it in a second guess.
+          flareSolverrError = solverProbe.error;
           log.warn('browser', `FlareSolverr liveness probe failed for ${site.name}`, { error: flareSolverrError });
         } else if (solverProbe.configured && solverProbe.ok) {
           try {

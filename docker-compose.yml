@@ -107,8 +107,14 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      # FlareSolverr is an *optional* sidecar: the app must start even when the
+      # solver's Chromium refuses to boot (that is a crash-loop, not a vu-movie
+      # failure). Gating startup on `condition: service_healthy` here turned a
+      # broken Cloudflare solver into "the whole app never comes up", so we only
+      # ask Compose to start it and let the scraper degrade gracefully with a
+      # "FlareSolverr is not reachable" log line.
       flaresolverr:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 30s
@@ -157,7 +163,10 @@ services:
   # reachable the scraper logs a clear error instead of returning the
   # interstitial as an empty "0 results" response.
   flaresolverr:
-    image: flaresolverr/flaresolverr:latest
+    # Pin a tag (FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21) if a new
+    # `latest` ever breaks on your box — FlareSolverr has shipped releases whose
+    # Chromium/undetected-chromedriver pairing did not start at all.
+    image: ${FLARESOLVERR_IMAGE:-flaresolverr/flaresolverr:latest}
     container_name: vu-movie-flaresolverr
     restart: unless-stopped
     environment:
@@ -166,13 +175,25 @@ services:
       TZ: "${TZ:-Europe/Amsterdam}"
     ports:
       - "${FLARESOLVERR_HOST_PORT:-8193}:8192"
-    mem_limit: 800m
+    # Chromium needs more shared memory than Docker's 64 MB default. Without
+    # this the browser hangs inside `test_browser_installation()` and
+    # FlareSolverr dies with "Error getting browser User-Agent … Read timed
+    # out" and restart-loops every ~7 minutes. (Same reason the app service
+    # sets shm_size.)
+    shm_size: "${FLARESOLVERR_SHM_SIZE:-512m}"
+    # Chromium + Python + xvfb need roughly 1 GB; 800 MB was enough to make the
+    # first browser launch exceed the 120 s chromedriver timeout on a J3455.
+    mem_limit: "${FLARESOLVERR_MEM_LIMIT:-1200m}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8192/health"]
       interval: 20s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      # Cold-starting Chromium on an Apollo Lake NAS can take a minute.
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     networks: [vu-movie]
 
 volumes:
