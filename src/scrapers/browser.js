@@ -18,7 +18,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { log, logError } from '../core/log.js';
+import { log, logError, errorText } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { sleep, safeHost, resolveUrl, request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
@@ -219,6 +219,7 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
 
   const media = new Map(); // url → record
   const apis = new Map();
+  const pendingJsonSettles = []; // promises mining JSON bodies for m3u8 URLs (awaited at end)
   const consoleErrors = [];
   const failedDocumentRequests = [];
 
@@ -267,10 +268,42 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
           });
           log.debug('browser', `media found (${kind}): ${u.slice(0, 160)}`);
         }
-      } else if (captureJson && /application\/json|text\/json/i.test(ct) && media.size === 0) {
+      } else if (captureJson && /application\/json|text\/json/i.test(ct)) {
         const len = Number(res.headers()['content-length'] || 0);
-        if (len && len < 600_000) {
-          apis.set(u, { url: u, status: res.status(), at: new Date().toISOString() });
+        if ((len === 0 || len < 600_000) && media.size < 12) {
+          // Some players (RabbitStream, UpCloud, VidCloud, the flixer clones'
+          // /ajax/player endpoints) don't set the video src directly; instead
+          // they POST to a JSON API that returns { sources: [{ file: "...m3u8" }] }.
+          // Mine those payloads for m3u8/dash URLs so we don't miss them just
+          // because they arrived over XHR rather than as a media request.
+          if (media.size === 0) apis.set(u, { url: u, status: res.status(), at: new Date().toISOString() });
+          const settle = (async () => {
+            try {
+              const body = await res.text().catch(() => '');
+              const matches = String(body || '').match(/https?:\/\/[^\s"']+?\.(?:m3u8|mpd)(?:\?[^\s"']*)?/gi) || [];
+              if (!matches.length) return;
+              let reqHeaders;
+              try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }
+              for (const raw of matches.slice(0, 5)) {
+                const found = raw.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                if (media.has(found)) continue;
+                const isDash = /\.mpd(?:\?|#|$)/i.test(found);
+                media.set(found, {
+                  url: found,
+                  kind: isDash ? 'dash' : 'hls',
+                  via: 'json-api',
+                  referer: reqHeaders.referer || reqHeaders.Referer || p.url() || url,
+                  contentType: isDash ? 'application/dash+xml' : 'application/vnd.apple.mpegurl',
+                  status: res.status(),
+                  headers: reqHeaders,
+                  foundAt: new Date().toISOString(),
+                  sourceApi: u,
+                });
+                log.info('browser', `mined ${isDash ? 'DASH' : 'HLS'} URL from JSON API response (${safeHost(u)})`, { url: found.slice(0, 160) });
+              }
+            } catch { /* ignore */ }
+          })();
+          pendingJsonSettles.push(settle);
         }
       }
     });
@@ -355,6 +388,16 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       await sleep(250);
     }
 
+    // Give in-flight JSON API response bodies a moment to settle so the
+    // m3u8-mining above catches manifests that arrived via XHR just as the
+    // wait loop was exiting. Cap it at 2 s so we don't extend the sniff.
+    if (pendingJsonSettles.length) {
+      await Promise.race([
+        Promise.allSettled(pendingJsonSettles),
+        sleep(2000),
+      ]);
+    }
+
     result.finalUrl = page.url();
     result.title = await page.title().catch(() => null);
     result.media = [...media.values()];
@@ -365,15 +408,29 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     result.ok = result.media.length > 0;
     if (!result.ok) {
       result.error = navigationError ? `navigation issue: ${navigationError}` : undefined;
-      result.note = navigationError
-        ? `page navigation did not complete: ${navigationError}`
-        : 'no media response observed — the page may need a click, a login, or a different player URL';
+      // Diagnose the most common failure modes from what we observed, so the
+      // log / UI can give the operator an actionable hint instead of the
+      // generic "may need a click".
+      const consoleJoin = consoleErrors.slice(0, 5).join(' | ').toLowerCase();
+      const netJoin = result.networkErrors.map((e) => `${e.host}:${e.error}`).join(' | ').toLowerCase();
+      const allSignals = `${consoleJoin} ${netJoin}`;
+      if (/err_connection_refused|err_failed|err_connection_reset/.test(allSignals) && !navigationError) {
+        // Page loaded but the player iframe / API host refused connections —
+        // almost always means the source's CDN/embed is dead, geo-blocked,
+        // or blocked by the container's network (DNS/proxy/firewall).
+        result.note = 'page loaded but the embedded player is unreachable (connection refused / failed) — the CDN/embed host may be dead, geo-blocked, or blocked by DNS';
+      } else if (navigationError) {
+        result.note = `page navigation did not complete: ${navigationError}`;
+      } else {
+        result.note = 'no media response observed — the page may need a click, a login, or a different player URL';
+      }
       log.warn('browser', `no media found on ${safeHost(url)} after ${Date.now() - started} ms`, {
         finalUrl: result.finalUrl.slice(0, 200),
         title: result.title,
         navigationError,
         failedRequests: result.networkErrors,
         consoleErrors: consoleErrors.slice(0, 3),
+        diagnosedNote: result.note,
       });
     }
   } catch (err) {
@@ -900,6 +957,56 @@ export async function searchSite(siteOrOpts, maybeQuery) {
     return out;
   }).catch(() => []);
 
+  // Flixer-clone sites (1flex, cinezo, …) routinely fire ad pop-under scripts
+  // that replace the page with youtube.com / random ad landers within a few
+  // hundred ms of load. We intercept that navigation, but Chromium then shows
+  // an ERR_BLOCKED_BY_CLIENT error page and the original DOM is gone. To avoid
+  // losing results we snapshot links as soon as domcontentloaded fires, and we
+  // retry the navigation once after an intercepted off-site redirect (the pop
+  // script usually only fires on the first load of a fresh tab).
+  let earlyRows = [];
+  let earlyRowsCaptured = false;
+  const captureEarlyRows = async () => {
+    if (earlyRowsCaptured) return;
+    earlyRowsCaptured = true;
+    const snapshot = await collectRows().catch(() => []);
+    if (snapshot.length > 0) {
+      earlyRows = snapshot;
+      log.debug('browser', `${site.name}: captured ${snapshot.length} link(s) at domcontentloaded (pre-hydration)`);
+    }
+  };
+  page.on('domcontentloaded', () => { captureEarlyRows().catch(() => {}); });
+
+  /**
+   * Quick liveness probe for FlareSolverr so we can tell the operator
+   * "FlareSolverr is not reachable at http://…" instead of showing the generic
+   * "no usable result links" message against a Cloudflare interstitial.
+   */
+  async function probeFlareSolverr() {
+    const endpoint = flaresolverrEndpoint();
+    if (!endpoint) return { configured: false };
+    try {
+      const healthUrl = endpoint.replace(/\/v1$/, '/health');
+      const probe = await request(healthUrl, { method: 'GET', timeoutMs: 3000, retries: 0, json: true, allowFailure: true });
+      if (probe.ok) return { configured: true, ok: true, version: probe.data?.version || probe.data?.message || 'ok' };
+      if (probe.status === 404) return { configured: true, ok: true, version: 'unknown (no /health endpoint)' };
+      return { configured: true, ok: false, error: `HTTP ${probe.status}` };
+    } catch (err) {
+      return { configured: true, ok: false, error: errorText(err) };
+    }
+  }
+
+  const performSearchNavigation = async (navUrl, { attempt = 1 } = {}) => page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch((err) => {
+    if (opts.signal?.aborted) throw abortError(opts.signal);
+    if (blockedOffsiteNavigation) {
+      log.warn('browser', `${site.name} search navigation hit an off-site redirect (attempt ${attempt})`, {
+        destination: safeHost(blockedOffsiteNavigation), error: err.message,
+      });
+      return null;
+    }
+    throw err;
+  });
+
   try {
     log.info('browser', `searching ${site.name} for "${query}"`, { url: url.slice(0, 200) });
     await page.route('**/*', async (route) => {
@@ -919,15 +1026,21 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       await route.continue().catch(() => {});
     });
 
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch((err) => {
-      if (opts.signal?.aborted) throw abortError(opts.signal);
-      if (!blockedOffsiteNavigation) throw err;
-      log.warn('browser', `${site.name} search navigation stopped at an off-site redirect`, {
-        destination: safeHost(blockedOffsiteNavigation), error: err.message,
-      });
-      return null;
-    });
+    let response = await performSearchNavigation(url);
     if (opts.signal?.aborted) throw abortError(opts.signal);
+
+    // If the first navigation was torpedoed by a pop-under *before* our
+    // domcontentloaded snapshot had a chance to run, blank the tab and try once
+    // more — ad scripts usually only fire on the first page load of a tab.
+    if (blockedOffsiteNavigation && earlyRows.length === 0) {
+      log.info('browser', `${site.name}: reloading search page once after blocked off-site redirect`);
+      earlyRowsCaptured = false;
+      blockedOffsiteNavigation = null;
+      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
+      response = await performSearchNavigation(url, { attempt: 2 });
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+    }
+
     status = response?.status?.() ?? null;
     if (isSameSiteNavigation(page.url(), url)) searchPageUrl = page.url();
 
@@ -937,33 +1050,42 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       .test(`${pageTitle || ''} ${initialBodyText.slice(0, 500)}`);
     if (status === 403 || status === 429 || challengePage()) {
       initialBodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
-      if (challengePage() && flaresolverrEndpoint()) {
-        try {
-          log.info('browser', `trying FlareSolverr for ${site.name} search`, { host: safeHost(url), status });
-          const solution = await requestFlareSolverr(url, { signal: opts.signal });
-          if (opts.signal?.aborted) throw abortError(opts.signal);
-          const cookies = flareSolverrCookies(solution.cookies, solution.url);
-          if (cookies.length) {
-            await ctx.addCookies(cookies).catch((err) => {
-              log.warn('browser', `could not import FlareSolverr cookies for ${site.name}`, { error: err.message });
+      if (challengePage()) {
+        const solverProbe = await probeFlareSolverr();
+        if (solverProbe.configured && !solverProbe.ok) {
+          flareSolverrError = `FlareSolverr is configured at ${flaresolverrEndpoint()} but unreachable (${solverProbe.error}) — start the flaresolverr container or fix FLARESOLVERR_URL`;
+          log.warn('browser', `FlareSolverr liveness probe failed for ${site.name}`, { error: flareSolverrError });
+        } else if (solverProbe.configured && solverProbe.ok) {
+          try {
+            log.info('browser', `trying FlareSolverr for ${site.name} search`, { host: safeHost(url), status, solver: solverProbe.version });
+            const solution = await requestFlareSolverr(url, { signal: opts.signal });
+            if (opts.signal?.aborted) throw abortError(opts.signal);
+            const cookies = flareSolverrCookies(solution.cookies, solution.url);
+            if (cookies.length) {
+              await ctx.addCookies(cookies).catch((cErr) => {
+                log.warn('browser', `could not import FlareSolverr cookies for ${site.name}`, { error: cErr.message });
+              });
+            }
+            // Search only needs the rendered DOM. Strip scripts so the returned
+            // third-party HTML cannot navigate or run twice in our context.
+            const staticHtml = solution.html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+            await page.setContent(staticHtml, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+            searchPageUrl = solution.url;
+            status = solution.status ?? status;
+            pageTitle = await page.title().catch(() => null);
+            initialBodyText = '';
+            usedFlareSolverr = true;
+            log.info('browser', `FlareSolverr returned ${site.name} search page`, {
+              status, cookies: cookies.length, url: searchPageUrl.slice(0, 180),
             });
+          } catch (err) {
+            if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
+            flareSolverrError = String(err?.message || err);
+            log.warn('browser', `FlareSolverr could not recover ${site.name} search`, { error: flareSolverrError });
           }
-          // Search only needs the rendered DOM. Strip scripts so the returned
-          // third-party HTML cannot navigate or run twice in our context.
-          const staticHtml = solution.html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
-          await page.setContent(staticHtml, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-          searchPageUrl = solution.url;
-          status = solution.status ?? status;
-          pageTitle = await page.title().catch(() => null);
-          initialBodyText = '';
-          usedFlareSolverr = true;
-          log.info('browser', `FlareSolverr returned ${site.name} search page`, {
-            status, cookies: cookies.length, url: searchPageUrl.slice(0, 180),
-          });
-        } catch (err) {
-          if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
-          flareSolverrError = String(err?.message || err);
-          log.warn('browser', `FlareSolverr could not recover ${site.name} search`, { error: flareSolverrError });
+        } else {
+          flareSolverrError = `${safeHost(url)} is showing a Cloudflare / bot challenge, but FLARESOLVERR_URL is not configured — set it (see docker-compose.yml) or visit the site manually once to get a clearance cookie`;
+          log.warn('browser', `${site.name} blocked by bot protection and FlareSolverr is not configured`);
         }
       }
     }
@@ -984,7 +1106,19 @@ export async function searchSite(siteOrOpts, maybeQuery) {
     const rows = await collectRows();
     if (opts.signal?.aborted) throw abortError(opts.signal);
     rawLinkCount = rows.length;
-    results.push(...normalizeSearchRows(rows, {
+    // Merge in the pre-hydration snapshot. If the live DOM was torn down by an
+    // intercepted ad-redirect, rows may be empty while earlyRows still has the
+    // real results. De-dupe happens by URL inside normalizeSearchRows (Map),
+    // but we also seed with the later/hydrated rows first because they have
+    // richer metadata (lazy posters, year, rating).
+    const mergedRows = [...rows];
+    if (earlyRows.length && earlyRows.length > rows.length) {
+      log.debug('browser', `${site.name}: using pre-hydration snapshot to supplement results`, {
+        liveRows: rows.length, earlyRows: earlyRows.length,
+      });
+      for (const row of earlyRows) mergedRows.push(row);
+    }
+    results.push(...normalizeSearchRows(mergedRows, {
       pageUrl: searchPageUrl,
       baseUrl: opts.baseUrl || url,
       query,
@@ -1005,13 +1139,18 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       const pageLooksUnavailable = status >= 400
         || /\b404\b|page not found|does not exist|bad gateway|just a moment|security verification|verify you are human|access denied|captcha/i.test(`${pageTitle || ''} ${bodyText.slice(0, 500)}`);
       if (blockedOffsiteNavigation) {
-        error = `search page redirected off-site to ${safeHost(blockedOffsiteNavigation)}`;
+        error = `search page redirected off-site to ${safeHost(blockedOffsiteNavigation)} (likely a pop-under/ad script); the site may be parked, dead, or behind a captcha`;
       } else if (pageLooksUnavailable) {
         error = `search page unavailable${status ? ` (HTTP ${status})` : ''}${pageTitle ? `: ${pageTitle}` : ''}`;
       } else if (rawLinkCount > 0) {
         error = `search page exposed ${rawLinkCount} candidate link(s), but none matched the result filters`;
       }
-      if (flareSolverrError && error) error += `; FlareSolverr fallback failed: ${flareSolverrError}`;
+      if (flareSolverrError) {
+        // The FlareSolverr message is the most actionable hint we have — make
+        // sure it surfaces even when no other error branch fired (e.g. the page
+        // rendered an empty body after a bot challenge we couldn't solve).
+        error = error ? `${error}; ${flareSolverrError}` : flareSolverrError;
+      }
       log.warn('browser', `${site.name}: no usable result links for "${query}"`, {
         status, title: pageTitle, links: rawLinkCount,
         finalUrl: searchPageUrl.slice(0, 180),

@@ -115,19 +115,62 @@ export function matchSourceByUrl(url) {
 /* ---------------- health bookkeeping (shown on the dashboard) ---------------- */
 
 const health = new Map();
+/**
+ * Failure classification — only "hard" outages (captcha blocks, parked sites,
+ * TLS reset across all hosts) trip the circuit breaker; a normal zero-results
+ * response or transient HTTP 5xx just increments `failures` without backing off.
+ */
+const CIRCUIT_BREAK_ERR_PATTERNS = [
+  /just a moment|security verification|verify you are human|captcha|cloudflare/i,
+  /blocked by bot protection/i,
+  /redirected off-site|pop-under\/ad/i,
+  /FlareSolverr/i,
+  /visitor-login failed.*TLS|all hosts closed the connection/i,
+];
+const BACKOFF_SCHEDULE_MS = [0, 0, 60_000, 5 * 60_000, 30 * 60_000]; // failures → cooldown
+const CIRCUIT_COOLDOWN_RESET_MS = 15 * 60_000; // reset failure count after 15 min of quiet
+function shouldTripCircuit(message) {
+  const text = String(message || '');
+  return CIRCUIT_BREAK_ERR_PATTERNS.some((re) => re.test(text));
+}
 function noteHealth(id, ok, message) {
-  const prev = health.get(id) || { id, ok: null, checks: 0, failures: 0 };
+  const prev = health.get(id) || { id, ok: null, checks: 0, failures: 0, cooldownUntil: 0, lastFailureAt: 0 };
+  const now = Date.now();
+  let failures = ok ? 0 : prev.failures + 1;
+  // Reset failure count if the source was healthy again for long enough.
+  if (!ok && prev.lastFailureAt && now - prev.lastFailureAt > CIRCUIT_COOLDOWN_RESET_MS) failures = 1;
+  const tripped = !ok && shouldTripCircuit(message);
+  const tier = Math.min(failures, BACKOFF_SCHEDULE_MS.length - 1);
+  const cooldownMs = tripped ? BACKOFF_SCHEDULE_MS[tier] : 0;
+  const cooldownUntil = tripped ? now + cooldownMs : 0;
   health.set(id, {
     ...prev,
     ok,
-    message,
+    message: message || (ok ? 'ok' : prev.message),
     checks: prev.checks + 1,
-    failures: ok ? 0 : prev.failures + 1,
+    failures,
+    tripped,
+    cooldownUntil,
+    backoffSeconds: cooldownMs ? Math.round(cooldownMs / 1000) : 0,
     lastCheck: new Date().toISOString(),
+    lastFailureAt: ok ? prev.lastFailureAt : now,
+    lastSuccessAt: ok ? now : prev.lastSuccessAt || null,
   });
 }
+/** Returns true when a source is currently in its circuit-breaker cooldown. */
+export function isSourceCoolingDown(id) {
+  const h = health.get(id);
+  return Boolean(h?.cooldownUntil && Date.now() < h.cooldownUntil);
+}
 export function healthOf(id) {
-  return health.get(id) || { id, ok: null, checks: 0, failures: 0, message: 'not used yet' };
+  const h = health.get(id);
+  if (!h) return { id, ok: null, checks: 0, failures: 0, message: 'not used yet', coolingDown: false };
+  return { ...h, coolingDown: Boolean(h.cooldownUntil && Date.now() < h.cooldownUntil) };
+}
+/** Manually reset a source's circuit breaker (called from the UI / /api/health reset). */
+export function resetSourceHealth(id = null) {
+  if (id) health.delete(id);
+  else health.clear();
 }
 
 /* ---------------- search ---------------- */
@@ -254,6 +297,21 @@ function posterTitleKey(value) {
     .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+/**
+ * Strip a trailing parenthesised year (e.g. "Unabomber (2022)") from a title so
+ * that a site returning the title with the year and one returning it without
+ * land in the same grouping bucket. Also strips common quality/edition tags
+ * (HD, 4K, "free", etc.) that sites append to titles.
+ */
+export function canonicalTitleKey(value) {
+  let t = posterTitleKey(value);
+  // posterTitleKey strips parens to spaces → "unabomber (2022)" becomes
+  // "unabomber 2022". Strip a trailing 4-digit year with or without parens.
+  t = t.replace(/\s+(?:19|20)\d{2}\s*$/, '').trim();
+  t = t.replace(/\s+(?:hd|4k|uhd|1080p|720p|480p|free|online|watch|movie|series)$/, '').trim();
+  return t;
+}
+
 function normalizedPosterUrl(result) {
   if (!result?.poster) return '';
   try {
@@ -305,27 +363,63 @@ export function fillMissingPosters(results) {
 /** Fill absent metadata from an exact title/year/type match on another source. */
 export function fillMissingMetadata(results) {
   const byExactTitle = new Map();
+  const byCanonicalTitle = new Map();
   const sourceRank = (sourceId) => sourceId === 'overlook' ? 3 : sourceId === 'moviebox' ? 2 : 1;
   const fields = ['rating', 'genres', 'runtime', 'description', 'releaseDate', 'language'];
   const hasValue = (result, field) => field === 'genres'
     ? Array.isArray(result[field]) && result[field].length > 0
     : result[field] != null && result[field] !== '';
+  const hasYear = (r) => Number.isFinite(Number(r?.year)) && Number(r.year) > 1800;
 
   for (const result of results) {
     const title = posterTitleKey(result.title);
-    if (!title || !fields.some((field) => hasValue(result, field))) continue;
-    const key = `${title}|${result.year || ''}|${String(result.kind || '').toLowerCase()}`;
-    const matches = byExactTitle.get(key) || [];
-    matches.push(result);
-    byExactTitle.set(key, matches);
+    const canon = canonicalTitleKey(result.title);
+    const kind = String(result.kind || '').toLowerCase();
+    if (title) {
+      const exactKey = `${title}|${result.year || ''}|${kind}`;
+      const exact = byExactTitle.get(exactKey) || [];
+      exact.push(result);
+      byExactTitle.set(exactKey, exact);
+    }
+    if (canon) {
+      const canonKey = `${canon}|${kind}`;
+      const c = byCanonicalTitle.get(canonKey) || [];
+      c.push(result);
+      byCanonicalTitle.set(canonKey, c);
+    }
+  }
+
+  // Best year per canonical title+kind: pick the most common numeric year so
+  // that a year-less "Unabomber" from site A inherits 2022 from site B/C/D.
+  const inferredYear = new Map(); // canonKey → best year
+  for (const [key, rows] of byCanonicalTitle) {
+    const yearCounts = new Map();
+    for (const r of rows) {
+      if (!hasYear(r)) continue;
+      const y = String(r.year);
+      yearCounts.set(y, (yearCounts.get(y) || 0) + 1);
+    }
+    if (!yearCounts.size) continue;
+    const best = [...yearCounts.entries()].sort((a, b) => b[1] - a[1] || Number(b[0]) - Number(a[0]))[0][0];
+    inferredYear.set(key, Number(best));
   }
 
   return results.map((result) => {
     const title = posterTitleKey(result.title);
-    const key = `${title}|${result.year || ''}|${String(result.kind || '').toLowerCase()}`;
-    const matches = (byExactTitle.get(key) || []).slice().sort((a, b) => sourceRank(b.sourceId) - sourceRank(a.sourceId));
-    if (!matches.length) return result;
+    const canon = canonicalTitleKey(result.title);
+    const kind = String(result.kind || '').toLowerCase();
+    const exactKey = `${title}|${result.year || ''}|${kind}`;
+    const canonKey = `${canon}|${kind}`;
+    const matches = (byExactTitle.get(exactKey) || []).slice().sort((a, b) => sourceRank(b.sourceId) - sourceRank(a.sourceId));
     const enriched = { ...result };
+
+    // Propagate missing year from same-title+kind consensus.
+    if (!hasYear(enriched)) {
+      const consensusYear = inferredYear.get(canonKey);
+      if (consensusYear) enriched.year = consensusYear;
+    }
+
+    if (!matches.length) return enriched;
     for (const field of fields) {
       if (hasValue(result, field)) continue;
       const value = matches.find((candidate) => hasValue(candidate, field))?.[field];
@@ -334,6 +428,37 @@ export function fillMissingMetadata(results) {
     }
     return enriched;
   });
+}
+
+/**
+ * Sort results so that the same movie/series appears as a contiguous block
+ * regardless of which source returned first. Group order:
+ *   1. Kind (series before movies when the user has no filter, or vice-versa?
+ *      We put movies first, then series — matches most user expectations).
+ *   2. Canonical title (case/diacritic/punctuation-insensitive).
+ *   3. Year (ascending — older remakes first, newest last).
+ *   4. Source preference (Overlook → MovieBox → others) — so the "best"
+ *      metadata/poster is always the first row the frontend picks as primary.
+ *   5. Original position (stable) to keep results within a source predictable.
+ */
+export function sortResultsForDisplay(results) {
+  const sourceRank = (sourceId) => sourceId === 'overlook' ? 0 : sourceId === 'moviebox' ? 1 : 2;
+  const kindRank = (k) => String(k || '').toLowerCase() === 'series' ? 1 : 0;
+  return [...results].map((r, idx) => ({ r, idx })).sort((a, b) => {
+    const ka = kindRank(a.r.kind);
+    const kb = kindRank(b.r.kind);
+    if (ka !== kb) return ka - kb;
+    const ta = canonicalTitleKey(a.r.title);
+    const tb = canonicalTitleKey(b.r.title);
+    if (ta !== tb) return ta.localeCompare(tb);
+    const ya = Number(a.r.year) || 0;
+    const yb = Number(b.r.year) || 0;
+    if (ya !== yb) return ya - yb;
+    const sa = sourceRank(a.r.sourceId);
+    const sb = sourceRank(b.r.sourceId);
+    if (sa !== sb) return sa - sb;
+    return a.idx - b.idx;
+  }).map(({ r }) => r);
 }
 
 /** Search every enabled source (plus MovieBox). Runs with a small pool to spare the NAS. */
@@ -348,6 +473,13 @@ export async function searchAll(query, {
   const results = [];
   const providerErrors = [];
   const jobs = chosen.map((source) => async () => {
+    if (isSourceCoolingDown(source.id)) {
+      const h = healthOf(source.id);
+      const msg = `${source.name} is in cooldown for another ${Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000))}s after ${h.failures} consecutive failures (${h.message || 'unknown error'})`;
+      log.warn('scraper', `skipping ${source.name} (circuit breaker open)`, { backoffSeconds: h.backoffSeconds });
+      providerErrors.push({ sourceId: source.id, sourceName: source.name, error: msg, skipped: true });
+      return;
+    }
     const outcome = await searchSource(source, query, { signal, detailed: true });
     results.push(...outcome.results);
     if (outcome.error) providerErrors.push({ sourceId: source.id, sourceName: source.name, error: outcome.error });
@@ -363,35 +495,42 @@ export async function searchAll(query, {
   }));
 
   if (includeMoviebox) {
-    try {
-      const rows = await moviebox.search(query, { perPage: limitPerSource, signal });
-      noteHealth('moviebox', rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
-      for (const r of rows) {
-        const metadata = normalizeSearchMetadata(r);
-        results.push({
-          title: r.title,
-          year: r.year || Number(metadata.releaseDate?.slice(0, 4)) || null,
-          kind: r.kind,
-          poster: r.poster,
-          movieboxSubjectId: r.subjectId,
-          url: `moviebox://subject/${encodeURIComponent(r.subjectId)}`,
-          sourceId: 'moviebox',
-          sourceName: 'MovieBox',
-          ...metadata,
-        });
+    if (isSourceCoolingDown('moviebox')) {
+      const h = healthOf('moviebox');
+      const waitSec = Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000));
+      log.warn('scraper', 'skipping MovieBox (circuit breaker open)', { backoffSeconds: waitSec });
+      providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: `MovieBox is in cooldown for another ${waitSec}s after ${h.failures} consecutive failures (${h.message || 'unknown error'})`, skipped: true });
+    } else {
+      try {
+        const rows = await moviebox.search(query, { perPage: limitPerSource, signal });
+        noteHealth('moviebox', rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
+        for (const r of rows) {
+          const metadata = normalizeSearchMetadata(r);
+          results.push({
+            title: r.title,
+            year: r.year || Number(metadata.releaseDate?.slice(0, 4)) || null,
+            kind: r.kind,
+            poster: r.poster,
+            movieboxSubjectId: r.subjectId,
+            url: `moviebox://subject/${encodeURIComponent(r.subjectId)}`,
+            sourceId: 'moviebox',
+            sourceName: 'MovieBox',
+            ...metadata,
+          });
+        }
+      } catch (err) {
+        if (signal?.aborted || err?.name === 'AbortError') throw err;
+        const message = errorText(err);
+        noteHealth('moviebox', false, message);
+        providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: message });
+        logError('scraper', 'MovieBox search failed', err);
       }
-    } catch (err) {
-      if (signal?.aborted || err?.name === 'AbortError') throw err;
-      const message = errorText(err);
-      noteHealth('moviebox', false, message);
-      providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: message });
-      logError('scraper', 'MovieBox search failed', err);
     }
   }
 
   const enriched = fillMissingMetadata(fillMissingPosters(results));
   const filtered = type && type !== 'both' ? enriched.filter((r) => r.kind === type) : enriched;
-  const deduped = dedupeResults(filtered);
+  const deduped = sortResultsForDisplay(dedupeResults(filtered));
   const withPosters = deduped.filter((r) => Boolean(normalizedPosterUrl(r))).length;
   log.info('scraper', `search total: ${deduped.length} results from ${new Set(deduped.map((r) => r.sourceId)).size} sources`, {
     withPosters, withoutPosters: deduped.length - withPosters,
@@ -538,8 +677,15 @@ export async function resolveTarget(input) {
     }
   }
 
-  // MovieBox by title (gives a second, browser-free source for most titles)
-  if (!String(url || '').startsWith('moviebox://') && title) {
+  // MovieBox by title (gives a second, browser-free source for most titles).
+  // When the browser already found playable candidates and MovieBox is
+  // cooling down (circuit breaker open after repeated TLS failures), skip it
+  // — we don't want a 2–3 second dead-host timeout for every resolve.
+  const movieboxWorthTrying = !String(url || '').startsWith('moviebox://')
+    && title
+    && candidates.length === 0   // browser returned nothing → MovieBox might still help
+    && !isSourceCoolingDown('moviebox');
+  if (movieboxWorthTrying) {
     try {
       const t0 = Date.now();
       const { item, candidates: mb } = await moviebox.findStreamsByTitle(title, {
@@ -555,6 +701,9 @@ export async function resolveTarget(input) {
       notes.push(`MovieBox is unreachable (${message})`);
       log.warn('scraper', 'MovieBox title lookup failed (non-fatal)', { error: message });
     }
+  } else if (title && !String(url || '').startsWith('moviebox://') && isSourceCoolingDown('moviebox')) {
+    const h = healthOf('moviebox');
+    log.debug('scraper', 'skipping MovieBox title lookup (circuit breaker open)', { backoffSeconds: h.backoffSeconds });
   }
 
   // Optional external extractor
@@ -578,23 +727,98 @@ export async function resolveTarget(input) {
   return { ok: unique.length > 0, candidates: unique, timeline, notes, error };
 }
 
+/**
+ * Normalise a candidate URL for deduplication.
+ *
+ * Streaming sites fire the same manifest request multiple times per page load
+ * (e.g. two clicks on the play button + a retry), which gives us duplicate
+ * media entries with slightly different tokens/signatures in the query string.
+ * Naïve string comparison keeps them all and multiplies ffprobe timeouts.
+ *
+ * We normalise by:
+ *   1. stripping the fragment,
+ *   2. dropping the obvious one-time token/signature query params
+ *      (Policy/Signature/Key-Pair-Id for CloudFront signed cookies; sig, token,
+ *      t, exp, s, cb, _, v for generic CDN signatures),
+ *   3. keeping everything else (path + remaining query) — that is what
+ *      identifies a unique playlist/mirror.
+ */
+function candidateKey(rawUrl) {
+  let u;
+  try { u = new URL(String(rawUrl)); } catch { return String(rawUrl).split('#')[0]; }
+  u.hash = '';
+  const DROP = /^(policy|signature|key-pair-id|expires|awsaccesskeyid|sig|signature|token|t|exp|cb|_|v|nonce|ts|timestamp|rnd)$/i;
+  for (const key of [...u.searchParams.keys()]) {
+    if (DROP.test(key)) u.searchParams.delete(key);
+  }
+  return u.toString();
+}
+
 function dedupeCandidates(list) {
-  const seen = new Set();
-  const out = [];
+  const seen = new Map(); // key → candidate (we keep the one with richer headers/metadata)
   for (const c of list) {
     if (!c?.url) continue;
-    const key = String(c.url).split('#')[0];
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(c);
+    const key = candidateKey(c.url);
+    const existing = seen.get(key);
+    if (!existing) { seen.set(key, c); continue; }
+    // Merge: prefer the candidate that actually has Referer/User-Agent headers
+    // (some sniffs see the URL before the response-headers are attached).
+    const merged = {
+      ...existing,
+      ...c,
+      headers: { ...(existing.headers || {}), ...(c.headers || {}) },
+      meta: { ...(existing.meta || {}), ...(c.meta || {}) },
+    };
+    seen.set(key, merged);
   }
-  return out;
+  return [...seen.values()];
 }
 
 export function qualityFromUrl(url = '') {
   const m = /(?:^|[^0-9])(2160|1440|1080|720|576|480|360)p?(?:[^0-9]|$)/i.exec(String(url));
   if (m) return `${m[1]}p`;
   return null;
+}
+
+/**
+ * Probe candidates (ffprobe) and rank them.
+ * Candidates that fail to probe are kept but flagged, so the UI can show why.
+ */
+/**
+ * Quick TCP+TLS connectivity check so we can skip ffprobe on hosts that are
+ * not reachable from the container (DNS failure, connection refused, TLS
+ * reset). Chromium has its own async DNS resolver and sometimes sees hosts
+ * (like onlinevisibilitysystem.site in the redflix logs) that Node/ffprobe
+ * running on the container's glibc resolver can't look up at that exact
+ * moment. A 3-second preflight saves us a 15-20 second ffprobe hang per
+ * dead candidate, which is what turned one successful HLS sniff into a
+ * 2-minute probe storm.
+ */
+async function quickConnectProbe(url, { timeoutMs = 5000 } = {}) {
+  try {
+    const u = new URL(url);
+    const isTls = u.protocol === 'https:';
+    const port = Number(u.port) || (isTls ? 443 : 80);
+    const res = await request(url, {
+      method: 'GET',
+      // Range: bytes=0-0 is enough to open a TCP+TLS connection and get a
+      // first byte without downloading the manifest body.
+      headers: { Range: 'bytes=0-0' },
+      timeoutMs,
+      retries: 0,
+      allowFailure: true,
+      // Don't follow redirects off the CDN — we just want to know if it answers.
+      redirect: 'manual',
+    });
+    // Any response that isn't a DNS/TCP/timeout error counts as reachable:
+    // CloudFront S3 often returns 403 to a bare byte-range request, but the
+    // TCP+TLS connection succeeded. That's enough to say "DNS/TCP works, let
+    // ffprobe take its turn".
+    const reachable = res.status > 0 || !res.error;
+    return { ok: reachable, status: res.status, error: res.error };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
 }
 
 /**
@@ -620,26 +844,60 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       const myIndex = idx++;
       const cand = list[myIndex];
       const t0 = Date.now();
-      let info = await probe(cand.url, { headers: cand.headers || {}, timeoutMs: Math.min(20000, cfg.scraper.resolveTimeoutMs) });
-      if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
-      // A failed probe on an HLS master may simply mean ffprobe dislikes the
-      // container: parse the playlist ourselves and expand the variants.
-      if (!info && streamKind(cand.url) === 'hls') {
-        const variants = await expandHlsVariants(cand.url, cand.headers || {});
-        if (variants.length) {
-          log.info('scraper', `expanded HLS master into ${variants.length} variant(s)`, { url: truncate(cand.url, 100) });
-          cand.variants = variants.map((v) => ({
-            ...cand,
-            url: v.url,
-            quality: v.height ? `${v.height}p` : cand.quality,
-            height: v.height || null,
-            bandwidth: v.bandwidth || null,
-            label: v.name || (v.height ? `${v.height}p` : 'variant'),
-          }));
-          info = await probe(variants[0].url, { headers: cand.headers || {}, timeoutMs: 15000 });
+      // Quick connectivity preflight — if the CDN hostname doesn't resolve or
+      // refuses TCP we fail fast instead of letting ffprobe hang for 20s. For
+      // HLS we can combine this with the master-playlist fetch we need anyway
+      // to expand variants, so we don't waste a round-trip.
+      const isHls = streamKind(cand.url) === 'hls';
+      let preflightOk = true;
+      let variants = [];
+      if (isHls) {
+        variants = await expandHlsVariants(cand.url, cand.headers || {});
+        if (!variants.length) {
+          cand.probe = null;
+          cand.probeMs = Date.now() - t0;
+          cand.ok = false;
+          cand.error = 'HLS master playlist unreachable (DNS failure, expired token or geo-block)';
+          log.warn('scraper', 'candidate host unreachable — HLS master could not be fetched', {
+            url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs,
+          });
+          continue;
+        }
+        cand.variants = variants.map((v) => ({
+          ...cand,
+          url: v.url,
+          quality: v.height ? `${v.height}p` : cand.quality,
+          height: v.height || null,
+          bandwidth: v.bandwidth || null,
+          label: v.name || (v.height ? `${v.height}p` : 'variant'),
+        }));
+        log.info('scraper', `expanded HLS master into ${variants.length} variant(s)`, { url: truncate(cand.url, 100) });
+      } else {
+        const reach = await quickConnectProbe(cand.url, { timeoutMs: 4000 });
+        if (!reach.ok) {
+          preflightOk = false;
+          cand.probe = null;
+          cand.probeMs = Date.now() - t0;
+          cand.ok = false;
+          cand.error = `host unreachable (${reach.error || 'no response'}) — DNS/TCP preflight failed`;
+          log.warn('scraper', 'candidate host unreachable — skipping ffprobe', {
+            url: truncate(cand.url, 120), source: cand.sourceId, error: cand.error,
+          });
         }
       }
+      if (!preflightOk) continue;
+
+      // HLS manifests don't need a long ffprobe timeout just to detect video
+      // (we already fetched the master ourselves above); 8s is enough to open
+      // TCP+TLS and read the first segment. Dash/file still gets 20s.
+      const probeTimeoutMs = isHls ? 8000 : Math.min(20000, cfg.scraper.resolveTimeoutMs);
+      // For HLS: probe only the highest-bandwidth variant. If that works we
+      // mark the candidate playable; probing every variant was burning 15–20s
+      // per duplicate on DNS failures.
+      const probeUrl = isHls && variants.length ? variants[0].url : cand.url;
+      let info = await probe(probeUrl, { headers: cand.headers || {}, timeoutMs: probeTimeoutMs });
+      if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
       cand.probe = info;
       cand.probeMs = Date.now() - t0;
@@ -653,7 +911,9 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       }
       if (!info) {
         cand.error = 'probe failed (dead mirror, expired token, geo-block or unsupported container)';
-        log.warn('scraper', 'candidate rejected by probe', { url: truncate(cand.url, 120), source: cand.sourceId });
+        log.warn('scraper', 'candidate rejected by probe', { url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs });
+      } else {
+        log.debug('scraper', 'candidate probed ok', { url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs });
       }
     }
   });
@@ -695,5 +955,8 @@ function pickPath(obj, dotted) {
   if (!dotted || !obj) return null;
   return String(dotted).split('.').reduce((acc, key) => (acc == null ? acc : acc[key]), obj);
 }
+
+/* test-only exports (also useful for diagnostics in /api/health) */
+export { candidateKey, dedupeCandidates, quickConnectProbe };
 
 export default { loadSources, listSources, getSource, searchAll, searchSource, resolveTarget, probeCandidates, rankCandidates };
