@@ -116,6 +116,15 @@ export const DEFAULTS = {
      * `mobile` never uses it.
      */
     movieboxTransport: (process.env.MOVIEBOX_TRANSPORT || 'auto').toLowerCase(),
+    /**
+     * How long FlareSolverr may spend solving one page (`maxTimeout` in its
+     * API). Its own default is 60 s; 30 s is enough for most challenges but
+     * not on a slow NAS, so raise it with FLARESOLVERR_TIMEOUT_MS if searches
+     * report "FlareSolverr timed out solving the challenge".
+     */
+    flaresolverrTimeoutMs: Number(process.env.FLARESOLVERR_TIMEOUT_MS) > 0
+      ? Number(process.env.FLARESOLVERR_TIMEOUT_MS)
+      : 30_000,
     /** Persisted cookies/session per source (Cloudflare handshakes). */
     sessionDir: process.env.SESSION_DIR || path.join(path.dirname(CONFIG_FILE), 'sessions'),
     userAgent: process.env.USER_AGENT
@@ -224,6 +233,7 @@ function envOverrides() {
   if (process.env.MOVIEBOX_EXTRA_HOSTS) set('scraper.movieboxExtraHosts', process.env.MOVIEBOX_EXTRA_HOSTS.split(',').map((s) => s.trim()).filter(Boolean));
   if (process.env.MOVIEBOX_BROWSER_FALLBACK) set('scraper.movieboxBrowserFallback', String(process.env.MOVIEBOX_BROWSER_FALLBACK).toLowerCase() !== 'false');
   if (process.env.MOVIEBOX_TRANSPORT) set('scraper.movieboxTransport', String(process.env.MOVIEBOX_TRANSPORT).toLowerCase());
+  if (Number(process.env.FLARESOLVERR_TIMEOUT_MS) > 0) set('scraper.flaresolverrTimeoutMs', Number(process.env.FLARESOLVERR_TIMEOUT_MS));
   return o;
 }
 

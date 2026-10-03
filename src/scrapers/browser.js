@@ -1000,15 +1000,25 @@ function flareSolverrCookies(cookies, pageUrl) {
   return out;
 }
 
+/** How long the solver may spend on one page (FLARESOLVERR_TIMEOUT_MS, default 30 s). */
+function solverTimeoutMs() {
+  const configured = (() => { try { return Number(getConfig?.()?.scraper?.flaresolverrTimeoutMs); } catch { return 0; } })();
+  return Number.isFinite(configured) && configured > 0 ? configured : 30_000;
+}
+
 async function requestFlareSolverr(url, { signal = null } = {}) {
   const endpoint = flaresolverrEndpoint();
   if (!endpoint) return null;
+  const maxTimeout = solverTimeoutMs();
   const response = await request(endpoint, {
     method: 'POST',
-    body: { cmd: 'request.get', url, maxTimeout: 30_000 },
+    body: { cmd: 'request.get', url, maxTimeout },
     json: true,
     allowFailure: true,
-    timeoutMs: 35_000,
+    // Leave the solver a little more room than its own budget, otherwise the
+    // transport cuts the connection first and the error says "timed out"
+    // instead of whatever FlareSolverr would have reported.
+    timeoutMs: maxTimeout + 5_000,
     retries: 0,
     signal,
   });

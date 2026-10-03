@@ -73,6 +73,9 @@ services:
       # FlareSolverr listens on 8192 inside the container; on the NAS it is
       # published on 8193 by default (see FLARESOLVERR_HOST_PORT below).
       FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8192}"
+      # How long the solver may take per page (30 s fits most challenges;
+      # raise it on a slow NAS if searches log a solver timeout).
+      FLARESOLVERR_TIMEOUT_MS: "${FLARESOLVERR_TIMEOUT_MS:-30000}"
       EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
       # --- MovieBox bypass for SNI/IP-blocked ISPs ---
       # When api*.aoneroom.com is SNI-filtered the direct Node TLS handshake

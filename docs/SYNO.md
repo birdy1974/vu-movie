@@ -219,6 +219,35 @@ page streams the same entries live, so you rarely need `docker logs`.
 
 ---
 
+### Proving the solver actually solves (not just answers /health)
+
+`/health` only says the process is alive. The real test is one challenge page through its API —
+run this **inside the vu-movie container** (from the NAS: `docker compose exec vu-movie sh -c '…'`):
+
+```bash
+curl -sS -m 90 -X POST http://flaresolverr:8192/v1 \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"request.get","url":"https://cinevo.nl/search?q=dune","maxTimeout":60000}' \
+  | head -c 400
+```
+
+* `"status":"ok"` with a large `solution.response` containing the site's HTML → the solver works;
+  vu-movie will use it on the next challenged search (log: `trying FlareSolverr for …`).
+* `"status":"error"` mentioning the browser or a timeout → its Chromium cannot solve this page
+  (raise `FLARESOLVERR_TIMEOUT_MS`, or check `docker compose logs flaresolverr`).
+* connection refused / no route → the name or port is wrong for *this* container: fix
+  `FLARESOLVERR_URL` (container-to-container, not the published NAS port).
+* If you use the published port from the NAS instead: `http://<nas-ip>:8193/health`.
+
+Confirm the basics first:
+
+```bash
+getent hosts flaresolverr        # must print the solver container's IP
+curl -sS -m 10 http://flaresolverr:8192/health; echo
+```
+
+---
+
 ## 7. Updating
 
 ```bash
