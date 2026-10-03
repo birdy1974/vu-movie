@@ -70,7 +70,8 @@ services:
       # --- scraping (raise these only on a stronger NAS) ---
       BROWSER_CONCURRENCY: "${BROWSER_CONCURRENCY:-1}"
       RESOLVE_TIMEOUT_MS: "${RESOLVE_TIMEOUT_MS:-45000}"
-      # FlareSolverr listens on 8192 inside the container and on the NAS by default.
+      # FlareSolverr listens on 8192 inside the container; on the NAS it is
+      # published on 8193 by default (see FLARESOLVERR_HOST_PORT below).
       FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8192}"
       EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
@@ -132,8 +133,9 @@ services:
     networks: [vu-movie]
 
   # -------------------------------------------------------- Cloudflare solver
-  # Always started with the project. Set FlareSolverr's actual listener to 8192
-  # and publish it on host/NAS port 8192. Keep this port off public Internet.
+  # Always started with the project. FlareSolverr's listener stays on 8192
+  # inside the container; it is published on host/NAS port 8193
+  # (FLARESOLVERR_HOST_PORT) by default. Keep this port off public Internet.
   #
   # The scraper falls back to this container whenever a source returns a
   # Cloudflare / "Just a moment…" interstitial. When FlareSolverr is not
@@ -148,7 +150,7 @@ services:
       PORT: "8192"
       TZ: "${TZ:-Europe/Amsterdam}"
     ports:
-      - "${FLARESOLVERR_HOST_PORT:-8192}:8192"
+      - "${FLARESOLVERR_HOST_PORT:-8193}:8192"
     mem_limit: 800m
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8192/health"]
