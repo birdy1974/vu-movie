@@ -89,6 +89,9 @@ services:
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1}"
       MOVIEBOX_EXTRA_HOSTS: "${MOVIEBOX_EXTRA_HOSTS:-}"
       MOVIEBOX_BROWSER_FALLBACK: "${MOVIEBOX_BROWSER_FALLBACK:-true}"
+      # auto (default) = mobile BFF, fall back to the web (H5) BFF when the
+      # api*.aoneroom.com edge never answers; h5 = web BFF first; mobile = never.
+      MOVIEBOX_TRANSPORT: "${MOVIEBOX_TRANSPORT:-auto}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
       APP_USERNAME: "${APP_USERNAME:-}"
       APP_PASSWORD: "${APP_PASSWORD:-}"

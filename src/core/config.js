@@ -107,6 +107,15 @@ export const DEFAULTS = {
      * fail fast instead of spending ~8s on the fallback.
      */
     movieboxBrowserFallback: String(process.env.MOVIEBOX_BROWSER_FALLBACK || 'true').toLowerCase() !== 'false',
+    /**
+     * Which MovieBox backend to use. `auto` (default) prefers the mobile BFF
+     * (`api*.aoneroom.com`/wefeed-mobile-bff — what MovieBox-TUI speaks) and
+     * falls back to the *web* BFF (`h5-api.aoneroom.com`/wefeed-h5api-bff, plus
+     * the public site mirrors) when the mobile edge never answers at the HTTP
+     * layer — the SNI/IP-filtered case. `h5` always tries the web BFF first,
+     * `mobile` never uses it.
+     */
+    movieboxTransport: (process.env.MOVIEBOX_TRANSPORT || 'auto').toLowerCase(),
     /** Persisted cookies/session per source (Cloudflare handshakes). */
     sessionDir: process.env.SESSION_DIR || path.join(path.dirname(CONFIG_FILE), 'sessions'),
     userAgent: process.env.USER_AGENT
@@ -214,6 +223,7 @@ function envOverrides() {
   if (process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY) set('scraper.proxyUrl', (process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || '').trim());
   if (process.env.MOVIEBOX_EXTRA_HOSTS) set('scraper.movieboxExtraHosts', process.env.MOVIEBOX_EXTRA_HOSTS.split(',').map((s) => s.trim()).filter(Boolean));
   if (process.env.MOVIEBOX_BROWSER_FALLBACK) set('scraper.movieboxBrowserFallback', String(process.env.MOVIEBOX_BROWSER_FALLBACK).toLowerCase() !== 'false');
+  if (process.env.MOVIEBOX_TRANSPORT) set('scraper.movieboxTransport', String(process.env.MOVIEBOX_TRANSPORT).toLowerCase());
   return o;
 }
 

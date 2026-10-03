@@ -11,7 +11,9 @@ import {
   dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo,
   releasesFromResources, parseJwtClaims, sessionIsValid, findStreamsByTitle, search,
   buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool, retryDelayMs,
-  classifyFetchError, HOST_POOL,
+  classifyFetchError, HOST_POOL, getHostPool,
+  h5ClientToken, tokenFromXUser, mapH5SearchResults, releasesFromH5Streams, transportMode,
+  H5_API_BASES, H5_SITE_BASES,
 } from '../src/scrapers/moviebox.js';
 
 test('canonicalUrl sorts query parameters like the reference client', () => {
@@ -354,4 +356,114 @@ test('the dead api6sg host has been removed from the host pool', () => {
   assert.ok(!HOST_POOL.some((h) => h.includes('api6sg')), 'api6sg.aoneroom.com was DNS-dead and must be removed');
   assert.ok(HOST_POOL.includes('https://api6.aoneroom.com'), 'primary hosts must remain');
   assert.ok(HOST_POOL.includes('https://api.inmoviebox.com'), 'legacy fallback must remain');
+});
+
+
+test('the host pool is the reference client pool: only the mobile-BFF hosts', () => {
+  // MovieBox-TUI uses api6/5/4/4sg/3 + api.inmoviebox.com (api6sg no longer
+  // resolves). The H5/web hostnames were removed from it: they answer 404 to
+  // /wefeed-mobile-bff because they are a *different* BFF, not extra mirrors.
+  const pool = getHostPool();
+  assert.deepEqual(pool, [
+    'https://api6.aoneroom.com',
+    'https://api5.aoneroom.com',
+    'https://api4.aoneroom.com',
+    'https://api4sg.aoneroom.com',
+    'https://api3.aoneroom.com',
+    'https://api.inmoviebox.com',
+  ]);
+  for (const host of ['h5-api.aoneroom.com', 'h5.aoneroom.com', 'api.aoneroom.com', 'i-api.aoneroom.com', 'apii.inmoviebox.com']) {
+    assert.ok(!pool.some((h) => h.includes(host)), `${host} must not be in the mobile-BFF pool`);
+  }
+  assert.deepEqual(HOST_POOL, pool);
+});
+
+test('the web (H5) BFF signs X-Client-Token in seconds, not milliseconds', () => {
+  const now = Date.UTC(2026, 9, 3, 20, 15, 30);
+  const seconds = Math.floor(now / 1000);
+  const token = h5ClientToken(now);
+  assert.equal(token.split(',')[0], String(seconds));
+  assert.equal(token, `${seconds},${crypto.createHash('md5').update(String(seconds).split('').reverse().join('')).digest('hex')}`);
+  assert.notEqual(h5ClientToken(now), h5ClientToken(now + 1000), 'the token must change every second');
+});
+
+test('the web BFF hands the anonymous JWT back in the x-user header', () => {
+  const jwt = 'header.eyJ1aWQiOjQyfQ.signature';
+  assert.equal(tokenFromXUser({ 'x-user': JSON.stringify({ token: jwt, uid: '42' }) }), jwt);
+  assert.equal(tokenFromXUser({ 'X-User': JSON.stringify({ token: jwt }) }), jwt);
+  assert.equal(tokenFromXUser(new Headers({ 'x-user': JSON.stringify({ token: jwt }) })), jwt);
+  assert.equal(tokenFromXUser({}), null);
+  assert.equal(tokenFromXUser(null), null);
+  assert.equal(tokenFromXUser({ 'x-user': 'not json' }), null);
+  assert.equal(tokenFromXUser({ 'x-user': JSON.stringify({ token: '   ' }) }), null);
+});
+
+test('web (H5) search rows keep the detailPath the web BFF addresses titles by', () => {
+  const rows = mapH5SearchResults({
+    data: {
+      items: [
+        {
+          subjectId: '12345', detailPath: 'dune-part-two-Akh5Nrwl7o', title: 'Dune: Part Two',
+          subjectType: 1, releaseDate: '2024-02-27', duration: 10008,
+          cover: { url: 'https://images.example/dune2.jpg' },
+          genre: 'Action, Adventure', imdbRatingValue: '8.5', description: 'Paul Atreides.',
+        },
+        { subjectId: '999', title: 'Dune: Prophecy', subjectType: 2, detailPath: 'dune-prophecy-Xy1' },
+      ],
+      pager: { totalCount: 2, hasMore: false },
+    },
+  });
+  assert.equal(rows.length, 2);
+  const [movie, series] = rows;
+  assert.equal(movie.subjectId, '12345');
+  assert.equal(movie.detailPath, 'dune-part-two-Akh5Nrwl7o');
+  assert.equal(movie.title, 'Dune: Part Two');
+  assert.equal(movie.year, 2024);
+  assert.equal(movie.kind, 'movie');
+  assert.equal(movie.poster, 'https://images.example/dune2.jpg');
+  assert.equal(movie.rating, 8.5);
+  assert.equal(movie.transport, 'h5');
+  assert.equal(series.kind, 'series');
+  // A row without an identifier is not a result we can play.
+  assert.equal(mapH5SearchResults({ data: { items: [{ title: 'no id' }] } }).length, 0);
+  assert.equal(mapH5SearchResults(null).length, 0);
+});
+
+test('web (H5) streams become candidates and VIP-locked rows are dropped', () => {
+  const candidates = releasesFromH5Streams({
+    data: {
+      streams: [
+        { url: 'https://cdn.example/dune/1080.mpd', resolutions: '1080', size: 4294967296, codecName: 'h264', duration: 10008 },
+        { url: 'https://cdn.example/dune/720.mp4', resolutions: '720', size: 2147483648 },
+        { url: 'https://cdn.example/dune/4k.mpd', resolutions: '2160', vipLocked: true },
+        { url: '', resolutions: '480' },
+      ],
+      downloads: [{ url: 'https://cdn.example/dune/360.mp4', resolution: 360, size: 1073741824 }],
+    },
+  }, { season: 1, episode: 2, detailPath: 'dune-part-two-Akh5Nrwl7o', title: 'Dune: Part Two' });
+
+  assert.deepEqual(candidates.map((c) => c.quality), ['1080p', '720p', '360p']);
+  assert.equal(candidates[0].via, 'moviebox-h5');
+  assert.equal(candidates[0].kind, 'dash');
+  assert.equal(candidates[0].height, 1080);
+  assert.equal(candidates[0].sizeBytes, 4294967296);
+  assert.equal(candidates[2].height, 360, 'download rows expose `resolution`, not `resolutions`');
+  // The CDN checks the play-page Referer the browser would send.
+  assert.equal(candidates[0].headers.Referer, 'https://movieboxonline.net/play/dune-part-two-Akh5Nrwl7o');
+  assert.equal(candidates[0].meta.season, 1);
+  assert.equal(candidates[0].meta.episode, 2);
+  assert.equal(candidates[0].meta.transport, 'h5');
+  assert.equal(releasesFromH5Streams({ data: { streams: [{ url: 'https://cdn.example/x.mp4', vipLocked: true }] } }).length, 0);
+  assert.equal(releasesFromH5Streams(null).length, 0);
+});
+
+test('transport selection honours MOVIEBOX_TRANSPORT and defaults to auto', () => {
+  assert.equal(transportMode('auto'), 'auto');
+  assert.equal(transportMode('h5'), 'h5');
+  assert.equal(transportMode('mobile'), 'mobile');
+  assert.equal(transportMode('H5'), 'h5');
+  assert.equal(transportMode(null, ), transportMode(process.env.MOVIEBOX_TRANSPORT));
+  // The web BFF lives on hosts that are not the filtered api* edge.
+  assert.deepEqual(H5_API_BASES, ['https://h5-api.aoneroom.com']);
+  assert.ok(H5_SITE_BASES.every((base) => !base.includes('aoneroom')), 'site mirrors are ordinary website domains');
 });

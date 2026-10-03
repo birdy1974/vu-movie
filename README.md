@@ -73,7 +73,11 @@ permissions, Container Manager project import, firewall, where the data lives).
   [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
   see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a
   line-by-line comparison of how both apps select a title versus how they fetch and
-  play it).
+  play it). When the `api*.aoneroom.com` edge is filtered and no host answers at
+  all, the same search is retried on MovieBox's **web** backend
+  (`/wefeed-h5api-bff` on `h5-api.aoneroom.com` and the public site mirrors) —
+  different hosts, so it survives blocks that target the mobile API
+  (`MOVIEBOX_TRANSPORT=auto|h5|mobile`, see §6 of that document).
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match

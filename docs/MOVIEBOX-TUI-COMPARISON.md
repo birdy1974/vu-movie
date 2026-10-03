@@ -180,14 +180,14 @@ expanded `h5-api` mirror pool).
   cookie / `x-*`), because a redirect cannot replay them: the reference client never hands a
   bare CDN URL to a player either. The relay URL is always offered and always works.
 * `src/scrapers/http.js` — `undici.ProxyAgent` support for `MOVIEBOX_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (with `NO_PROXY` bypass) so an SNI-filtered ISP can be bypassed via a forward proxy/VPN; Chromium is also launched with `--proxy-server` when a proxy is set.
-* `src/scrapers/moviebox.js` — expanded host pool with the H5/web mirrors (`h5-api.aoneroom.com`, `h5.aoneroom.com`, `api.aoneroom.com`, `i-api.aoneroom.com`, `apii.inmoviebox.com`) plus `MOVIEBOX_EXTRA_HOSTS`; automatic fallback to `fetchViaBrowser` (Chromium BoringSSL, different JA3) on `tls-or-ip-block`; richer `classifyFetchError` (TLS before reset) and proxy-aware diagnostics hints.
-* Tests: 20 MovieBox tests, 3 diagnostics, 5 wire-level parity tests (108 total — now with proxy/host-pool coverage).
+* `src/scrapers/moviebox.js` — `MOVIEBOX_EXTRA_HOSTS`; automatic fallback to `fetchViaBrowser` (Chromium BoringSSL, different JA3) on `tls-or-ip-block`; richer `classifyFetchError` (TLS before reset) and proxy-aware diagnostics hints; and a **second transport** for the *web* BFF (see §6) used when the mobile edge never answers.
+* Tests: 26 MovieBox tests, 3 diagnostics, 5 wire-level parity tests (116 total — now with proxy/host-pool and web-BFF coverage).
 
 What was deliberately **not** ported: the full sidecar proxy (ffmpeg already re-requests segments
 with `-headers`, and the relay is the single place headers are applied; the Chromium fallback
 for the *API* itself — `fetchViaBrowser` with BoringSSL + `ProxyAgent` — is now ported), and the Rust DNS
-crate (see §5). The H5/web BFF mirrors (`h5-api.aoneroom.com` etc.) and `MOVIEBOX_EXTRA_HOSTS`
-also extend the host pool beyond the original six `api*` hosts.
+crate (see §5). `MOVIEBOX_EXTRA_HOSTS` extends the mobile host pool beyond the original six
+`api*` hosts; the web (H5) BFF is a separate transport, not a mirror of it — see §6.
 
 ---
 
@@ -200,7 +200,7 @@ The verdict from `diagnoseReachability` tells you which of these you are in:
 | `no-egress` | the container cannot reach *any* third-party host (both the failing host **and** the control hosts are dead) | fix the Docker network: `docker compose exec vu-movie getent hosts api6.aoneroom.com`, DNS server of the NAS, firewall, or a missing proxy/VPN. Nothing in the scraper can help |
 | `tls-intercepted` | a proxy/AV/gateway re-signs TLS and Node does not trust its CA (Node ships its own CA bundle) | add `NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem` to the container, or set `HTTP_PROXY` to bypass it; Chromium's `ignoreHTTPSErrors` also helps for the browser fallback |
 | `dns-filtered` | the container's resolver answers differently from public DNS (ISP blocklist, Pi-hole, Synology DNS Server, ControlD…) | point the container at `1.1.1.1`/`8.8.8.8` (`dns:` in `docker-compose.yml`), or enable the reference client's trick of a public-resolver fallback |
-| `tls-or-ip-block` | DNS is fine and the container has internet, but the MovieBox edge closes the handshake | SNI/IP-level filtering, ISP blocking, or JA3 fingerprinting. **Now automatically mitigated in two layers:** (1) `MOVIEBOX_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` (forward proxy/VPN outside the block; supports `NO_PROXY`), (2) `MOVIEBOX_BROWSER_FALLBACK=true` (default) retries the same signed request via Chromium BoringSSL (different JA3, plus `--proxy-server` support). Extra mirrors (`h5-api.aoneroom.com`, `h5.aoneroom.com`, `api.aoneroom.com`, …) are also probed automatically; add more via `MOVIEBOX_EXTRA_HOSTS`. If all else fails, route the container through a VPN/other egress |
+| `tls-or-ip-block` | DNS is fine and the container has internet, but the MovieBox edge closes the handshake | SNI/IP-level filtering, ISP blocking, or JA3 fingerprinting. **Now automatically mitigated in three layers:** (1) `MOVIEBOX_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` (forward proxy/VPN outside the block; supports `NO_PROXY`), (2) `MOVIEBOX_BROWSER_FALLBACK=true` (default) retries the same signed request via Chromium BoringSSL (different JA3, plus `--proxy-server` support), (3) **the web (H5) BFF transport** (§6) re-runs the search on completely different hosts. `MOVIEBOX_TRANSPORT=h5` skips straight to (3). If all else fails, route the container through a VPN/other egress |
 | `service-unreachable` | MovieBox itself is down or has rotated its host pool | wait, add a new mirror via `MOVIEBOX_EXTRA_HOSTS` or update `HOST_POOL` |
 
 Remember that MovieBox-TUI and vu-movie run the *same* protocol here: if
@@ -223,3 +223,67 @@ The MovieBox-TUI protocol was reverse-engineered by its authors and is dual-lice
 MIT/Apache-2.0; the endpoints, signing scheme, cookie handling and deprecation markers
 re-implemented here are credited to them. vu-movie remains a personal proxy for streams you
 are allowed to watch — see the README's *Legal / etiquette* section.
+
+---
+
+## 6. Two backends, not one: mobile BFF vs web (H5) BFF
+
+MovieBox runs two different backends, and only one of them is what MovieBox-TUI speaks:
+
+| | mobile BFF | web (H5) BFF |
+|---|---|---|
+| hosts | `api6/api5/api4/api4sg/api3.aoneroom.com`, `api.inmoviebox.com` | `h5-api.aoneroom.com`, and the public sites (`movieboxhd.net`, `movieboxonline.net`) which proxy the same BFF |
+| prefix | `/wefeed-mobile-bff` | `/wefeed-h5api-bff` |
+| who uses it | the Android app, and MovieBox-TUI | the website player |
+| auth | `POST /user-api/visitor-login` → `token` in the body | `POST /subject/search-suggest` → anonymous JWT in the **`x-user` response header** |
+| token clock | `X-Client-Token: <ms>,<md5(reverse(ms))>` | `X-Client-Token: <seconds>,<md5(reverse(seconds))>` |
+| search | `POST /subject-api/search/v2` | `POST /subject/search` `{keyword, page, perPage: 0, subjectType: 0}` |
+| playback | `/subject-api/play-info/v2` (+ `/subject-api/resource`) | `/subject/play?subjectId=…&se=…&ep=…&detailPath=…` (fallback `/subject/download`, which only answers on the *site* domain) |
+| titles addressed by | `subjectId` | `detailPath` |
+
+This matters because the two host groups do **not** fail together. In the log that prompted
+§6, every `apiN.aoneroom.com` host died in the TLS handshake — and `h5-api.aoneroom.com`,
+`h5.aoneroom.com` and `i-api.aoneroom.com` completed the handshake and answered **HTTP 404**.
+That 404 was the diagnosis: they were never broken mirrors of the mobile BFF, we were just
+knocking on them with the mobile path. (vu-movie used to list them as extra mirrors, which
+bought a 12-second timeout per sweep per host and nothing else — they are not in the mobile
+pool any more.)
+
+vu-movie therefore keeps the reference client's protocol as the **primary** transport and adds
+the web BFF as an automatic fallback:
+
+```
+search("dune")
+   └─ mobile BFF  ── TLS-reset on every host ──▶ err.movieboxTransport = true
+         └─ web (H5) BFF on h5-api.aoneroom.com, then the site mirrors
+               ├─ POST /subject/search-suggest   → JWT from the x-user header
+               ├─ POST /subject/search           → rows (each keeps its detailPath)
+               └─ GET  /subject/play?…           → candidates
+```
+
+Rules: the fallback only fires when **no host answered at the HTTP layer** (a transport-level
+block). An HTTP 401/404/5xx is a protocol answer and switching transports would only hide it.
+`MOVIEBOX_TRANSPORT=h5|mobile|auto` (default `auto`) overrides the order; after a failed sweep
+the web BFF is tried first so a blocked NAS does not pay for another doomed host sweep on every
+search. Playback keeps the same rule: `resolveTarget()` tries mobile play-info first and only
+asks the web BFF when that produced nothing.
+
+Streams from the web BFF are `/subject/play` rows (`resolutions`, `size`, `codecName`,
+`vipLocked`); VIP-locked rows carry no URL and are dropped rather than offered as dead mirrors.
+The CDN checks the Referer the browser would send, so candidates carry
+`Referer: https://movieboxhd.net/play/<detailPath>`.
+
+### Checking from the NAS whether the web BFF is reachable at all
+
+```bash
+docker compose exec vu-movie curl -sS -i --max-time 20 -X POST \
+  'https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search-suggest' \
+  -H 'Content-Type: application/json' -H 'X-Client-Token: 1,c4ca4238a0b923820dcc509a6f75849b' \
+  -d '{"keyword":"dune","perPage":10}' | head -20
+```
+
+* `200` **and** an `x-user:` header → the web backend answers from this network; the app will
+  use it as soon as the mobile edge fails (look for `web (H5) BFF: anonymous token acquired`).
+* connection reset / timeout here too → both MovieBox backends are filtered on this egress; use
+  `MOVIEBOX_PROXY` or a VPN.
+* `404` → right host group, wrong prefix (that is the bug this section documents).
