@@ -83,6 +83,7 @@
             <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="q-moviebox" checked> include MovieBox</label>
             <span class="mut" id="find-hint"></span>
           </div>
+          <div id="find-errors" class="search-errors hide" role="status" aria-live="polite"></div>
         </div>
 
         <div id="tab-url" class="hide">
@@ -112,8 +113,18 @@
 
       <div class="gl" style="margin-top:14px">
         <div class="card pad0">
-          <div class="cardhead"><h2 style="margin:0">Results</h2><span class="mut" id="results-count"></span></div>
-          <div id="results" style="padding:14px"><div class="meta">No search yet.</div></div>
+          <div class="cardhead results-head">
+            <h2 style="margin:0">Results</h2>
+            <div class="results-head-tools">
+              <span class="mut" id="results-count"></span>
+              <div class="results-view-switch" id="results-view" role="group" aria-label="Search results display">
+                <button type="button" data-view="list" aria-pressed="false" title="Show results as a list">List</button>
+                <button type="button" data-view="poster" class="on" aria-pressed="true" title="Show large posters">Poster</button>
+                <button type="button" data-view="thumbnails" aria-pressed="false" title="Show compact thumbnails">Thumbnails</button>
+              </div>
+            </div>
+          </div>
+          <div id="results" class="results results-poster"><div class="meta">No search yet.</div></div>
         </div>
         <div class="card">
           <h3>Selected title</h3>
@@ -122,6 +133,12 @@
             <div style="flex:1;min-width:0">
               <div id="sel-name" style="font-weight:600">nothing selected</div>
               <div class="meta" id="sel-meta">search or paste a URL, then pick a candidate below</div>
+              <div id="sel-details" class="selected-details hide"></div>
+              <div id="sel-episode-controls" class="selected-episodes hide">
+                <div class="field"><label for="sel-season">Season</label><select id="sel-season"></select></div>
+                <div class="field"><label for="sel-episode">Episode</label><select id="sel-episode"></select></div>
+                <div id="sel-episode-status" class="meta episode-status"></div>
+              </div>
             </div>
           </div>
           <div style="margin-top:12px" id="candidates"><div class="meta">No candidates yet.</div></div>

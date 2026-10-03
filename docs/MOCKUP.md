@@ -38,14 +38,14 @@
                     └───────┬─────────────────────────────────────────────┬───────────────────────────────────┘
                             │ postgres (lazy pool, migrations on boot)     │ /downloads  /config  /cache (volumes)
                      ┌──────▼──────┐                              ┌────────▼─────────┐
-                     │  postgres:16│                              │  flaresolverr    │  (optional, only if a site
-                     └─────────────┘                              │  browserless CF  │   starts blocking headless)
+                     │  postgres:16│                              │  flaresolverr    │  (always on)
+                     └─────────────┘                              │  host :8192      │   (container :8191)
                                                                   └──────────────────┘
 ```
 
 **Data flow of one title**
 
-1. **Find** — search on the enabled sites (recipe adapter or headless sniffer) → normalised `Title` (TMDB metadata optional: poster, year, plot, runtime).
+1. **Find** — search on the enabled sites (recipe adapter or headless sniffer) → normalised `Title` with available poster, year, rating, genres, runtime, language and synopsis metadata.
 2. **Resolve** — adapter walks the source’s own server list (like the site’s player does), decrypting/unpacking as needed → candidates `[{url, quality, codec, headers}]`.
 3. **Probe** — every candidate is fetched with `ffprobe` (or a HEAD/`m3u8` parse for HLS): resolution, codec, fps, bitrate, audio tracks, subtitle tracks. Dead/403/expired candidates are dropped, the rest ranked.
 4. **Unify** — resolve the chosen candidate to a **segment list** (HLS/DASH) or a single progressive URL and expose *one* stable URL on the NAS. VLC, the Duo2 and a download all read from that URL; the upstream (expiring) URL never leaves the container.
@@ -77,9 +77,9 @@ Their backend returns encrypted bytes decrypted by a WASM blob in the front-end.
 the resulting media URL (simpler, slower), **(c)** accept what the plain API farms already give us and skip the
 site-specific path. **Recommendation: (b) by default, (a) as an optimisation later.**
 
-**Optional Layer 4 — external extractor hook.** Any external resolver you already like (a Stremio addon
-endpoint, cinepro-style API, FlareSolverr for Cloudflare) can be configured as a provider in settings. Off by
-default — no third-party service is required to run vu-movie.
+**Optional Layer 4 — external extractor hook.** A Stremio addon endpoint or cinepro-style API can be
+configured as a provider in settings. FlareSolverr is a separate service that Compose starts automatically
+and publishes on host port 8192 (container port 8191); the current scraper does not yet call its API.
 
 **MovieBox (you explicitly asked for this one):** implemented natively — visitor-login token + HMAC-MD5
 signed requests + host-pool retry, exactly as the Apache-2.0 client does it, in TypeScript against the same
@@ -187,7 +187,7 @@ and the UI tells you which one the box will actually use.
 | Your requirement | How it is handled |
 |---|---|
 | Complete Dockerfile with Chromium, FFmpeg, VAAPI | multi-stage `node:22-bookworm-slim`; contrib/non-free enabled in *both* source formats (`debian.sources` deb822 + classic `*.list`); apt: `ffmpeg`, `chromium`, `libva2`, `libva-drm2`, `vainfo`, `intel-media-va-driver-non-free` (iHD) with `i965-va-driver` fallback, `p7zip-full` (provides `/usr/bin/7z`, with the `7zip` package as fallback), `unrar` (non-free, RAR4/RAR5) with `unrar-free` fallback, `unzip`, `ca-certificates`; optional packages go through a tolerant installer, so a renamed package (e.g. bookworm's `libva-utils` → `vainfo`) no longer fails the build, while `ffmpeg`/`ffprobe`/`chromium`/`tini` are verified at build time; `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` + `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` (system Chromium — no 300 MB download) |
-| `docker-compose.yml` with PostgreSQL + app, `/dev/dri` | 3 services (`vu-movie`, `db`, optional `flaresolverr`), `devices: [/dev/dri:/dev/dri]`, healthchecks, `depends_on: service_healthy`, named volumes for `pgdata`, `/downloads`, `/config`, `/cache` |
+| `docker-compose.yml` with PostgreSQL + app, `/dev/dri` | 3 services (`vu-movie`, `db`, always-on `flaresolverr` published on host port 8192), `devices: [/dev/dri:/dev/dri]`, healthchecks, `depends_on: service_healthy`, named volumes for `pgdata`, `/downloads`, `/config`, `/cache` |
 | Optimised for J3455 / HD Graphics 500 | 1 browser + 1 transcode concurrency by default, `shm_size: 512mb` for Chromium, memory limits, `LIBVA_DRIVER_NAME` auto-detected at boot, `MALLOC_ARENA_MAX=2` |
 | Detailed logging & comments | `pino` structured logs, per component (`scraper`, `browser`, `resolver`, `transcode`, `subtitles`, `enigma2`, `db`, `hwaccel`), every stage logs latency + reason for rejection, ffmpeg stderr mirrored, `/api/health` JSON, log viewer page with filters |
 | `package-lock.json` / failing Docker build | `npm ci` **needs** the lockfile → the repo ships a committed `package-lock.json` (generated with `npm install --package-lock-only`); Dockerfile falls back to `npm install` with a clear warning if a lockfile is ever missing, so a build never dies on that |
@@ -206,7 +206,7 @@ the render group, `tini` as PID 1 so ffmpeg/Chromium children are reaped, and a 
 
 ```
 vu-movie/
-├─ docker-compose.yml            # app + postgres (+ optional flaresolverr)
+├─ docker-compose.yml            # app + postgres + always-on flaresolverr (host port 8192)
 ├─ Dockerfile                    # node 22 + ffmpeg + chromium + vaapi
 ├─ .dockerignore  .env.example  package.json  package-lock.json  README.md
 ├─ docs/  MOCKUP.md  API.md  SYNO.md

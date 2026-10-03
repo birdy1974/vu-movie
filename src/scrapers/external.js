@@ -15,7 +15,7 @@
  *   // Stremio addon style
  *   { "streams": [ { "url": "…", "name": "1080p", "title": "…", "behaviorHints": {…} } ] }
  *
- * FlareSolverr (Cloudflare) is a separate, narrower integration and lives in http.js.
+ * FlareSolverr is a separate service; this external-extractor client does not speak its API.
  */
 
 import { log, logError } from '../core/log.js';
@@ -36,7 +36,7 @@ export function isConfigured() {
   return Boolean(extractorEndpoint());
 }
 
-export async function extract({ url, title, year, kind, season = 0, episode = 0 }) {
+export async function extract({ url, title, year, kind, season = 0, episode = 0, signal = null }) {
   const endpoint = extractorEndpoint();
   if (!endpoint) return { ok: false, providers: [], error: 'no valid HTTP(S) external extractor URL configured' };
 
@@ -50,6 +50,7 @@ export async function extract({ url, title, year, kind, season = 0, episode = 0 
       retries: 1,
       json: true,
       allowFailure: true,
+      signal,
     });
     if (!res.ok) {
       log.warn('external', 'external extractor failed', { status: res.status, error: res.error });
@@ -70,6 +71,7 @@ export async function extract({ url, title, year, kind, season = 0, episode = 0 
     log.info('external', `external extractor returned ${providers.length} streams`);
     return { ok: providers.length > 0, providers };
   } catch (err) {
+    if (signal?.aborted || err?.name === 'AbortError') throw err;
     logError('external', 'external extractor threw', err);
     return { ok: false, providers: [], error: String(err?.message || err) };
   }

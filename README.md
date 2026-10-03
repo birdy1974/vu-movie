@@ -70,6 +70,10 @@ permissions, Container Manager project import, firewall, where the data lives).
 * Source list (editable in Settings → Sources): `overlook.cx`, `cinevo.nl`,
   `cinejoy.pk`, `flixhub.studio`, `redflix.club`, `1flex.org`, `cinezo.st` — and
   **MovieBox** through its own signed REST client.
+* Result cards show available release year, rating, genres and runtime; the
+  selected-title panel adds the synopsis, release date and language when a source
+  provides them. Missing fields can be filled from an exact title/year/type match
+  from another source.
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
@@ -182,12 +186,16 @@ The ones that matter most on a DS918+:
   **fails loudly if `public/` is missing** and falls back to `npm install` with a
   warning if `package-lock.json` is absent; `package-lock.json` is committed, so
   `npm ci` is the normal path.
-* `docker-compose.yml` — the app, `postgres:16-alpine`, an optional
-  `flaresolverr` (profile `cf`) and the `/dev/dri` device passthrough.
+* `docker-compose.yml` — the app, `postgres:16-alpine`, and an always-started
+  FlareSolverr service. Its API is available on the NAS at port `8192` (host port
+  `8192` → container port `8191`); containers on the Compose network use
+  `http://flaresolverr:8191`. Do not forward this unauthenticated API to the public
+  Internet.
 * Health: `GET /api/health` (also wired into the container healthcheck).
 
 ```bash
-docker compose logs -f vu-movie          # structured logs
+docker compose logs -f vu-movie          # structured app logs
+docker compose logs -f flaresolverr      # Cloudflare solver logs
 docker compose exec vu-movie vainfo      # what the GPU actually supports
 docker compose exec vu-movie ffmpeg -hwaccels
 ```

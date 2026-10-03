@@ -29,6 +29,7 @@ import * as relay from '../streams/relay.js';
 import * as exporter from '../streams/export.js';
 import * as subs from '../subtitles/index.js';
 import * as enigma2 from '../enigma2/index.js';
+import { fetchPosterImage, posterProxyUrl } from './poster-proxy.js';
 
 const router = express.Router();
 const startedAt = Date.now();
@@ -36,9 +37,27 @@ const startedAt = Date.now();
 /* ---------- small helpers ---------- */
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((err) => {
+  if (req.aborted || res.destroyed) return;
   logError('api', `${req.method} ${req.originalUrl} failed`, err);
   res.status(err.status || 500).json({ ok: false, error: errorText(err) });
 });
+
+function requestAbortSignal(req, res) {
+  const controller = new AbortController();
+  const onRequestAborted = () => controller.abort();
+  const onResponseClosed = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.once('aborted', onRequestAborted);
+  res.once('close', onResponseClosed);
+  return {
+    signal: controller.signal,
+    dispose() {
+      req.off('aborted', onRequestAborted);
+      res.off('close', onResponseClosed);
+    },
+  };
+}
 
 const baseUrlFrom = (req) => {
   const configured = cfg('app.baseUrl');
@@ -188,47 +207,116 @@ router.post('/sources/test', wrap(async (req, res) => {
 
 /* ---------- find / resolve ---------- */
 
+router.get('/poster', wrap(async (req, res) => {
+  const image = await fetchPosterImage({
+    url: req.query.url,
+    referer: req.query.ref,
+    signature: req.query.sig,
+  });
+  res.status(image.status);
+  if (image.status !== 200) {
+    res.set('Cache-Control', 'no-store').end();
+    return;
+  }
+  res.set({
+    'Content-Type': image.contentType,
+    'Content-Length': String(image.body.length),
+    'Cache-Control': 'public, max-age=86400',
+    'X-Content-Type-Options': 'nosniff',
+  }).end(image.body);
+}));
+
 router.get('/find/search', wrap(async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ ok: false, error: 'q is required' });
-  const results = await registry.searchAll(q, {
-    type: req.query.type || null,
-    sources: req.query.sources === undefined ? null : String(req.query.sources).split(',').filter(Boolean),
-    includeMoviebox: req.query.moviebox === undefined || String(req.query.moviebox).toLowerCase() !== 'false',
-  });
-  res.json({ ok: true, query: q, results });
+  const request = requestAbortSignal(req, res);
+  try {
+    const outcome = await registry.searchAll(q, {
+      type: req.query.type || null,
+      sources: req.query.sources === undefined ? null : String(req.query.sources).split(',').filter(Boolean),
+      includeMoviebox: req.query.moviebox === undefined || String(req.query.moviebox).toLowerCase() !== 'false',
+      signal: request.signal,
+      detailed: true,
+    });
+    if (request.signal.aborted) return;
+    const withProxiedPosters = outcome.results.map((result) => ({
+      ...result,
+      // Never expose an untrusted remote poster directly to the browser.
+      poster: result.poster ? (posterProxyUrl(result.poster, result.url) || '') : '',
+    }));
+    res.json({ ok: true, query: q, results: withProxiedPosters, providerErrors: outcome.providerErrors });
+  } finally {
+    request.dispose();
+  }
+}));
+
+router.get('/find/details', wrap(async (req, res) => {
+  const subjectId = String(req.query.subjectId || '').trim();
+  if (!subjectId) return res.status(400).json({ ok: false, error: 'subjectId is required' });
+  const request = requestAbortSignal(req, res);
+  try {
+    const details = await moviebox.detail(subjectId, { signal: request.signal });
+    let seasons = null;
+    let seasonError = null;
+    if (String(req.query.kind || '').toLowerCase() === 'series') {
+      try {
+        seasons = await moviebox.seasonInfo(subjectId, { signal: request.signal });
+      } catch (err) {
+        if (request.signal.aborted || err?.name === 'AbortError') throw err;
+        seasonError = errorText(err);
+      }
+    }
+    if (request.signal.aborted) return;
+    res.json({ ok: true, subjectId, details, seasons, seasonError });
+  } finally {
+    request.dispose();
+  }
 }));
 
 router.post('/find/resolve', wrap(async (req, res) => {
   const { url, sourceId, title, year, kind, season, episode, probe: doProbe = true, useBrowser = true } = req.body || {};
   if (!url && !title) return res.status(400).json({ ok: false, error: 'url or title is required' });
-  const resolved = await registry.resolveTarget({ url, sourceId, title, year, kind, season: Number(season) || 0, episode: Number(episode) || 0, useBrowser });
-  const candidates = doProbe ? await registry.probeCandidates(resolved.candidates, { limit: cfg('scraper.maxCandidates') }) : resolved.candidates;
-  log.info('api', 'resolve finished', {
-    title: title || url, candidates: candidates.length, playable: candidates.filter((c) => c.ok).length,
-  });
-  res.json({
-    ok: candidates.length > 0,
-    candidates: candidates.map((c, i) => ({
-      index: i,
-      url: c.url,
-      quality: c.quality,
-      label: c.label,
-      sourceId: c.sourceId,
-      kind: c.kind,
-      ok: c.ok,
-      error: c.error || null,
-      probe: c.probe ? {
-        container: c.probe.container, durationSec: c.probe.durationSec, bitrate: c.probe.bitrate,
-        video: c.probe.video, audio: c.probe.audio, subtitles: c.probe.subtitles,
-      } : null,
-      headers: Object.keys(c.headers || {}),
-      variants: c.variants || null,
-    })),
-    timeline: resolved.timeline,
-    error: resolved.error
-      || (candidates.length ? null : 'no playable stream found — open the page in a browser, copy the final player/embed URL, or enable the external extractor'),
-  });
+  const request = requestAbortSignal(req, res);
+  try {
+    const resolved = await registry.resolveTarget({
+      url, sourceId, title, year, kind,
+      season: Number(season) || 0,
+      episode: Number(episode) || 0,
+      useBrowser,
+      signal: request.signal,
+    });
+    const candidates = doProbe
+      ? await registry.probeCandidates(resolved.candidates, { limit: cfg('scraper.maxCandidates'), signal: request.signal })
+      : resolved.candidates;
+    if (request.signal.aborted) return;
+    log.info('api', 'resolve finished', {
+      title: title || url, candidates: candidates.length, playable: candidates.filter((c) => c.ok).length,
+    });
+    res.json({
+      ok: candidates.length > 0,
+      candidates: candidates.map((c, i) => ({
+        index: i,
+        url: c.url,
+        quality: c.quality,
+        label: c.label,
+        sourceId: c.sourceId,
+        kind: c.kind,
+        ok: c.ok,
+        error: c.error || null,
+        probe: c.probe ? {
+          container: c.probe.container, durationSec: c.probe.durationSec, bitrate: c.probe.bitrate,
+          video: c.probe.video, audio: c.probe.audio, subtitles: c.probe.subtitles,
+        } : null,
+        headers: Object.keys(c.headers || {}),
+        variants: c.variants || null,
+      })),
+      timeline: resolved.timeline,
+      error: resolved.error
+        || (candidates.length ? null : 'no playable stream found — open the page in a browser, copy the final player/embed URL, or enable the external extractor'),
+    });
+  } finally {
+    request.dispose();
+  }
 }));
 
 /* ---------- streams ---------- */

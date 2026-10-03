@@ -5,7 +5,7 @@
  *   1. recipes   — per-site JSON describing search + how to open a title
  *   2. browser   — generic headless sniffer (always available, handles WASM players)
  *   3. moviebox  — native signed-API client, no browser needed
- *   4. external  — optional external extractor (your own resolver, FlareSolverr, …)
+ *   4. external  — optional external extractor (your own resolver, …)
  *
  * Whatever layer produced a candidate, the candidate is then *probed* with ffprobe
  * before it is offered: dead mirrors, expired tokens and 403s are filtered out here
@@ -15,10 +15,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { log, logError, truncate } from '../core/log.js';
+import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { probe, parseHlsMaster, streamKind, checkBinaries } from '../core/media.js';
 import { request, resolveUrl } from './http.js';
+import { normalizeSearchMetadata } from './metadata.js';
 import * as browser from './browser.js';
 import * as moviebox from './moviebox.js';
 import * as external from './external.js';
@@ -131,14 +132,27 @@ export function healthOf(id) {
 
 /* ---------------- search ---------------- */
 
+function firstMappedField(item, map, key, aliases = []) {
+  const hasValue = (value) => value != null && value !== '' && (!Array.isArray(value) || value.length > 0);
+  const mapped = pickPath(item, map?.[key]);
+  if (hasValue(mapped)) return mapped;
+  for (const alias of aliases) {
+    const value = pickPath(item, alias);
+    if (hasValue(value)) return value;
+  }
+  return null;
+}
+
 /**
  * Search one source. Returns normalised result rows.
  * @param {object} source recipe
  * @param {string} query
  */
-export async function searchSource(source, query) {
+export async function searchSource(source, query, { signal = null, detailed = false } = {}) {
   const started = Date.now();
+  const finish = (results, error = null) => detailed ? { results, error } : results;
   try {
+    if (signal?.aborted) throw Object.assign(new Error('search aborted'), { name: 'AbortError' });
     if (source.search?.kind === 'api') {
       const search = source.search;
       const url = String(search.url).replace(/\{(?:query|q)\}/g, encodeURIComponent(query));
@@ -148,6 +162,7 @@ export async function searchSource(source, query) {
         json: true,
         allowFailure: true,
         retries: 1,
+        signal,
       });
       if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
       const items = pickPath(res.data, search.items) || [];
@@ -169,20 +184,34 @@ export async function searchSource(source, query) {
             ? String(rawPoster)
             : resolveUrl(`${String(search.posterBaseUrl || source.home).replace(/\/?$/, '/')}`, String(rawPoster).replace(/^\/+/, ''))
           : null;
-        const rawYear = pickPath(item, map.year) || item.year;
+        const rawReleaseDate = firstMappedField(item, map, 'releaseDate', [
+          'release_date', 'first_air_date', 'releaseDate', 'air_date', 'airDate',
+        ]);
+        const metadata = normalizeSearchMetadata({
+          rating: firstMappedField(item, map, 'rating', ['vote_average', 'voteAverage', 'rating', 'imdbRatingValue', 'score']),
+          genres: firstMappedField(item, map, 'genres', ['genres', 'genre_names', 'genreNames', 'genre', 'categories', 'genre_ids', 'genreIds']),
+          runtime: firstMappedField(item, map, 'runtime', ['runtime', 'duration', 'runtimeMinutes']),
+          description: firstMappedField(item, map, 'description', ['overview', 'description', 'plot', 'summary']),
+          releaseDate: rawReleaseDate,
+          language: firstMappedField(item, map, 'language', ['original_language', 'originalLanguage', 'language']),
+        });
+        const rawYear = pickPath(item, map.year) || item.year || rawReleaseDate;
+        const year = Number(rawYear) || Number(/\b((?:19|20)\d{2})\b/.exec(String(rawYear || ''))?.[1])
+          || Number(metadata.releaseDate?.slice(0, 4)) || null;
         return {
           title: pickPath(item, map.title) || item.title || item.name || '',
-          year: Number(rawYear) || null,
+          year,
           kind,
           poster,
           url: rawUrl ? resolveUrl(source.home, rawUrl) : '',
           sourceId: source.id,
           sourceName: source.name,
+          ...metadata,
         };
       }).filter((r) => r.url && r.title);
       noteHealth(source.id, rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
       log.info('scraper', `${source.id}: api search → ${rows.length} results`, { ms: Date.now() - started });
-      return rows;
+      return finish(rows);
     }
 
     // browser search
@@ -193,70 +222,183 @@ export async function searchSource(source, query) {
       query,
       linkSelector: source.search?.linkSelector,
       linkPattern: source.search?.linkPattern,
+      signal,
     });
-    const rows = (res.results || []).map((r) => ({
-      title: r.title,
-      year: Number(r.year || (/(19|20)\d{2}/.exec(r.title) || [])[0]) || null,
-      kind: r.kind || (/(season|s\d{1,2}e\d{1,2}|series)/i.test(r.title) ? 'series' : 'movie'),
-      poster: r.poster || null,
-      url: r.url,
-      sourceId: source.id,
-      sourceName: source.name,
-    }));
+    const rows = (res.results || []).map((r) => {
+      const metadata = normalizeSearchMetadata(r, `${r.text || ''} ${r.cardText || ''}`);
+      return {
+        title: r.title,
+        year: Number(r.year || metadata.releaseDate?.slice(0, 4) || (/(19|20)\d{2}/.exec(r.title) || [])[0]) || null,
+        kind: r.kind || (/(season|s\d{1,2}e\d{1,2}|series)/i.test(r.title) ? 'series' : 'movie'),
+        poster: r.poster || null,
+        url: r.url,
+        sourceId: source.id,
+        sourceName: source.name,
+        ...metadata,
+      };
+    });
     noteHealth(source.id, rows.length > 0, res.error || (rows.length ? `${rows.length} results` : 'search page returned no links'));
     log.info('scraper', `${source.id}: browser search → ${rows.length} results`, { ms: Date.now() - started, error: res.error });
-    return rows;
+    return finish(rows, res.error || null);
   } catch (err) {
-    noteHealth(source.id, false, String(err?.message || err));
+    if (signal?.aborted) throw err;
+    const message = errorText(err);
+    noteHealth(source.id, false, message);
     logError('scraper', `${source.id}: search failed`, err, { query });
-    return [];
+    return finish([], message);
   }
 }
 
+function posterTitleKey(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function normalizedPosterUrl(result) {
+  if (!result?.poster) return '';
+  try {
+    const base = /^https?:/i.test(String(result.url || '')) ? result.url : undefined;
+    const url = new URL(String(result.poster), base);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch { return ''; }
+}
+
+/**
+ * Reuse poster artwork across equivalent results from different sources. Many
+ * sites omit poster metadata even when another enabled source has it.
+ */
+export function fillMissingPosters(results) {
+  const exact = new Map();
+  const byTitleKind = new Map();
+  const sourceRank = (sourceId) => sourceId === 'overlook' ? 3 : sourceId === 'moviebox' ? 2 : 1;
+  const add = (map, key, poster, rank) => {
+    if (!key) return;
+    const candidates = map.get(key) || [];
+    if (!candidates.some((candidate) => candidate.poster === poster)) candidates.push({ poster, rank });
+    map.set(key, candidates);
+  };
+
+  for (const result of results) {
+    const title = posterTitleKey(result.title);
+    const kind = String(result.kind || '').toLowerCase();
+    const poster = normalizedPosterUrl(result);
+    if (!title || !poster) continue;
+    const rank = sourceRank(result.sourceId);
+    add(exact, `${title}|${result.year || ''}|${kind}`, poster, rank);
+    add(byTitleKind, `${title}|${kind}`, poster, rank);
+  }
+
+  const bestPoster = (candidates) => candidates?.slice().sort((a, b) => b.rank - a.rank)[0]?.poster || '';
+  return results.map((result) => {
+    if (normalizedPosterUrl(result)) return result;
+    const title = posterTitleKey(result.title);
+    const kind = String(result.kind || '').toLowerCase();
+    const exactCandidates = exact.get(`${title}|${result.year || ''}|${kind}`);
+    const titleCandidates = byTitleKind.get(`${title}|${kind}`) || [];
+    const uniqueTitlePosters = [...new Set(titleCandidates.map((candidate) => candidate.poster))];
+    const poster = bestPoster(exactCandidates)
+      || (uniqueTitlePosters.length === 1 ? uniqueTitlePosters[0] : '');
+    return poster ? { ...result, poster } : result;
+  });
+}
+
+/** Fill absent metadata from an exact title/year/type match on another source. */
+export function fillMissingMetadata(results) {
+  const byExactTitle = new Map();
+  const sourceRank = (sourceId) => sourceId === 'overlook' ? 3 : sourceId === 'moviebox' ? 2 : 1;
+  const fields = ['rating', 'genres', 'runtime', 'description', 'releaseDate', 'language'];
+  const hasValue = (result, field) => field === 'genres'
+    ? Array.isArray(result[field]) && result[field].length > 0
+    : result[field] != null && result[field] !== '';
+
+  for (const result of results) {
+    const title = posterTitleKey(result.title);
+    if (!title || !fields.some((field) => hasValue(result, field))) continue;
+    const key = `${title}|${result.year || ''}|${String(result.kind || '').toLowerCase()}`;
+    const matches = byExactTitle.get(key) || [];
+    matches.push(result);
+    byExactTitle.set(key, matches);
+  }
+
+  return results.map((result) => {
+    const title = posterTitleKey(result.title);
+    const key = `${title}|${result.year || ''}|${String(result.kind || '').toLowerCase()}`;
+    const matches = (byExactTitle.get(key) || []).slice().sort((a, b) => sourceRank(b.sourceId) - sourceRank(a.sourceId));
+    if (!matches.length) return result;
+    const enriched = { ...result };
+    for (const field of fields) {
+      if (hasValue(result, field)) continue;
+      const value = matches.find((candidate) => hasValue(candidate, field))?.[field];
+      if (value == null) continue;
+      enriched[field] = field === 'genres' ? [...value] : value;
+    }
+    return enriched;
+  });
+}
+
 /** Search every enabled source (plus MovieBox). Runs with a small pool to spare the NAS. */
-export async function searchAll(query, { sources = null, type = null, limitPerSource = 12, includeMoviebox = true } = {}) {
+export async function searchAll(query, {
+  sources = null, type = null, limitPerSource = 12, includeMoviebox = true,
+  signal = null, detailed = false,
+} = {}) {
   const all = loadSources().filter((s) => s.enabled);
   const chosen = sources == null ? all : all.filter((s) => sources.includes(s.id));
   log.info('scraper', `searching ${chosen.length} source(s) for "${query}"`, { sources: chosen.map((s) => s.id).join(',') });
 
-  const jobs = chosen.map((s) => () => searchSource(s, query));
   const results = [];
+  const providerErrors = [];
+  const jobs = chosen.map((source) => async () => {
+    const outcome = await searchSource(source, query, { signal, detailed: true });
+    results.push(...outcome.results);
+    if (outcome.error) providerErrors.push({ sourceId: source.id, sourceName: source.name, error: outcome.error });
+  });
   const pool = 3;
   let idx = 0;
   await Promise.all(Array.from({ length: Math.min(pool, jobs.length) }, async () => {
     while (idx < jobs.length) {
+      if (signal?.aborted) throw Object.assign(new Error('search aborted'), { name: 'AbortError' });
       const myIndex = idx++;
-      results.push(...await jobs[myIndex]());
+      await jobs[myIndex]();
     }
   }));
 
   if (includeMoviebox) {
     try {
-      const rows = await moviebox.search(query, { perPage: limitPerSource });
+      const rows = await moviebox.search(query, { perPage: limitPerSource, signal });
       noteHealth('moviebox', rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
       for (const r of rows) {
+        const metadata = normalizeSearchMetadata(r);
         results.push({
           title: r.title,
-          year: r.year,
+          year: r.year || Number(metadata.releaseDate?.slice(0, 4)) || null,
           kind: r.kind,
           poster: r.poster,
-          url: `moviebox://subject/${r.subjectId}${r.kind === 'series' ? '?se=1&ep=1' : ''}`,
+          movieboxSubjectId: r.subjectId,
+          url: `moviebox://subject/${encodeURIComponent(r.subjectId)}`,
           sourceId: 'moviebox',
           sourceName: 'MovieBox',
-          rating: r.rating,
-          description: r.description,
+          ...metadata,
         });
       }
     } catch (err) {
-      noteHealth('moviebox', false, String(err?.message || err));
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      const message = errorText(err);
+      noteHealth('moviebox', false, message);
+      providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: message });
       logError('scraper', 'MovieBox search failed', err);
     }
   }
 
-  const filtered = type && type !== 'both' ? results.filter((r) => r.kind === type) : results;
+  const enriched = fillMissingMetadata(fillMissingPosters(results));
+  const filtered = type && type !== 'both' ? enriched.filter((r) => r.kind === type) : enriched;
   const deduped = dedupeResults(filtered);
-  log.info('scraper', `search total: ${deduped.length} results from ${new Set(deduped.map((r) => r.sourceId)).size} sources`);
-  return deduped.slice(0, 60);
+  const withPosters = deduped.filter((r) => Boolean(normalizedPosterUrl(r))).length;
+  log.info('scraper', `search total: ${deduped.length} results from ${new Set(deduped.map((r) => r.sourceId)).size} sources`, {
+    withPosters, withoutPosters: deduped.length - withPosters,
+    providerErrors: providerErrors.length,
+  });
+  const limitedResults = deduped.slice(0, 60);
+  return detailed ? { results: limitedResults, providerErrors } : limitedResults;
 }
 
 function dedupeResults(list) {
@@ -273,6 +415,21 @@ function dedupeResults(list) {
 
 /* ---------------- resolve ---------------- */
 
+export function parseMovieBoxTarget(url) {
+  const value = String(url || '');
+  const match = /^moviebox:\/\/subject\/([^/?#]+)/i.exec(value);
+  if (!match) return null;
+  const query = value.split('?')[1]?.split('#')[0] || '';
+  const params = new URLSearchParams(query);
+  let subjectId = match[1];
+  try { subjectId = decodeURIComponent(subjectId); } catch { /* keep the raw identifier */ }
+  return {
+    subjectId,
+    season: Number(params.get('se')) || 0,
+    episode: Number(params.get('ep')) || 0,
+  };
+}
+
 /**
  * Turn a source URL (or a moviebox:// pseudo URL) into playable candidates.
  * @returns {{ ok:boolean, candidates:object[], meta:object, error?:string, logs:object }}
@@ -280,26 +437,30 @@ function dedupeResults(list) {
 export async function resolveTarget(input) {
   const {
     url, sourceId = null, title = null, year = null, kind = null, season = 0, episode = 0,
-    useBrowser = true,
+    useBrowser = true, signal = null,
   } = input;
   const timeline = {};
   const candidates = [];
   const notes = [];
 
-  if (String(url || '').startsWith('moviebox://')) {
-    const subjectId = String(url).replace('moviebox://subject/', '').split('?')[0];
+  const movieboxTarget = parseMovieBoxTarget(url);
+  const selectedSeason = Number(season) || movieboxTarget?.season || 0;
+  const selectedEpisode = Number(episode) || movieboxTarget?.episode || 0;
+  if (movieboxTarget) {
+    const { subjectId } = movieboxTarget;
     const t0 = Date.now();
     try {
-      const info = await moviebox.playInfo(subjectId, { se: season, ep: episode });
-      candidates.push(...moviebox.releasesFromPlayInfo(info, { season, episode }));
+      const info = await moviebox.playInfo(subjectId, { se: selectedSeason, ep: selectedEpisode, signal });
+      candidates.push(...moviebox.releasesFromPlayInfo(info, { season: selectedSeason, episode: selectedEpisode }));
       noteHealth('moviebox', candidates.length > 0, `${candidates.length} candidates`);
     } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
       // Play-info failures are the most common "nothing happens" case: the
       // container may have no internet, or MovieBox rotated its host pool.
-      const message = String(err?.message || err);
+      const message = errorText(err);
       notes.push(`MovieBox play-info failed (${message})`);
       noteHealth('moviebox', false, message);
-      log.error('scraper', 'MovieBox play-info failed', { subjectId, error: message });
+      logError('scraper', 'MovieBox play-info failed', err, { subjectId });
     } finally {
       timeline.moviebox = Date.now() - t0;
     }
@@ -329,8 +490,12 @@ export async function resolveTarget(input) {
         session: source?.id || 'default',
         playerPathPrefix: source?.resolve?.playerPathPrefix || null,
         timeoutMs: getConfig().scraper.resolveTimeoutMs,
+        signal,
       });
       timeline.browser = Date.now() - t0;
+      if (!sniff.ok && (sniff.error || sniff.note)) {
+        notes.push(`Browser ${sniff.note || 'scrape failed'}${sniff.error ? ` (${sniff.error})` : ''}`);
+      }
       for (const m of sniff.media || []) {
         candidates.push({
           url: m.url,
@@ -357,6 +522,7 @@ export async function resolveTarget(input) {
         pageTitle: sniff.title,
         note: sniff.note,
         error: sniff.error,
+        networkErrors: sniff.networkErrors,
       });
     } else {
       log.info('scraper', 'browser sniff disabled for this request — using the URL directly');
@@ -376,13 +542,16 @@ export async function resolveTarget(input) {
   if (!String(url || '').startsWith('moviebox://') && title) {
     try {
       const t0 = Date.now();
-      const { item, candidates: mb } = await moviebox.findStreamsByTitle(title, { year, kind, season, episode });
+      const { item, candidates: mb } = await moviebox.findStreamsByTitle(title, {
+        year, kind, season: selectedSeason, episode: selectedEpisode, signal,
+      });
       timeline.moviebox = Date.now() - t0;
       if (item) {
         for (const c of mb) candidates.push({ ...c, meta: { ...c.meta, movieboxTitle: item.title, poster: item.poster } });
       }
     } catch (err) {
-      const message = String(err?.message || err);
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      const message = errorText(err);
       notes.push(`MovieBox is unreachable (${message})`);
       log.warn('scraper', 'MovieBox title lookup failed (non-fatal)', { error: message });
     }
@@ -391,7 +560,9 @@ export async function resolveTarget(input) {
   // Optional external extractor
   if (external.isConfigured()) {
     const t0 = Date.now();
-    const ext = await external.extract({ url, title, year, kind, season, episode });
+    const ext = await external.extract({
+      url, title, year, kind, season: selectedSeason, episode: selectedEpisode, signal,
+    });
     timeline.external = Date.now() - t0;
     candidates.push(...(ext.providers || []));
   }
@@ -430,7 +601,7 @@ export function qualityFromUrl(url = '') {
  * Probe candidates (ffprobe) and rank them.
  * Candidates that fail to probe are kept but flagged, so the UI can show why.
  */
-export async function probeCandidates(candidates, { limit = null, concurrency = 3 } = {}) {
+export async function probeCandidates(candidates, { limit = null, concurrency = 3, signal = null } = {}) {
   const cfg = getConfig();
   const list = limit ? candidates.slice(0, limit) : candidates;
   if (!cfg.scraper.probeCandidates) {
@@ -445,10 +616,12 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
   let idx = 0;
   const workers = Array.from({ length: Math.min(concurrency, list.length) }, async () => {
     while (idx < list.length) {
+      if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
       const myIndex = idx++;
       const cand = list[myIndex];
       const t0 = Date.now();
       let info = await probe(cand.url, { headers: cand.headers || {}, timeoutMs: Math.min(20000, cfg.scraper.resolveTimeoutMs) });
+      if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
       // A failed probe on an HLS master may simply mean ffprobe dislikes the
       // container: parse the playlist ourselves and expand the variants.

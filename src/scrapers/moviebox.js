@@ -18,9 +18,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { log, logError, truncate } from '../core/log.js';
+import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { request, sleep } from './http.js';
+import { request } from './http.js';
+import { normalizeSearchMetadata } from './metadata.js';
 
 const API_PREFIX = '/wefeed-mobile-bff';
 const HOST_POOL = [
@@ -32,7 +33,7 @@ const HOST_POOL = [
   'https://api6sg.aoneroom.com',
   'https://api.inmoviebox.com',
 ];
-const RETRY_STATUS = new Set([403, 406, 407, 429, 500, 502, 503, 504]);
+const HOST_REQUEST_TIMEOUT_MS = 12_000;
 /** Referer the client app uses when fetching media from the CDN. */
 export const STREAM_REFERER = 'https://sportslive.wine';
 /** 32-byte key baked into the client (Apache-2.0 MovieBox-TUI, crypto.rs). */
@@ -150,6 +151,58 @@ function signedHeaders({ method, url, body, token, identity }) {
   };
 }
 
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return Object.assign(new Error('MovieBox request aborted'), { name: 'AbortError' });
+}
+
+/** Try each API host until one succeeds; transport failures and retryable HTTP responses both advance the pool. */
+export async function requestHostPool({ hosts = HOST_POOL, startIndex = 0, signal = null, requestHost, onFailure = null }) {
+  if (typeof requestHost !== 'function') throw new TypeError('requestHostPool needs requestHost(host, index, hop)');
+  if (!hosts.length) return { ok: false, result: null, index: null, error: new Error('MovieBox host pool is empty') };
+  let lastError = null;
+  for (let hop = 0; hop < hosts.length; hop += 1) {
+    if (signal?.aborted) throw abortError(signal);
+    const index = (startIndex + hop) % hosts.length;
+    const host = hosts[index];
+    try {
+      const result = await requestHost(host, index, hop);
+      if (result?.ok) return { ok: true, result, index };
+      lastError = result?.error instanceof Error
+        ? result.error
+        : new Error(String(result?.error || `HTTP ${result?.status || 'request failed'}`));
+      onFailure?.({ host, index, hop, error: lastError, result });
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      lastError = err;
+      onFailure?.({ host, index, hop, error: err, result: null });
+      if (err?.terminal) break;
+    }
+  }
+  return { ok: false, result: null, index: null, error: lastError || new Error('all MovieBox hosts exhausted') };
+}
+
+/** Visitor-login variant that only treats a response with a token as authenticated success. */
+export async function loginWithHostFailover({ hosts = HOST_POOL, startIndex = 0, signal = null, requestHost, onFailure = null }) {
+  return requestHostPool({
+    hosts,
+    startIndex,
+    signal,
+    onFailure,
+    requestHost: async (host, index, hop) => {
+      const response = await requestHost(host, index, hop);
+      if (!response?.ok) return response || { ok: false, error: 'visitor-login returned no response' };
+      const data = response.data?.data || response.data;
+      const token = data?.token;
+      if (!token) return { ok: false, status: response.status, error: 'visitor-login returned no token' };
+      return {
+        ok: true,
+        session: { token, uid: data?.uid || data?.userId || null, savedAt: new Date().toISOString() },
+      };
+    },
+  });
+}
+
 /* ---------------- session handling ---------------- */
 
 const sessionFile = () => path.join(getConfig().scraper.sessionDir, 'moviebox.json');
@@ -180,127 +233,203 @@ function saveSession(s) {
   }
 }
 
-async function login(identity) {
-  const base = HOST_POOL[hostIndex % HOST_POOL.length];
-  const url = `${base}${API_PREFIX}/user-api/visitor-login`;
+function clearSession() {
+  session = null;
+  try { fs.rmSync(sessionFile(), { force: true }); }
+  catch (err) { log.warn('moviebox', 'could not remove the rejected visitor session', { error: String(err?.message || err) }); }
+}
+
+async function login(identity, { signal = null } = {}) {
   const body = '{}';
-  log.info('moviebox', 'requesting a visitor token', { host: base });
-  const res = await request(url, {
-    method: 'POST', body, headers: signedHeaders({ method: 'POST', url, body, identity }), retries: 1,
-    allowFailure: true, useJar: false,
+  log.info('moviebox', 'requesting a visitor token', { startHost: HOST_POOL[hostIndex % HOST_POOL.length] });
+  const outcome = await loginWithHostFailover({
+    startIndex: hostIndex,
+    signal,
+    requestHost: async (base) => {
+      const url = `${base}${API_PREFIX}/user-api/visitor-login`;
+      return request(url, {
+        method: 'POST', body,
+        headers: signedHeaders({ method: 'POST', url, body, identity }),
+        timeoutMs: HOST_REQUEST_TIMEOUT_MS,
+        retries: 0,
+        json: true,
+        allowFailure: true,
+        useJar: false,
+        signal,
+      });
+    },
+    onFailure: ({ host, hop, error }) => {
+      lastError = errorText(error);
+      log.warn('moviebox', `visitor-login failed on ${host} — trying next host`, { hop: hop + 1, error: lastError });
+    },
   });
-  if (!res.ok) {
-    lastError = `visitor-login failed: ${res.error || res.status}`;
-    logError('moviebox', 'visitor-login failed', new Error(lastError), { host: base });
-    return null;
+
+  if (!outcome.ok) {
+    lastError = errorText(outcome.error);
+    logError('moviebox', 'visitor-login failed on every API host', outcome.error);
+    throw new Error(`MovieBox visitor-login failed: ${lastError}`, { cause: outcome.error });
   }
-  const token = res.data?.token;
-  if (!token) {
-    lastError = 'visitor-login returned no token';
-    log.error('moviebox', lastError, { body: truncate(res.text, 200) });
-    return null;
-  }
-  session = { token, uid: res.data?.uid || res.data?.userId || null, savedAt: new Date().toISOString() };
+
+  hostIndex = outcome.index;
+  session = outcome.result.session;
+  lastError = null;
   saveSession(session);
-  log.info('moviebox', 'visitor token acquired', { uid: session.uid, host: base });
+  log.info('moviebox', 'visitor token acquired', { uid: session.uid, host: HOST_POOL[hostIndex] });
   return session;
 }
 
-async function ensureSession(identity) {
+async function ensureSession(identity, { signal = null } = {}) {
   if (session?.token) return session;
   session = loadSession();
   if (session?.token) return session;
-  return login(identity);
+  return login(identity, { signal });
 }
 
-/**
- * Perform a signed request, walking the host pool and re-authenticating once on
- * 401/403 (the reference client does exactly this).
- */
-async function apiRequest(pathAndQuery, { method = 'GET', body, authenticated = true } = {}) {
+/** Signed API request with per-host transport/status failover and one re-login on 401/403. */
+export async function apiRequest(pathAndQuery, { method = 'GET', body, authenticated = true, signal = null } = {}) {
   const identity = clientIdentity();
-  if (authenticated) await ensureSession(identity);
+  if (authenticated) await ensureSession(identity, { signal });
 
-  for (let hop = 0; hop < HOST_POOL.length; hop += 1) {
-    const idx = (hostIndex + hop) % HOST_POOL.length;
-    const base = HOST_POOL[idx];
-    const url = `${base}${API_PREFIX}${pathAndQuery}`;
-    const headers = signedHeaders({ method, url, body, token: authenticated ? session?.token : null, identity });
-    const res = await request(url, { method, body, headers, retries: 0, json: true, allowFailure: true, useJar: false });
+  let reauthenticationAttempted = false;
+  const outcome = await requestHostPool({
+    startIndex: hostIndex,
+    signal,
+    requestHost: async (base) => {
+      const url = `${base}${API_PREFIX}${pathAndQuery}`;
+      const send = () => request(url, {
+        method, body,
+        headers: signedHeaders({ method, url, body, token: authenticated ? session?.token : null, identity }),
+        timeoutMs: HOST_REQUEST_TIMEOUT_MS,
+        retries: 0,
+        json: true,
+        allowFailure: true,
+        useJar: false,
+        signal,
+      });
+      let res = await send();
+      if ([401, 403].includes(res.status) && authenticated && !reauthenticationAttempted) {
+        reauthenticationAttempted = true;
+        clearSession();
+        try {
+          await ensureSession(identity, { signal });
+        } catch (err) {
+          throw Object.assign(err, { terminal: true });
+        }
+        res = await send();
+      }
+      return res;
+    },
+    onFailure: ({ host, hop, error, result }) => {
+      lastError = errorText(error);
+      const status = result?.status;
+      log.warn('moviebox', status
+        ? `host ${host} answered ${status} — trying next host`
+        : `request failed on ${host} — trying next host`, {
+        path: pathAndQuery, hop: hop + 1, error: lastError,
+      });
+    },
+  });
 
-    if (res.ok) {
-      hostIndex = idx; // stick to a host that works
-      return res.data;
-    }
-    if (res.status && RETRY_STATUS.has(res.status)) {
-      log.warn('moviebox', `host ${base} answered ${res.status} — switching host`, { path: pathAndQuery });
-      if (res.status === 401 || res.status === 403) { session = null; await ensureSession(identity); }
-      await sleep(120 * (hop + 1));
-      continue;
-    }
-    lastError = res.error || `HTTP ${res.status}`;
-    log.warn('moviebox', 'request failed on this host', { host: base, path: pathAndQuery, error: lastError });
+  if (!outcome.ok) {
+    lastError = errorText(outcome.error);
+    log.error('moviebox', 'all API hosts exhausted', { path: pathAndQuery, error: lastError });
+    throw new Error(`MovieBox request failed (${pathAndQuery}): ${lastError}`, { cause: outcome.error });
   }
-  log.error('moviebox', 'all API hosts exhausted', { path: pathAndQuery, lastError });
-  throw new Error(`MovieBox request failed (${pathAndQuery}): ${lastError || 'all hosts exhausted'}`);
+  hostIndex = outcome.index; // stick to a host that works
+  lastError = null;
+  return outcome.result.data;
 }
 
 /* ---------------- public API ---------------- */
 
 export function isAvailable() { return true; }
 
-export async function search(query, { page = 1, perPage = 15 } = {}) {
+export function buildSearchRequest(query, { page = 1, perPage = 15 } = {}) {
+  return { keyword: query, page, perPage, subjectType: 0 };
+}
+
+/** Adapt both legacy and current MovieBox search payloads into stable subject rows. */
+export function mapSearchResults(data) {
+  const payload = data?.data || data;
+  const items = payload?.items
+    || payload?.data?.items
+    || payload?.list
+    || payload?.results?.[0]?.subjects
+    || data?.results?.[0]?.subjects
+    || [];
+  return (Array.isArray(items) ? items : []).map((item) => {
+    const rawType = item.subjectType ?? item.subject_type ?? item.stype ?? item.type;
+    const numericType = Number(rawType);
+    const kind = numericType === 2 || /tv|series|show/i.test(String(rawType ?? ''))
+      ? 'series'
+      : 'movie';
+    const metadata = normalizeSearchMetadata({
+      rating: item.imdbRatingValue ?? item.rating,
+      genres: item.genres ?? item.genreList ?? item.genreNames ?? item.genre,
+      description: item.description ?? item.overview ?? item.summary,
+      releaseDate: item.releaseDate ?? item.release_date ?? item.firstAirDate ?? item.first_air_date,
+      language: item.originalLanguage ?? item.original_language ?? item.language,
+      runtime: item.duration ?? item.runtime,
+    }, item.description || item.overview || '');
+    const releaseDate = item.releaseDate || item.release_date || item.firstAirDate || item.first_air_date || metadata.releaseDate;
+    return {
+      subjectId: String(item.subjectId || item.id || ''),
+      title: item.title || item.name || '',
+      year: Number(item.year || releaseDate?.slice?.(0, 4) || 0) || null,
+      kind,
+      subjectType: Number.isFinite(numericType) ? numericType : rawType ?? null,
+      poster: item.cover?.url || (typeof item.cover === 'string' ? item.cover : null) || item.poster || item.coverUrl || item.pic || null,
+      ...metadata,
+      releaseDate,
+      seasonCount: item.seasonCount || item.season_count || item.season || null,
+      duration: item.duration || item.runtime || metadata.runtime || null,
+    };
+  }).filter((item) => item.subjectId);
+}
+
+export async function search(query, { page = 1, perPage = 15, signal = null } = {}) {
   if (!query) throw new Error('search needs a query');
-  const data = await apiRequest(`${API_PREFIX ? '' : ''}/subject-api/search/v2`, {
+  const data = await apiRequest('/subject-api/search/v2', {
     method: 'POST',
-    body: JSON.stringify({ keyword: query, page, perPage }),
+    body: JSON.stringify(buildSearchRequest(query, { page, perPage })),
+    signal,
   });
-  const items = data?.items || data?.data?.items || data?.list || [];
-  log.info('moviebox', `search "${query}" → ${items.length} items`);
-  return items.map((item) => ({
-    subjectId: String(item.subjectId || item.id || ''),
-    title: item.title || item.name || '',
-    year: Number(item.year || item.releaseDate?.slice(0, 4) || 0) || null,
-    kind: /tv|series|show/i.test(String(item.subjectType ?? item.type ?? '')) ? 'series' : 'movie',
-    poster: item.cover?.url || item.poster || null,
-    rating: item.imdbRatingValue ? Number(item.imdbRatingValue) : null,
-    description: item.description || null,
-    seasonCount: item.seasonCount || null,
-    duration: item.duration || null,
-  })).filter((i) => i.subjectId);
+  const results = mapSearchResults(data);
+  log.info('moviebox', `search "${query}" → ${results.length} items`);
+  return results;
 }
 
-export async function detail(subjectId) {
-  const data = await apiRequest(`/subject-api/get?subjectId=${encodeURIComponent(subjectId)}`);
+export async function detail(subjectId, { signal = null } = {}) {
+  const data = await apiRequest(`/subject-api/get?subjectId=${encodeURIComponent(subjectId)}`, { signal });
   return data?.data || data;
 }
 
-export async function seasonInfo(subjectId) {
-  const data = await apiRequest(`/subject-api/season-info?subjectId=${encodeURIComponent(subjectId)}`);
+export async function seasonInfo(subjectId, { signal = null } = {}) {
+  const data = await apiRequest(`/subject-api/season-info?subjectId=${encodeURIComponent(subjectId)}`, { signal });
   return data?.data || data;
 }
 
-export async function resources(subjectId, { page = 1, perPage = 20, se = null, ep = null, resolution = null } = {}) {
+export async function resources(subjectId, { page = 1, perPage = 20, se = null, ep = null, resolution = null, signal = null } = {}) {
   const params = [`subjectId=${encodeURIComponent(subjectId)}`];
   if (se) params.push(`se=${se}`);
   if (ep) params.push(`ep=${ep}`);
   params.push(`page=${page}`, `perPage=${perPage}`);
   if (resolution) params.push(`resolution=${resolution}`);
-  const data = await apiRequest(`/subject-api/resource?${params.join('&')}`);
+  const data = await apiRequest(`/subject-api/resource?${params.join('&')}`, { signal });
   return data?.data || data;
 }
 
-export async function playInfo(subjectId, { se = 0, ep = 0 } = {}) {
+export async function playInfo(subjectId, { se = 0, ep = 0, signal = null } = {}) {
   const q = se && ep
     ? `/subject-api/play-info/v2?subjectId=${encodeURIComponent(subjectId)}&se=${se}&ep=${ep}`
     : `/subject-api/play-info/v2?subjectId=${encodeURIComponent(subjectId)}`;
-  const data = await apiRequest(q);
+  const data = await apiRequest(q, { signal });
   return data?.data || data;
 }
 
-export async function captions(subjectId, resourceId) {
+export async function captions(subjectId, resourceId, { signal = null } = {}) {
   const q = `/subject-api/get-ext-captions?subjectId=${encodeURIComponent(subjectId)}&resourceId=${encodeURIComponent(resourceId)}`;
-  const data = await apiRequest(q);
+  const data = await apiRequest(q, { signal });
   return data?.data || data;
 }
 
@@ -402,8 +531,8 @@ export function releasesFromPlayInfo(payload, { season = 0, episode = 0, userAge
 }
 
 /** High level: search → pick best match → candidate list. */
-export async function findStreamsByTitle(title, { year = null, kind = null, season = 0, episode = 0 } = {}) {
-  const results = await search(title, { perPage: 20 });
+export async function findStreamsByTitle(title, { year = null, kind = null, season = 0, episode = 0, signal = null } = {}) {
+  const results = await search(title, { perPage: 20, signal });
   if (!results.length) return { item: null, candidates: [] };
   const scored = results.map((item) => {
     let score = 0;
@@ -417,7 +546,7 @@ export async function findStreamsByTitle(title, { year = null, kind = null, seas
 
   const best = scored[0].item;
   log.info('moviebox', `best match for "${title}"`, { matched: best.title, year: best.year, score: scored[0].score });
-  const info = await playInfo(best.subjectId, { se: season, ep: episode });
+  const info = await playInfo(best.subjectId, { se: season, ep: episode, signal });
   return { item: best, candidates: releasesFromPlayInfo(info, { season, episode }) };
 }
 
@@ -425,4 +554,4 @@ export function status() {
   return { session: session ? { uid: session.uid, savedAt: session.savedAt } : null, host: HOST_POOL[hostIndex % HOST_POOL.length], lastError };
 }
 
-export default { search, detail, playInfo, resources, captions, findStreamsByTitle, releasesFromPlayInfo, status };
+export default { search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle, releasesFromPlayInfo, status };

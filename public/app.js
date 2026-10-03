@@ -4,12 +4,28 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
+const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
+const RESULT_VIEWS = ['list', 'poster', 'thumbnails'];
+function getInitialResultsView() {
+  try {
+    const saved = localStorage.getItem(RESULT_VIEW_KEY);
+    return RESULT_VIEWS.includes(saved) ? saved : 'poster';
+  } catch {
+    return 'poster';
+  }
+}
+
 const state = {
   health: null,
   sources: [],
   selectedSources: [],
   results: [],
+  providerErrors: [],
+  resultsView: getInitialResultsView(),
   selected: null,
+  selectedSeason: 0,
+  selectedEpisode: 0,
+  selectedSeasons: [],
   candidates: [],
   stream: null,
   streams: [],
@@ -21,19 +37,43 @@ const state = {
   sessions: [],
 };
 
+let searchRequestId = 0;
+let selectionRequestId = 0;
+let detailRequestId = 0;
+let resolveRequestId = 0;
+let searchAbortController = null;
+let detailAbortController = null;
+let resolveAbortController = null;
+
+function isAbortError(error) {
+  return error?.name === 'AbortError' || error?.name === 'CanceledError';
+}
+
+function invalidateSelectionRequests() {
+  selectionRequestId += 1;
+  detailRequestId += 1;
+  resolveRequestId += 1;
+  detailAbortController?.abort();
+  resolveAbortController?.abort();
+  detailAbortController = null;
+  resolveAbortController = null;
+  return selectionRequestId;
+}
+
 /* ---------------- tiny helpers ---------------- */
 
 async function api(path, opts = {}) {
+  const { silent = false, ...fetchOptions } = opts;
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    ...opts,
-    body: opts.body ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined,
+    headers: { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) },
+    ...fetchOptions,
+    body: fetchOptions.body ? (typeof fetchOptions.body === 'string' ? fetchOptions.body : JSON.stringify(fetchOptions.body)) : undefined,
   });
   let data = null;
   try { data = await res.json(); } catch { data = { ok: false, error: `invalid JSON (HTTP ${res.status})` }; }
   if (!res.ok || data?.ok === false) {
     const message = data?.error || `HTTP ${res.status}`;
-    toast(`${path}: ${message}`, 'err');
+    if (!silent) toast(`${path}: ${message}`, 'err');
     throw new Error(message);
   }
   return data;
@@ -224,10 +264,53 @@ async function loadSources() {
   renderSourceHealth();
 }
 
+function renderProviderErrors(errors = []) {
+  state.providerErrors = Array.isArray(errors) ? errors : [];
+  const node = $('#find-errors');
+  if (!state.providerErrors.length) {
+    node.classList.add('hide');
+    node.innerHTML = '';
+    return;
+  }
+  node.innerHTML = `<b>${state.providerErrors.length} search provider${state.providerErrors.length === 1 ? '' : 's'} unavailable:</b><ul>${state.providerErrors
+    .map((entry) => `<li><b>${escapeHtml(entry.sourceName || entry.sourceId || 'Provider')}:</b> ${escapeHtml(entry.error || 'request failed')}</li>`)
+    .join('')}</ul>`;
+  node.classList.remove('hide');
+}
+
+function resetSelectedTitle() {
+  state.selected = null;
+  state.selectedSeason = 0;
+  state.selectedEpisode = 0;
+  state.selectedSeasons = [];
+  state.candidates = [];
+  $('#sel-name').textContent = 'nothing selected';
+  $('#sel-meta').textContent = 'search or paste a URL, then pick a candidate below';
+  $('#sel-poster').innerHTML = '<b>—</b>';
+  $('#sel-details').innerHTML = '';
+  $('#sel-details').classList.add('hide');
+  $('#sel-episode-controls').classList.add('hide');
+  $('#sel-actions').innerHTML = '';
+  $('#sel-note').textContent = 'Select a title to load details and resolve its streams.';
+  $('#candidates').innerHTML = '<div class="meta">No candidates yet.</div>';
+}
+
 async function doSearch() {
   const query = $('#q').value.trim();
   if (!query) return toast('Enter a title first', 'warn');
+
+  searchAbortController?.abort();
+  const controller = new AbortController();
+  searchAbortController = controller;
+  const requestId = ++searchRequestId;
+  invalidateSelectionRequests();
+  resetSelectedTitle();
+  state.results = [];
+  renderProviderErrors([]);
+  $('#results-count').textContent = '';
+  $('#results').innerHTML = '<div class="meta"><span class="spin"></span> searching…</div>';
   $('#find-hint').innerHTML = '<span class="spin"></span> searching…';
+
   try {
     const params = new URLSearchParams({
       q: query,
@@ -235,48 +318,419 @@ async function doSearch() {
       sources: state.selectedSources.join(','),
       moviebox: String($('#q-moviebox').checked),
     });
-    const res = await api(`/api/find/search?${params}`);
-    state.results = res.results;
-    $('#results-count').textContent = `${res.results.length} results`;
+    const res = await api(`/api/find/search?${params}`, { signal: controller.signal, silent: true });
+    if (requestId !== searchRequestId || controller.signal.aborted) return;
+    state.results = Array.isArray(res.results) ? res.results : [];
+    renderProviderErrors(res.providerErrors || []);
+    $('#results-count').textContent = `${state.results.length} result${state.results.length === 1 ? '' : 's'}`;
     renderResults();
-    $('#find-hint').textContent = `${res.results.length} results`;
+    const failures = state.providerErrors.length;
+    $('#find-hint').textContent = `${state.results.length} result${state.results.length === 1 ? '' : 's'}${failures ? ` · ${failures} provider failure${failures === 1 ? '' : 's'}` : ''}`;
+  } catch (err) {
+    if (requestId !== searchRequestId || controller.signal.aborted || isAbortError(err)) return;
+    renderProviderErrors([{ sourceName: 'Search service', error: err.message }]);
+    $('#results-count').textContent = 'Search failed';
+    $('#results').innerHTML = `<div class="note err">Search failed: ${escapeHtml(err.message)}. Check the search service and provider connectivity, then retry.</div>`;
+    $('#find-hint').textContent = 'Search failed';
   } finally {
-    $('#find-hint').textContent = $('#find-hint').textContent.replace(' searching…', '');
+    if (requestId === searchRequestId) {
+      if (searchAbortController === controller) searchAbortController = null;
+      if ($('#find-hint').textContent.includes('searching…')) $('#find-hint').textContent = 'Search cancelled';
+    }
   }
 }
 
+function safePosterUrl(value, resultUrl = '') {
+  if (!value) return '';
+  try {
+    const text = String(value);
+    const isRelative = /^(?:\/|\.\/|\.\.\/)/.test(text);
+    const base = !isRelative && /^https?:/i.test(String(resultUrl)) ? resultUrl : window.location.href;
+    const url = new URL(text, base);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch { return ''; }
+}
+
+function attachPosterImageFallbacks(root = document) {
+  root.querySelectorAll('.result-poster img, #sel-poster img').forEach((img) => {
+    img.addEventListener('error', () => img.remove(), { once: true });
+  });
+}
+
+function resultPosterMarkup(result, compact = false) {
+  const words = String(result.title || '').trim().split(/\s+/).filter(Boolean);
+  const initials = words.slice(0, 2).map((word) => word[0]).join('').toUpperCase() || '▶';
+  const posterUrl = safePosterUrl(result.poster, result.url);
+  return `<div class="poster result-poster${compact ? ' compact' : ''}">
+    <span class="poster-fallback" aria-hidden="true">${escapeHtml(initials)}</span>
+    ${posterUrl ? `<img src="${escapeHtml(posterUrl)}" alt="" loading="lazy" decoding="async">` : ''}
+    <span class="tag ok badge">${escapeHtml(result.kind || 'title')}</span>
+  </div>`;
+}
+
+function formatRuntime(minutes) {
+  const total = Number(minutes);
+  if (!Number.isInteger(total) || total <= 0) return '';
+  if (total < 60) return `${total} min`;
+  const hours = Math.floor(total / 60);
+  const remainder = total % 60;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
+
+function resultMetaMarkup(result, includeKind = true, includeLanguage = false) {
+  const parts = [];
+  if (result.year) parts.push(String(result.year));
+  if (includeKind && result.kind) parts.push(result.kind);
+  if (result.sourceName) parts.push(result.sourceName);
+  if (result.rating != null && Number.isFinite(Number(result.rating))) {
+    const rating = Number(result.rating);
+    parts.push(`★ ${Number.isInteger(rating) ? rating : rating.toFixed(1)}`);
+  }
+  const genres = Array.isArray(result.genres) ? result.genres : result.genres ? [result.genres] : [];
+  if (genres.length) parts.push(`Genres: ${genres.slice(0, 4).join(', ')}`);
+  const runtime = formatRuntime(result.runtime);
+  if (runtime) parts.push(`Runtime: ${runtime}`);
+  if (includeLanguage && result.language) parts.push(`Language: ${String(result.language).toUpperCase()}`);
+  return parts.map((part) => `<span class="result-meta-item">${escapeHtml(part)}</span>`).join('');
+}
+
+function resultCardMarkup(result, index, view) {
+  const selected = state.selected === result ? ' sel' : '';
+  const title = escapeHtml(result.title || 'Untitled');
+  const metadata = resultMetaMarkup(result, view === 'thumbnails');
+  const description = result.description
+    ? `<div class="result-description">${escapeHtml(result.description)}</div>`
+    : '';
+  const copy = `<div class="moviecard-copy">
+    <div class="moviecard-title" title="${title}">${title}</div>
+    ${metadata ? `<div class="meta result-meta">${metadata}</div>` : ''}
+    ${description}
+  </div>`;
+  if (view === 'list') {
+    return `<div class="moviecard moviecard-list${selected}" data-i="${index}">
+      ${resultPosterMarkup(result, true)}${copy}<span class="result-kind">${tag(result.kind || 'title')}</span>
+    </div>`;
+  }
+  if (view === 'thumbnails') {
+    return `<div class="moviecard moviecard-thumb${selected}" data-i="${index}">
+      ${resultPosterMarkup(result, true)}${copy}
+    </div>`;
+  }
+  return `<div class="moviecard moviecard-poster${selected}" data-i="${index}">
+    ${resultPosterMarkup(result)}${copy}
+  </div>`;
+}
+
+function updateResultsViewButtons() {
+  $$('#results-view [data-view]').forEach((button) => {
+    const active = button.dataset.view === state.resultsView;
+    button.classList.toggle('on', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function setResultsView(view) {
+  if (!RESULT_VIEWS.includes(view)) return;
+  state.resultsView = view;
+  try { localStorage.setItem(RESULT_VIEW_KEY, view); } catch { /* storage may be disabled */ }
+  updateResultsViewButtons();
+  renderResults();
+}
+
 function renderResults() {
+  const results = $('#results');
+  results.className = `results results-${state.resultsView}`;
   if (!state.results.length) {
-    $('#results').innerHTML = '<div class="meta">No results. Try fewer sources, or use “Paste URL” with the movie page you have open.</div>';
+    results.innerHTML = state.providerErrors.length
+      ? '<div class="note err">Search returned no titles because one or more providers failed. See the provider errors above; this is not a confirmed no-results response.</div>'
+      : '<div class="meta">No results. Try fewer sources, or use “Paste URL” with the movie page you have open.</div>';
     return;
   }
-  $('#results').innerHTML = `<div class="grid g3">${state.results.map((r, i) => `
-    <div class="moviecard" data-i="${i}">
-      <div class="poster"><span class="tag ok badge">${escapeHtml(r.kind)}</span><b>${escapeHtml(r.title)}</b></div>
-      <div class="meta">${r.year ? `${r.year} · ` : ''}${escapeHtml(r.sourceName)}${r.rating ? ` · ★ ${r.rating}` : ''}</div>
-    </div>`).join('')}</div>`;
-  $$('#results .moviecard').forEach((card) => card.addEventListener('click', () => selectResult(Number(card.dataset.i))));
+  results.innerHTML = `<div class="results-cards">${state.results.map((r, i) => resultCardMarkup(r, i, state.resultsView)).join('')}</div>`;
+  $$('#results .moviecard').forEach((card) => {
+    const index = Number(card.dataset.i);
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('aria-pressed', String(state.selected === state.results[index]));
+    card.addEventListener('click', () => selectResult(index));
+    card.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectResult(index);
+      }
+    });
+  });
+  attachPosterImageFallbacks($('#results'));
+}
+
+function movieBoxTargetForResult(result) {
+  const url = String(result?.url || '');
+  const match = /^moviebox:\/\/subject\/([^/?#]+)/i.exec(url);
+  const params = new URLSearchParams(url.split('?')[1]?.split('#')[0] || '');
+  let subjectId = result?.movieboxSubjectId || match?.[1] || '';
+  try { subjectId = decodeURIComponent(String(subjectId)); } catch { /* use the supplied id */ }
+  return subjectId ? {
+    subjectId: String(subjectId),
+    season: Number(params.get('se')) || 0,
+    episode: Number(params.get('ep')) || 0,
+  } : null;
+}
+
+function renderSelectedInfo(result) {
+  $('#sel-name').textContent = `${result.title}${result.year ? ` (${result.year})` : ''}`;
+  const meta = resultMetaMarkup(result, true, true);
+  $('#sel-meta').innerHTML = `${meta ? `<div class="result-meta">${meta}</div>` : ''}${result.url ? `<div class="selected-url mono" title="${escapeHtml(result.url)}">${escapeHtml(result.url)}</div>` : ''}`;
+  const detailParts = [];
+  if (result.releaseDate && String(result.releaseDate) !== String(result.year || '')) {
+    detailParts.push(`<div class="selected-release">Release date: ${escapeHtml(result.releaseDate)}</div>`);
+  }
+  if (result.description) detailParts.push(`<p>${escapeHtml(result.description)}</p>`);
+  $('#sel-details').innerHTML = detailParts.join('');
+  $('#sel-details').classList.toggle('hide', detailParts.length === 0);
+  const posterUrl = safePosterUrl(result.poster, result.url);
+  $('#sel-poster').innerHTML = posterUrl
+    ? `<img src="${escapeHtml(posterUrl)}" alt="" style="width:100%;border-radius:8px">`
+    : `<b>${escapeHtml(result.title)}</b>`;
+  attachPosterImageFallbacks($('#sel-poster'));
+}
+
+function positiveNumber(value, fallback = null) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 && number <= 500 ? number : fallback;
+}
+
+function findMovieBoxArray(value, keys, depth = 0, seen = new Set()) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object' || depth > 5 || seen.has(value)) return null;
+  seen.add(value);
+  for (const key of keys) if (Array.isArray(value[key])) return value[key];
+  for (const key of keys) {
+    if (value[key] && typeof value[key] === 'object') {
+      const found = findMovieBoxArray(value[key], keys, depth + 1, seen);
+      if (found) return found;
+    }
+  }
+  for (const key of ['data', 'subject', 'subjectInfo', 'seasonInfo', 'result']) {
+    if (value[key] && typeof value[key] === 'object') {
+      const found = findMovieBoxArray(value[key], keys, depth + 1, seen);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function normalizeMovieBoxSeasons(payload, details = {}, result = {}) {
+  const seasonKeys = ['seasons', 'seasonList', 'season_list', 'seasonInfos', 'seasonInfoList', 'items', 'list', 'results'];
+  const episodeKeys = ['episodes', 'episodeList', 'episode_list', 'episodeInfoList', 'epList', 'episodesList', 'list', 'items'];
+  const rows = findMovieBoxArray(payload, seasonKeys) || findMovieBoxArray(details, seasonKeys) || [];
+  const normalized = rows.map((season, index) => {
+    const entry = season && typeof season === 'object' ? season : { se: season };
+    const number = positiveNumber(entry.se ?? entry.seasonNumber ?? entry.seasonNo ?? entry.season ?? entry.number, index + 1);
+    const episodeRows = findMovieBoxArray(entry, episodeKeys) || [];
+    const episodes = episodeRows.map((episode, episodeIndex) => {
+      const item = episode && typeof episode === 'object' ? episode : { ep: episode };
+      const episodeNumber = positiveNumber(item.ep ?? item.episodeNumber ?? item.episodeNo ?? item.episode ?? item.number, episodeIndex + 1);
+      return { number: episodeNumber, title: item.title || item.name || item.episodeTitle || `Episode ${episodeNumber}` };
+    });
+    const count = positiveNumber(entry.episodeCount ?? entry.totalEpisodes ?? entry.totalEpisode
+      ?? entry.episodeNum ?? entry.epCount ?? entry.epNum ?? entry.episodesCount ?? entry.episodeTotal ?? entry.count, null);
+    const finalEpisodes = episodes.length ? episodes : Array.from({ length: count || 30 }, (_, i) => ({ number: i + 1, title: `Episode ${i + 1}` }));
+    return {
+      number,
+      title: entry.name || entry.title || entry.seasonName || `Season ${number}`,
+      episodes: finalEpisodes,
+      episodesFromApi: episodes.length > 0 || count != null,
+    };
+  }).filter((season) => season.number);
+  if (normalized.length) return normalized.sort((a, b) => a.number - b.number);
+
+  const rawCount = details.seasonCount ?? details.season_count ?? details.totalSeasons
+    ?? details.season ?? result.seasonCount;
+  const count = positiveNumber(rawCount, 1);
+  return Array.from({ length: Math.min(count, 100) }, (_, index) => ({
+    number: index + 1,
+    title: `Season ${index + 1}`,
+    episodes: Array.from({ length: 30 }, (_episode, episodeIndex) => ({
+      number: episodeIndex + 1,
+      title: `Episode ${episodeIndex + 1}`,
+    })),
+    episodesFromApi: false,
+  }));
+}
+
+function unwrapMovieBoxDetails(value) {
+  let current = value;
+  const visited = new Set();
+  for (let i = 0; i < 5 && current && typeof current === 'object' && !Array.isArray(current) && !visited.has(current); i += 1) {
+    visited.add(current);
+    const nested = current.subject || current.subjectInfo || current.detail || current.details || current.data;
+    if (!nested || typeof nested !== 'object') break;
+    current = nested;
+  }
+  return current || {};
+}
+
+function movieBoxGenreNames(value) {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+  return values.map((genre) => genre && typeof genre === 'object'
+    ? genre.name || genre.title || genre.label
+    : genre).filter((genre) => genre != null && String(genre).trim());
+}
+
+function updateSelectedFromMovieBox(result, payload) {
+  const details = unwrapMovieBoxDetails(payload);
+  const cover = details.cover?.url || details.coverUrl || details.poster || details.pic || null;
+  result.title = details.title || details.name || result.title;
+  result.year = result.year || Number(details.year || details.releaseDate?.slice?.(0, 4) || 0) || null;
+  result.description = details.description || details.overview || details.plot || details.introduction || result.description;
+  result.releaseDate = details.releaseDate || details.release_date || details.firstAirDate || details.first_air_date || result.releaseDate;
+  result.rating = details.imdbRatingValue || details.rating || result.rating;
+  const genres = details.genres || details.genreList || details.genreNames;
+  if (genres) result.genres = movieBoxGenreNames(genres);
+  result.runtime = details.duration || details.runtime || result.runtime;
+  if (!result.poster && cover && /^https?:\/\//i.test(String(cover))) result.poster = cover;
+  renderSelectedInfo(result);
+  return details;
+}
+
+function renderEpisodeOptions(season) {
+  const select = $('#sel-episode');
+  const episodes = season?.episodes?.length ? season.episodes : [{ number: 1, title: 'Episode 1' }];
+  select.innerHTML = episodes.map((episode) => `<option value="${episode.number}">${escapeHtml(episode.title || `Episode ${episode.number}`)}</option>`).join('');
+  if (episodes.some((episode) => episode.number === state.selectedEpisode)) select.value = String(state.selectedEpisode);
+  else {
+    state.selectedEpisode = episodes[0].number;
+    select.value = String(state.selectedEpisode);
+  }
+}
+
+function renderSeriesControls(seasons, selectionId, statusMessage = '') {
+  const controls = $('#sel-episode-controls');
+  state.selectedSeasons = seasons;
+  controls.classList.remove('hide');
+  const seasonSelect = $('#sel-season');
+  seasonSelect.innerHTML = seasons.map((season) => `<option value="${season.number}">${escapeHtml(season.title)}</option>`).join('');
+  const available = seasons.some((season) => season.number === state.selectedSeason);
+  if (!available) state.selectedSeason = seasons[0]?.number || 1;
+  seasonSelect.value = String(state.selectedSeason);
+  renderEpisodeOptions(seasons.find((season) => season.number === state.selectedSeason));
+  $('#sel-episode-status').textContent = statusMessage;
+
+  seasonSelect.onchange = () => {
+    if (selectionId !== selectionRequestId) return;
+    state.selectedSeason = Number(seasonSelect.value) || 1;
+    state.selectedEpisode = 0;
+    renderEpisodeOptions(seasons.find((season) => season.number === state.selectedSeason));
+    resolveSelectedMovieBox(selectionId);
+  };
+  $('#sel-episode').onchange = () => {
+    if (selectionId !== selectionRequestId) return;
+    state.selectedEpisode = Number($('#sel-episode').value) || 1;
+    resolveSelectedMovieBox(selectionId);
+  };
+}
+
+function isCurrentSelection(selectionId) {
+  return selectionId === selectionRequestId;
+}
+
+async function resolveSelectedMovieBox(selectionId) {
+  if (!isCurrentSelection(selectionId) || !state.selected) return;
+  const result = state.selected;
+  result.selectedSeason = state.selectedSeason;
+  result.selectedEpisode = state.selectedEpisode;
+  await resolve({
+    url: result.url,
+    title: result.title,
+    year: result.year,
+    kind: result.kind,
+    sourceId: result.sourceId,
+    season: state.selectedSeason,
+    episode: state.selectedEpisode,
+  }, selectionId);
+}
+
+async function loadMovieBoxDetails(result, selectionId) {
+  const target = movieBoxTargetForResult(result);
+  if (!target) {
+    $('#sel-note').textContent = 'MovieBox subject ID is missing; cannot load title details.';
+    return;
+  }
+  const controller = new AbortController();
+  detailAbortController?.abort();
+  detailAbortController = controller;
+  const requestId = ++detailRequestId;
+  $('#sel-note').textContent = 'Loading MovieBox title details and episode information…';
+  try {
+    const params = new URLSearchParams({ subjectId: target.subjectId, kind: result.kind || 'movie' });
+    const response = await api(`/api/find/details?${params}`, { signal: controller.signal, silent: true });
+    if (!isCurrentSelection(selectionId) || requestId !== detailRequestId || controller.signal.aborted) return;
+    const details = updateSelectedFromMovieBox(result, response.details);
+    if (result.kind === 'series') {
+      const seasons = normalizeMovieBoxSeasons(response.seasons, details, result);
+      state.selectedSeason = target.season || seasons[0]?.number || 1;
+      state.selectedEpisode = target.episode || 0;
+      const hasEpisodeData = seasons.some((season) => season.episodesFromApi);
+      const status = response.seasonError
+        ? `Episode list unavailable (${response.seasonError}); showing selectable fallback episode numbers.`
+        : hasEpisodeData
+          ? 'Choose a season and episode; streams reload for the selected episode.'
+          : 'MovieBox returned no episode list; showing fallback episode numbers. Streams still resolve for the selection.';
+      renderSeriesControls(seasons, selectionId, status);
+    }
+    $('#sel-note').textContent = result.kind === 'series'
+      ? 'Resolving the selected season and episode…'
+      : 'Details loaded. Resolving MovieBox streams…';
+    await resolveSelectedMovieBox(selectionId);
+  } catch (err) {
+    if (!isCurrentSelection(selectionId) || requestId !== detailRequestId || controller.signal.aborted || isAbortError(err)) return;
+    $('#sel-note').textContent = `MovieBox details failed (${err.message}); trying the selected title with default episode values.`;
+    if (result.kind === 'series') {
+      const seasons = normalizeMovieBoxSeasons(null, {}, result);
+      state.selectedSeason = target.season || 1;
+      state.selectedEpisode = target.episode || 1;
+      renderSeriesControls(seasons, selectionId, 'Episode details are unavailable; choose a fallback season and episode number.');
+    }
+    await resolveSelectedMovieBox(selectionId);
+  } finally {
+    if (requestId === detailRequestId && detailAbortController === controller) detailAbortController = null;
+  }
 }
 
 async function selectResult(index) {
   const r = state.results[index];
+  if (!r) return;
+  const selectionId = invalidateSelectionRequests();
   state.selected = r;
-  $$('#results .moviecard').forEach((c) => c.classList.toggle('sel', Number(c.dataset.i) === index));
-  $('#sel-name').textContent = `${r.title}${r.year ? ` (${r.year})` : ''}`;
-  $('#sel-meta').innerHTML = `${escapeHtml(r.sourceName)} · ${escapeHtml(r.kind)}${r.url ? ` · <span class="mono">${escapeHtml(r.url.slice(0, 60))}…</span>` : ''}`;
-  $('#sel-poster').innerHTML = r.poster
-    ? `<img src="${escapeHtml(r.poster)}" alt="" style="width:100%;border-radius:8px">`
-    : `<b>${escapeHtml(r.title)}</b>`;
-  $('#sel-note').textContent = r.description || 'Resolving candidates — every URL is probed with ffprobe before it is offered.';
+  state.selectedSeason = 0;
+  state.selectedEpisode = 0;
+  state.selectedSeasons = [];
+  state.candidates = [];
+  $$('#results .moviecard').forEach((card) => {
+    const active = Number(card.dataset.i) === index;
+    card.classList.toggle('sel', active);
+    card.setAttribute('aria-pressed', String(active));
+  });
+  renderSelectedInfo(r);
+  $('#sel-episode-controls').classList.add('hide');
+  $('#sel-note').textContent = 'Resolving candidates — every URL is probed with ffprobe before it is offered.';
   $('#sel-actions').innerHTML = '';
   $('#candidates').innerHTML = '<div class="meta"><span class="spin"></span> resolving…</div>';
-  await resolve({ url: r.url, title: r.title, year: r.year, kind: r.kind, sourceId: r.sourceId });
+  if (r.sourceId === 'moviebox' || String(r.url || '').startsWith('moviebox://')) {
+    await loadMovieBoxDetails(r, selectionId);
+  } else {
+    await resolve({ url: r.url, title: r.title, year: r.year, kind: r.kind, sourceId: r.sourceId }, selectionId);
+  }
 }
 
 async function doResolveFromUrl() {
   const url = $('#u-url').value.trim();
   if (!url) return toast('Paste a URL first', 'warn');
-  $('#candidates').innerHTML = '<div class="meta"><span class="spin"></span> scraping…</div>';
+  const selectionId = invalidateSelectionRequests();
+  resetSelectedTitle();
+  $('#sel-name').textContent = $('#u-title').value.trim() || url;
+  $('#sel-meta').textContent = 'Pasted URL resolve';
+  $('#sel-note').textContent = 'Scraping the supplied URL…';
   await resolve({
     url,
     title: $('#u-title').value.trim() || null,
@@ -286,16 +740,35 @@ async function doResolveFromUrl() {
     episode: Number($('#u-episode').value) || 0,
     useBrowser: $('#u-browser').checked,
     probe: $('#u-probe').checked,
-  });
+  }, selectionId);
 }
 
-async function resolve(payload) {
+async function resolve(payload, selectionId = null) {
+  resolveAbortController?.abort();
+  const controller = new AbortController();
+  resolveAbortController = controller;
+  const requestId = ++resolveRequestId;
+  state.candidates = [];
+  $('#sel-actions').innerHTML = '';
+  $('#candidates').innerHTML = '<div class="meta"><span class="spin"></span> resolving…</div>';
+  const isCurrent = () => requestId === resolveRequestId
+    && !controller.signal.aborted
+    && (selectionId == null || isCurrentSelection(selectionId));
   try {
-    const res = await api('/api/find/resolve', { method: 'POST', body: { ...payload, probe: payload.probe !== false } });
+    const res = await api('/api/find/resolve', {
+      method: 'POST',
+      body: { ...payload, probe: payload.probe !== false },
+      signal: controller.signal,
+      silent: true,
+    });
+    if (!isCurrent()) return;
     state.candidates = res.candidates || [];
     renderCandidates(res);
   } catch (err) {
-    $('#candidates').innerHTML = `<div class="note err">${escapeHtml(err.message)}</div>`;
+    if (!isCurrent() || isAbortError(err)) return;
+    $('#candidates').innerHTML = `<div class="note err">Resolve failed: ${escapeHtml(err.message)}</div>`;
+  } finally {
+    if (requestId === resolveRequestId && resolveAbortController === controller) resolveAbortController = null;
   }
 }
 
@@ -332,8 +805,12 @@ async function createStream(candidate) {
         poster: sel.poster || null,
         description: sel.description || null,
         sourceId: candidate.sourceId,
-        season: Number($('#u-season').value) || null,
-        episode: Number($('#u-episode').value) || null,
+        season: sel.kind === 'series'
+          ? (Number(state.selectedSeason || sel.selectedSeason) || null)
+          : (sel.kind ? null : Number($('#u-season').value) || null),
+        episode: sel.kind === 'series'
+          ? (Number(state.selectedEpisode || sel.selectedEpisode) || null)
+          : (sel.kind ? null : Number($('#u-episode').value) || null),
         candidate: {
           url: candidate.url,
           quality: candidate.quality,
@@ -812,6 +1289,11 @@ window.App = App;
 
 function wire() {
   $('#btn-search').addEventListener('click', doSearch);
+  $('#results-view').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-view]');
+    if (button) setResultsView(button.dataset.view);
+  });
+  updateResultsViewButtons();
   $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   $('#btn-resolve').addEventListener('click', doResolveFromUrl);
 

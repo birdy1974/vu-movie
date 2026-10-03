@@ -70,7 +70,8 @@ services:
       # --- scraping (raise these only on a stronger NAS) ---
       BROWSER_CONCURRENCY: "${BROWSER_CONCURRENCY:-1}"
       RESOLVE_TIMEOUT_MS: "${RESOLVE_TIMEOUT_MS:-45000}"
-      FLARESOLVERR_URL: "${FLARESOLVERR_URL:-}"
+      # FlareSolverr's container port; the host publishes it on 8192 by default.
+      FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8191}"
       EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
       APP_USERNAME: "${APP_USERNAME:-}"
@@ -128,18 +129,18 @@ services:
       options: { max-size: "5m", max-file: "2" }
     networks: [vu-movie]
 
-  # ------------------------------- optional: Cloudflare solver (profile: cf) --
-  # Only needed if one of your sites starts serving Cloudflare challenges to the
-  # headless browser. Enable with:  docker compose --profile cf up -d
-  # and set FLARESOLVERR_URL=http://flaresolverr:8191
+  # -------------------------------------------------------- Cloudflare solver
+  # Always started with the project. The API listens on container port 8191 and
+  # is published as host/NAS port 8192. Keep this port off public Internet.
   flaresolverr:
     image: flaresolverr/flaresolverr:latest
     container_name: vu-movie-flaresolverr
-    profiles: ["cf"]
     restart: unless-stopped
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       TZ: "${TZ:-Europe/Amsterdam}"
+    ports:
+      - "${FLARESOLVERR_HOST_PORT:-8192}:8191"
     mem_limit: 800m
     networks: [vu-movie]
 
