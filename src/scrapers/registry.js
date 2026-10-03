@@ -71,17 +71,33 @@ export function loadSources({ force = false } = {}) {
     if (custom?.id) byId.set(custom.id, { kind: 'browser', enabled: true, ...custom });
   }
 
-  const sources = [...byId.values()].map((r) => ({
-    id: r.id,
-    name: r.name || r.id,
-    home: r.home || '',
-    enabled: r.enabled !== false,
-    kind: r.kind || 'browser',
-    notes: r.notes || '',
-    match: r.match || [],
-    search: r.search || null,
-    resolve: r.resolve || { kind: 'browser' },
-  }));
+  // Recipes stored in /config/sources (or added by hand) predate DASH/HLS
+  // media detection and may be missing fields entirely. Fold the current
+  // patterns in so an old recipe cannot be the reason a `.mpd` player is
+  // invisible to the sniffer.
+  let upgradedRecipes = 0;
+  const sources = [...byId.values()].map((raw) => {
+    const { site, upgraded } = browser.upgradeRecipe(raw);
+    if (upgraded) upgradedRecipes += 1;
+    return {
+      id: site.id,
+      name: site.name || site.id,
+      home: site.home || '',
+      enabled: site.enabled !== false,
+      kind: site.kind || 'browser',
+      notes: site.notes || '',
+      match: site.match || [],
+      search: site.search || null,
+      resolve: site.resolve || { kind: 'browser' },
+      mediaPatterns: site.mediaPatterns || null,
+      mediaPatternsVersion: site.mediaPatternsVersion || null,
+    };
+  });
+  if (upgradedRecipes) {
+    log.debug('scraper', `upgraded ${upgradedRecipes} source recipe(s) to media-detection v${browser.RECIPE_SCHEMA_VERSION}`, {
+      version: browser.RECIPE_SCHEMA_VERSION,
+    });
+  }
 
   for (const id of cfg.sources.disabled || []) {
     const s = sources.find((x) => x.id === id);

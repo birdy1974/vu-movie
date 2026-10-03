@@ -10,7 +10,7 @@ import {
   generateXClientToken, generateXTrSignature, canonicalUrl, buildCanonicalString,
   dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo,
   releasesFromResources, parseJwtClaims, sessionIsValid, findStreamsByTitle, search,
-  buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool,
+  buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool, retryDelayMs,
   classifyFetchError, HOST_POOL,
 } from '../src/scrapers/moviebox.js';
 
@@ -325,6 +325,28 @@ test('classifyFetchError distinguishes DNS, TLS, reset and timeout failures', ()
   assert.equal(reset.kind, 'connection-reset');
   const timeout = classifyFetchError({ message: 'fetch failed', cause: { code: 'ETIMEDOUT', message: 'connect ETIMEDOUT' } });
   assert.equal(timeout.kind, 'timeout');
+});
+
+test('a 429 pauses for Retry-After before the next host, and the cap is 3 s', async () => {
+  // The delay computation is the reference client's, cap included.
+  assert.equal(retryDelayMs({ headers: { 'retry-after': '30' } }), 3000);
+  assert.equal(retryDelayMs({ headers: { 'retry-after': '1' } }), 1000);
+  assert.equal(retryDelayMs({ headers: {} }), 400);
+  assert.equal(retryDelayMs(null), 400);
+
+  const attempts = [];
+  const started = Date.now();
+  const outcome = await requestHostPool({
+    hosts: ['api-a', 'api-b'],
+    requestHost: async (host) => {
+      attempts.push(host);
+      if (host === 'api-a') return { ok: false, status: 429, headers: { 'retry-after': '0.25' }, error: 'rate limited' };
+      return { ok: true, status: 200, data: { ok: true } };
+    },
+  });
+  assert.equal(outcome.ok, true);
+  assert.deepEqual(attempts, ['api-a', 'api-b']);
+  assert.ok(Date.now() - started >= 240, 'the hop waited for Retry-After before retrying');
 });
 
 test('the dead api6sg host has been removed from the host pool', () => {

@@ -1042,7 +1042,7 @@ function renderStream(res) {
     ['Playlist (.m3u8)', urls.hls],
     ['Playlist (.m3u)', urls.playlist],
     ['Enigma2 / Duo2', urls.forBox],
-    ['Direct upstream link (302)', urls.direct],
+    ...(urls.direct ? [['Direct upstream link (302)', urls.direct]] : []),
     ['Watch in browser', urls.watch],
   ];
   $('#st-client-urls').innerHTML = rows.map(([label, url]) => `
@@ -1050,7 +1050,10 @@ function renderStream(res) {
       <label>${escapeHtml(label)}</label>
       <div class="row"><input class="mono" readonly value="${escapeHtml(url || '')}" style="flex:1">
       <button class="btn sm" onclick="App.copy('${escapeHtml(url || '')}')">copy</button></div>
-    </div>`).join('');
+    </div>`).join('')
+    + (urls.directNote
+      ? `<div class="note mut" style="flex-basis:100%;margin-top:4px">Direct upstream link ${escapeHtml(urls.directNote)}.</div>`
+      : '');
 
   const p = s.profile || {};
   if (p.resolution) $('#pf-res').value = String(p.resolution);

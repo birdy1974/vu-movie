@@ -125,6 +125,39 @@ differences that cannot be fixed by "porting code" and are discussed in §5.
 
 ---
 
+## 3b. Fetching fidelity report — "is our fetching code exactly the reference's?"
+
+**No — and it cannot be, by construction.** MovieBox-TUI is a Rust binary that speaks the
+API and re-hosts the CDN through a sidecar process; vu-movie is a Node app that runs a
+headless browser for the other sites and hands streams to ffmpeg. What *can* be identical is
+the **request layer**, and that now is:
+
+| Fetch layer | Reference | vu-movie | Verdict |
+|---|---|---|---|
+| Visitor login, search, detail, season-info, play-info, resource, captions endpoints | `mod.rs` | same paths, same query building | ✅ identical |
+| `x-client-token`, `x-tr-signature`, canonical string, secret, body hash/length | `crypto.rs` | same algorithm, unit-tested against reference fixtures | ✅ identical |
+| `Accept`/`Content-Type`/`Connection: keep-alive`, `x-client-status: 0` | `build_signed_headers` | same six headers + UA | ✅ identical |
+| UA string, `x-client-info` JSON shape, spoofed `x-forwarded-for` | `generate_client_info_and_ua` | same fields/space, **one identity per session**, persisted with the token | ✅ identical (behaviour) |
+| Token lifecycle: JWT `exp`/`userId`, 7-day ceiling, `x-user` rotation, 401/403 + exhausted-host re-login, one retry | `session.rs`, `client.rs` | same | ✅ identical |
+| Host sweep: order, sticky index, hop on transport error **and** retryable status, JSON parse failure = host failure, 429 `Retry-After` capped at 3 s, 50 ms breather | `request_hosts` | same | ✅ identical |
+| play-info **+** resource union, per-episode filtering, placeholders filtered by the exact marker list | `episode_streams`, `is_deprecation_notice_url` | same (parallel + union + path dedupe) | ✅ identical |
+| Media fetch: header injection on every manifest *and* segment request | sidecar proxy, per-request | ffmpeg `-headers` — verified on the wire to reach `/seg/*` requests too | ✅ equivalent for headers |
+| DASH manifest rewriting, `max_height` filtering, segment cache/prefetch, ranged m4s, subtitle-through-proxy | sidecar (`proxy.rs`) | not ported: ffmpeg reads the live MPD directly; the relay is the single place headers are applied | ⚠️ deliberate divergence |
+| DNS: system resolver **with public-resolver fallback** | hickory + Cloudflare/Google/Quad9 | system resolver only; public DNS is used for *diagnosis*, not for scraping | ⚠️ divergence (see below) |
+| TLS: rustls/`webpki-roots` | rustls | Node/OpenSSL (undici) | ⚠️ divergence (see below) |
+| Page sniffing | not implemented (never needed) | Chromium lane for the seven site sources | ➕ extra, not a difference in MovieBox fetching |
+
+The two ⚠️ items are transport, not protocol: Node 22 exposes no supported way to override
+the resolver used by `fetch`/`getaddrinfo` (the reference embeds a Rust resolver for exactly
+that reason), and swapping the TLS stack would mean moving the API calls into Chromium's
+network stack. Both are detectable now (`dns-filtered`, `tls-or-ip-block`, `tls-intercepted`
+verdicts) and both have an operator-level fix (`dns:` in compose; `NODE_EXTRA_CA_CERTS`).
+
+If the goal is literal byte-for-byte framing-level equality — the same ClientHello the Rust
+client sends — the only way is to make the API calls from inside the Chromium we already run
+(or a shared rustls sidecar). Say the word and that transport can be added; it is a bigger
+change (signed headers built in an init script, no dependency on CORS, one extra context).
+
 ## 4. What changed in vu-movie for this comparison
 
 * `src/scrapers/moviebox.js`
@@ -143,9 +176,13 @@ differences that cannot be fixed by "porting code" and are discussed in §5.
   actionable hint (`DIAGNOSE_ON_FAILURE`, `DNS_CHECK_SERVERS`).
 * `src/scrapers/browser.js` — the sniffer now (a) names the refused embed hosts, (b) blocks
   main-frame `about:blank`/off-site hijacks and reloads once, so `finalUrl: about:blank`
-  no longer ends the story with "no media found".
-* `src/scrapers/registry.js` — the resolve error now carries the network verdict.
-* Tests: 19 MovieBox tests (7 new), 3 diagnostics tests.
+  no longer ends the story with "no media found", and (c) applies per-site `mediaPatterns`
+  from the recipe, so an extension-less DASH endpoint is still recognised.
+* `src/streams/store.js` + `src/http/server.js` + `public/app.js` — `/s/<token>/direct`
+  (a 302 to the CDN) is no longer offered for sources that need request headers (signed
+  cookie / `x-*`), because a redirect cannot replay them: the reference client never hands a
+  bare CDN URL to a player either. The relay URL is always offered and always works.
+* Tests: 20 MovieBox tests, 3 diagnostics, 5 wire-level parity tests (108 total).
 
 What was deliberately **not** ported: the sidecar proxy (ffmpeg already re-requests segments
 with `-headers`, and the relay is the single place headers are applied), and the Rust DNS

@@ -162,17 +162,38 @@ export async function closeContexts() {
   }
 }
 
-export function looksLikeMedia(url, contentType, resourceType = '') {
+/** Accepts compiled `{re, kind}` entries as well as raw recipe strings. */
+function asMatcher(pattern) {
+  if (!pattern) return null;
+  if (pattern instanceof RegExp) return { re: pattern, kind: null };
+  if (typeof pattern === 'string') {
+    try { return { re: new RegExp(pattern, 'i'), kind: null }; } catch { return null; }
+  }
+  if (pattern.re instanceof RegExp) return { re: pattern.re, kind: pattern.kind || null };
+  if (typeof pattern.re === 'string') {
+    try { return { re: new RegExp(pattern.re, pattern.flags || 'i'), kind: pattern.kind || null }; } catch { return null; }
+  }
+  return null;
+}
+
+export function looksLikeMedia(url, contentType, resourceType = '', extraPatterns = []) {
   const target = String(url || '');
   const ct = String(contentType || '').toLowerCase();
+  const extras = extraPatterns.map(asMatcher).filter(Boolean);
   // Some CDNs mislabel fonts as application/octet-stream; they are not video
   // candidates even though their MIME type otherwise looks like binary media.
   if (resourceType === 'font' || FONT_FILE_PATTERN.test(target)) return false;
   if (MEDIA_CONTENT_TYPES.some((t) => ct.includes(t.toLowerCase()))) return true;
   if (/^application\/octet-stream(?:\s*;|$)/i.test(ct)) {
-    return resourceType === 'media' || MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
+    return resourceType === 'media'
+      || MEDIA_PATTERNS.some((pattern) => pattern.re.test(target))
+      || extras.some((pattern) => pattern.re.test(target));
   }
-  return MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
+  return MEDIA_PATTERNS.some((pattern) => pattern.re.test(target))
+    // Per-site patterns from the recipe (some sites serve manifests behind a
+    // route with no extension, e.g. /api/stream?id=…). A match here also tells
+    // us the kind, so the candidate is not recorded as a generic 'file'.
+    || extras.some((pattern) => pattern.re.test(target));
 }
 
 function kindOf(url, contentType) {
@@ -180,7 +201,60 @@ function kindOf(url, contentType) {
   if (/mpegurl/.test(ct) || /\.m3u8/i.test(url)) return 'hls';
   if (/dash\+xml/.test(ct) || /\.mpd/i.test(url)) return 'dash';
   if (/mp2t/.test(ct) || /\.ts(\?|#|$)/i.test(url)) return 'segment';
+  if (/video\/mp4|video\/webm/i.test(ct)) return 'file';
   return 'file';
+}
+
+/**
+ * Bumped whenever the regexes a stored recipe carries may be out of date.
+ * Recipes downloaded by an earlier version (or hand-written ones for a site
+ * that changed its player) keep working because `upgradeRecipe` folds the
+ * current built-in regexes back in — see registry.loadSources().
+ */
+export const RECIPE_SCHEMA_VERSION = 2;
+
+/** A sane default pattern for a media kind, used when a recipe has none. */
+export function defaultMediaPattern(kind) {
+  const found = MEDIA_PATTERNS.find((pattern) => pattern.kind === kind);
+  return found ? found.re.source : null;
+}
+
+/** Cache of compiled recipe patterns (site id → [{re, kind}]). */
+const recipeMediaPatterns = new Map();
+
+function compiledPatternsFor(siteId) {
+  const cached = recipeMediaPatterns.get(siteId);
+  if (cached) return cached;
+  let patterns = [];
+  if (siteId) {
+    try {
+      const source = loadSources().find((s) => s.id === siteId);
+      patterns = Array.isArray(source?.mediaPatterns) ? source.mediaPatterns : [];
+    } catch { /* registry not loaded (unit tests) — fall back to the built-ins */ }
+  }
+  const compiled = patterns.map(asMatcher).filter(Boolean);
+  recipeMediaPatterns.set(siteId, compiled);
+  return compiled;
+}
+
+/**
+ * Fold the *current* media-detection patterns into a possibly stale site
+ * recipe. Sites stored in /config/sources predate DASH/HLS detection and carry
+ * no patterns at all, which is how a `.mpd`-only site ends up "no media found".
+ */
+export function upgradeRecipe(site = {}) {
+  const version = Number(site.mediaPatternsVersion || 0);
+  if (version >= RECIPE_SCHEMA_VERSION && Array.isArray(site.mediaPatterns)) {
+    return { site, upgraded: false };
+  }
+  return {
+    site: {
+      ...site,
+      mediaPatterns: MEDIA_PATTERNS.map((pattern) => pattern.re.source),
+      mediaPatternsVersion: RECIPE_SCHEMA_VERSION,
+    },
+    upgraded: true,
+  };
 }
 
 /**
@@ -268,11 +342,12 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
       const req = res.request();
-      if (looksLikeMedia(u, ct, req.resourceType())) {
+      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session);
+      if (looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns)) {
         if (!media.has(u)) {
           let reqHeaders;
           try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }
-          const kind = kindOf(u, ct);
+          const kind = sitePatterns.find((pattern) => pattern.re.test(u))?.kind || kindOf(u, ct);
           media.set(u, {
             url: u,
             kind,

@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { request } from './http.js';
+import { request, sleep } from './http.js';
 import { diagnoseReachability } from './diagnostics.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
@@ -230,8 +230,16 @@ export async function requestHostPool({ hosts = HOST_POOL, startIndex = 0, signa
   if (typeof requestHost !== 'function') throw new TypeError('requestHostPool needs requestHost(host, index, hop)');
   if (!hosts.length) return { ok: false, result: null, index: null, error: new Error('MovieBox host pool is empty') };
   let lastError = null;
+  let backoffMs = 0;
   for (let hop = 0; hop < hosts.length; hop += 1) {
     if (signal?.aborted) throw abortError(signal);
+    if (hop > 0) {
+      // Reference parity (`request_hosts`): a 50 ms breather between hosts, and
+      // on HTTP 429 sleep for the server's Retry-After (capped at 3 s, like the
+      // reference client) so we do not turn rate-limiting into a ban.
+      await sleep(backoffMs || 50);
+      backoffMs = 0;
+    }
     const index = (startIndex + hop) % hosts.length;
     const host = hosts[index];
     try {
@@ -240,6 +248,7 @@ export async function requestHostPool({ hosts = HOST_POOL, startIndex = 0, signa
       lastError = result?.error instanceof Error
         ? result.error
         : new Error(String(result?.error || `HTTP ${result?.status || 'request failed'}`));
+      if (result?.status === 429) backoffMs = retryDelayMs(result);
       onFailure?.({ host, index, hop, error: lastError, result });
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -249,6 +258,16 @@ export async function requestHostPool({ hosts = HOST_POOL, startIndex = 0, signa
     }
   }
   return { ok: false, result: null, index: null, error: lastError || new Error('all MovieBox hosts exhausted') };
+}
+
+/**
+ * Pause before the next host after a 429, mirroring the reference client:
+ * honour `Retry-After` but never wait longer than 3 s (a rate-limited edge is
+ * not worth stalling the whole resolve for).
+ */
+export function retryDelayMs(result) {
+  const retryAfter = Number(result?.headers?.['retry-after']);
+  return Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 3000) : 400;
 }
 
 /** Visitor-login variant that only treats a response with a token as authenticated success. */
