@@ -220,11 +220,12 @@ The ones that matter most on a DS918+:
   all of that (restart count, `/dev/shm` size, reachable API) for you; to pin a
   known-good image set `FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21`.
 * Health: `GET /api/health` (also wired into the container healthcheck).
-  The receiver status in that payload is **cached for 60 s**: the healthcheck
-  (every 30 s) and the dashboard (every 15 s) both read it, and a VU+ should
-  not be woken up every 15 seconds for a value that changes roughly never.
-  The UI's *test connection* button (`GET /api/enigma2/status`) always asks the
-  box for real, and reachability is logged when it **changes**, not per poll.
+  The receiver is **not** contacted by this endpoint — it reports the last known
+  state only. The container healthcheck (every 30 s) and the dashboard (every
+  15 s) both read `/api/health`, and a VU+ should not be woken up that often for
+  a value that changes roughly never. The box is checked on demand
+  (`GET /api/enigma2/status`, the *test connection* button) and before every
+  bouquet push; reachability is logged when it **changes**, not per poll.
 
 ```bash
 docker compose logs -f vu-movie          # structured app logs

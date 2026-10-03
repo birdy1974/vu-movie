@@ -81,12 +81,11 @@ router.get('/health', wrap(async (req, res) => {
   hardware();
   const hw = hardwareStatus();
   const binaries = binariesStatus() || { ffmpeg: { ok: false, pending: true }, ffprobe: { ok: false, pending: true } };
-  // Cached: this endpoint answers the container healthcheck every 30 s and the
-  // dashboard every 15 s, and a receiver should not be woken up that often for
-  // a value that almost never changes.
-  const enigma = cfg('enigma2.host')
-    ? await enigma2.status({ timeoutMs: 3000, maxAgeMs: 60_000 }).catch((e) => ({ ok: false, message: errorText(e) }))
-    : { configured: false };
+  // Last known receiver state only — this endpoint answers the container
+  // healthcheck every 30 s and the dashboard every 15 s, and neither is a
+  // reason to send a request to the box. The receiver is checked on demand
+  // (GET /api/enigma2/status) and when a bouquet is pushed.
+  const enigma = enigma2.cachedStatus();
   res.json({
     ok: true,
     version: process.env.APP_VERSION || '1.0.0',

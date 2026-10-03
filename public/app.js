@@ -165,8 +165,11 @@ async function loadHealth() {
         title: 'VU+ Duo2 (Enigma2)',
         rows: [
           ['configured', h.enigma2?.configured ? 'yes' : 'no (set host in Settings)', h.enigma2?.configured],
-          ['reachable', h.enigma2?.message || '—', h.enigma2?.ok],
+          // The health endpoint never polls the box, so say when the answer is
+          // from and that it is a last-known value, not a fresh probe.
+          ['reachable', h.enigma2?.message || '—', h.enigma2?.ok === null ? null : h.enigma2?.ok],
           ['model', h.enigma2?.model || '—', null],
+          ['last checked', h.enigma2?.checked ? `${h.enigma2.ageMs != null ? Math.round(h.enigma2.ageMs / 1000) : '?'}s ago (on demand only)` : 'never', null],
         ],
       },
     ];

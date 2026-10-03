@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef, status, resetStatusCache, xmlTag,
+  cachedStatus,
 } from '../src/enigma2/index.js';
 import { getConfig } from '../src/core/config.js';
 import { getRecentLogs } from '../src/core/log.js';
@@ -164,4 +165,62 @@ test('repeated polls do not spam INFO with an unchanged receiver', async (t) => 
   await status({ timeoutMs: 1000, force: true });
   const down = getRecentLogs({ component: 'enigma2', level: 'warn', search: 'unreachable' });
   assert.ok(down.length > 0, 'the receiver going away must be logged');
+});
+
+test('/api/health never contacts the receiver: cachedStatus() does no request', async (t) => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(ABOUT_XML, { status: 200, headers: { 'content-type': 'text/xml' } });
+  };
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, username: cfg.username };
+  Object.assign(cfg, { host: '192.168.1.20', username: '' });
+  resetStatusCache();
+  t.after(() => {
+    globalThis.fetch = original;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  // Before any check: an explicit "never checked", not a silent false.
+  const fresh = cachedStatus();
+  assert.equal(fresh.configured, true);
+  assert.equal(fresh.ok, null);
+  assert.equal(fresh.checked, false);
+  assert.match(fresh.message, /not checked/);
+  assert.equal(calls, 0, 'the healthcheck must not wake the receiver');
+
+  // Many "health polls" in a row: still zero requests to the box.
+  for (let i = 0; i < 10; i += 1) cachedStatus();
+  assert.equal(calls, 0);
+
+  // The operator asks for a real check (Settings → Enigma2 → test connection).
+  const forced = await status({ timeoutMs: 1000, force: true });
+  assert.equal(forced.ok, true);
+  assert.equal(calls, 1);
+
+  // …and the health payload then reports it as a last-known value.
+  const afterCheck = cachedStatus();
+  assert.equal(afterCheck.ok, true);
+  assert.equal(afterCheck.checked, true);
+  assert.equal(afterCheck.model, 'Duo\u00b2');
+  assert.ok(afterCheck.ageMs >= 0);
+  assert.equal(calls, 1, 'reporting the last known state is free');
+});
+
+test('no receiver configured reports that, without probing', () => {
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host };
+  cfg.host = '';
+  resetStatusCache();
+  try {
+    const state = cachedStatus();
+    assert.equal(state.configured, false);
+    assert.match(state.message, /no receiver configured/);
+  } finally {
+    cfg.host = saved.host;
+    resetStatusCache();
+  }
 });

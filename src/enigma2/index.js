@@ -148,6 +148,27 @@ export function resetStatusCache() {
 }
 
 /**
+ * The last known receiver state, or a placeholder that says it was never
+ * checked. **Never contacts the box** — this is what `/api/health` reports.
+ *
+ * The container healthcheck hits `/api/health` every 30 s and the dashboard
+ * every 15 s; neither is a reason to wake a VU+. The receiver is checked when
+ * the operator asks (Settings → Enigma2 → test connection) or when we actually
+ * need it (a bouquet push), and the dashboard simply shows the outcome.
+ */
+export function cachedStatus() {
+  const cfg = getConfig().enigma2;
+  if (!cfg.host) return { configured: false, ok: false, checked: false, message: 'no receiver configured (Settings → Enigma2)' };
+  if (statusCache.value) {
+    return { ...statusCache.value, cached: true, checked: true, ageMs: Date.now() - statusCache.at };
+  }
+  return {
+    configured: true, ok: null, checked: false, ageMs: null,
+    message: 'not checked — press “test connection” in Settings → Enigma2',
+  };
+}
+
+/**
  * Log the receiver state only when it *changes*.
  *
  * The old code logged `receiver reachable: <model>` at INFO on every poll, so
@@ -292,7 +313,10 @@ export async function pushBouquet(entries, { name = null, dryRun = false } = {})
     return { ok: true, dryRun: true, bouquet, bouquetsLine: bouquet.bouquetsLine };
   }
 
-  const reachable = await status();
+  // A push must not trust a cached "reachable": a box that went to standby
+  // since the last check would fail halfway through the upload. This also
+  // refreshes the state the dashboard shows.
+  const reachable = await status({ force: true });
   if (!reachable.ok) {
     return { ok: false, error: `receiver not reachable: ${reachable.message}`, bouquet };
   }
