@@ -404,14 +404,22 @@ function normalizeResultText(value) {
 function resultYearKey(result) {
   const explicitYear = Number(result?.year);
   if (Number.isFinite(explicitYear) && explicitYear > 0) return String(Math.floor(explicitYear));
-  const parentheticalYear = /\s+\(((?:19|20)\d{2})\)\s*$/.exec(String(result?.title || ''));
-  return parentheticalYear?.[1] || '';
+  const title = String(result?.title || '');
+  // Accept both "Title (2022)" and "Title 2022" (after normalizeResultText the
+  // parens are already stripped to spaces, but we run the regex against the
+  // raw title too so we don't miss the parenthetical form).
+  const parentheticalYear = /\s*\(((?:19|20)\d{2})\)\s*$/.exec(title);
+  if (parentheticalYear) return parentheticalYear[1];
+  const bareYear = /\s+((?:19|20)\d{2})\s*$/.exec(normalizeResultText(title));
+  return bareYear?.[1] || '';
 }
 
 function resultGroupingTitle(result, index) {
   let title = normalizeResultText(result?.title);
   const year = resultYearKey(result);
   if (year) title = title.replace(new RegExp(`\\s+${year}$`), '').trim();
+  // Also strip common quality tags sites append to titles.
+  title = title.replace(/\s+(?:hd|4k|uhd|1080p|720p|480p|free|online|watch|movie|series)$/, '').trim();
   return title || `untitled ${index}`;
 }
 
@@ -445,17 +453,31 @@ function groupSearchResults(results = state.results) {
 
   for (const bucket of buckets.values()) {
     const years = [...new Set(bucket.entries.map(({ result }) => resultYearKey(result)).filter(Boolean))];
+    const yearless = bucket.entries.filter(({ result }) => !resultYearKey(result));
     if (years.length <= 1) {
       // A missing year can join the only known edition, but never bridges two
       // different remakes with the same title.
       addGroup(bucket, bucket.entries, years[0] || '');
       continue;
     }
+    // Multiple distinct years → each year gets its own card (remakes / show vs
+    // movie with same title). Merge entries without a year into the year that
+    // has the most provider results — that's almost always the same title
+    // (sites that omit the year are usually scrapers missing metadata on a
+    // single source, not an undiscovered edition).
+    const counts = new Map();
+    for (const year of years) {
+      counts.set(year, bucket.entries.filter(({ result }) => resultYearKey(result) === year).length);
+    }
+    const majorityYear = [...counts.entries()].sort((a, b) => b[1] - a[1] || Number(b[0]) - Number(a[0]))[0]?.[0];
     years.sort((a, b) => Number(b) - Number(a));
     for (const year of years) {
-      addGroup(bucket, bucket.entries.filter(({ result }) => resultYearKey(result) === year), year);
+      const entries = bucket.entries.filter(({ result }) => resultYearKey(result) === year);
+      // Merge the yearless entries into the most-numerous year group rather
+      // than leaving them as an "unknown year" orphan.
+      if (year === majorityYear && yearless.length) entries.push(...yearless);
+      addGroup(bucket, entries, year);
     }
-    addGroup(bucket, bucket.entries.filter(({ result }) => !resultYearKey(result)), '');
   }
   return groups;
 }

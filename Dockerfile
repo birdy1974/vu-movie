@@ -89,6 +89,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # DS918+ iHD installs but fails to initialise, so the app self-tests iHD and
     # i965 and pins the driver that actually encodes. Set it in .env to override.
     LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+# DNS: be more tolerant of Docker's embedded resolver (127.0.0.11), which can
+# return EAI_AGAIN under load. Chromium has its own async resolver and rarely
+# trips; ffprobe/glibc processes do unless we raise retries/timeouts.
+# (Set separately because the value contains a space, which Docker's ENV
+# continuation parser does not accept inside a multi-line block.)
+ENV RES_OPTIONS="attempts:4 timeout:3"
 
 # System packages.
 #   ffmpeg/ffprobe      → probing, remuxing and (with vaapi) transcoding

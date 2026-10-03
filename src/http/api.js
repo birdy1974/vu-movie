@@ -201,8 +201,26 @@ router.post('/sources/test', wrap(async (req, res) => {
   const { sourceId, query } = req.body || {};
   const source = registry.getSource(sourceId);
   if (!source) return res.status(404).json({ ok: false, error: `unknown source ${sourceId}` });
+  registry.resetSourceHealth(sourceId);
   const results = await registry.searchSource(source, query || 'matrix');
   res.json({ ok: true, results, health: registry.healthOf(sourceId) });
+}));
+
+/** Reset the circuit breaker for a source (or all sources when id="*"). */
+router.post('/sources/reset-health', wrap(async (req, res) => {
+  const sourceId = (req.body?.sourceId || req.query.sourceId || '').trim();
+  if (sourceId === '*' || !sourceId) {
+    registry.resetSourceHealth();
+    try { moviebox.resetBackoff?.(); } catch { /* moviebox may not be loaded */ }
+    log.info('api', 'source health reset (all sources)');
+  } else {
+    registry.resetSourceHealth(sourceId);
+    if (sourceId === 'moviebox') {
+      try { moviebox.resetBackoff?.(); } catch { /* ignore */ }
+    }
+    log.info('api', `source health reset: ${sourceId}`);
+  }
+  res.json({ ok: true, sources: registry.listSources(), moviebox: moviebox.status() });
 }));
 
 /* ---------- find / resolve ---------- */

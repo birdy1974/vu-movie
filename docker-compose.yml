@@ -91,6 +91,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      flaresolverr:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 30s
@@ -132,6 +134,11 @@ services:
   # -------------------------------------------------------- Cloudflare solver
   # Always started with the project. Set FlareSolverr's actual listener to 8192
   # and publish it on host/NAS port 8192. Keep this port off public Internet.
+  #
+  # The scraper falls back to this container whenever a source returns a
+  # Cloudflare / "Just a moment…" interstitial. When FlareSolverr is not
+  # reachable the scraper logs a clear error instead of returning the
+  # interstitial as an empty "0 results" response.
   flaresolverr:
     image: flaresolverr/flaresolverr:latest
     container_name: vu-movie-flaresolverr
@@ -143,6 +150,12 @@ services:
     ports:
       - "${FLARESOLVERR_HOST_PORT:-8192}:8192"
     mem_limit: 800m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8192/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks: [vu-movie]
 
 volumes:

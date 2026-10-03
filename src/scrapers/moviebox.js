@@ -24,16 +24,52 @@ import { request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
 const API_PREFIX = '/wefeed-mobile-bff';
+/**
+ * Host pool — order matters; api*.aoneroom.com are primary, api.inmoviebox.com
+ * is the legacy fallback. `api6sg.aoneroom.com` was removed 2026-10 after it
+ * stopped resolving (ENOTFOUND); keep the list trim so we don't waste a 12 s
+ * timeout per search on a dead NLB.
+ */
 const HOST_POOL = [
   'https://api6.aoneroom.com',
   'https://api5.aoneroom.com',
   'https://api4.aoneroom.com',
   'https://api4sg.aoneroom.com',
   'https://api3.aoneroom.com',
-  'https://api6sg.aoneroom.com',
   'https://api.inmoviebox.com',
 ];
 const HOST_REQUEST_TIMEOUT_MS = 12_000;
+
+/**
+ * Classify Node/undici fetch failures into actionable categories. `fetch failed`
+ * by itself is useless — callers (and logs) need to know whether this is DNS,
+ * TCP, TLS or a timeout so the operator can diagnose proxy/geo/TLS-fingerprint
+ * problems rather than just seeing a wall of identical errors.
+ */
+export function classifyFetchError(err) {
+  const cause = err?.cause;
+  const raw = String(err?.message || err || '');
+  if (!cause) {
+    if (/ENOTFOUND|getaddrinfo/.test(raw)) return { kind: 'dns', detail: raw };
+    if (/ECONNREFUSED/.test(raw)) return { kind: 'connection-refused', detail: raw };
+    if (/ECONNRESET|EPIPE/.test(raw)) return { kind: 'connection-reset', detail: raw };
+    if (/ETIMEDOUT|timeout/i.test(raw)) return { kind: 'timeout', detail: raw };
+    return { kind: 'unknown', detail: raw };
+  }
+  const code = cause.code || cause.errno;
+  if (code === 'ENOTFOUND' || /getaddrinfo ENOTFOUND/.test(String(cause.message || ''))) {
+    return { kind: 'dns', detail: String(cause.message || cause).slice(0, 200), host: cause.hostname };
+  }
+  if (code === 'ECONNREFUSED') return { kind: 'connection-refused', detail: String(cause.message || '').slice(0, 200), port: cause.port };
+  if (code === 'ECONNRESET' || code === 'EPIPE') return { kind: 'connection-reset', detail: String(cause.message || '').slice(0, 200) };
+  if (code === 'ETIMEDOUT' || /timed out/i.test(String(cause.message || ''))) return { kind: 'timeout', detail: String(cause.message || '').slice(0, 200) };
+  // TLS handshake aborted/reset before ServerHello is common when a reverse
+  // proxy (Alibaba NLB / Cloudflare) drops the connection based on JA3/SNI.
+  if (/TLS|ssl|alert|handshake|WRONG_VERSION|CERTIFICATE/i.test(String(cause.message || ''))) {
+    return { kind: 'tls', detail: String(cause.message || '').slice(0, 240) };
+  }
+  return { kind: 'fetch-failed', detail: `${raw} <- ${String(cause.message || cause).slice(0, 200)}` };
+}
 /** Referer the client app uses when fetching media from the CDN. */
 export const STREAM_REFERER = 'https://sportslive.wine';
 /** 32-byte key baked into the client (Apache-2.0 MovieBox-TUI, crypto.rs). */
@@ -47,6 +83,11 @@ const SIGNATURE_BODY_MAX = 102_400;
 let session = null;      // { token, uid, savedAt }
 let hostIndex = 0;
 let lastError = null;
+/** Tracks consecutive transport failures so we can back off instead of spamming every search. */
+let consecutiveFailures = 0;
+let disabledUntil = 0;
+export const FAILURE_BACKOFF = [0, 0, 30_000, 120_000, 600_000]; // ms added per failure tier
+export { HOST_POOL };
 
 const md5 = (s) => crypto.createHash('md5').update(s).digest('hex');
 
@@ -240,8 +281,13 @@ function clearSession() {
 }
 
 async function login(identity, { signal = null } = {}) {
+  if (Date.now() < disabledUntil) {
+    const waitSec = Math.round((disabledUntil - Date.now()) / 1000);
+    throw new Error(`MovieBox is temporarily backed off for ${waitSec}s after ${consecutiveFailures} consecutive failures`);
+  }
   const body = '{}';
   log.info('moviebox', 'requesting a visitor token', { startHost: HOST_POOL[hostIndex % HOST_POOL.length] });
+  const failureBreakdown = new Map(); // kind → count (for a useful aggregated log line)
   const outcome = await loginWithHostFailover({
     startIndex: hostIndex,
     signal,
@@ -260,16 +306,35 @@ async function login(identity, { signal = null } = {}) {
     },
     onFailure: ({ host, hop, error }) => {
       lastError = errorText(error);
-      log.warn('moviebox', `visitor-login failed on ${host} — trying next host`, { hop: hop + 1, error: lastError });
+      const info = classifyFetchError(error);
+      failureBreakdown.set(info.kind, (failureBreakdown.get(info.kind) || 0) + 1);
+      log.warn('moviebox', `visitor-login failed on ${host} — trying next host`, {
+        hop: hop + 1, error: lastError, kind: info.kind, detail: info.detail?.slice?.(0, 140) || info.detail,
+      });
     },
   });
 
   if (!outcome.ok) {
+    consecutiveFailures += 1;
+    const tier = Math.min(consecutiveFailures, FAILURE_BACKOFF.length - 1);
+    const backoffMs = FAILURE_BACKOFF[tier];
+    if (backoffMs > 0) disabledUntil = Date.now() + backoffMs;
     lastError = errorText(outcome.error);
-    logError('moviebox', 'visitor-login failed on every API host', outcome.error);
-    throw new Error(`MovieBox visitor-login failed: ${lastError}`, { cause: outcome.error });
+    const breakdown = [...failureBreakdown.entries()].map(([k, v]) => `${k}:${v}`).join(',') || 'no detail';
+    // When *every* host fails with TLS/reset, the API edge is almost certainly
+    // rejecting our TLS fingerprint or the service has gone dark.
+    const allTls = failureBreakdown.size > 0 && [...failureBreakdown.keys()].every((k) => ['tls', 'connection-reset', 'fetch-failed', 'timeout'].includes(k));
+    const hint = allTls
+      ? ' (all hosts closed the connection at the TLS layer — likely JA3/TLS fingerprint rejection or the API is down)'
+      : failureBreakdown.has('dns')
+        ? ' (some hosts do not resolve — DNS issue or deprecated hostnames)'
+        : '';
+    logError('moviebox', `visitor-login failed on every API host [${breakdown}]${hint}`, outcome.error);
+    throw new Error(`MovieBox visitor-login failed: ${lastError}${hint}`, { cause: outcome.error });
   }
 
+  consecutiveFailures = 0;
+  disabledUntil = 0;
   hostIndex = outcome.index;
   session = outcome.result.session;
   lastError = null;
@@ -322,10 +387,12 @@ export async function apiRequest(pathAndQuery, { method = 'GET', body, authentic
     onFailure: ({ host, hop, error, result }) => {
       lastError = errorText(error);
       const status = result?.status;
+      const info = !status ? classifyFetchError(error) : null;
       log.warn('moviebox', status
         ? `host ${host} answered ${status} — trying next host`
         : `request failed on ${host} — trying next host`, {
         path: pathAndQuery, hop: hop + 1, error: lastError,
+        ...(info ? { kind: info.kind, detail: info.detail?.slice?.(0, 140) || info.detail } : {}),
       });
     },
   });
@@ -551,7 +618,22 @@ export async function findStreamsByTitle(title, { year = null, kind = null, seas
 }
 
 export function status() {
-  return { session: session ? { uid: session.uid, savedAt: session.savedAt } : null, host: HOST_POOL[hostIndex % HOST_POOL.length], lastError };
+  return {
+    session: session ? { uid: session.uid, savedAt: session.savedAt } : null,
+    host: HOST_POOL[hostIndex % HOST_POOL.length],
+    hostsTotal: HOST_POOL.length,
+    lastError,
+    consecutiveFailures,
+    backoffUntilMs: disabledUntil > Date.now() ? disabledUntil : null,
+    backedOff: Date.now() < disabledUntil,
+  };
 }
 
-export default { search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle, releasesFromPlayInfo, status };
+/** Test/ops helper: reset backoff state so an operator can retry immediately. */
+export function resetBackoff() {
+  consecutiveFailures = 0;
+  disabledUntil = 0;
+  lastError = null;
+}
+
+export default { search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle, releasesFromPlayInfo, status, resetBackoff, classifyFetchError, HOST_POOL };

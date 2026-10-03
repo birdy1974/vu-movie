@@ -10,6 +10,7 @@ import {
   generateXClientToken, generateXTrSignature, canonicalUrl, buildCanonicalString,
   dashManifestFromSignCookie, cookieHeaderFromSignCookie, releasesFromPlayInfo,
   buildSearchRequest, mapSearchResults, loginWithHostFailover, requestHostPool,
+  classifyFetchError, HOST_POOL,
 } from '../src/scrapers/moviebox.js';
 
 test('canonicalUrl sorts query parameters like the reference client', () => {
@@ -185,4 +186,22 @@ test('streams without a playable manifest are skipped, deprecation URLs ignored'
   assert.equal(releases.length, 3);
   assert.ok(releases.every((r) => r.url === 'https://macdn.aoneroom.com/other/x.mp4'));
   assert.deepEqual(releases.map((r) => r.quality), ['1080p', '720p', '480p']);
+});
+
+test('classifyFetchError distinguishes DNS, TLS, reset and timeout failures', () => {
+  const dns = classifyFetchError({ message: 'fetch failed', cause: { code: 'ENOTFOUND', hostname: 'api6sg.aoneroom.com', message: 'getaddrinfo ENOTFOUND api6sg.aoneroom.com' } });
+  assert.equal(dns.kind, 'dns');
+  const tls = classifyFetchError({ message: 'fetch failed', cause: { message: 'Client network socket disconnected before secure TLS connection was established' } });
+  assert.equal(tls.kind, 'tls');
+  const reset = classifyFetchError({ message: 'fetch failed', cause: { code: 'ECONNRESET', message: 'read ECONNRESET' } });
+  assert.equal(reset.kind, 'connection-reset');
+  const timeout = classifyFetchError({ message: 'fetch failed', cause: { code: 'ETIMEDOUT', message: 'connect ETIMEDOUT' } });
+  assert.equal(timeout.kind, 'timeout');
+});
+
+test('the dead api6sg host has been removed from the host pool', () => {
+  assert.ok(Array.isArray(HOST_POOL) && HOST_POOL.length > 0, 'HOST_POOL should be a non-empty array');
+  assert.ok(!HOST_POOL.some((h) => h.includes('api6sg')), 'api6sg.aoneroom.com was DNS-dead and must be removed');
+  assert.ok(HOST_POOL.includes('https://api6.aoneroom.com'), 'primary hosts must remain');
+  assert.ok(HOST_POOL.includes('https://api.inmoviebox.com'), 'legacy fallback must remain');
 });
