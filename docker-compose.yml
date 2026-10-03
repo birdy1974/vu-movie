@@ -74,6 +74,21 @@ services:
       # published on 8193 by default (see FLARESOLVERR_HOST_PORT below).
       FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8192}"
       EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
+      # --- MovieBox bypass for SNI/IP-blocked ISPs ---
+      # When api*.aoneroom.com is SNI-filtered the direct Node TLS handshake
+      # (OpenSSL) is reset before ServerHello. Two built-in workarounds exist:
+      #   1) set MOVIEBOX_PROXY to an http(s) or socks5 proxy that CAN reach
+      #      the host (e.g. your router's VPN or http://proxy:3128), and
+      #   2) keep MOVIEBOX_BROWSER_FALLBACK=true (default) so the app retries
+      #      the same signed request via Chromium (BoringSSL, different JA3).
+      # Both respect NO_PROXY (localhost by default). See docs/MOVIEBOX-TUI-COMPARISON.md §5.
+      MOVIEBOX_PROXY: "${MOVIEBOX_PROXY:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1}"
+      MOVIEBOX_EXTRA_HOSTS: "${MOVIEBOX_EXTRA_HOSTS:-}"
+      MOVIEBOX_BROWSER_FALLBACK: "${MOVIEBOX_BROWSER_FALLBACK:-true}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
       APP_USERNAME: "${APP_USERNAME:-}"
       APP_PASSWORD: "${APP_PASSWORD:-}"

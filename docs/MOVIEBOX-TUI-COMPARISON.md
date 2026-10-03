@@ -151,12 +151,9 @@ The two ⚠️ items are transport, not protocol: Node 22 exposes no supported w
 the resolver used by `fetch`/`getaddrinfo` (the reference embeds a Rust resolver for exactly
 that reason), and swapping the TLS stack would mean moving the API calls into Chromium's
 network stack. Both are detectable now (`dns-filtered`, `tls-or-ip-block`, `tls-intercepted`
-verdicts) and both have an operator-level fix (`dns:` in compose; `NODE_EXTRA_CA_CERTS`).
-
-If the goal is literal byte-for-byte framing-level equality — the same ClientHello the Rust
-client sends — the only way is to make the API calls from inside the Chromium we already run
-(or a shared rustls sidecar). Say the word and that transport can be added; it is a bigger
-change (signed headers built in an init script, no dependency on CORS, one extra context).
+verdicts) and the operator fixes are `dns:` / `NODE_EXTRA_CA_CERTS` *plus* the
+automatically-attempted workarounds in §5 (proxy + Chromium BoringSSL fallback, and the
+expanded `h5-api` mirror pool).
 
 ## 4. What changed in vu-movie for this comparison
 
@@ -182,11 +179,15 @@ change (signed headers built in an init script, no dependency on CORS, one extra
   (a 302 to the CDN) is no longer offered for sources that need request headers (signed
   cookie / `x-*`), because a redirect cannot replay them: the reference client never hands a
   bare CDN URL to a player either. The relay URL is always offered and always works.
-* Tests: 20 MovieBox tests, 3 diagnostics, 5 wire-level parity tests (108 total).
+* `src/scrapers/http.js` — `undici.ProxyAgent` support for `MOVIEBOX_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (with `NO_PROXY` bypass) so an SNI-filtered ISP can be bypassed via a forward proxy/VPN; Chromium is also launched with `--proxy-server` when a proxy is set.
+* `src/scrapers/moviebox.js` — expanded host pool with the H5/web mirrors (`h5-api.aoneroom.com`, `h5.aoneroom.com`, `api.aoneroom.com`, `i-api.aoneroom.com`, `apii.inmoviebox.com`) plus `MOVIEBOX_EXTRA_HOSTS`; automatic fallback to `fetchViaBrowser` (Chromium BoringSSL, different JA3) on `tls-or-ip-block`; richer `classifyFetchError` (TLS before reset) and proxy-aware diagnostics hints.
+* Tests: 20 MovieBox tests, 3 diagnostics, 5 wire-level parity tests (108 total — now with proxy/host-pool coverage).
 
-What was deliberately **not** ported: the sidecar proxy (ffmpeg already re-requests segments
-with `-headers`, and the relay is the single place headers are applied), and the Rust DNS
-crate (see §5).
+What was deliberately **not** ported: the full sidecar proxy (ffmpeg already re-requests segments
+with `-headers`, and the relay is the single place headers are applied; the Chromium fallback
+for the *API* itself — `fetchViaBrowser` with BoringSSL + `ProxyAgent` — is now ported), and the Rust DNS
+crate (see §5). The H5/web BFF mirrors (`h5-api.aoneroom.com` etc.) and `MOVIEBOX_EXTRA_HOSTS`
+also extend the host pool beyond the original six `api*` hosts.
 
 ---
 
@@ -197,10 +198,10 @@ The verdict from `diagnoseReachability` tells you which of these you are in:
 | verdict | What it means | Fix |
 |---|---|---|
 | `no-egress` | the container cannot reach *any* third-party host (both the failing host **and** the control hosts are dead) | fix the Docker network: `docker compose exec vu-movie getent hosts api6.aoneroom.com`, DNS server of the NAS, firewall, or a missing proxy/VPN. Nothing in the scraper can help |
-| `tls-intercepted` | a proxy/AV/gateway re-signs TLS and Node does not trust its CA (Node ships its own CA bundle) | add `NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem` to the container, or stop proxying it |
+| `tls-intercepted` | a proxy/AV/gateway re-signs TLS and Node does not trust its CA (Node ships its own CA bundle) | add `NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem` to the container, or set `HTTP_PROXY` to bypass it; Chromium's `ignoreHTTPSErrors` also helps for the browser fallback |
 | `dns-filtered` | the container's resolver answers differently from public DNS (ISP blocklist, Pi-hole, Synology DNS Server, ControlD…) | point the container at `1.1.1.1`/`8.8.8.8` (`dns:` in `docker-compose.yml`), or enable the reference client's trick of a public-resolver fallback |
-| `tls-or-ip-block` | DNS is fine and the container has internet, but the MovieBox edge closes the handshake | this is the case the TUI survives with **rustls** where Node/OpenSSL does not: SNI/IP-level filtering, ISP-level blocking of the API host, or JA3 fingerprinting. Options: route the container through a VPN/other egress, or ask for the browser-TLS transport (harness Chromium's stack for the API calls) — the only remaining technique from the reference implementation that is not ported |
-| `service-unreachable` | MovieBox itself is down or has rotated its host pool | wait, or update `HOST_POOL` |
+| `tls-or-ip-block` | DNS is fine and the container has internet, but the MovieBox edge closes the handshake | SNI/IP-level filtering, ISP blocking, or JA3 fingerprinting. **Now automatically mitigated in two layers:** (1) `MOVIEBOX_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` (forward proxy/VPN outside the block; supports `NO_PROXY`), (2) `MOVIEBOX_BROWSER_FALLBACK=true` (default) retries the same signed request via Chromium BoringSSL (different JA3, plus `--proxy-server` support). Extra mirrors (`h5-api.aoneroom.com`, `h5.aoneroom.com`, `api.aoneroom.com`, …) are also probed automatically; add more via `MOVIEBOX_EXTRA_HOSTS`. If all else fails, route the container through a VPN/other egress |
+| `service-unreachable` | MovieBox itself is down or has rotated its host pool | wait, add a new mirror via `MOVIEBOX_EXTRA_HOSTS` or update `HOST_POOL` |
 
 Remember that MovieBox-TUI and vu-movie run the *same* protocol here: if
 `tls-or-ip-block` is the verdict, the TUI would fail too unless its TLS/DNS stack is the

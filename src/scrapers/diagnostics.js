@@ -169,7 +169,16 @@ export async function diagnoseReachability({
     hint = 'General internet works, but DNS for the failing host looks filtered or stale. Point the container at public DNS (or the resolver setting below) and retry.';
   } else if (egressOk && dnsKinds.has('dns-consistent')) {
     verdict = 'tls-or-ip-block';
-    hint = 'DNS resolves correctly and the container has internet, yet the host closes the TLS handshake. That is SNI/IP-level blocking (ISP, firewall, or a transparent proxy) rather than a bug in the scraper.';
+    const proxyHint = (() => {
+      try {
+        const cfg = getConfig?.();
+        if (cfg?.scraper?.proxyUrl) return ' (proxy already configured — check that it can reach aoneroom.com)';
+        return '';
+      } catch { return ''; }
+    })();
+    const envProxy = process.env.MOVIEBOX_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy ? ' (proxy already configured via env — check that it can reach aoneroom.com)' : '';
+    const proxyNote = proxyHint || envProxy || ' — fastest fix: set MOVIEBOX_PROXY or HTTP_PROXY to a proxy/VPN outside the blocking ISP (e.g. http://proxy:3128), or leave MOVIEBOX_BROWSER_FALLBACK=true (default) to retry via Chromium BoringSSL which has a different JA3 fingerprint.';
+    hint = `DNS resolves correctly and the container has internet, yet the host closes the TLS handshake. That is SNI/IP-level blocking (ISP, firewall, or a transparent proxy) rather than a bug in the scraper${proxyNote}`;
   }
 
   const summary = [egress.summary, ...dns.map(describeDnsCheck)].filter(Boolean).join(' | ');
