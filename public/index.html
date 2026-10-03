@@ -117,6 +117,14 @@
             <h2 style="margin:0">Results</h2>
             <div class="results-head-tools">
               <span class="mut" id="results-count"></span>
+              <div class="results-filters" aria-label="Filter search results">
+                <label class="results-filter" for="results-title-filter"><span>Title</span>
+                  <input id="results-title-filter" type="search" placeholder="Filter titles…" autocomplete="off" aria-label="Filter results by title">
+                </label>
+                <label class="results-filter" for="results-provider-filter"><span>Provider</span>
+                  <select id="results-provider-filter" aria-label="Filter results by provider"><option value="">All providers</option></select>
+                </label>
+              </div>
               <div class="results-view-switch" id="results-view" role="group" aria-label="Search results display">
                 <button type="button" data-view="list" aria-pressed="false" title="Show results as a list">List</button>
                 <button type="button" data-view="poster" class="on" aria-pressed="true" title="Show large posters">Poster</button>

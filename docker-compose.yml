@@ -70,8 +70,8 @@ services:
       # --- scraping (raise these only on a stronger NAS) ---
       BROWSER_CONCURRENCY: "${BROWSER_CONCURRENCY:-1}"
       RESOLVE_TIMEOUT_MS: "${RESOLVE_TIMEOUT_MS:-45000}"
-      # FlareSolverr's container port; the host publishes it on 8192 by default.
-      FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8191}"
+      # FlareSolverr listens on 8192 inside the container and on the NAS by default.
+      FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8192}"
       EXTERNAL_EXTRACTOR_URL: "${EXTERNAL_EXTRACTOR_URL:-}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
       APP_USERNAME: "${APP_USERNAME:-}"
@@ -130,17 +130,18 @@ services:
     networks: [vu-movie]
 
   # -------------------------------------------------------- Cloudflare solver
-  # Always started with the project. The API listens on container port 8191 and
-  # is published as host/NAS port 8192. Keep this port off public Internet.
+  # Always started with the project. Set FlareSolverr's actual listener to 8192
+  # and publish it on host/NAS port 8192. Keep this port off public Internet.
   flaresolverr:
     image: flaresolverr/flaresolverr:latest
     container_name: vu-movie-flaresolverr
     restart: unless-stopped
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      PORT: "8192"
       TZ: "${TZ:-Europe/Amsterdam}"
     ports:
-      - "${FLARESOLVERR_HOST_PORT:-8192}:8191"
+      - "${FLARESOLVERR_HOST_PORT:-8192}:8192"
     mem_limit: 800m
     networks: [vu-movie]
 

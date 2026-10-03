@@ -39,7 +39,7 @@
                             │ postgres (lazy pool, migrations on boot)     │ /downloads  /config  /cache (volumes)
                      ┌──────▼──────┐                              ┌────────▼─────────┐
                      │  postgres:16│                              │  flaresolverr    │  (always on)
-                     └─────────────┘                              │  host :8192      │   (container :8191)
+                     └─────────────┘                              │  host :8192      │   (container :8192)
                                                                   └──────────────────┘
 ```
 
@@ -79,7 +79,7 @@ site-specific path. **Recommendation: (b) by default, (a) as an optimisation lat
 
 **Optional Layer 4 — external extractor hook.** A Stremio addon endpoint or cinepro-style API can be
 configured as a provider in settings. FlareSolverr is a separate service that Compose starts automatically
-and publishes on host port 8192 (container port 8191); the current scraper does not yet call its API.
+and listens on container port 8192, published on host port 8192 by default. Challenged searches retry through its API.
 
 **MovieBox (you explicitly asked for this one):** implemented natively — visitor-login token + HMAC-MD5
 signed requests + host-pool retry, exactly as the Apache-2.0 client does it, in TypeScript against the same

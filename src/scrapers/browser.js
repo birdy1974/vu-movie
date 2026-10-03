@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, logError } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { sleep, safeHost, resolveUrl } from './http.js';
+import { sleep, safeHost, resolveUrl, request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
 let playwright = null;
@@ -43,8 +43,8 @@ const MEDIA_PATTERNS = [
 const MEDIA_CONTENT_TYPES = [
   'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl',
   'application/dash+xml', 'video/mp4', 'video/webm', 'video/MP2T', 'video/mp2t',
-  'application/octet-stream',
 ];
+const FONT_FILE_PATTERN = /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i;
 /** Pages that are obviously advertising or analytics — never load them. */
 const BLOCK_PATTERNS = [
   'doubleclick.net', 'googlesyndication.com', 'google-analytics.com', 'googletagmanager.com',
@@ -162,10 +162,17 @@ export async function closeContexts() {
   }
 }
 
-function looksLikeMedia(url, contentType) {
+export function looksLikeMedia(url, contentType, resourceType = '') {
+  const target = String(url || '');
   const ct = String(contentType || '').toLowerCase();
+  // Some CDNs mislabel fonts as application/octet-stream; they are not video
+  // candidates even though their MIME type otherwise looks like binary media.
+  if (resourceType === 'font' || FONT_FILE_PATTERN.test(target)) return false;
   if (MEDIA_CONTENT_TYPES.some((t) => ct.includes(t.toLowerCase()))) return true;
-  return MEDIA_PATTERNS.some((p) => p.re.test(url));
+  if (/^application\/octet-stream(?:\s*;|$)/i.test(ct)) {
+    return resourceType === 'media' || MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
+  }
+  return MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
 }
 
 function kindOf(url, contentType) {
@@ -241,9 +248,9 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     p.on('response', async (res) => {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
-      if (looksLikeMedia(u, ct)) {
+      const req = res.request();
+      if (looksLikeMedia(u, ct, req.resourceType())) {
         if (!media.has(u)) {
-          const req = res.request();
           let reqHeaders;
           try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }
           const kind = kindOf(u, ct);
@@ -471,7 +478,12 @@ export function playerUrlWithPrefix(url, prefix) {
   } catch { return null; }
 }
 
-const SEARCH_RESULT_ROUTE = /(?:^|\/)(?:movies?|films?|tv|series?|serie|shows?|watch|titles?|details?|play)(?:\/|\.html|$)/i;
+const SEARCH_RESULT_ROUTE = /(?:^|\/)(?:movies?|films?|tv|series?|serie|shows?|watch|titles?|details?|play)(?:\/|\.html|[?#]|$)/i;
+const DETAIL_ID_PARAMS = ['id', 'tmdb', 'tmdb_id', 'imdb', 'imdb_id', 'movie_id', 'movieId', 'subjectId', 'subject_id', 'media_id', 'slug'];
+
+function hasDetailIdentifier(url) {
+  return DETAIL_ID_PARAMS.some((name) => Boolean(String(url.searchParams.get(name) || '').trim()));
+}
 const GENERIC_RESULT_TITLES = /^(?:home|movies?|films?|tv|series?|shows?|search|browse|login|log in|register|sign up|watch|watch now|play|view details|details|more|next|previous)$/i;
 const QUERY_STOP_WORDS = new Set(['a', 'an', 'and', 'for', 'in', 'of', 'the', 'to']);
 
@@ -512,6 +524,89 @@ function sameSiteHost(host, baseHost) {
     || (host.includes('.') && baseHost.endsWith(`.${host}`));
 }
 
+/** Whether a URL stays on the search site's host (including www/subdomains). */
+export function isSameSiteNavigation(url, baseUrl) {
+  try {
+    const target = new URL(url);
+    const base = new URL(baseUrl);
+    return ['http:', 'https:'].includes(target.protocol)
+      && sameSiteHost(target.hostname.toLowerCase(), base.hostname.toLowerCase());
+  } catch { return false; }
+}
+
+/** Normalize the optional FlareSolverr URL to its v1 API endpoint. */
+export function flaresolverrEndpoint(value = getConfig().scraper.flaresolverrUrl) {
+  const configured = String(value || '').trim();
+  if (!configured) return null;
+  try {
+    const endpoint = new URL(configured);
+    if (!['http:', 'https:'].includes(endpoint.protocol) || !endpoint.hostname) return null;
+    const pathname = endpoint.pathname.replace(/\/+$/, '');
+    endpoint.pathname = /\/v1$/i.test(pathname) ? pathname : `${pathname}/v1`;
+    endpoint.search = '';
+    endpoint.hash = '';
+    return endpoint.toString();
+  } catch { return null; }
+}
+
+/** Validate and normalize the FlareSolverr `request.get` response. */
+export function parseFlareSolverrResult(payload, requestedUrl) {
+  const solution = payload?.solution;
+  if (payload?.status !== 'ok' || typeof solution?.response !== 'string' || !solution.response) {
+    throw new Error(String(payload?.message || 'FlareSolverr returned no page content'));
+  }
+  const finalUrl = String(solution.url || requestedUrl);
+  if (!isSameSiteNavigation(finalUrl, requestedUrl)) {
+    throw new Error(`FlareSolverr redirected the search off-site to ${safeHost(finalUrl)}`);
+  }
+  const status = Number(solution.status);
+  return {
+    html: solution.response,
+    url: finalUrl,
+    status: Number.isFinite(status) && status > 0 ? status : null,
+    cookies: Array.isArray(solution.cookies) ? solution.cookies : [],
+  };
+}
+
+function flareSolverrCookies(cookies, pageUrl) {
+  const out = [];
+  for (const cookie of cookies || []) {
+    if (!cookie?.name) continue;
+    const normalized = {
+      name: String(cookie.name),
+      value: String(cookie.value ?? ''),
+      path: String(cookie.path || '/'),
+      ...(cookie.domain ? { domain: String(cookie.domain) } : { url: pageUrl }),
+      ...(cookie.secure != null ? { secure: Boolean(cookie.secure) } : {}),
+      ...(cookie.httpOnly != null ? { httpOnly: Boolean(cookie.httpOnly) } : {}),
+    };
+    const expires = Number(cookie.expires ?? cookie.expiry);
+    if (Number.isFinite(expires) && expires > 0) normalized.expires = expires;
+    const sameSite = ({ strict: 'Strict', lax: 'Lax', none: 'None', no_restriction: 'None' })[
+      String(cookie.sameSite || '').toLowerCase().replace(/[ -]/g, '_')
+    ];
+    if (sameSite) normalized.sameSite = sameSite;
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function requestFlareSolverr(url, { signal = null } = {}) {
+  const endpoint = flaresolverrEndpoint();
+  if (!endpoint) return null;
+  const response = await request(endpoint, {
+    method: 'POST',
+    body: { cmd: 'request.get', url, maxTimeout: 30_000 },
+    json: true,
+    allowFailure: true,
+    timeoutMs: 35_000,
+    retries: 0,
+    signal,
+  });
+  if (!response.ok) throw new Error(response.error || `FlareSolverr HTTP ${response.status}`);
+  return parseFlareSolverrResult(response.data, url);
+}
+
 /**
  * Turn the small set of DOM fields captured from each card into stable result
  * rows. A configured linkPattern remains the preferred route filter, but it is
@@ -550,9 +645,12 @@ export function normalizeSearchRows(rows, {
     const title = cleanResultTitle(row.title || row.cardTitle || row.text || row.cardText || titleFromPath(target.href));
     if (!title || title.length < 2 || GENERIC_RESULT_TITLES.test(title)) continue;
     const cardText = plainText(row.cardText || '');
-    const textForMatch = normalizeForSearch(`${title} ${row.text || ''} ${cardText} ${target.pathname}`);
-    const queryMatch = terms.some((word) => textForMatch.includes(word));
-    const routeMatch = SEARCH_RESULT_ROUTE.test(target.pathname)
+    const contentForMatch = normalizeForSearch(`${title} ${row.text || ''} ${cardText}`);
+    const pathForMatch = normalizeForSearch(`${target.pathname} ${target.search}`);
+    const contentMatch = terms.some((word) => contentForMatch.includes(word));
+    const queryMatch = contentMatch || terms.some((word) => pathForMatch.includes(word));
+    const routeMatch = SEARCH_RESULT_ROUTE.test(`${target.pathname}${target.search}`)
+      || hasDetailIdentifier(target)
       || Boolean(target.searchParams.get('type') && (target.searchParams.get('id') || target.searchParams.get('tmdb')));
     const explicitMatch = configuredPattern
       ? configuredPattern.test(href) || configuredPattern.test(`${target.pathname}${target.search}`) || configuredPattern.test(target.href)
@@ -560,10 +658,14 @@ export function normalizeSearchRows(rows, {
     const classSignal = Boolean(row.cardLike)
       || /(?:movie|film|title|poster|result|card|catalog|media|entry|tile|item)/i.test(String(row.classes || ''));
     const hasImage = Boolean(row.hasImage || row.poster);
-    // Search results should mention at least one query term. Explicit recipe
-    // matches can still be accepted for sites that rewrite titles in the URL.
-    if (!explicitMatch && !(queryMatch && (routeMatch || classSignal || hasImage))) continue;
-    if (!explicitMatch && !queryMatch) continue;
+    const searchLanding = !hasDetailIdentifier(target)
+      && /(?:^|\/)(?:search|browse)(?:\/|[?#]|$)/i.test(`${target.pathname}${target.search}`);
+    // A matching title is a useful signal even on sites with opaque detail
+    // routes and plain text links. Never mistake a repeated search/browse link
+    // for an item, though; result links there normally carry an explicit id.
+    if (searchLanding) continue;
+    const resultSignal = routeMatch || classSignal || hasImage || contentMatch;
+    if (!explicitMatch && (!queryMatch || !resultSignal)) continue;
 
     const metadata = normalizeSearchMetadata(row, `${row.text || ''} ${cardText}`);
     const yearText = `${row.year || ''} ${metadata.releaseDate || ''} ${row.title || ''} ${row.cardTitle || ''} ${title} ${row.text || ''} ${cardText}`;
@@ -652,6 +754,10 @@ export async function searchSite(siteOrOpts, maybeQuery) {
   let status = null;
   let pageTitle = null;
   let rawLinkCount = 0;
+  let searchPageUrl = url;
+  let blockedOffsiteNavigation = null;
+  let flareSolverrError = null;
+  let usedFlareSolverr = false;
   const selector = opts.linkSelector || 'a[href], [data-href], [data-url], [data-link]';
   const collectRows = async () => page.$$eval(selector, (elements) => {
     const clean = (value) => String(value || '').replace(/[\s\u00a0]+/g, ' ').trim();
@@ -796,20 +902,90 @@ export async function searchSite(siteOrOpts, maybeQuery) {
 
   try {
     log.info('browser', `searching ${site.name} for "${query}"`, { url: url.slice(0, 200) });
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+    await page.route('**/*', async (route) => {
+      const pageRequest = route.request();
+      if (pageRequest.isNavigationRequest()) {
+        try {
+          if (pageRequest.frame() === page.mainFrame() && !isSameSiteNavigation(pageRequest.url(), url)) {
+            blockedOffsiteNavigation ||= pageRequest.url();
+            log.warn('browser', `blocked off-site redirect during ${site.name} search`, {
+              destination: safeHost(pageRequest.url()),
+            });
+            await route.abort('blockedbyclient');
+            return;
+          }
+        } catch { /* the navigation frame may already have been detached */ }
+      }
+      await route.continue().catch(() => {});
+    });
+
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch((err) => {
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+      if (!blockedOffsiteNavigation) throw err;
+      log.warn('browser', `${site.name} search navigation stopped at an off-site redirect`, {
+        destination: safeHost(blockedOffsiteNavigation), error: err.message,
+      });
+      return null;
+    });
     if (opts.signal?.aborted) throw abortError(opts.signal);
     status = response?.status?.() ?? null;
-    // Client-rendered catalogues need a moment after networkidle to hydrate cards.
-    await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
-    if (opts.signal?.aborted) throw abortError(opts.signal);
-    await sleep(1200);
-    if (opts.signal?.aborted) throw abortError(opts.signal);
+    if (isSameSiteNavigation(page.url(), url)) searchPageUrl = page.url();
 
+    pageTitle = await page.title().catch(() => null);
+    let initialBodyText = '';
+    const challengePage = () => /cloudflare|just a moment|security verification|verify you are human|checking your browser|captcha/i
+      .test(`${pageTitle || ''} ${initialBodyText.slice(0, 500)}`);
+    if (status === 403 || status === 429 || challengePage()) {
+      initialBodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
+      if (challengePage() && flaresolverrEndpoint()) {
+        try {
+          log.info('browser', `trying FlareSolverr for ${site.name} search`, { host: safeHost(url), status });
+          const solution = await requestFlareSolverr(url, { signal: opts.signal });
+          if (opts.signal?.aborted) throw abortError(opts.signal);
+          const cookies = flareSolverrCookies(solution.cookies, solution.url);
+          if (cookies.length) {
+            await ctx.addCookies(cookies).catch((err) => {
+              log.warn('browser', `could not import FlareSolverr cookies for ${site.name}`, { error: err.message });
+            });
+          }
+          // Search only needs the rendered DOM. Strip scripts so the returned
+          // third-party HTML cannot navigate or run twice in our context.
+          const staticHtml = solution.html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+          await page.setContent(staticHtml, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+          searchPageUrl = solution.url;
+          status = solution.status ?? status;
+          pageTitle = await page.title().catch(() => null);
+          initialBodyText = '';
+          usedFlareSolverr = true;
+          log.info('browser', `FlareSolverr returned ${site.name} search page`, {
+            status, cookies: cookies.length, url: searchPageUrl.slice(0, 180),
+          });
+        } catch (err) {
+          if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
+          flareSolverrError = String(err?.message || err);
+          log.warn('browser', `FlareSolverr could not recover ${site.name} search`, { error: flareSolverrError });
+        }
+      }
+    }
+
+    if (!usedFlareSolverr) {
+      // Client-rendered catalogues need a moment after networkidle to hydrate cards.
+      await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+      await sleep(1200);
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+    }
+
+    const currentPageUrl = page.url();
+    if (!usedFlareSolverr && isSameSiteNavigation(currentPageUrl, url)) searchPageUrl = currentPageUrl;
+    else if (!usedFlareSolverr && currentPageUrl !== 'about:blank' && !isSameSiteNavigation(currentPageUrl, url)) {
+      blockedOffsiteNavigation ||= currentPageUrl;
+    }
     const rows = await collectRows();
     if (opts.signal?.aborted) throw abortError(opts.signal);
     rawLinkCount = rows.length;
     results.push(...normalizeSearchRows(rows, {
-      pageUrl: page.url(),
+      pageUrl: searchPageUrl,
       baseUrl: opts.baseUrl || url,
       query,
       resultPattern: site.resultPattern,
@@ -817,22 +993,31 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       siteName: site.name,
       limit: 40,
     }));
-    pageTitle = await page.title().catch(() => null);
+    pageTitle = await page.title().catch(() => pageTitle);
 
     if (results.length) {
       log.info('browser', `${site.name}: ${results.length} result(s) for "${query}"`, {
-        status, links: rawLinkCount, finalUrl: page.url().slice(0, 180),
+        status, links: rawLinkCount, finalUrl: searchPageUrl.slice(0, 180),
+        ...(blockedOffsiteNavigation ? { blockedRedirect: safeHost(blockedOffsiteNavigation) } : {}),
       });
     } else {
-      const bodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
+      const bodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => initialBodyText);
       const pageLooksUnavailable = status >= 400
-        || /\b404\b|page not found|does not exist|bad gateway|just a moment|verify you are human|access denied|captcha/i.test(`${pageTitle || ''} ${bodyText.slice(0, 500)}`);
-      if (pageLooksUnavailable) {
+        || /\b404\b|page not found|does not exist|bad gateway|just a moment|security verification|verify you are human|access denied|captcha/i.test(`${pageTitle || ''} ${bodyText.slice(0, 500)}`);
+      if (blockedOffsiteNavigation) {
+        error = `search page redirected off-site to ${safeHost(blockedOffsiteNavigation)}`;
+      } else if (pageLooksUnavailable) {
         error = `search page unavailable${status ? ` (HTTP ${status})` : ''}${pageTitle ? `: ${pageTitle}` : ''}`;
+      } else if (rawLinkCount > 0) {
+        error = `search page exposed ${rawLinkCount} candidate link(s), but none matched the result filters`;
       }
+      if (flareSolverrError && error) error += `; FlareSolverr fallback failed: ${flareSolverrError}`;
       log.warn('browser', `${site.name}: no usable result links for "${query}"`, {
-        status, title: pageTitle, links: rawLinkCount, finalUrl: page.url().slice(0, 180),
+        status, title: pageTitle, links: rawLinkCount,
+        finalUrl: searchPageUrl.slice(0, 180),
+        ...(blockedOffsiteNavigation ? { blockedRedirect: safeHost(blockedOffsiteNavigation) } : {}),
         preview: bodyText.slice(0, 180).replace(/\s+/g, ' '),
+        ...(flareSolverrError ? { flareSolverrError } : {}),
       });
     }
   } catch (err) {

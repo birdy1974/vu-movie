@@ -187,9 +187,12 @@ The ones that matter most on a DS918+:
   warning if `package-lock.json` is absent; `package-lock.json` is committed, so
   `npm ci` is the normal path.
 * `docker-compose.yml` — the app, `postgres:16-alpine`, and an always-started
-  FlareSolverr service. Its API is available on the NAS at port `8192` (host port
-  `8192` → container port `8191`); containers on the Compose network use
-  `http://flaresolverr:8191`. Do not forward this unauthenticated API to the public
+  FlareSolverr service. Its API listens on port `8192` inside the container and
+  is published on NAS port `8192` by default; containers on the Compose network
+  use `http://flaresolverr:8192`. Browser searches that hit a Cloudflare/security
+  challenge automatically retry through the configured `FLARESOLVERR_URL`; the
+  solved page is parsed as static HTML and its cookies are imported into that
+  site's browser context. Do not forward this unauthenticated API to the public
   Internet.
 * Health: `GET /api/health` (also wired into the container healthcheck).
 

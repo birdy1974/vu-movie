@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from '../src/scrapers/http.js';
-import { getRecentLogs } from '../src/core/log.js';
+import { errorText, getRecentLogs } from '../src/core/log.js';
 
 test('request supports the json alias, JSON request bodies, and parsed data aliases', async (t) => {
   const originalFetch = globalThis.fetch;
@@ -59,6 +59,16 @@ test('request aborts promptly without retrying an obsolete request', async (t) =
   controller.abort();
   await assert.rejects(pending, (error) => error.name === 'AbortError');
   assert.equal(calls, 1, 'an aborted request must not consume retries');
+});
+
+test('network error formatting expands AggregateError socket causes', () => {
+  const refused = Object.assign(new Error('connect ECONNREFUSED 203.0.113.7:443'), { code: 'ECONNREFUSED' });
+  const dns = Object.assign(new Error('getaddrinfo ENOTFOUND api.example.test'), { code: 'ENOTFOUND' });
+  const error = new TypeError('fetch failed', { cause: new AggregateError([refused, dns], 'all connection attempts failed') });
+  const message = errorText(error);
+  assert.match(message, /ECONNREFUSED/);
+  assert.match(message, /ENOTFOUND/);
+  assert.match(message, /all connection attempts failed/);
 });
 
 test('request failure logs include the nested network cause', async (t) => {

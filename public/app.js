@@ -306,6 +306,7 @@ async function doSearch() {
   invalidateSelectionRequests();
   resetSelectedTitle();
   state.results = [];
+  resetResultFilters();
   renderProviderErrors([]);
   $('#results-count').textContent = '';
   $('#results').innerHTML = '<div class="meta"><span class="spin"></span> searching…</div>';
@@ -321,11 +322,12 @@ async function doSearch() {
     const res = await api(`/api/find/search?${params}`, { signal: controller.signal, silent: true });
     if (requestId !== searchRequestId || controller.signal.aborted) return;
     state.results = Array.isArray(res.results) ? res.results : [];
+    resetResultFilters();
     renderProviderErrors(res.providerErrors || []);
-    $('#results-count').textContent = `${state.results.length} result${state.results.length === 1 ? '' : 's'}`;
     renderResults();
+    const titleCount = groupSearchResults(state.results).length;
     const failures = state.providerErrors.length;
-    $('#find-hint').textContent = `${state.results.length} result${state.results.length === 1 ? '' : 's'}${failures ? ` · ${failures} provider failure${failures === 1 ? '' : 's'}` : ''}`;
+    $('#find-hint').textContent = `${titleCount} title${titleCount === 1 ? '' : 's'} · ${state.results.length} provider result${state.results.length === 1 ? '' : 's'}${failures ? ` · ${failures} provider failure${failures === 1 ? '' : 's'}` : ''}`;
   } catch (err) {
     if (requestId !== searchRequestId || controller.signal.aborted || isAbortError(err)) return;
     renderProviderErrors([{ sourceName: 'Search service', error: err.message }]);
@@ -394,10 +396,150 @@ function resultMetaMarkup(result, includeKind = true, includeLanguage = false) {
   return parts.map((part) => `<span class="result-meta-item">${escapeHtml(part)}</span>`).join('');
 }
 
-function resultCardMarkup(result, index, view) {
-  const selected = state.selected === result ? ' sel' : '';
+function normalizeResultText(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function resultYearKey(result) {
+  const explicitYear = Number(result?.year);
+  if (Number.isFinite(explicitYear) && explicitYear > 0) return String(Math.floor(explicitYear));
+  const parentheticalYear = /\s+\(((?:19|20)\d{2})\)\s*$/.exec(String(result?.title || ''));
+  return parentheticalYear?.[1] || '';
+}
+
+function resultGroupingTitle(result, index) {
+  let title = normalizeResultText(result?.title);
+  const year = resultYearKey(result);
+  if (year) title = title.replace(new RegExp(`\\s+${year}$`), '').trim();
+  return title || `untitled ${index}`;
+}
+
+function resultProviderKey(result) {
+  return String(result?.sourceId || result?.sourceName || 'unknown').trim();
+}
+
+function groupSearchResults(results = state.results) {
+  const buckets = new Map();
+  results.forEach((result, index) => {
+    if (!result || typeof result !== 'object') return;
+    const titleKey = resultGroupingTitle(result, index);
+    const kind = String(result.kind || 'title').toLowerCase();
+    const key = `${kind}|${titleKey}`;
+    if (!buckets.has(key)) buckets.set(key, { key, titleKey, kind, entries: [] });
+    buckets.get(key).entries.push({ result, index });
+  });
+
+  const groups = [];
+  const addGroup = (bucket, entries, year) => {
+    if (!entries.length) return;
+    groups.push({
+      key: `${bucket.key}|${year || 'unknown'}`,
+      titleKey: bucket.titleKey,
+      kind: bucket.kind,
+      year: year ? Number(year) : null,
+      allResults: entries,
+      matches: entries,
+    });
+  };
+
+  for (const bucket of buckets.values()) {
+    const years = [...new Set(bucket.entries.map(({ result }) => resultYearKey(result)).filter(Boolean))];
+    if (years.length <= 1) {
+      // A missing year can join the only known edition, but never bridges two
+      // different remakes with the same title.
+      addGroup(bucket, bucket.entries, years[0] || '');
+      continue;
+    }
+    years.sort((a, b) => Number(b) - Number(a));
+    for (const year of years) {
+      addGroup(bucket, bucket.entries.filter(({ result }) => resultYearKey(result) === year), year);
+    }
+    addGroup(bucket, bucket.entries.filter(({ result }) => !resultYearKey(result)), '');
+  }
+  return groups;
+}
+
+function preferredResultEntry(entries) {
+  const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
+  return [...entries].sort((a, b) => {
+    const posterOrder = Number(Boolean(b.result.poster)) - Number(Boolean(a.result.poster));
+    if (posterOrder) return posterOrder;
+    const rankA = sourceOrder.get(resultProviderKey(a.result)) ?? state.sources.length + 1;
+    const rankB = sourceOrder.get(resultProviderKey(b.result)) ?? state.sources.length + 1;
+    return rankA - rankB || a.index - b.index;
+  })[0];
+}
+
+function updateResultProviderFilter() {
+  const select = $('#results-provider-filter');
+  if (!select) return;
+  const selected = select.value;
+  const providers = new Map();
+  for (const result of state.results) {
+    const id = resultProviderKey(result);
+    if (!providers.has(id)) providers.set(id, { id, name: result.sourceName || id, count: 0 });
+    providers.get(id).count += 1;
+  }
+  const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
+  const ordered = [...providers.values()].sort((a, b) =>
+    (sourceOrder.get(a.id) ?? state.sources.length + 1) - (sourceOrder.get(b.id) ?? state.sources.length + 1)
+      || a.name.localeCompare(b.name));
+  select.innerHTML = `<option value="">All providers</option>${ordered.map((provider) =>
+    `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)} (${provider.count})</option>`).join('')}`;
+  select.value = providers.has(selected) ? selected : '';
+}
+
+function resetResultFilters() {
+  const title = $('#results-title-filter');
+  const provider = $('#results-provider-filter');
+  if (title) title.value = '';
+  if (provider) provider.value = '';
+  updateResultProviderFilter();
+}
+
+function visibleResultGroups() {
+  const titleFilter = normalizeResultText($('#results-title-filter')?.value);
+  const providerFilter = $('#results-provider-filter')?.value || '';
+  return groupSearchResults().map((group) => {
+    const matches = group.allResults.filter((entry) =>
+      !providerFilter || resultProviderKey(entry.result) === providerFilter);
+    if (!matches.length) return null;
+    if (titleFilter && !group.allResults.some((entry) =>
+      normalizeResultText(entry.result.title).includes(titleFilter))) return null;
+    return { ...group, matches };
+  }).filter(Boolean);
+}
+
+function providerChoicesMarkup(group) {
+  const providers = new Map();
+  for (const entry of group.matches) {
+    const id = resultProviderKey(entry.result);
+    if (!providers.has(id)) providers.set(id, { id, name: entry.result.sourceName || id, entries: [] });
+    providers.get(id).entries.push(entry);
+  }
+  const choices = [...providers.values()].sort((a, b) => {
+    const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
+    return (sourceOrder.get(a.id) ?? state.sources.length + 1) - (sourceOrder.get(b.id) ?? state.sources.length + 1)
+      || a.name.localeCompare(b.name);
+  });
+  return `<div class="moviecard-providers"><span class="moviecard-providers-label">Providers</span>${choices.map((provider) => {
+    const entry = preferredResultEntry(provider.entries);
+    const selected = provider.entries.some((candidate) => candidate.result === state.selected);
+    return `<button type="button" class="provider-choice${selected ? ' on' : ''}"
+      data-result-index="${entry.index}" aria-pressed="${selected}"
+      title="Select ${escapeHtml(provider.name)} for this title">${escapeHtml(provider.name)}</button>`;
+  }).join('')}</div>`;
+}
+
+function resultCardMarkup(group, view) {
+  const primary = preferredResultEntry(group.matches);
+  const rawResult = primary.result;
+  const result = group.year && !resultYearKey(rawResult) ? { ...rawResult, year: group.year } : rawResult;
+  const selected = group.allResults.some((entry) => entry.result === state.selected);
   const title = escapeHtml(result.title || 'Untitled');
-  const metadata = resultMetaMarkup(result, view === 'thumbnails');
+  const metadataResult = { ...result, sourceName: '' };
+  const metadata = resultMetaMarkup(metadataResult, view === 'thumbnails');
   const description = result.description
     ? `<div class="result-description">${escapeHtml(result.description)}</div>`
     : '';
@@ -406,19 +548,20 @@ function resultCardMarkup(result, index, view) {
     ${metadata ? `<div class="meta result-meta">${metadata}</div>` : ''}
     ${description}
   </div>`;
-  if (view === 'list') {
-    return `<div class="moviecard moviecard-list${selected}" data-i="${index}">
-      ${resultPosterMarkup(result, true)}${copy}<span class="result-kind">${tag(result.kind || 'title')}</span>
-    </div>`;
-  }
-  if (view === 'thumbnails') {
-    return `<div class="moviecard moviecard-thumb${selected}" data-i="${index}">
-      ${resultPosterMarkup(result, true)}${copy}
-    </div>`;
-  }
-  return `<div class="moviecard moviecard-poster${selected}" data-i="${index}">
-    ${resultPosterMarkup(result)}${copy}
-  </div>`;
+  const content = view === 'list'
+    ? `${resultPosterMarkup(result, true)}${copy}<span class="result-kind">${tag(result.kind || 'title')}</span>`
+    : view === 'thumbnails'
+      ? `${resultPosterMarkup(result, true)}${copy}`
+      : `${resultPosterMarkup(result)}${copy}`;
+  const titleLabel = `${result.title || 'Untitled'}${group.year ? ` (${group.year})` : ''}`;
+  const providerName = rawResult.sourceName || rawResult.sourceId || 'provider';
+  const indices = group.allResults.map((entry) => entry.index).join(',');
+  return `<article class="moviecard moviecard-${view}${selected ? ' sel' : ''}" data-result-indices="${indices}">
+    <div class="moviecard-main moviecard-main-${view}" role="button" tabindex="0"
+      data-result-index="${primary.index}" aria-pressed="${state.selected === rawResult}"
+      aria-label="Select ${escapeHtml(titleLabel)} from ${escapeHtml(providerName)}">${content}</div>
+    ${providerChoicesMarkup(group)}
+  </article>`;
 }
 
 function updateResultsViewButtons() {
@@ -441,24 +584,32 @@ function renderResults() {
   const results = $('#results');
   results.className = `results results-${state.resultsView}`;
   if (!state.results.length) {
+    $('#results-count').textContent = '0 titles';
     results.innerHTML = state.providerErrors.length
       ? '<div class="note err">Search returned no titles because one or more providers failed. See the provider errors above; this is not a confirmed no-results response.</div>'
       : '<div class="meta">No results. Try fewer sources, or use “Paste URL” with the movie page you have open.</div>';
     return;
   }
-  results.innerHTML = `<div class="results-cards">${state.results.map((r, i) => resultCardMarkup(r, i, state.resultsView)).join('')}</div>`;
-  $$('#results .moviecard').forEach((card) => {
-    const index = Number(card.dataset.i);
-    card.setAttribute('role', 'button');
-    card.setAttribute('tabindex', '0');
-    card.setAttribute('aria-pressed', String(state.selected === state.results[index]));
-    card.addEventListener('click', () => selectResult(index));
-    card.addEventListener('keydown', (event) => {
+  const groups = visibleResultGroups();
+  const matchCount = groups.reduce((sum, group) => sum + group.matches.length, 0);
+  $('#results-count').textContent = `${groups.length} title${groups.length === 1 ? '' : 's'} · ${matchCount} provider result${matchCount === 1 ? '' : 's'}`;
+  if (!groups.length) {
+    results.innerHTML = '<div class="meta">No titles match these filters. Clear the title and provider filters to see all results.</div>';
+    return;
+  }
+  results.innerHTML = `<div class="results-cards">${groups.map((group) => resultCardMarkup(group, state.resultsView)).join('')}</div>`;
+  $$('#results .moviecard-main').forEach((main) => {
+    const index = Number(main.dataset.resultIndex);
+    main.addEventListener('click', () => selectResult(index));
+    main.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         selectResult(index);
       }
     });
+  });
+  $$('#results .provider-choice').forEach((button) => {
+    button.addEventListener('click', () => selectResult(Number(button.dataset.resultIndex)));
   });
   attachPosterImageFallbacks($('#results'));
 }
@@ -707,9 +858,16 @@ async function selectResult(index) {
   state.selectedSeasons = [];
   state.candidates = [];
   $$('#results .moviecard').forEach((card) => {
-    const active = Number(card.dataset.i) === index;
+    const active = (card.dataset.resultIndices || '').split(',').includes(String(index));
     card.classList.toggle('sel', active);
-    card.setAttribute('aria-pressed', String(active));
+  });
+  $$('#results .moviecard-main').forEach((main) => {
+    main.setAttribute('aria-pressed', String(Number(main.dataset.resultIndex) === index));
+  });
+  $$('#results .provider-choice').forEach((button) => {
+    const active = Number(button.dataset.resultIndex) === index;
+    button.classList.toggle('on', active);
+    button.setAttribute('aria-pressed', String(active));
   });
   renderSelectedInfo(r);
   $('#sel-episode-controls').classList.add('hide');
@@ -1289,6 +1447,8 @@ window.App = App;
 
 function wire() {
   $('#btn-search').addEventListener('click', doSearch);
+  $('#results-title-filter').addEventListener('input', renderResults);
+  $('#results-provider-filter').addEventListener('change', renderResults);
   $('#results-view').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-view]');
     if (button) setResultsView(button.dataset.view);
