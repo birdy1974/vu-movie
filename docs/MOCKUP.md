@@ -11,7 +11,7 @@
 
 | Check | Result | Why it matters for the design |
 |---|---|---|
-| `mesamirh/MovieBox-TUI` source, licence, architecture | Rust TUI, **Apache-2.0**, backend = signed REST API (`api*.aoneroom.com` + HMAC-MD5 request signing, visitor-login token, host pool with retry) | An Apache-2.0 licence means we *can* reuse the protocol knowledge. But there is **no Node/Rust library to call**: we implement the same signed REST client natively in Node. No browser needed for MovieBox → fast, reliable |
+| `mesamirh/MovieBox-TUI` source, licence, architecture | Rust TUI, **MIT OR Apache-2.0**, backend = signed REST API (`api*.aoneroom.com` + HMAC-MD5 request signing, visitor-login token, host pool with retry) | A permissive licence means we *can* reuse the protocol knowledge. But there is **no Node/Rust library to call**: we implement the same signed REST client natively in Node. No browser needed for MovieBox → fast, reliable |
 | Your 7 source sites reachable from this sandbox | **No** — all 7 resolve but time out / return nothing from this build environment | I cannot reverse-engineer the exact player API of each site here. The design therefore does **not** hard-code one brittle path per site; see §3 |
 | Relationship between “Flixer” and Overlook / Flixhub / 1flex / Redflix / Cinevo / Cinejoy / Cinezo | Independent research confirms these are a **family of Flixer-style aggregator front-ends**: they share the same player-API “farms” (vidrock, vixsrc, vidnest, vidlove, moviesapi, rivestream…). Some speak a plain JSON API, Cinejoy and Flixer speak an **encrypted binary API decrypted by a WASM blob** | One good resolver unlocks most sites. Also explains why “just parse the HTML” fails on some of them |
 | Cheap/flaky shortcuts exist (Stremio scraper, cinepro) | yes, but (a) no licence on the scraper repo (all rights reserved), (b) cinepro needs its own server. **We will not copy their code** | Our code stays ours; we may add an *optional* external-extractor hook you can point at anything |
@@ -82,7 +82,7 @@ configured as a provider in settings. FlareSolverr is a separate service that Co
 and listens on container port 8192, published on host port 8193 by default. Challenged searches retry through its API.
 
 **MovieBox (you explicitly asked for this one):** implemented natively — visitor-login token + HMAC-MD5
-signed requests + host-pool retry, exactly as the Apache-2.0 client does it, in TypeScript against the same
+signed requests + host-pool retry, exactly as the reference client does it, in TypeScript against the same
 `api*.aoneroom.com` endpoints. No Chromium, no download of the Rust binary. (Alternative, if you prefer: bundle
 the MovieBox-TUI binary and shell out to it — bigger image, brittle CLI parsing. **Recommendation: native.**)
 

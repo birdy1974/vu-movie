@@ -22,6 +22,7 @@ import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 import * as browser from './browser.js';
 import * as moviebox from './moviebox.js';
+import { diagnoseReachability } from './diagnostics.js';
 import * as external from './external.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -70,17 +71,33 @@ export function loadSources({ force = false } = {}) {
     if (custom?.id) byId.set(custom.id, { kind: 'browser', enabled: true, ...custom });
   }
 
-  const sources = [...byId.values()].map((r) => ({
-    id: r.id,
-    name: r.name || r.id,
-    home: r.home || '',
-    enabled: r.enabled !== false,
-    kind: r.kind || 'browser',
-    notes: r.notes || '',
-    match: r.match || [],
-    search: r.search || null,
-    resolve: r.resolve || { kind: 'browser' },
-  }));
+  // Recipes stored in /config/sources (or added by hand) predate DASH/HLS
+  // media detection and may be missing fields entirely. Fold the current
+  // patterns in so an old recipe cannot be the reason a `.mpd` player is
+  // invisible to the sniffer.
+  let upgradedRecipes = 0;
+  const sources = [...byId.values()].map((raw) => {
+    const { site, upgraded } = browser.upgradeRecipe(raw);
+    if (upgraded) upgradedRecipes += 1;
+    return {
+      id: site.id,
+      name: site.name || site.id,
+      home: site.home || '',
+      enabled: site.enabled !== false,
+      kind: site.kind || 'browser',
+      notes: site.notes || '',
+      match: site.match || [],
+      search: site.search || null,
+      resolve: site.resolve || { kind: 'browser' },
+      mediaPatterns: site.mediaPatterns || null,
+      mediaPatternsVersion: site.mediaPatternsVersion || null,
+    };
+  });
+  if (upgradedRecipes) {
+    log.debug('scraper', `upgraded ${upgradedRecipes} source recipe(s) to media-detection v${browser.RECIPE_SCHEMA_VERSION}`, {
+      version: browser.RECIPE_SCHEMA_VERSION,
+    });
+  }
 
   for (const id of cfg.sources.disabled || []) {
     const s = sources.find((x) => x.id === id);
@@ -624,13 +641,24 @@ export async function resolveTarget(input) {
     const source = getSource(sourceId) || matchSourceByUrl(url);
     if (useBrowser) {
       const t0 = Date.now();
-      const sniff = await browser.sniff({
-        url,
-        session: source?.id || 'default',
-        playerPathPrefix: source?.resolve?.playerPathPrefix || null,
-        timeoutMs: getConfig().scraper.resolveTimeoutMs,
-        signal,
-      });
+      // A broken/absent Chromium (crash, OOM on the NAS, missing binary) is a
+      // reason to lose *this* layer, not the whole resolve: MovieBox-by-title
+      // and the external extractor do not need a browser and may still work.
+      let sniff = { ok: false, media: [], error: null, note: null, finalUrl: url, title: null, networkErrors: [] };
+      try {
+        sniff = await browser.sniff({
+          url,
+          session: source?.id || 'default',
+          playerPathPrefix: source?.resolve?.playerPathPrefix || null,
+          timeoutMs: getConfig().scraper.resolveTimeoutMs,
+          signal,
+        });
+      } catch (err) {
+        if (signal?.aborted || err?.name === 'AbortError') throw err;
+        const message = errorText(err);
+        notes.push(`Headless browser unavailable (${truncate(message, 160)})`);
+        logError('scraper', 'headless browser could not run — continuing without the sniffer', err, { url: truncate(url, 120) });
+      }
       timeline.browser = Date.now() - t0;
       if (!sniff.ok && (sniff.error || sniff.note)) {
         notes.push(`Browser ${sniff.note || 'scrape failed'}${sniff.error ? ` (${sniff.error})` : ''}`);
@@ -721,9 +749,27 @@ export async function resolveTarget(input) {
     timeline, sources: [...new Set(unique.map((c) => c.sourceId))].join(','),
   });
 
-  const error = unique.length
-    ? null
-    : ['no playable stream found', ...notes].join(' — ');
+  let error = unique.length ? null : ['no playable stream found', ...notes].join(' — ');
+
+  // Nothing worked. Instead of leaving the operator with a wall of identical
+  // `fetch failed` lines, run the reachability probe once (cached for a minute)
+  // and say which layer is broken: general egress, DNS filtering, a TLS
+  // interception proxy, or the service itself.
+  if (!unique.length && error && !signal?.aborted) {
+    const diagnosis = await diagnoseReachability({
+      hosts: [...(url && /^https?:/i.test(String(url)) ? [url] : []), ...moviebox.HOST_POOL],
+      sourceUrl: url || null,
+      signal,
+    }).catch(() => null);
+    if (diagnosis && !error.includes(diagnosis.verdict)) {
+      // The MovieBox lane already embeds the verdict in its own error text; do
+      // not repeat the same paragraph twice in the UI.
+      error += ` — network check: ${diagnosis.verdict} — ${diagnosis.hint}`;
+      log.warn('scraper', 'resolve failed — reachability diagnosis', {
+        verdict: diagnosis.verdict, summary: diagnosis.summary,
+      });
+    }
+  }
   return { ok: unique.length > 0, candidates: unique, timeline, notes, error };
 }
 

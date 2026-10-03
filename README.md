@@ -69,7 +69,11 @@ permissions, Container Manager project import, firewall, where the data lives).
   for a page or player URL.
 * Source list (editable in Settings → Sources): `overlook.cx`, `cinevo.nl`,
   `cinejoy.pk`, `flixhub.studio`, `redflix.club`, `1flex.org`, `cinezo.st` — and
-  **MovieBox** through its own signed REST client.
+  **MovieBox** through its own signed REST client (the same protocol the
+  [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
+  see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a
+  line-by-line comparison of how both apps select a title versus how they fetch and
+  play it).
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
@@ -135,6 +139,11 @@ picks it up next to the recording.
 * Postgres (with migrations) or **in-memory mode** when no database is reachable —
   the app degrades instead of refusing to start, and `REQUIRE_DB=true` flips that
   to a hard failure if you prefer.
+* **"Nothing resolved — why?" answered in one line.** When a resolve ends with zero
+  candidates the app probes a control host and compares the container's DNS answers
+  with public resolvers, then reports a verdict: `no-egress`, `tls-intercepted`
+  (a proxy re-signing TLS), `dns-filtered`, `tls-or-ip-block` (SNI/JA3 filtering) or
+  `service-unreachable`. Set `DIAGNOSE_ON_FAILURE=false` to skip the ~4 s probe.
 
 ---
 
@@ -245,6 +254,11 @@ npm run dev          # nodemon-style watch with debug logging
 LOG_LEVEL=debug npm start
 ```
 
+See [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for how this
+app's title selection and stream fetching compare to the MovieBox-TUI reference client,
+and for the failure-verdict table (`no-egress` / `tls-intercepted` / `dns-filtered` /
+`tls-or-ip-block`) that tells you which layer is broken when a resolve fails.
+
 Useful endpoints while debugging: `GET /api/health`, `GET /api/logs?level=warn`,
 `GET /api/events` (SSE), `POST /api/find/resolve`, `GET /api/streams/:id/command`
 (prints the exact ffmpeg command line the relay would run).
@@ -253,7 +267,8 @@ Useful endpoints while debugging: `GET /api/health`, `GET /api/logs?level=warn`,
 
 ```
 src/core/       log, config, db+repo, job queue, media (ffmpeg probing + VAAPI) 
-src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox client
+src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox client,
+                failure diagnostics (DNS/egress/TLS verdicts)
 src/streams/    stream store (tokens/URLs), relay (ffmpeg sessions), downloads, M3U
 src/subtitles/  5 providers + custom templates, SRT/VTT/encoding tools, receiver push
 src/enigma2/    bouquet builder/patcher + OpenWebif upload and verification

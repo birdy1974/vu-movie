@@ -29,7 +29,10 @@
     "idleStopSeconds": 45
   },
   "subtitles": {
-    "languages": ["nl", "en"],
+    "languages": [
+      "nl",
+      "en"
+    ],
     "autoSearch": true,
     "pushToReceiver": false,
     "receiverDir": "/media/hdd/movie/vumovie",
@@ -79,6 +82,12 @@
     "maxCandidates": 12,
     "flaresolverrUrl": "",
     "externalExtractorUrl": "",
+    "diagnoseOnFailure": true,
+    "dnsCheckServers": [
+      "1.1.1.1",
+      "8.8.8.8",
+      "9.9.9.9"
+    ],
     "customSources": []
   }
 }

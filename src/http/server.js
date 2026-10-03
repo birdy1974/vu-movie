@@ -104,8 +104,19 @@ export function createApp() {
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const ext = extensionOf(req.params.name);
 
-    // direct redirect (hybrid mode from decision D2) — zero load on the NAS
+    // direct redirect (hybrid mode from decision D2) — zero load on the NAS.
+    // Only valid for sources that need no request headers: a 302 cannot carry
+    // the signed Cookie/Referer that MovieBox and friends demand, so those URLs
+    // are refused with an explanation instead of sending VLC into a 403.
     if (ext === 'direct' || req.path.endsWith('/direct')) {
+      if (!store.directPlaybackAvailable(stream)) {
+        log.warn('http', 'direct redirect refused — the source needs request headers', { stream: stream.id });
+        return res.status(409).json({
+          ok: false,
+          error: 'this source needs request headers (signed cookie / referer) that a 302 redirect cannot replay',
+          hint: `use ${store.urlsFor(stream, baseUrlFrom(req, cfg)).ts} — the relay replays the headers`,
+        });
+      }
       log.info('http', `redirecting to upstream (direct mode)`, { stream: stream.id });
       return res.redirect(302, stream.upstream?.url);
     }

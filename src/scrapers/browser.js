@@ -162,17 +162,38 @@ export async function closeContexts() {
   }
 }
 
-export function looksLikeMedia(url, contentType, resourceType = '') {
+/** Accepts compiled `{re, kind}` entries as well as raw recipe strings. */
+function asMatcher(pattern) {
+  if (!pattern) return null;
+  if (pattern instanceof RegExp) return { re: pattern, kind: null };
+  if (typeof pattern === 'string') {
+    try { return { re: new RegExp(pattern, 'i'), kind: null }; } catch { return null; }
+  }
+  if (pattern.re instanceof RegExp) return { re: pattern.re, kind: pattern.kind || null };
+  if (typeof pattern.re === 'string') {
+    try { return { re: new RegExp(pattern.re, pattern.flags || 'i'), kind: pattern.kind || null }; } catch { return null; }
+  }
+  return null;
+}
+
+export function looksLikeMedia(url, contentType, resourceType = '', extraPatterns = []) {
   const target = String(url || '');
   const ct = String(contentType || '').toLowerCase();
+  const extras = extraPatterns.map(asMatcher).filter(Boolean);
   // Some CDNs mislabel fonts as application/octet-stream; they are not video
   // candidates even though their MIME type otherwise looks like binary media.
   if (resourceType === 'font' || FONT_FILE_PATTERN.test(target)) return false;
   if (MEDIA_CONTENT_TYPES.some((t) => ct.includes(t.toLowerCase()))) return true;
   if (/^application\/octet-stream(?:\s*;|$)/i.test(ct)) {
-    return resourceType === 'media' || MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
+    return resourceType === 'media'
+      || MEDIA_PATTERNS.some((pattern) => pattern.re.test(target))
+      || extras.some((pattern) => pattern.re.test(target));
   }
-  return MEDIA_PATTERNS.some((pattern) => pattern.re.test(target));
+  return MEDIA_PATTERNS.some((pattern) => pattern.re.test(target))
+    // Per-site patterns from the recipe (some sites serve manifests behind a
+    // route with no extension, e.g. /api/stream?id=…). A match here also tells
+    // us the kind, so the candidate is not recorded as a generic 'file'.
+    || extras.some((pattern) => pattern.re.test(target));
 }
 
 function kindOf(url, contentType) {
@@ -180,7 +201,60 @@ function kindOf(url, contentType) {
   if (/mpegurl/.test(ct) || /\.m3u8/i.test(url)) return 'hls';
   if (/dash\+xml/.test(ct) || /\.mpd/i.test(url)) return 'dash';
   if (/mp2t/.test(ct) || /\.ts(\?|#|$)/i.test(url)) return 'segment';
+  if (/video\/mp4|video\/webm/i.test(ct)) return 'file';
   return 'file';
+}
+
+/**
+ * Bumped whenever the regexes a stored recipe carries may be out of date.
+ * Recipes downloaded by an earlier version (or hand-written ones for a site
+ * that changed its player) keep working because `upgradeRecipe` folds the
+ * current built-in regexes back in — see registry.loadSources().
+ */
+export const RECIPE_SCHEMA_VERSION = 2;
+
+/** A sane default pattern for a media kind, used when a recipe has none. */
+export function defaultMediaPattern(kind) {
+  const found = MEDIA_PATTERNS.find((pattern) => pattern.kind === kind);
+  return found ? found.re.source : null;
+}
+
+/** Cache of compiled recipe patterns (site id → [{re, kind}]). */
+const recipeMediaPatterns = new Map();
+
+function compiledPatternsFor(siteId) {
+  const cached = recipeMediaPatterns.get(siteId);
+  if (cached) return cached;
+  let patterns = [];
+  if (siteId) {
+    try {
+      const source = loadSources().find((s) => s.id === siteId);
+      patterns = Array.isArray(source?.mediaPatterns) ? source.mediaPatterns : [];
+    } catch { /* registry not loaded (unit tests) — fall back to the built-ins */ }
+  }
+  const compiled = patterns.map(asMatcher).filter(Boolean);
+  recipeMediaPatterns.set(siteId, compiled);
+  return compiled;
+}
+
+/**
+ * Fold the *current* media-detection patterns into a possibly stale site
+ * recipe. Sites stored in /config/sources predate DASH/HLS detection and carry
+ * no patterns at all, which is how a `.mpd`-only site ends up "no media found".
+ */
+export function upgradeRecipe(site = {}) {
+  const version = Number(site.mediaPatternsVersion || 0);
+  if (version >= RECIPE_SCHEMA_VERSION && Array.isArray(site.mediaPatterns)) {
+    return { site, upgraded: false };
+  }
+  return {
+    site: {
+      ...site,
+      mediaPatterns: MEDIA_PATTERNS.map((pattern) => pattern.re.source),
+      mediaPatternsVersion: RECIPE_SCHEMA_VERSION,
+    },
+    upgraded: true,
+  };
 }
 
 /**
@@ -222,6 +296,11 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   const pendingJsonSettles = []; // promises mining JSON bodies for m3u8 URLs (awaited at end)
   const consoleErrors = [];
   const failedDocumentRequests = [];
+  /**
+   * Main-frame navigations we abort ourselves (pop-unders → about:blank/ads).
+   * Tracked so our own block is not reported as a network error of the site.
+   */
+  const blockedNavigations = new Set();
 
   page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 200));
@@ -241,20 +320,34 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     p.on('requestfailed', (request) => {
       if (failedDocumentRequests.length >= 12) return;
       try {
-        if (!request.isNavigationRequest() || request.frame() !== p.mainFrame()) return;
-        const failure = request.failure() || 'document request failed';
-        failedDocumentRequests.push({ host: safeHost(request.url()), error: String(failure).slice(0, 180) });
+        if (blockedNavigations.has(request.url())) return;
+        const failure = String(request.failure() || 'request failed');
+        const isFrameDocument = request.isNavigationRequest() || request.resourceType() === 'subdocument';
+        // Sub-frame failures matter as much as the main frame: when the movie
+        // page loads but its embedded player is refused, the *only* evidence is
+        // the refused iframe. Naming that host turns "no media found" into an
+        // actionable "embed host X is unreachable".
+        if (!isFrameDocument && !isNetworkNavigationError(failure)) return;
+        const frame = request.frame();
+        const isMainFrame = frame === p.mainFrame();
+        failedDocumentRequests.push({
+          host: safeHost(request.url()),
+          url: String(request.url()).slice(0, 160),
+          kind: isMainFrame ? 'main-frame' : 'embed',
+          error: failure.slice(0, 180),
+        });
       } catch { /* a closed popup may no longer have a frame */ }
     });
     p.on('response', async (res) => {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
       const req = res.request();
-      if (looksLikeMedia(u, ct, req.resourceType())) {
+      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session);
+      if (looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns)) {
         if (!media.has(u)) {
           let reqHeaders;
           try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }
-          const kind = kindOf(u, ct);
+          const kind = sitePatterns.find((pattern) => pattern.re.test(u))?.kind || kindOf(u, ct);
           media.set(u, {
             url: u,
             kind,
@@ -316,6 +409,13 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   };
   let navigationError = null;
 
+  // Flixer-clone pages (Overlook, 1flex, cinezo, redflix …) fire ad pop-unders
+  // that navigate the *main frame* to `about:blank` or to a random lander a few
+  // hundred ms after load. The player then never starts, the DOM we are watching
+  // disappears, and the sniff times out reporting `finalUrl: about:blank` — with
+  // no hint that the page was hijacked. We block those navigations instead (the
+  // search path already does exactly this) and remember the destination.
+  let hijackedTo = null;
   try {
     await page.route('**/*', async (route) => {
       const req = route.request();
@@ -328,6 +428,17 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
         if (type === 'media') return route.abort();
         return route.continue();
       }
+      try {
+        if (req.isNavigationRequest() && req.frame() === page.mainFrame()
+            && (u === 'about:blank' || !isSameSiteNavigation(u, url))) {
+          hijackedTo ||= u;
+          blockedNavigations.add(u);
+          log.warn('browser', `blocked an off-site / blank main-frame navigation on ${safeHost(url)} (pop-under?)`, {
+            destination: safeHost(u),
+          });
+          return route.abort('blockedbyclient');
+        }
+      } catch { /* frame may be detached while the pop-under fires */ }
       return route.continue();
     });
 
@@ -373,19 +484,40 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
     // Wait until we have media AND the page has been quiet for `quietMs`.
     // The aggressive click is a single retry; repeating it every 250 ms can
     // continually reload the player before it has time to initialize.
-    let lastCount = 0;
-    let lastChange = Date.now();
-    let aggressivePlayRetried = false;
-    while (Date.now() - started < timeoutMs) {
-      if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-      const count = media.size + apis.size;
-      if (count !== lastCount) { lastCount = count; lastChange = Date.now(); }
-      if (media.size > 0 && Date.now() - lastChange > quietMs) break;
-      if (!aggressivePlayRetried && media.size === 0 && Date.now() - started > Math.min(timeoutMs, 12_000)) {
-        aggressivePlayRetried = true;
-        await nudgePlay(page, true);
+    const waitForMedia = async (nudgeAtMs) => {
+      let lastCount = 0;
+      let lastChange = Date.now();
+      let aggressivePlayRetried = false;
+      while (Date.now() - started < timeoutMs) {
+        if (opts.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        const count = media.size + apis.size;
+        if (count !== lastCount) { lastCount = count; lastChange = Date.now(); }
+        if (media.size > 0 && Date.now() - lastChange > quietMs) break;
+        if (!aggressivePlayRetried && media.size === 0 && Date.now() - started > nudgeAtMs) {
+          aggressivePlayRetried = true;
+          await nudgePlay(page, true);
+        }
+        await sleep(250);
       }
-      await sleep(250);
+    };
+    await waitForMedia(Math.min(timeoutMs, 12_000));
+
+    // If the tab was replaced anyway (a same-site rewrite to about:blank, a
+    // renderer crash, `window.close()`), the page is gone and nothing further
+    // can be observed. Reload once: ad pop-unders here fire on the first load of
+    // a fresh tab, which is also what the search path relies on.
+    const pageWasReplaced = () => {
+      const current = page.url();
+      return !current || current.startsWith('about:') || !isSameSiteNavigation(current, url);
+    };
+    if (media.size === 0 && pageWasReplaced()) {
+      log.warn('browser', `${safeHost(url)} replaced the tab (now ${String(page.url()).slice(0, 120)}) — reloading it once`, {
+        blockedRedirect: hijackedTo ? safeHost(hijackedTo) : null,
+      });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 20_000) })
+        .catch((err) => log.warn('browser', `reload after tab replacement failed: ${err.message}`));
+      if (opts.click !== false) await nudgePlay(page);
+      await waitForMedia(Date.now() - started + 4_000);
     }
 
     // Give in-flight JSON API response bodies a moment to settle so the
@@ -418,7 +550,18 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
         // Page loaded but the player iframe / API host refused connections —
         // almost always means the source's CDN/embed is dead, geo-blocked,
         // or blocked by the container's network (DNS/proxy/firewall).
-        result.note = 'page loaded but the embedded player is unreachable (connection refused / failed) — the CDN/embed host may be dead, geo-blocked, or blocked by DNS';
+        // Name the actual hosts: with several embeds per page the operator
+        // otherwise cannot tell which one is dead.
+        const refused = [...new Set(result.networkErrors
+          .filter((e) => /ERR_(CONNECTION|NAME|ADDRESS|INTERNET|PROXY)/i.test(String(e.error)))
+          .map((e) => e.host))]
+          .filter(Boolean);
+        result.note = refused.length
+          ? `page loaded but its embedded player/CDN is unreachable — refused host(s): ${refused.join(', ')} (dead, geo-blocked, or blocked by DNS/firewall/proxy)`
+          : 'page loaded but the embedded player is unreachable (connection refused / failed) — the CDN/embed host may be dead, geo-blocked, or blocked by DNS';
+        result.refusedHosts = refused;
+      } else if (hijackedTo) {
+        result.note = `the page was replaced by an off-site/ad redirect to ${safeHost(hijackedTo)} — the site is likely parked, ad-hijacked, or requires a captcha`;
       } else if (navigationError) {
         result.note = `page navigation did not complete: ${navigationError}`;
       } else {
