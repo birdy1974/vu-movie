@@ -73,7 +73,11 @@ permissions, Container Manager project import, firewall, where the data lives).
   [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
   see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a
   line-by-line comparison of how both apps select a title versus how they fetch and
-  play it).
+  play it). When the `api*.aoneroom.com` edge is filtered and no host answers at
+  all, the same search is retried on MovieBox's **web** backend
+  (`/wefeed-h5api-bff` on `h5-api.aoneroom.com` and the public site mirrors) —
+  different hosts, so it survives blocks that target the mobile API
+  (`MOVIEBOX_TRANSPORT=auto|h5|mobile`, see §6 of that document).
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
@@ -204,7 +208,24 @@ The ones that matter most on a DS918+:
   solved page is parsed as static HTML and its cookies are imported into that
   site's browser context. Do not forward this unauthenticated API to the public
   Internet.
+  If `FLARESOLVERR_URL` is empty or malformed, vu-movie says so at startup and
+  in `GET /api/health` (`flaresolverr`: configured / reachable / version / hint)
+  instead of only complaining on the first Cloudflare page.
+  It is a **sidecar, not a dependency**: the app starts without it (only
+  Cloudflare-protected sources degrade, with a "FlareSolverr is not reachable"
+  log line). The service runs with `shm_size: 512m` and a 1.2 GB memory limit
+  because Chromium cannot start in Docker's 64 MB `/dev/shm` default — the
+  symptom when it can't is `Error getting browser User-Agent … Read timed out`
+  and a container that restart-loops. `sh scripts/doctor.sh` section 6 checks
+  all of that (restart count, `/dev/shm` size, reachable API) for you; to pin a
+  known-good image set `FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21`.
 * Health: `GET /api/health` (also wired into the container healthcheck).
+  The receiver is **not** contacted by this endpoint — it reports the last known
+  state only. The container healthcheck (every 30 s) and the dashboard (every
+  15 s) both read `/api/health`, and a VU+ should not be woken up that often for
+  a value that changes roughly never. The box is checked on demand
+  (`GET /api/enigma2/status`, the *test connection* button) and before every
+  bouquet push; reachability is logged when it **changes**, not per poll.
 
 ```bash
 docker compose logs -f vu-movie          # structured app logs

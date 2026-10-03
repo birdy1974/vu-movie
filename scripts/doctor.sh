@@ -14,6 +14,8 @@
 #   3. ffmpeg exists in the container and how long `ffmpeg -version` takes
 #   4. which VA-API driver really encodes a 2 s test pattern (iHD vs i965)
 #   5. what the app itself reports (GET /api/diagnostics/ffmpeg)
+#   6. FlareSolverr: is it up, is it crash-looping, is /dev/shm big enough, and
+#      can the app container actually reach it over FLARESOLVERR_URL
 #
 # Every line is a fact read from your machine — the point is to stop guessing.
 # Exit status 0 = everything a stream needs is in place.
@@ -167,6 +169,91 @@ if printf '%s' "$DIAG" | grep -q '"report"'; then
 else
   warn "the app did not answer on http://127.0.0.1:${PORT} inside the container:"
   printf '%s\n' "$DIAG" | tail -3 | sed 's/^/         /'
+fi
+
+# -----------------------------------------------------------------------------
+head1 "6. FlareSolverr (Cloudflare solver)"
+# Optional service: a broken solver costs you Cloudflare-protected sources, not
+# the whole app — so every failure here is a [warn] except an actual crash loop.
+FS_CONTAINER="${FS_CONTAINER:-vu-movie-flaresolverr}"
+FS_PORT="${FLARESOLVERR_PORT:-8192}"
+
+if docker inspect -f '{{.State.Running}}' "$FS_CONTAINER" > /dev/null 2>&1; then
+  if docker inspect -f '{{.State.Running}}' "$FS_CONTAINER" 2>/dev/null | grep -q true; then
+    ok "container '$FS_CONTAINER' is running"
+  else
+    bad "container '$FS_CONTAINER' exists but is not running — see: docker compose logs $FS_CONTAINER"
+  fi
+  docker inspect -f '    image: {{.Config.Image}}' "$FS_CONTAINER" 2>/dev/null
+  RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$FS_CONTAINER" 2>/dev/null)
+  case "$RESTARTS" in
+    ''|*[!0-9]*) RESTARTS=0 ;;
+  esac
+  if [ "$RESTARTS" -ge 2 ]; then
+    bad "the container has restarted $RESTARTS time(s) — it is crash-looping, not 'still starting'"
+  else
+    ok "restart count: $RESTARTS"
+  fi
+  MEM=$(docker inspect -f '{{.HostConfig.Memory}}' "$FS_CONTAINER" 2>/dev/null)
+  SHM=$(docker inspect -f '{{.HostConfig.ShmSize}}' "$FS_CONTAINER" 2>/dev/null)
+  printf '    memory limit: %s bytes (0 = unlimited)   /dev/shm: %s bytes\n' "$MEM" "$SHM"
+  case "$MEM" in
+    0|'') ;;
+    *) if [ "$MEM" -lt 1048576000 ]; then warn "memory limit is under 1 GB — Chromium+xvfb need about that; raise FLARESOLVERR_MEM_LIMIT"; fi ;;
+  esac
+  case "$SHM" in
+    0|'') ;;
+    *) if [ "$SHM" -le 67108864 ]; then bad "/dev/shm is <= 64 MB (Docker's default) — Chromium cannot start in it. Set FLARESOLVERR_SHM_SIZE=512m in .env and run: docker compose up -d --force-recreate flaresolverr"; fi ;;
+  esac
+  FS_SHM=$(docker exec "$FS_CONTAINER" sh -c "df -k /dev/shm 2>/dev/null | tail -1" 2>/dev/null | awk '{print $2}')
+  if [ -n "$FS_SHM" ]; then
+    printf '    inside the container /dev/shm is %s kB\n' "$FS_SHM"
+    if [ "$FS_SHM" -le 65536 ]; then bad "container /dev/shm is still 64 MB — the shm_size setting did not take effect (recreate the container, not just restart it)"; fi
+  fi
+else
+  warn "container '$FS_CONTAINER' does not exist — FlareSolverr is optional; Cloudflare-protected sources will be skipped"
+fi
+
+# The signature of "Chromium never started": FlareSolverr tests its browser on
+# boot and *exits* when that test fails, so it never serves a single request.
+if docker inspect "$FS_CONTAINER" > /dev/null 2>&1; then
+  FS_LOGS=$(docker logs --tail 200 "$FS_CONTAINER" 2>&1)
+  if printf '%s' "$FS_LOGS" | grep -q 'Error getting browser User-Agent'; then
+    bad "FlareSolverr logged 'Error getting browser User-Agent' — its own Chromium did not start"
+    printf '%s\n' "$FS_LOGS" | grep -m1 'Error getting browser User-Agent' | sed 's/^/         /'
+    printf '         Fix in this order:\n'
+    printf '           1. FLARESOLVERR_SHM_SIZE=512m in .env, then\n'
+    printf '              docker compose up -d --force-recreate flaresolverr\n'
+    printf '           2. give the container >=1 GB RAM (FLARESOLVERR_MEM_LIMIT) and\n'
+    printf '              stop other containers while testing\n'
+    printf '           3. pin an older image: FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21\n'
+  else
+    ok "no 'Error getting browser User-Agent' in the last 200 log lines"
+  fi
+fi
+
+if docker inspect -f '{{.State.Running}}' "$FS_CONTAINER" 2>/dev/null | grep -q true; then
+  FS_HEALTH=$(docker exec "$FS_CONTAINER" curl -fsS --max-time 10 "http://127.0.0.1:${FS_PORT}/health" 2>&1)
+  if printf '%s' "$FS_HEALTH" | grep -qi 'ok'; then
+    ok "solver API answers on 127.0.0.1:${FS_PORT}/health: $FS_HEALTH"
+  else
+    bad "solver API did not answer on 127.0.0.1:${FS_PORT}/health (is PORT=8192 set?):"
+    printf '%s\n' "$FS_HEALTH" | tail -2 | sed 's/^/         /'
+  fi
+  # What the app container sees is what matters — FLARESOLVERR_URL is
+  # container-to-container, not the published NAS port.
+  APP_URL=$(docker exec "$CONTAINER" sh -c 'echo "${FLARESOLVERR_URL:-}"' 2>/dev/null)
+  if [ -n "$APP_URL" ]; then
+    APP_CURL=$(docker exec "$CONTAINER" curl -fsS --max-time 10 "${APP_URL%/}/health" 2>&1)
+    if printf '%s' "$APP_CURL" | grep -qi 'ok'; then
+      ok "vu-movie reaches the solver over $APP_URL"
+    else
+      bad "vu-movie cannot reach $APP_URL from inside its container:"
+      printf '%s\n' "$APP_CURL" | tail -2 | sed 's/^/         /'
+    fi
+  else
+    warn "FLARESOLVERR_URL is empty in the app container — the solver will never be used"
+  fi
 fi
 
 head1 "cache + next steps"

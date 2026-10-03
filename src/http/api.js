@@ -81,7 +81,11 @@ router.get('/health', wrap(async (req, res) => {
   hardware();
   const hw = hardwareStatus();
   const binaries = binariesStatus() || { ffmpeg: { ok: false, pending: true }, ffprobe: { ok: false, pending: true } };
-  const enigma = cfg('enigma2.host') ? await enigma2.status({ timeoutMs: 3000 }).catch((e) => ({ ok: false, message: errorText(e) })) : { configured: false };
+  // Last known receiver state only — this endpoint answers the container
+  // healthcheck every 30 s and the dashboard every 15 s, and neither is a
+  // reason to send a request to the box. The receiver is checked on demand
+  // (GET /api/enigma2/status) and when a bouquet is pushed.
+  const enigma = enigma2.cachedStatus();
   res.json({
     ok: true,
     version: process.env.APP_VERSION || '1.0.0',
@@ -95,6 +99,9 @@ router.get('/health', wrap(async (req, res) => {
     hwaccelPending: hardwarePending(),
     browser: browser.browserInfo(),
     externalExtractor: external.isConfigured(),
+    // Cloudflare-protected sources silently degrade when this is missing, so
+    // report it here rather than only in a scraper log line.
+    flaresolverr: await browser.flaresolverrStatus({ probe: true, maxAgeMs: 300_000 }).catch((e) => ({ configured: false, error: errorText(e) })),
     enigma2: enigma,
     streamSessions: relay.listSessions(),
     jobs: jobStats(),
@@ -155,6 +162,7 @@ router.put('/config', wrap(async (req, res) => {
   log.info('api', 'config update requested', { sections: Object.keys(patch).join(',') });
   const next = saveConfig(patch);
   if (patch.app?.logLevel) setLogLevel(patch.app.logLevel);
+  if (patch.enigma2) enigma2.resetStatusCache();
   res.json({ ok: true, config: publicConfig(), changed: Object.keys(patch) });
 }));
 
@@ -609,7 +617,9 @@ function spawnUpload(localFile, remoteName, remoteDir) {
 /* ---------- enigma2 ---------- */
 
 router.get('/enigma2/status', wrap(async (req, res) => {
-  res.json({ ok: true, status: await enigma2.status() });
+  // Explicit "is the box there?" from the UI: always ask the receiver for real,
+  // never serve the cached answer.
+  res.json({ ok: true, status: await enigma2.status({ force: true }) });
 }));
 
 router.post('/enigma2/preview', wrap(async (req, res) => {

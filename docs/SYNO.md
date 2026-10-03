@@ -174,8 +174,12 @@ the new profile on the next request.
 
 | Symptom | Where to look |
 |---|---|
+| `blocked by bot protection and FlareSolverr is not configured` (or `FLARESOLVERR_URL is set but is not a usable URL`) | The source returned a Cloudflare challenge and the solver could not be used. Check `docker compose exec vu-movie printenv FLARESOLVERR_URL` and the `flaresolverr` block of `GET /api/health`: it reports whether the URL is configured, whether the solver answers and which version. Empty → set `FLARESOLVERR_URL=http://flaresolverr:8192` and recreate the container; `set but not a usable URL` → the value is malformed (an inline `# comment` copied from an older `.env` is the classic cause — the app strips it, older builds did not); a solver that answers while the variable is empty is reported too |
 | "no media found" while scraping | Logs page → filter `browser`. FlareSolverr starts with the project, listens on container port `8192`, and is published on NAS port `8193` by default (`FLARESOLVERR_HOST_PORT`); inspect it with `docker compose logs -f flaresolverr`. Challenged searches retry through its API; outbound DNS/network failures still need to be fixed separately. |
+| `flaresolverr` container restart-loops: `Error getting browser User-Agent … Read timed out (read timeout=120)` | FlareSolverr's *own* Chromium never answered its boot test, so the process exits and Docker restarts it — nothing is wrong with vu-movie. Run `sh scripts/doctor.sh` (section 6) and fix in this order: (1) `FLARESOLVERR_SHM_SIZE=512m` in `.env` then `docker compose up -d --force-recreate flaresolverr` (Docker's `/dev/shm` default is 64 MB and Chromium hangs in it); (2) give it ≥ 1 GB RAM (`FLARESOLVERR_MEM_LIMIT`, raise it or stop other containers — 2 GB NAS boxes are tight); (3) pin an older image with `FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21`. The app itself keeps running and skips Cloudflare sources meanwhile. |
+| MovieBox: `visitor-login failed on every API host [fetch-failed:…]` and `tls-or-ip-block`, while some hosts answer `HTTP 404` | Those two verdicts together mean the *mobile* edge (`api*.aoneroom.com`) is blocked at the TLS layer, but other MovieBox hosts still complete a handshake — the 404 is a real HTTP answer to the mobile path from a *different* backend. vu-movie now retries the search on the web (H5) BFF (`h5-api.aoneroom.com` + the public site mirrors) automatically. Force it with `MOVIEBOX_TRANSPORT=h5`, or skip it with `mobile`; full comparison in [docs/MOVIEBOX-TUI-COMPARISON.md §6](MOVIEBOX-TUI-COMPARISON.md) |
 | Resolve ends with zero candidates; browser reports `ERR_CONNECTION_REFUSED` and MovieBox reports `fetch failed` | These are outbound HTTPS failures from the app container, separate from Enigma2 reachability. Check DNS and HTTPS from inside `vu-movie` using the commands below; if both providers fail, check NAS/Docker egress, DNS, firewall, or proxy configuration. A reachable FlareSolverr container does not by itself provide a general proxy. |
+| The log repeats `enigma2 receiver reachable: <model>` every few seconds | That was `/api/health` forwarding a fresh `/web/about` request to the box on every poll — the container healthcheck (30 s) plus the dashboard (15 s). `/api/health` now **never** contacts the receiver: it reports the last known state (`not checked` until someone tests). The box is checked by the *test connection* button (`GET /api/enigma2/status`) and before each bouquet push; reachability is logged when it **changes** |
 | Stream plays but stops after a while | `relay` logs: most upstream URLs expire. Increase `TOKEN_TTL_MINUTES`, or use *Transcode* so the app owns the connection and re-fetches |
 | VLC shows a black screen | Copy the ffmpeg command from the Stream page and run it inside the container: `docker compose exec vu-movie sh -c '<command> > /tmp/x.ts'` — the error message is always in the last lines |
 | `permission denied /dev/dri/renderD128` | Section 2 above |
@@ -213,6 +217,35 @@ transcoding permanently); if you want to force a fresh probe anyway, press
 
 Log level: `.env` → `LOG_LEVEL=debug`, then `docker compose up -d`. The UI's Logs
 page streams the same entries live, so you rarely need `docker logs`.
+
+---
+
+### Proving the solver actually solves (not just answers /health)
+
+`/health` only says the process is alive. The real test is one challenge page through its API —
+run this **inside the vu-movie container** (from the NAS: `docker compose exec vu-movie sh -c '…'`):
+
+```bash
+curl -sS -m 90 -X POST http://flaresolverr:8192/v1 \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"request.get","url":"https://cinevo.nl/search?q=dune","maxTimeout":60000}' \
+  | head -c 400
+```
+
+* `"status":"ok"` with a large `solution.response` containing the site's HTML → the solver works;
+  vu-movie will use it on the next challenged search (log: `trying FlareSolverr for …`).
+* `"status":"error"` mentioning the browser or a timeout → its Chromium cannot solve this page
+  (raise `FLARESOLVERR_TIMEOUT_MS`, or check `docker compose logs flaresolverr`).
+* connection refused / no route → the name or port is wrong for *this* container: fix
+  `FLARESOLVERR_URL` (container-to-container, not the published NAS port).
+* If you use the published port from the NAS instead: `http://<nas-ip>:8193/health`.
+
+Confirm the basics first:
+
+```bash
+getent hosts flaresolverr        # must print the solver container's IP
+curl -sS -m 10 http://flaresolverr:8192/health; echo
+```
 
 ---
 

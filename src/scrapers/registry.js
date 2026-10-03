@@ -529,7 +529,7 @@ export async function searchAll(query, {
             kind: r.kind,
             poster: r.poster,
             movieboxSubjectId: r.subjectId,
-            url: `moviebox://subject/${encodeURIComponent(r.subjectId)}`,
+            url: `moviebox://subject/${encodeURIComponent(r.subjectId)}${r.detailPath ? `?dp=${encodeURIComponent(r.detailPath)}` : ''}`,
             sourceId: 'moviebox',
             sourceName: 'MovieBox',
             ...metadata,
@@ -583,6 +583,9 @@ export function parseMovieBoxTarget(url) {
     subjectId,
     season: Number(params.get('se')) || 0,
     episode: Number(params.get('ep')) || 0,
+    // `dp` = the web (H5) BFF's detailPath, carried along when the search row
+    // has one so playback can fall back to the H5 transport by id alone.
+    detailPath: params.get('dp') || null,
   };
 }
 
@@ -605,10 +608,13 @@ export async function resolveTarget(input) {
   if (movieboxTarget) {
     const { subjectId } = movieboxTarget;
     const t0 = Date.now();
+    let movieboxOk = false;
     try {
       const info = await moviebox.playInfo(subjectId, { se: selectedSeason, ep: selectedEpisode, signal });
-      candidates.push(...moviebox.releasesFromPlayInfo(info, { season: selectedSeason, episode: selectedEpisode }));
-      noteHealth('moviebox', candidates.length > 0, `${candidates.length} candidates`);
+      const playCandidates = moviebox.releasesFromPlayInfo(info, { season: selectedSeason, episode: selectedEpisode });
+      candidates.push(...playCandidates);
+      movieboxOk = playCandidates.length > 0;
+      noteHealth('moviebox', playCandidates.length > 0, `${playCandidates.length} candidates`);
     } catch (err) {
       if (signal?.aborted || err?.name === 'AbortError') throw err;
       // Play-info failures are the most common "nothing happens" case: the
@@ -619,6 +625,31 @@ export async function resolveTarget(input) {
       logError('scraper', 'MovieBox play-info failed', err, { subjectId });
     } finally {
       timeline.moviebox = Date.now() - t0;
+    }
+    // The mobile API and the web player use different hosts. When the mobile
+    // edge is filtered (TLS reset on every api*.aoneroom.com) but the site
+    // still answers, the web BFF is the difference between "0 candidates" and
+    // a playable stream — try it before declaring the title unplayable.
+    if (!movieboxOk) {
+      const t1 = Date.now();
+      try {
+        const h5 = await moviebox.h5StreamsFor({
+          subjectId, detailPath: movieboxTarget.detailPath || null,
+          season: selectedSeason, episode: selectedEpisode, title, signal,
+        });
+        if (h5.length) {
+          candidates.push(...h5);
+          notes.push(`MovieBox web (H5) transport supplied ${h5.length} candidate(s)`);
+          noteHealth('moviebox', true, `${h5.length} candidates via the web BFF`);
+          log.info('scraper', 'MovieBox web (H5) transport resolved the title', { subjectId, count: h5.length });
+        }
+      } catch (err) {
+        if (signal?.aborted || err?.name === 'AbortError') throw err;
+        notes.push(`MovieBox web (H5) transport failed (${errorText(err)})`);
+        log.warn('scraper', 'MovieBox web (H5) transport failed', { subjectId, error: errorText(err) });
+      } finally {
+        timeline.movieboxH5 = Date.now() - t1;
+      }
     }
   }
 

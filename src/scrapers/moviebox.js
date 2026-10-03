@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { request, sleep } from './http.js';
+import { request, sleep, safeHost } from './http.js';
 import { diagnoseReachability } from './diagnostics.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
@@ -60,18 +60,20 @@ function browserFallbackEnabled() {
 
 const API_PREFIX = '/wefeed-mobile-bff';
 /**
- * Host pool — order matters; api*.aoneroom.com are primary, api.inmoviebox.com
- * is the legacy fallback. `api6sg.aoneroom.com` was removed 2026-10 after it
- * stopped resolving (ENOTFOUND); keep the list trim so we don't waste a 12 s
- * timeout per search on a dead NLB.
+ * Host pool — reference parity: this is exactly `HOST_POOL` from
+ * `MovieBox-TUI` (`src/providers/moviebox/client.rs`), minus `api6sg`, which
+ * stopped resolving (NXDOMAIN) and therefore only bought us a guaranteed miss
+ * per sweep. Order matters; api*.aoneroom.com are primary, api.inmoviebox.com
+ * is the legacy fallback. Operators can extend the pool via
+ * MOVIEBOX_EXTRA_HOSTS (comma-separated) without editing code.
  *
- * 2026-10 extension: several users behind SNI-filtering ISPs reported that the
- * direct api*.aoneroom.com edge is blocked even though the H5/web BFF mirrors
- * (h5-api.aoneroom.com, h5.aoneroom.com) and the i-api mirror are still
- * reachable via a different ALB/certificate. Add those as secondary hosts so
- * the pool can hop there automatically. Operators can also extend the pool via
- * MOVIEBOX_EXTRA_HOSTS (comma-separated) without editing code. The web BFF
- * uses /wefeed-mobile-bff as well, so no prefix change is needed for these.
+ * 2026-10 correction: h5-api / h5 / api / i-api .aoneroom.com and
+ * apii.inmoviebox.com used to be appended here as "H5 mirrors" on the
+ * assumption they serve /wefeed-mobile-bff too. They do not — every one of
+ * them answers **HTTP 404** to `/wefeed-mobile-bff/user-api/visitor-login`
+ * while the api* edge is TLS-reset, so each sweep burned a 12 s timeout on
+ * hosts that can never answer. They are a *different* BFF (see the H5
+ * transport below), not extra mirrors of this one.
  */
 const BUILTIN_HOST_POOL = [
   'https://api6.aoneroom.com',
@@ -81,18 +83,11 @@ const BUILTIN_HOST_POOL = [
   'https://api3.aoneroom.com',
   'https://api.inmoviebox.com',
 ];
-const EXTRA_MIRRORS = [
-  'https://h5-api.aoneroom.com',
-  'https://h5.aoneroom.com',
-  'https://api.aoneroom.com',
-  'https://i-api.aoneroom.com',
-  'https://apii.inmoviebox.com',
-];
 export function getHostPool() {
   const cfg = (() => { try { return getConfig?.(); } catch { return null; } })();
   const extra = cfg?.scraper?.movieboxExtraHosts || [];
   const envExtra = (process.env.MOVIEBOX_EXTRA_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const merged = [...BUILTIN_HOST_POOL, ...EXTRA_MIRRORS, ...extra, ...envExtra];
+  const merged = [...BUILTIN_HOST_POOL, ...extra, ...envExtra];
   // Deduplicate while preserving order (first occurrence wins)
   const seen = new Set();
   return merged.filter((h) => {
@@ -533,7 +528,12 @@ async function apiRequestViaBrowser(pathAndQuery, { method = 'GET', body, authen
   return { ok: false, error: outcome.error, sawHttp };
 }
 
-async function login({ signal = null } = {}) {
+/**
+ * @param {boolean} skipBrowserFallback  Do not spend ~15 s retrying the mobile
+ *        API through Chromium — the caller has a cheaper alternative (the web
+ *        BFF) and will come back for the browser sweep only if that fails too.
+ */
+async function login({ signal = null, skipBrowserFallback = false } = {}) {
   if (Date.now() < disabledUntil) {
     const waitSec = Math.round((disabledUntil - Date.now()) / 1000);
     throw new Error(`MovieBox is temporarily backed off for ${waitSec}s after ${consecutiveFailures} consecutive failures`);
@@ -543,6 +543,7 @@ async function login({ signal = null } = {}) {
   const pool = getHostPool();
   log.info('moviebox', 'requesting a visitor token', { startHost: pool[hostIndex % pool.length] });
   const failureBreakdown = new Map(); // kind → count (for a useful aggregated log line)
+  let sawHttpStatus = false;
   let outcome = await loginWithHostFailover({
     hosts: pool,
     startIndex: hostIndex,
@@ -560,8 +561,9 @@ async function login({ signal = null } = {}) {
         signal,
       });
     },
-    onFailure: ({ host, hop, error }) => {
+    onFailure: ({ host, hop, error, result }) => {
       lastError = errorText(error);
+      if (result?.status) sawHttpStatus = true;
       const info = classifyFetchError(error);
       failureBreakdown.set(info.kind, (failureBreakdown.get(info.kind) || 0) + 1);
       log.warn('moviebox', `visitor-login failed on ${host} — trying next host`, {
@@ -575,7 +577,7 @@ async function login({ signal = null } = {}) {
   // declare the service dead. This is the user-visible fix for
   // `tls-or-ip-block` when the container sits behind an ISP that filters
   // api*.aoneroom.com at the SNI layer.
-  if (!outcome.ok && browserFallbackEnabled() && !signal?.aborted) {
+  if (!outcome.ok && browserFallbackEnabled() && !skipBrowserFallback && !signal?.aborted) {
     const breakdownKinds = [...failureBreakdown.keys()];
     const looksLikeTlsBlock = breakdownKinds.includes('tls') || breakdownKinds.includes('tls-intercepted');
     // We also check the diagnosis verdict — but don't wait for it if we already suspect TLS.
@@ -632,7 +634,13 @@ async function login({ signal = null } = {}) {
     }
     logError('moviebox', `visitor-login failed on every API host [${breakdown}]${hint}`, outcome.error);
     if (diagnosis) log.warn('moviebox', 'MovieBox reachability diagnosis', { verdict: diagnosis.verdict, summary: diagnosis.summary });
-    throw new Error(`MovieBox visitor-login failed: ${lastError}${hint}`, { cause: outcome.error });
+    // `movieboxTransport` marks "no host ever answered at the HTTP layer" —
+    // i.e. the mobile edge is blocked, which is exactly when the web (H5) BFF
+    // (different hosts) is worth trying. An HTTP-level rejection is a protocol
+    // problem and switching transports would only hide it.
+    throw Object.assign(new Error(`MovieBox visitor-login failed: ${lastError}${hint}`), {
+      cause: outcome.error, movieboxTransport: !sawHttpStatus,
+    });
   }
 
   consecutiveFailures = 0;
@@ -654,11 +662,11 @@ async function login({ signal = null } = {}) {
   return session;
 }
 
-async function ensureSession({ signal = null } = {}) {
+async function ensureSession({ signal = null, skipBrowserFallback = false } = {}) {
   if (session?.token && sessionIsValid(session)) return session;
   session = loadSession();
   if (session?.token) return session;
-  return login({ signal });
+  return login({ signal, skipBrowserFallback });
 }
 
 /**
@@ -687,9 +695,10 @@ function absorbXUser(headers = {}) {
  */
 export async function apiRequest(pathAndQuery, {
   method = 'GET', body, authenticated = true, signal = null, allowFreshTokenRetry = true,
+  skipBrowserFallback = false,
 } = {}) {
   const id = identity();
-  if (authenticated) await ensureSession({ signal });
+  if (authenticated) await ensureSession({ signal, skipBrowserFallback });
 
   let reauthenticationAttempted = false;
   let sawHttpStatus = false;
@@ -749,7 +758,7 @@ export async function apiRequest(pathAndQuery, {
   // Direct Node fetch failed with transport errors (no HTTP status) and the
   // failure looks like SNI/JA3 filtering → retry the same signed request via
   // Chromium (BoringSSL) before we surface the error to the operator.
-  if (!outcome.ok && !sawHttpStatus && browserFallbackEnabled() && !signal?.aborted) {
+  if (!outcome.ok && !sawHttpStatus && browserFallbackEnabled() && !skipBrowserFallback && !signal?.aborted) {
     const hasTlsHint = [...failureKinds.keys()].some((k) => ['tls', 'tls-intercepted'].includes(k));
     let verdictIsTlsBlock = hasTlsHint;
     if (!verdictIsTlsBlock) {
@@ -795,11 +804,377 @@ export async function apiRequest(pathAndQuery, {
       return apiRequest(pathAndQuery, { method, body, authenticated, signal, allowFreshTokenRetry: false });
     }
     log.error('moviebox', 'all API hosts exhausted', { path: pathAndQuery, error: lastError });
-    throw new Error(`MovieBox request failed (${pathAndQuery}): ${lastError}`, { cause: outcome.error });
+    throw Object.assign(new Error(`MovieBox request failed (${pathAndQuery}): ${lastError}`), {
+      cause: outcome.error, movieboxTransport: !sawHttpStatus,
+    });
   }
   hostIndex = outcome.index; // stick to a host that works
   lastError = null;
   return outcome.result.data;
+}
+
+/* ---------------- web (H5) BFF transport ---------------- */
+/**
+ * A second transport for the *web* player's backend.
+ *
+ * MovieBox-TUI only knows the mobile BFF (`api*.aoneroom.com/wefeed-mobile-bff`)
+ * implemented above. The website (movieboxhd.net and its mirrors) talks to a
+ * different backend, on different hosts, under `/wefeed-h5api-bff`:
+ *
+ *   POST /subject/search-suggest           → mints an anonymous JWT and returns
+ *        it in the `x-user` response header — the same rotation channel the
+ *        mobile BFF uses and the same one `absorb_x_user()` reads in the
+ *        reference client
+ *   POST /subject/search                   → { keyword, page, perPage: 0, subjectType: 0 }
+ *   GET  /detail?detailPath=…              → the subject (+ seasons)
+ *   GET  /subject/play?subjectId=…&se=…&ep=…&detailPath=…
+ *   GET  /subject/download?…               → only answers on the site's own
+ *        domain; the API host 404s it
+ *
+ * Why this exists: those hosts are reachable from networks where the `api*`
+ * edge is reset. The log that prompted this code is the proof — while every
+ * `apiN.aoneroom.com` host died in the TLS handshake, `h5-api.aoneroom.com`,
+ * `h5.aoneroom.com` and `i-api.aoneroom.com` completed TLS and answered
+ * **HTTP 404**, because we had been sending them the *mobile* path all along.
+ * They are not broken mirrors of the mobile BFF; they are a different BFF.
+ *
+ * The public site mirrors proxy that BFF under their own domain
+ * (`https://movieboxhd.net/wefeed-h5api-bff/…`), which matters for the same
+ * reason: those are ordinary website hostnames, so they survive filtering that
+ * targets `api*.aoneroom.com`. They are tried after the API host.
+ */
+const H5_PREFIX = '/wefeed-h5api-bff';
+export const H5_API_BASES = ['https://h5-api.aoneroom.com'];
+export const H5_SITE_BASES = ['https://movieboxonline.net', 'https://movieboxhd.net'];
+/** Origin/Referer the web player sends — the BFF checks them. */
+const H5_ORIGIN = H5_SITE_BASES[0];
+
+let h5Token = null; // { token, expiresAt (unix seconds), uid }
+
+function h5UserAgent() {
+  const cfg = (() => { try { return getConfig?.(); } catch { return null; } })();
+  return cfg?.scraper?.userAgent
+    || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+}
+
+/**
+ * `X-Client-Token: <unix-seconds>,<md5(reverse(seconds))>`.
+ * Same construction as the mobile BFF but in **seconds**, not milliseconds —
+ * the web BFF rejects a millisecond timestamp outright.
+ */
+export function h5ClientToken(nowMs = Date.now()) {
+  const seconds = Math.floor(nowMs / 1000);
+  return `${seconds},${md5(String(seconds).split('').reverse().join(''))}`;
+}
+
+/** The web BFF hands the anonymous JWT back in the `x-user` response header. */
+export function tokenFromXUser(headers = null) {
+  if (!headers) return null;
+  const raw = typeof headers?.get === 'function'
+    ? headers.get('x-user')
+    : (headers['x-user'] || headers['X-User']);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const token = typeof parsed === 'string' ? parsed : parsed?.token;
+    return typeof token === 'string' && token.trim() ? token.trim() : null;
+  } catch { return null; }
+}
+
+/** The site a request pretends to come from: its own domain for a site mirror, the primary site for the API host. */
+function originFor(base) {
+  return H5_SITE_BASES.includes(base) ? base : H5_SITE_BASES[0];
+}
+
+function h5Headers({ token = null, referer = null, clientToken = null, origin = H5_ORIGIN } = {}) {
+  let timezone = 'Europe/Amsterdam';
+  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || timezone; } catch { /* keep the default */ }
+  const headers = {
+    'User-Agent': h5UserAgent(),
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'X-Client-Info': JSON.stringify({ timezone }),
+    'X-Request-Lang': 'en',
+    Origin: origin,
+    Referer: referer || `${origin}/`,
+    Authorization: token ? `Bearer ${token}` : '',
+  };
+  if (clientToken) headers['X-Client-Token'] = clientToken;
+  return headers;
+}
+
+/** How the operator wants the two transports ordered (see MOVIEBOX_TRANSPORT). */
+export function transportMode(configured = null) {
+  const raw = String(configured
+    ?? process.env.MOVIEBOX_TRANSPORT
+    ?? (() => { try { return getConfig?.()?.scraper?.movieboxTransport; } catch { return null; } })()
+    ?? 'auto').toLowerCase();
+  return ['h5', 'mobile'].includes(raw) ? raw : 'auto';
+}
+
+/** The web BFF may be used at all (`auto` = as a fallback, `h5` = first). */
+function h5Enabled() { return transportMode() !== 'mobile'; }
+
+/** …and should be tried *before* the mobile BFF. */
+function h5First() {
+  if (!h5Enabled()) return false;
+  // After a full failed sweep the mobile edge is backing off; paying for
+  // another doomed host sweep on every keystroke is worse than asking the web
+  // BFF first.
+  return transportMode() === 'h5' || (Date.now() < disabledUntil && consecutiveFailures > 0);
+}
+
+async function h5MintToken({ signal = null } = {}) {
+  const bases = [...H5_API_BASES, ...H5_SITE_BASES];
+  const errors = [];
+  for (const base of bases) {
+    if (signal?.aborted) throw abortError(signal);
+    try {
+      const res = await request(`${base}${H5_PREFIX}/subject/search-suggest`, {
+        method: 'POST',
+        body: JSON.stringify({ keyword: 'movie', perPage: 10 }),
+        headers: h5Headers({ clientToken: h5ClientToken() }),
+        timeoutMs: HOST_REQUEST_TIMEOUT_MS,
+        retries: 0,
+        json: true,
+        allowFailure: true,
+        signal,
+      });
+      const token = tokenFromXUser(res?.headers);
+      if (token) {
+        const claims = parseJwtClaims(token);
+        h5Token = { token, expiresAt: claims.exp, uid: claims.userId };
+        log.info('moviebox', 'web (H5) BFF: anonymous token acquired', { base, expiresAt: claims.exp || null });
+        return h5Token.token;
+      }
+      errors.push(`${safeHost(base)}: no x-user token${res?.error ? ` (${res.error})` : ''}`);
+    } catch (err) {
+      errors.push(`${safeHost(base)}: ${errorText(err)}`);
+    }
+  }
+  throw new Error(`MovieBox web (H5) BFF could not mint a token — ${errors.join('; ')}`);
+}
+
+async function h5EnsureToken({ signal = null, force = false } = {}) {
+  if (!force && h5Token?.token && sessionIsValid({ token: h5Token.token, expiresAt: h5Token.expiresAt })) {
+    return h5Token.token;
+  }
+  return h5MintToken({ signal });
+}
+
+/**
+ * One call against the web BFF, hopping API host → site mirrors, with the same
+ * "a 2xx that is not JSON is a host failure" rule the mobile path uses (WAF and
+ * block pages arrive as HTML with a 200).
+ */
+async function h5Request(pathAndQuery, {
+  method = 'GET', body = null, token = null, referer = null, signal = null, bases = null,
+} = {}) {
+  const pool = bases || [...H5_API_BASES, ...H5_SITE_BASES];
+  let lastError = null;
+  for (const base of pool) {
+    if (signal?.aborted) throw abortError(signal);
+    try {
+      const origin = originFor(base);
+      const send = (authToken) => request(`${base}${H5_PREFIX}${pathAndQuery}`, {
+        method, body,
+        headers: h5Headers({ token: authToken, referer, origin }),
+        timeoutMs: HOST_REQUEST_TIMEOUT_MS,
+        retries: 0,
+        json: true,
+        allowFailure: true,
+        signal,
+      });
+      let res = await send(token);
+      // A rejected token is worth one re-mint before we hop on (the web JWT is
+      // anonymous and short-lived compared to the mobile visitor token).
+      if ([401, 403].includes(res.status) && token) {
+        try {
+          const fresh = await h5MintToken({ signal });
+          res = await send(fresh);
+        } catch { /* fall through to the next base with the original failure */ }
+      }
+      const rotated = tokenFromXUser(res.headers);
+      if (rotated && rotated !== h5Token?.token) {
+        const claims = parseJwtClaims(rotated);
+        h5Token = { token: rotated, expiresAt: claims.exp, uid: claims.userId };
+      }
+      if (res.ok && res.data == null) {
+        lastError = new Error(`HTTP 200 from ${safeHost(base)} but the body was not JSON`);
+        continue;
+      }
+      if (!res.ok) {
+        lastError = new Error(`${safeHost(base)}: ${res.error || `HTTP ${res.status}`}`);
+        continue;
+      }
+      return res.data;
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(String(lastError || 'MovieBox web (H5) BFF request failed'));
+}
+
+/** Adapt a `/wefeed-h5api-bff` search payload to the same rows the mobile API produces. */
+export function mapH5SearchResults(data) {
+  const payload = data?.data || data;
+  const items = Array.isArray(payload?.items) ? payload.items
+    : Array.isArray(payload?.list) ? payload.list
+      : Array.isArray(payload) ? payload
+        : [];
+  return items.map((item) => {
+    const rawType = item?.subjectType ?? item?.type ?? item?.stype;
+    const numericType = Number(rawType);
+    const kind = numericType === 2 || /tv|series/i.test(String(rawType ?? '')) ? 'series' : 'movie';
+    const metadata = normalizeSearchMetadata({
+      rating: item?.imdbRatingValue ?? item?.imdbRating,
+      genres: item?.genre ?? item?.genreList ?? item?.genres,
+      description: item?.description ?? item?.overview,
+      releaseDate: item?.releaseDate,
+      language: item?.language ?? item?.lanName,
+      runtime: item?.duration,
+    }, item?.description || '');
+    const releaseDate = item?.releaseDate || metadata.releaseDate || null;
+    return {
+      subjectId: String(item?.subjectId || item?.id || item?.detailPath || ''),
+      // The web API addresses titles by `detailPath`, not by subjectId — keep
+      // it so playback does not have to search a second time.
+      detailPath: item?.detailPath || null,
+      title: item?.title || '',
+      year: Number(item?.year || String(releaseDate || '').slice(0, 4) || 0) || null,
+      kind,
+      subjectType: Number.isFinite(numericType) ? numericType : rawType ?? null,
+      poster: item?.cover?.url || (typeof item?.cover === 'string' ? item.cover : null) || item?.poster || null,
+      ...metadata,
+      releaseDate,
+      seasonCount: item?.seasonCount ?? item?.season_count ?? null,
+      duration: item?.duration || metadata.runtime || null,
+      transport: 'h5',
+    };
+  }).filter((row) => row.subjectId);
+}
+
+/**
+ * `/subject/play` (and `/subject/download`) → vu-movie candidates.
+ * `vipLocked` rows carry no usable URL, so they are dropped rather than
+ * offered as a dead mirror.
+ */
+export function releasesFromH5Streams(payload, { season = 0, episode = 0, detailPath = null, title = null } = {}) {
+  const data = payload?.data || payload || {};
+  const streams = Array.isArray(data?.streams) ? data.streams : [];
+  const downloads = Array.isArray(data?.downloads) ? data.downloads : [];
+  const referer = detailPath ? `${H5_ORIGIN}/play/${detailPath}` : `${H5_ORIGIN}/`;
+  const out = [];
+  for (const stream of [...streams, ...downloads]) {
+    const url = String(stream?.url || '').trim();
+    if (!url || stream?.vipLocked) continue;
+    const height = Number(String(stream?.resolutions ?? stream?.resolution ?? '').replace(/[^0-9]/g, '')) || null;
+    const sizeBytes = Number.isFinite(Number(stream?.size)) ? Number(stream.size) : null;
+    out.push({
+      url,
+      sourceId: 'moviebox',
+      label: `MovieBox${height ? ` ${height}p` : ''}`,
+      quality: height ? `${height}p` : null,
+      height,
+      codec: stream?.codecName || null,
+      sizeBytes,
+      // The CDN checks the play-page Referer the browser would send. Origin is
+      // deliberately not replayed: it belongs to the BFF, not to the CDN.
+      headers: { Referer: referer, 'User-Agent': h5UserAgent() },
+      kind: streamKindFor(url),
+      via: 'moviebox-h5',
+      meta: {
+        movieboxId: String(stream?.id ?? stream?.subjectId ?? '') || null,
+        title: title || stream?.title || null,
+        detailPath: detailPath || null,
+        season: season || null,
+        episode: episode || null,
+        transport: 'h5',
+      },
+    });
+  }
+  if (out.length) {
+    log.info('moviebox', `web (H5) BFF produced ${out.length} candidate(s)`, {
+      qualities: [...new Set(out.map((c) => c.quality).filter(Boolean))].join(','),
+    });
+  }
+  return out;
+}
+
+/** Search the web BFF (used when the mobile edge is unreachable). */
+export async function h5Search(query, { page = 1, signal = null } = {}) {
+  if (!query) throw new Error('h5Search needs a query');
+  const token = await h5EnsureToken({ signal });
+  const data = await h5Request('/subject/search', {
+    method: 'POST',
+    // perPage stays 0: that is the body the website itself sends and any other
+    // value changes both the item count and the ordering.
+    body: JSON.stringify({ keyword: query, page, perPage: 0, subjectType: 0 }),
+    token,
+    signal,
+  });
+  const results = mapH5SearchResults(data);
+  log.info('moviebox', `search "${query}" via the web (H5) BFF → ${results.length} items`);
+  return results;
+}
+
+/**
+ * Resolve one title to playable URLs over the web BFF. Accepts a `detailPath`
+ * (best), a `subjectId`, or a `title` to search with.
+ */
+export async function h5StreamsFor({
+  subjectId = null, detailPath = null, season = 0, episode = 0, title = null, signal = null,
+} = {}) {
+  const token = await h5EnsureToken({ signal });
+  let resolvedPath = detailPath || null;
+  let resolvedId = subjectId || null;
+  if (!resolvedPath && title) {
+    const rows = await h5Search(title, { signal });
+    resolvedPath = rows[0]?.detailPath || null;
+    resolvedId = rows[0]?.subjectId || resolvedId;
+  }
+  if (!resolvedPath && !resolvedId) {
+    throw new Error('MovieBox web (H5) transport needs a detailPath, a subjectId or a title');
+  }
+  if (!resolvedId && resolvedPath) {
+    const detail = await h5Request(`/detail?detailPath=${encodeURIComponent(resolvedPath)}`, { token, signal });
+    resolvedId = detail?.data?.subject?.subjectId || detail?.subject?.subjectId || null;
+  }
+  const query = [
+    `subjectId=${encodeURIComponent(resolvedId ?? '')}`,
+    `se=${season || 0}`,
+    `ep=${episode || 0}`,
+    ...(resolvedPath ? [`detailPath=${encodeURIComponent(resolvedPath)}`] : []),
+  ].join('&');
+  const referer = resolvedPath ? `${H5_ORIGIN}/play/${resolvedPath}` : null;
+  let playError = null;
+  try {
+    const play = await h5Request(`/subject/play?${query}`, { token, referer, signal });
+    const candidates = releasesFromH5Streams(play, { season, episode, detailPath: resolvedPath, title });
+    if (candidates.length) return candidates;
+  } catch (err) {
+    if (signal?.aborted || err?.name === 'AbortError') throw err;
+    playError = err;
+  }
+  if (resolvedPath) {
+    // `/subject/download` only answers on the site's own domain, so this one
+    // request deliberately goes through the mirrors instead of the API host.
+    try {
+      const download = await h5Request(`/subject/download?${query}`, {
+        token, referer, signal, bases: H5_SITE_BASES,
+      });
+      const candidates = releasesFromH5Streams(download, { season, episode, detailPath: resolvedPath, title });
+      if (candidates.length) return candidates;
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      throw new Error(`MovieBox web (H5) transport found no playable URL (/subject/play: ${errorText(playError) || 'no streams'}; /subject/download: ${errorText(err)})`);
+    }
+  }
+  if (playError) throw playError;
+  return [];
 }
 
 /* ---------------- public API ---------------- */
@@ -836,6 +1211,9 @@ export function mapSearchResults(data) {
     const releaseDate = item.releaseDate || item.release_date || item.firstAirDate || item.first_air_date || metadata.releaseDate;
     return {
       subjectId: String(item.subjectId || item.id || ''),
+      // Carried when the payload has it: lets the web (H5) transport resolve
+      // the same title without a second search.
+      detailPath: item.detailPath || item.detail_path || null,
       title: item.title || item.name || '',
       year: Number(item.year || releaseDate?.slice?.(0, 4) || 0) || null,
       kind,
@@ -849,13 +1227,49 @@ export function mapSearchResults(data) {
   }).filter((item) => item.subjectId);
 }
 
+/**
+ * Search. The mobile BFF (what MovieBox-TUI speaks) is preferred; when it is
+ * unreachable *at the transport layer* — the `api*` edge being filtered, which
+ * is the common failure — the same search is retried on the web (H5) BFF, which
+ * lives on different hosts and often still answers.
+ */
 export async function search(query, { page = 1, perPage = 15, signal = null } = {}) {
   if (!query) throw new Error('search needs a query');
-  const data = await apiRequest('/subject-api/search/v2', {
-    method: 'POST',
-    body: JSON.stringify(buildSearchRequest(query, { page, perPage })),
-    signal,
-  });
+  if (h5First()) {
+    try {
+      return await h5Search(query, { page, signal });
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      log.warn('moviebox', 'web (H5) BFF search failed — falling back to the mobile BFF', { error: errorText(err) });
+    }
+  }
+  let data;
+  try {
+    data = await apiRequest('/subject-api/search/v2', {
+      method: 'POST',
+      body: JSON.stringify(buildSearchRequest(query, { page, perPage })),
+      signal,
+      // Two other attempts exist for a filtered edge; take the cheap one
+      // (two requests to different hosts) before the ~15 s Chromium sweep.
+      skipBrowserFallback: h5Enabled(),
+    });
+  } catch (err) {
+    if (signal?.aborted || err?.name === 'AbortError') throw err;
+    if (!h5Enabled() || !err?.movieboxTransport) throw err;
+    log.warn('moviebox', 'mobile BFF unreachable — retrying the search on the web (H5) BFF', { error: errorText(err) });
+    try {
+      return await h5Search(query, { page, signal });
+    } catch (h5Err) {
+      if (signal?.aborted || h5Err?.name === 'AbortError') throw h5Err;
+      log.warn('moviebox', 'web (H5) BFF did not answer either — falling back to the mobile API via Chromium', { error: errorText(h5Err) });
+      data = await apiRequest('/subject-api/search/v2', {
+        method: 'POST',
+        body: JSON.stringify(buildSearchRequest(query, { page, perPage })),
+        signal,
+        allowFreshTokenRetry: false,
+      });
+    }
+  }
   const results = mapSearchResults(data);
   log.info('moviebox', `search "${query}" → ${results.length} items`);
   return results;
@@ -1131,6 +1545,26 @@ export async function findStreamsByTitle(title, { year = null, kind = null, seas
     log.warn('moviebox', 'resource listing failed for the selected title', { error: errorText(resourceOutcome.reason) });
   }
 
+  if (!candidates.length && h5Enabled()) {
+    // Last resort: the title exists on the web BFF even when the mobile
+    // play-info/resource endpoints came back empty.
+    try {
+      const h5 = await h5StreamsFor({
+        subjectId: best.subjectId, detailPath: best.detailPath || null,
+        season, episode, title: best.title, signal,
+      });
+      if (h5.length) {
+        log.info('moviebox', 'web (H5) BFF supplied the candidates for the selected title', {
+          matched: best.title, count: h5.length,
+        });
+        push(h5);
+      }
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      log.warn('moviebox', 'web (H5) BFF could not resolve the selected title', { error: errorText(err) });
+    }
+  }
+
   if (!candidates.length) {
     log.warn('moviebox', 'selected title resolved to zero candidates', {
       matched: best.title, subjectId: best.subjectId,
@@ -1152,6 +1586,13 @@ export function status() {
     proxy: proxy ? proxy.replace(/:\/\/[^@]*@/, '://***@') : null,
     proxyConfigured: Boolean(proxy),
     browserFallback: browserFallbackEnabled(),
+    transport: transportMode(),
+    h5: {
+      enabled: h5Enabled(),
+      preferred: h5First(),
+      bases: [...H5_API_BASES, ...H5_SITE_BASES],
+      tokenExpiresAt: h5Token?.expiresAt || null,
+    },
     lastError,
     consecutiveFailures,
     backoffUntilMs: disabledUntil > Date.now() ? disabledUntil : null,
@@ -1170,4 +1611,6 @@ export default {
   search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle,
   releasesFromPlayInfo, releasesFromResources, status, resetBackoff, resetIdentity,
   classifyFetchError, parseJwtClaims, sessionIsValid, HOST_POOL, getHostPool,
+  h5Search, h5StreamsFor, mapH5SearchResults, releasesFromH5Streams, h5ClientToken,
+  tokenFromXUser, transportMode, H5_API_BASES, H5_SITE_BASES,
 };

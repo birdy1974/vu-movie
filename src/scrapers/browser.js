@@ -18,7 +18,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { log, logError, errorText } from '../core/log.js';
+import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { sleep, safeHost, resolveUrl, request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
@@ -761,9 +761,52 @@ export function isSameSiteNavigation(url, baseUrl) {
   } catch { return false; }
 }
 
+/**
+ * Clean a configured URL before parsing it.
+ *
+ * The value comes from three places — the config file, Settings → Scraper and
+ * `FLARESOLVERR_URL` in `.env` — and the `.env` one is a trap: docker compose
+ * only strips an inline `# comment` in *some* versions (and `docker run
+ * --env-file` and DSM's Container Manager are no better), so a verbatim copy
+ * of `.env.example` can hand us
+ * `http://flaresolverr:8192   # container-to-container address`.
+ * `new URL()` throws on that, and a thrown parse used to be indistinguishable
+ * from "not configured": the operator sets the variable and the log says it is
+ * not set. Neither whitespace nor a bare `#` comment is legal in a URL anyway,
+ * so cut the value at the first whitespace and drop surrounding quotes.
+ */
+export function sanitizeSolverUrl(value) {
+  let text = String(value ?? '').trim().replace(/^["']+|["']+$/g, '');
+  if (!text) return '';
+  const cut = text.search(/\s/);
+  if (cut > 0) text = text.slice(0, cut);
+  return text;
+}
+
+/**
+ * Why the solver cannot be used, or `null` when it is configured fine.
+ * "empty" and "set but unusable" are different problems with different fixes,
+ * and reporting the second as the first is what made this hard to diagnose.
+ */
+export function flaresolverrConfigIssue(value = getConfig().scraper.flaresolverrUrl) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return {
+      kind: 'empty',
+      message: 'FLARESOLVERR_URL is empty — set it to http://flaresolverr:8192 (the compose project starts the flaresolverr service) and recreate the container',
+    };
+  }
+  if (flaresolverrEndpoint(raw)) return null;
+  return {
+    kind: 'unusable',
+    raw,
+    message: `FLARESOLVERR_URL is set but is not a usable URL (${truncate(raw, 60)}) — if it came from .env, remove the trailing "# …" comment (docker compose only strips it in some versions), then recreate the container`,
+  };
+}
+
 /** Normalize the optional FlareSolverr URL to its v1 API endpoint. */
 export function flaresolverrEndpoint(value = getConfig().scraper.flaresolverrUrl) {
-  const configured = String(value || '').trim();
+  const configured = sanitizeSolverUrl(value);
   if (!configured) return null;
   try {
     const endpoint = new URL(configured);
@@ -795,6 +838,145 @@ export function parseFlareSolverrResult(payload, requestedUrl) {
   };
 }
 
+/**
+ * Turn a FlareSolverr failure into a hint an operator can act on.
+ *
+ * From out here every solver failure used to look the same ("FlareSolverr
+ * could not recover <site> search"), even though the underlying causes are
+ * completely different and have completely different fixes:
+ *
+ *   - Chromium inside the solver never started. FlareSolverr tests its browser
+ *     on boot (`test_browser_installation()`), and when that test fails it
+ *     *exits* — so the container restart-loops and every `request.get` fails.
+ *     The log says "Error getting browser User-Agent …". In Docker the cause is
+ *     nearly always the 64 MB `/dev/shm` default (Chrome hangs or dies in it)
+ *     or a memory limit below ~1 GB.
+ *   - The challenge page timed out (slow NAS, starved container, real
+ *     challenge) — nothing is broken, it just needs more time/CPU.
+ *   - A plain HTTP status — wrong URL/port, or the solver really is down.
+ */
+export function describeFlareSolverrError(error, { endpoint = null } = {}) {
+  const message = String(error?.message ?? error ?? '').replace(/\s+/g, ' ').trim();
+  if (!message) return 'FlareSolverr failed without returning a reason';
+  const where = endpoint ? ` at ${endpoint}` : '';
+  const short = (limit = 160) => message.slice(0, limit);
+
+  if (/error getting browser user-agent|test_browser_installation|can not connect to the service|session not created|unexpectedly exited|chrome(?:driver)? (?:failed|is not reachable)|unable to (?:start|open) (?:the )?browser/i.test(message)) {
+    return `FlareSolverr's own Chromium did not start${where} — its container is crash-looping (${short()}). `
+      + 'Run `docker compose logs flaresolverr`; in Docker this is almost always /dev/shm still at the 64 MB default '
+      + '(add `shm_size: 512m` to the flaresolverr service) or a memory limit below ~1 GB';
+  }
+  if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|socket hang up|fetch failed|terminated/i.test(message)) {
+    return `FlareSolverr is not reachable${where} (${short(120)}) — start the flaresolverr container (\`docker compose up -d flaresolverr\`) or fix FLARESOLVERR_URL`;
+  }
+  if (/timed out|timeout|maxtimeout|readtimeout/i.test(message)) {
+    return `FlareSolverr timed out solving the challenge${where} (${short(120)}) — the solver container is slow or starved of CPU/RAM; see \`docker compose logs flaresolverr\``;
+  }
+  const httpStatus = message.match(/HTTP\s+(\d{3})/i)?.[1];
+  if (httpStatus) {
+    if (Number(httpStatus) >= 500) {
+      return `FlareSolverr answered HTTP ${httpStatus}${where} — its browser or API is failing internally (${short(120)}); check \`docker compose logs flaresolverr\``;
+    }
+    return `FlareSolverr answered HTTP ${httpStatus}${where} — check FLARESOLVERR_URL (container-to-container, e.g. http://flaresolverr:8192) and the published port`;
+  }
+  return `FlareSolverr failed${where}: ${short(200)}`;
+}
+
+/** The address the compose project's flaresolverr service listens on. */
+export const DEFAULT_FLARESOLVERR_URL = 'http://flaresolverr:8192';
+
+/**
+ * Quick liveness probe for FlareSolverr so we can tell the operator
+ * "FlareSolverr is reachable (vX)" or "nothing is listening" instead of showing
+ * a generic message against a Cloudflare interstitial.
+ *
+ * When nothing is configured we also probe the compose default, because "not
+ * configured" is two very different situations: the service was never started,
+ * or it *is* running (compose starts it with the project) and FLARESOLVERR_URL
+ * simply does not point at it.
+ */
+export async function probeFlareSolverrHealth({ timeoutMs = 3000, signal = null } = {}) {
+  const endpoint = flaresolverrEndpoint();
+  if (!endpoint) {
+    const defaultUrl = DEFAULT_FLARESOLVERR_URL;
+    try {
+      const probe = await request(`${defaultUrl}/health`, {
+        method: 'GET', timeoutMs: Math.min(timeoutMs, 2000), retries: 0, json: true, allowFailure: true, signal,
+      });
+      if (probe.ok) {
+        return { configured: false, issue: flaresolverrConfigIssue(), defaultReachable: true, defaultUrl, version: probe.data?.version || null };
+      }
+    } catch { /* nothing listening on the compose default either */ }
+    return { configured: false, issue: flaresolverrConfigIssue(), defaultReachable: false, defaultUrl };
+  }
+  try {
+    const healthUrl = endpoint.replace(/\/v1$/, '/health');
+    const probe = await request(healthUrl, { method: 'GET', timeoutMs, retries: 0, json: true, allowFailure: true, signal });
+    if (probe.ok) return { configured: true, ok: true, version: probe.data?.version || probe.data?.message || 'ok', url: healthUrl };
+    if (probe.status === 404) return { configured: true, ok: true, version: 'unknown (no /health endpoint)', url: healthUrl };
+    return { configured: true, ok: false, error: describeFlareSolverrError(probe.data?.message || `HTTP ${probe.status}`, { endpoint: healthUrl }) };
+  } catch (err) {
+    return { configured: true, ok: false, error: describeFlareSolverrError(errorText(err), { endpoint }) };
+  }
+}
+
+let solverStatusCache = { at: 0, value: null };
+const SOLVER_STATUS_TTL_MS = 30_000;
+
+/**
+ * Solver state for the API and the UI. Cached: `/api/health` is the container
+ * healthcheck and runs every 30 s, so a fresh probe on every call would be a
+ * permanent tax on the box.
+ */
+export async function flaresolverrStatus({ probe = true, maxAgeMs = SOLVER_STATUS_TTL_MS } = {}) {
+  const endpoint = flaresolverrEndpoint();
+  const issue = flaresolverrConfigIssue();
+  const base = {
+    configured: Boolean(endpoint),
+    url: endpoint ? endpoint.replace(/\/v1$/, '') : null,
+    issue: issue ? { kind: issue.kind, message: issue.message } : null,
+  };
+  if (!probe) return { ...base, checkedAt: null };
+  const freshEnough = solverStatusCache.value
+    && Date.now() - solverStatusCache.at < maxAgeMs
+    && solverStatusCache.value.configured === base.configured
+    && solverStatusCache.value.url === base.url;
+  if (freshEnough) return solverStatusCache.value;
+  const probed = await probeFlareSolverrHealth({ timeoutMs: 2000 });
+  const value = {
+    ...base,
+    reachable: probed.configured ? probed.ok === true : probed.defaultReachable === true,
+    ok: probed.ok === true,
+    version: probed.version || null,
+    error: probed.ok === false ? (probed.error || null) : null,
+    defaultReachable: probed.defaultReachable === true,
+    hint: probed.configured
+      ? (probed.ok ? null : probed.error)
+      : describeSolverNotUsable(probed, null),
+    checkedAt: new Date().toISOString(),
+  };
+  solverStatusCache = { at: Date.now(), value };
+  return value;
+}
+
+/**
+ * Turn "the solver is not usable" into one sentence that says which of the
+ * three situations this is — because the fix differs for each:
+ *   - the variable is wrong/unparseable (fix the value),
+ *   - the container is up but the variable is empty (set it),
+ *   - nothing is running at all (start the service).
+ */
+export function describeSolverNotUsable(probe = null, host = null) {
+  const challenge = host ? `${host} is showing a Cloudflare / bot challenge, but ` : '';
+  if (probe?.defaultReachable) {
+    return `${challenge}FLARESOLVERR_URL is empty while a FlareSolverr instance is already answering at ${probe.defaultUrl} — set FLARESOLVERR_URL=${probe.defaultUrl} in .env (or Settings → Scraper) and recreate the vu-movie container`;
+  }
+  if (probe?.issue?.kind === 'unusable') {
+    return `${challenge}${probe.issue.message}`;
+  }
+  return `${challenge}FLARESOLVERR_URL is not configured — start the flaresolverr service (docker compose up -d flaresolverr) and set FLARESOLVERR_URL=${DEFAULT_FLARESOLVERR_URL}; without it, sources behind Cloudflare are skipped (or visit the site once in a browser to get a clearance cookie)`;
+}
+
 function flareSolverrCookies(cookies, pageUrl) {
   const out = [];
   for (const cookie of cookies || []) {
@@ -818,19 +1000,35 @@ function flareSolverrCookies(cookies, pageUrl) {
   return out;
 }
 
+/** How long the solver may spend on one page (FLARESOLVERR_TIMEOUT_MS, default 30 s). */
+function solverTimeoutMs() {
+  const configured = (() => { try { return Number(getConfig?.()?.scraper?.flaresolverrTimeoutMs); } catch { return 0; } })();
+  return Number.isFinite(configured) && configured > 0 ? configured : 30_000;
+}
+
 async function requestFlareSolverr(url, { signal = null } = {}) {
   const endpoint = flaresolverrEndpoint();
   if (!endpoint) return null;
+  const maxTimeout = solverTimeoutMs();
   const response = await request(endpoint, {
     method: 'POST',
-    body: { cmd: 'request.get', url, maxTimeout: 30_000 },
+    body: { cmd: 'request.get', url, maxTimeout },
     json: true,
     allowFailure: true,
-    timeoutMs: 35_000,
+    // Leave the solver a little more room than its own budget, otherwise the
+    // transport cuts the connection first and the error says "timed out"
+    // instead of whatever FlareSolverr would have reported.
+    timeoutMs: maxTimeout + 5_000,
     retries: 0,
     signal,
   });
-  if (!response.ok) throw new Error(response.error || `FlareSolverr HTTP ${response.status}`);
+  if (!response.ok) {
+    // Prefer FlareSolverr's own `message` (it explains *why* it failed) but
+    // always fall back to the transport error, then translate both into a
+    // cause+named fix instead of a bare "FlareSolverr HTTP 500".
+    const reason = response.data?.message || response.error || `HTTP ${response.status}`;
+    throw new Error(describeFlareSolverrError(reason, { endpoint }));
+  }
   return parseFlareSolverrResult(response.data, url);
 }
 
@@ -1152,19 +1350,7 @@ export async function searchSite(siteOrOpts, maybeQuery) {
    * "FlareSolverr is not reachable at http://…" instead of showing the generic
    * "no usable result links" message against a Cloudflare interstitial.
    */
-  async function probeFlareSolverr() {
-    const endpoint = flaresolverrEndpoint();
-    if (!endpoint) return { configured: false };
-    try {
-      const healthUrl = endpoint.replace(/\/v1$/, '/health');
-      const probe = await request(healthUrl, { method: 'GET', timeoutMs: 3000, retries: 0, json: true, allowFailure: true });
-      if (probe.ok) return { configured: true, ok: true, version: probe.data?.version || probe.data?.message || 'ok' };
-      if (probe.status === 404) return { configured: true, ok: true, version: 'unknown (no /health endpoint)' };
-      return { configured: true, ok: false, error: `HTTP ${probe.status}` };
-    } catch (err) {
-      return { configured: true, ok: false, error: errorText(err) };
-    }
-  }
+  const probeFlareSolverr = () => probeFlareSolverrHealth({ timeoutMs: 3000, signal: opts.signal });
 
   const performSearchNavigation = async (navUrl, { attempt = 1 } = {}) => page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch((err) => {
     if (opts.signal?.aborted) throw abortError(opts.signal);
@@ -1223,7 +1409,9 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       if (challengePage()) {
         const solverProbe = await probeFlareSolverr();
         if (solverProbe.configured && !solverProbe.ok) {
-          flareSolverrError = `FlareSolverr is configured at ${flaresolverrEndpoint()} but unreachable (${solverProbe.error}) — start the flaresolverr container or fix FLARESOLVERR_URL`;
+          // solverProbe.error is already a full "cause + what to do" sentence
+          // (see describeFlareSolverrError) — don't wrap it in a second guess.
+          flareSolverrError = solverProbe.error;
           log.warn('browser', `FlareSolverr liveness probe failed for ${site.name}`, { error: flareSolverrError });
         } else if (solverProbe.configured && solverProbe.ok) {
           try {
@@ -1254,8 +1442,10 @@ export async function searchSite(siteOrOpts, maybeQuery) {
             log.warn('browser', `FlareSolverr could not recover ${site.name} search`, { error: flareSolverrError });
           }
         } else {
-          flareSolverrError = `${safeHost(url)} is showing a Cloudflare / bot challenge, but FLARESOLVERR_URL is not configured — set it (see docker-compose.yml) or visit the site manually once to get a clearance cookie`;
-          log.warn('browser', `${site.name} blocked by bot protection and FlareSolverr is not configured`);
+          flareSolverrError = describeSolverNotUsable(solverProbe, safeHost(url));
+          log.warn('browser', `${site.name} blocked by bot protection and FlareSolverr is not usable`, {
+            flaresolverr: flareSolverrError,
+          });
         }
       }
     }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { request } from '../src/scrapers/http.js';
+import { request, shouldProxy } from '../src/scrapers/http.js';
 import { errorText, getRecentLogs } from '../src/core/log.js';
 
 test('request supports the json alias, JSON request bodies, and parsed data aliases', async (t) => {
@@ -87,4 +87,30 @@ test('request failure logs include the nested network cause', async (t) => {
   await assert.rejects(request('https://api6.aoneroom.com/search', { retries: 0 }), /fetch failed/);
   const entries = getRecentLogs({ component: 'http', search: 'ECONNREFUSED', limit: 10 });
   assert.ok(entries.some((entry) => entry.fields?.error?.includes('ECONNREFUSED')));
+});
+
+test('a configured proxy carries outbound hosts but never internal service names', () => {
+  // Regression: setting MOVIEBOX_PROXY/HTTP_PROXY (recommended for the
+  // MovieBox TLS block) used to send the container-to-container FlareSolverr
+  // call through the external proxy too, where `flaresolverr` cannot resolve.
+  const saved = { HTTP_PROXY: process.env.HTTP_PROXY, NO_PROXY: process.env.NO_PROXY, MOVIEBOX_PROXY: process.env.MOVIEBOX_PROXY };
+  process.env.HTTP_PROXY = 'http://proxy.example:3128';
+  delete process.env.NO_PROXY;
+  delete process.env.MOVIEBOX_PROXY;
+  try {
+    assert.equal(shouldProxy('https://api6.aoneroom.com/wefeed-mobile-bff/user-api/visitor-login'), true);
+    assert.equal(shouldProxy('https://cinevo.nl/search?q=dune'), true);
+    assert.equal(shouldProxy('http://flaresolverr:8192/v1'), false, 'compose service names must bypass the proxy');
+    assert.equal(shouldProxy('http://db:5432'), false);
+    assert.equal(shouldProxy('http://127.0.0.1:8080/api/health'), false);
+    assert.equal(shouldProxy('not a url'), false, 'an unparseable target is never proxied');
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  // With no proxy configured nothing is proxied at all.
+  delete process.env.HTTP_PROXY;
+  assert.equal(shouldProxy('https://api6.aoneroom.com/x'), false);
 });

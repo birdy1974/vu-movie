@@ -7,12 +7,21 @@ import { normalizeSearchMetadata } from '../src/scrapers/metadata.js';
 
 test('MovieBox pseudo URLs retain explicit season and episode values', () => {
   assert.deepEqual(parseMovieBoxTarget('moviebox://subject/subject-42?se=3&ep=7'), {
-    subjectId: 'subject-42', season: 3, episode: 7,
+    subjectId: 'subject-42', season: 3, episode: 7, detailPath: null,
   });
   assert.deepEqual(parseMovieBoxTarget('moviebox://subject/42'), {
-    subjectId: '42', season: 0, episode: 0,
+    subjectId: '42', season: 0, episode: 0, detailPath: null,
   });
   assert.equal(parseMovieBoxTarget('https://example.com/title/42'), null);
+});
+
+test('MovieBox pseudo URLs carry the web (H5) detailPath when the row has one', () => {
+  // The web BFF addresses titles by detailPath; keeping it on the URL lets the
+  // resolve step fall back to that transport without searching again.
+  const parsed = parseMovieBoxTarget('moviebox://subject/subject-42?dp=dune-part-two-Akh5Nrwl7o');
+  assert.equal(parsed.subjectId, 'subject-42');
+  assert.equal(parsed.detailPath, 'dune-part-two-Akh5Nrwl7o');
+  assert.equal(parseMovieBoxTarget('moviebox://subject/subject-42?dp=').detailPath, null);
 });
 
 test('search source detailed mode distinguishes provider failure from an empty result list', async (t) => {

@@ -1,7 +1,12 @@
 /** Enigma2 bouquet generation — the exact syntax the receiver parses. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef } from '../src/enigma2/index.js';
+import {
+  buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef, status, resetStatusCache, xmlTag,
+  cachedStatus,
+} from '../src/enigma2/index.js';
+import { getConfig } from '../src/core/config.js';
+import { getRecentLogs } from '../src/core/log.js';
 import { buildM3U } from '../src/streams/export.js';
 import { slugify, urlsFor } from '../src/streams/store.js';
 
@@ -80,4 +85,142 @@ test('slugify and urlsFor build safe file/URL names', () => {
   assert.equal(urls.ts, 'http://nas:8080/s/tok123/Dune-Part-Two-2024.ts');
   assert.equal(urls.direct, 'http://nas:8080/s/tok123/direct');
   assert.equal(urls.watch, 'http://nas:8080/watch/tok123');
+});
+
+/** OpenWebif's /web/about, as a VU+ Duo2 answers it. */
+const ABOUT_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<e2abouts>
+<e2about>
+<e2enigmaversion>2019-11-22-master-0abcdef</e2enigmaversion>
+<e2imageversion>6.2</e2imageversion>
+<e2webifversion>1.4.5</e2webifversion>
+<e2model>Duo\u00b2</e2model>
+<e2lanip>192.168.1.20</e2lanip>
+</e2about>
+</e2abouts>`;
+
+test('xmlTag reads the e2* field names OpenWebif actually returns', () => {
+  assert.equal(xmlTag(ABOUT_XML, ['model', 'e2model']), 'Duo\u00b2');
+  assert.equal(xmlTag(ABOUT_XML, ['e2enigmaversion', 'e2imageversion', 'image', 'version']), '2019-11-22-master-0abcdef');
+  assert.equal(xmlTag('<x><version>1.2</version></x>', ['image', 'version']), '1.2');
+  assert.equal(xmlTag(ABOUT_XML, ['nope']), '');
+});
+
+test('receiver status reports the model and image version', async (t) => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(ABOUT_XML, { status: 200, headers: { 'content-type': 'text/xml' } });
+  };
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, port: cfg.port, username: cfg.username, password: cfg.password };
+  Object.assign(cfg, { host: '192.168.1.20', port: 80, username: '', password: '' });
+  resetStatusCache();
+  t.after(() => {
+    globalThis.fetch = original;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  const first = await status({ timeoutMs: 1000 });
+  assert.equal(first.ok, true);
+  assert.equal(first.model, 'Duo\u00b2');
+  assert.equal(first.version, '2019-11-22-master-0abcdef', 'the image version used to come back empty');
+  assert.equal(calls, 1);
+
+  // A healthcheck/dashboard poll reuses the answer instead of waking the box.
+  const second = await status({ timeoutMs: 1000 });
+  assert.equal(second.model, 'Duo\u00b2');
+  assert.equal(second.cached, true);
+  assert.equal(calls, 1, 'the receiver must not be polled on every health check');
+
+  // The UI's "test connection" always asks for real.
+  await status({ timeoutMs: 1000, force: true });
+  assert.equal(calls, 2);
+});
+
+test('repeated polls do not spam INFO with an unchanged receiver', async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(ABOUT_XML, { status: 200, headers: { 'content-type': 'text/xml' } });
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, username: cfg.username };
+  Object.assign(cfg, { host: '192.168.1.20', username: '' });
+  resetStatusCache();
+  t.after(() => {
+    globalThis.fetch = original;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  await status({ timeoutMs: 1000 });
+  const afterFirst = getRecentLogs({ component: 'enigma2', level: 'info', search: 'receiver reachable' }).length;
+  await status({ timeoutMs: 1000, force: true });
+  await status({ timeoutMs: 1000, force: true });
+  const afterThree = getRecentLogs({ component: 'enigma2', level: 'info', search: 'receiver reachable' }).length;
+  assert.equal(afterThree, afterFirst, 'an unchanged receiver is logged once, not per poll');
+
+  // …but a real change is still reported at INFO/WARN.
+  globalThis.fetch = async () => { throw new Error('fetch failed'); };
+  await status({ timeoutMs: 1000, force: true });
+  const down = getRecentLogs({ component: 'enigma2', level: 'warn', search: 'unreachable' });
+  assert.ok(down.length > 0, 'the receiver going away must be logged');
+});
+
+test('/api/health never contacts the receiver: cachedStatus() does no request', async (t) => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(ABOUT_XML, { status: 200, headers: { 'content-type': 'text/xml' } });
+  };
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, username: cfg.username };
+  Object.assign(cfg, { host: '192.168.1.20', username: '' });
+  resetStatusCache();
+  t.after(() => {
+    globalThis.fetch = original;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  // Before any check: an explicit "never checked", not a silent false.
+  const fresh = cachedStatus();
+  assert.equal(fresh.configured, true);
+  assert.equal(fresh.ok, null);
+  assert.equal(fresh.checked, false);
+  assert.match(fresh.message, /not checked/);
+  assert.equal(calls, 0, 'the healthcheck must not wake the receiver');
+
+  // Many "health polls" in a row: still zero requests to the box.
+  for (let i = 0; i < 10; i += 1) cachedStatus();
+  assert.equal(calls, 0);
+
+  // The operator asks for a real check (Settings → Enigma2 → test connection).
+  const forced = await status({ timeoutMs: 1000, force: true });
+  assert.equal(forced.ok, true);
+  assert.equal(calls, 1);
+
+  // …and the health payload then reports it as a last-known value.
+  const afterCheck = cachedStatus();
+  assert.equal(afterCheck.ok, true);
+  assert.equal(afterCheck.checked, true);
+  assert.equal(afterCheck.model, 'Duo\u00b2');
+  assert.ok(afterCheck.ageMs >= 0);
+  assert.equal(calls, 1, 'reporting the last known state is free');
+});
+
+test('no receiver configured reports that, without probing', () => {
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host };
+  cfg.host = '';
+  resetStatusCache();
+  try {
+    const state = cachedStatus();
+    assert.equal(state.configured, false);
+    assert.match(state.message, /no receiver configured/);
+  } finally {
+    cfg.host = saved.host;
+    resetStatusCache();
+  }
 });

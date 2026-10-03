@@ -116,9 +116,94 @@ function authHeader() {
   return { Authorization: `Basic ${token}` };
 }
 
-export async function status({ timeoutMs = 6000 } = {}) {
+/** First non-empty `<tag>…</tag>` in an OpenWebif XML response. */
+export function xmlTag(text, tags = []) {
+  for (const tag of tags) {
+    // Deliberately escape-free: XML values here never contain '<', and a
+    // character class inside a template literal is a backslash-quoting trap
+    // (a stray '\s' silently becomes 's', so the tag never matches).
+    const match = new RegExp(`<${tag}>([^<]*)</${tag}>`, 'i').exec(String(text || ''));
+    if (match && String(match[1]).trim()) return String(match[1]).trim();
+  }
+  return '';
+}
+
+/**
+ * How long a cached status stays valid.
+ *
+ * `/api/health` answers the container healthcheck (every 30 s) *and* the
+ * dashboard (every 15 s), and both used to forward a fresh request to the
+ * receiver — a VU+ Duo2 got woken up every 15 seconds for a value that changes
+ * roughly never. Callers that really need the truth (the UI's "test
+ * connection", a bouquet push) pass `force: true`.
+ */
+export const STATUS_TTL_MS = 60_000;
+let statusCache = { at: 0, value: null };
+let lastReachability = null;
+
+/** Forget a cached receiver status (after the host/credentials change). */
+export function resetStatusCache() {
+  statusCache = { at: 0, value: null };
+  lastReachability = null;
+}
+
+/**
+ * The last known receiver state, or a placeholder that says it was never
+ * checked. **Never contacts the box** — this is what `/api/health` reports.
+ *
+ * The container healthcheck hits `/api/health` every 30 s and the dashboard
+ * every 15 s; neither is a reason to wake a VU+. The receiver is checked when
+ * the operator asks (Settings → Enigma2 → test connection) or when we actually
+ * need it (a bouquet push), and the dashboard simply shows the outcome.
+ */
+export function cachedStatus() {
+  const cfg = getConfig().enigma2;
+  if (!cfg.host) return { configured: false, ok: false, checked: false, message: 'no receiver configured (Settings → Enigma2)' };
+  if (statusCache.value) {
+    return { ...statusCache.value, cached: true, checked: true, ageMs: Date.now() - statusCache.at };
+  }
+  return {
+    configured: true, ok: null, checked: false, ageMs: null,
+    message: 'not checked — press “test connection” in Settings → Enigma2',
+  };
+}
+
+/**
+ * Log the receiver state only when it *changes*.
+ *
+ * The old code logged `receiver reachable: <model>` at INFO on every poll, so
+ * the log filled with identical lines every 15 s while the dashboard was open
+ * and the one line worth reading (the receiver going away) drowned in them.
+ */
+function logReachability(result) {
+  const state = result.ok
+    ? `up|${result.model}|${result.version}`
+    : `down|${result.status || result.message || 'unreachable'}`;
+  const changed = state !== lastReachability;
+  const previous = lastReachability;
+  lastReachability = state;
+  if (result.ok) {
+    if (changed || !previous) {
+      log.info('enigma2', `receiver reachable: ${result.model}`, {
+        version: result.version, ...(previous ? { was: previous } : {}),
+      });
+    } else {
+      log.debug('enigma2', `receiver still reachable (${result.model})`, { cached: true });
+    }
+    return;
+  }
+  if (changed || !previous) log.warn('enigma2', `receiver unreachable: ${result.message}`, { status: result.status || null });
+  else log.debug('enigma2', 'receiver still unreachable', { cached: true, message: result.message });
+}
+
+export async function status({ timeoutMs = 6000, maxAgeMs = STATUS_TTL_MS, force = false } = {}) {
   const cfg = getConfig().enigma2;
   if (!cfg.host) return { configured: false, ok: false, message: 'no receiver configured (Settings → Enigma2)' };
+  const age = Date.now() - statusCache.at;
+  if (!force && statusCache.value && age < maxAgeMs) {
+    return { ...statusCache.value, cached: true, ageMs: age };
+  }
+  let result;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -126,18 +211,23 @@ export async function status({ timeoutMs = 6000 } = {}) {
     clearTimeout(timer);
     const text = await res.text();
     if (!res.ok) {
-      log.warn('enigma2', 'WebIF reachable but refused the request', { status: res.status });
-      return { configured: true, ok: false, status: res.status, message: `WebIF HTTP ${res.status} (check user/password)` };
+      result = { configured: true, ok: false, status: res.status, message: `WebIF HTTP ${res.status} (check user/password)` };
+    } else {
+      // OpenWebif's /web/about answers with <e2model>, <e2enigmaversion>,
+      // <e2imageversion>, <e2webifversion>; plain <model>/<version> only turn
+      // up on some images. Read both, otherwise `version` is silently "".
+      const model = xmlTag(text, ['model', 'e2model']) || 'unknown';
+      const version = xmlTag(text, ['e2enigmaversion', 'e2imageversion', 'e2distroversion', 'e2webifversion', 'image', 'version']);
+      result = { configured: true, ok: true, model, version, message: `WebIF ok (${model}${version ? `, ${version}` : ''})` };
     }
-    const model = (/<model>([^<]+)<\/model>/.exec(text) || [])[1]
-      || (/<e2model>([^<]+)<\/e2model>/.exec(text) || [])[1] || 'unknown';
-    const version = (/<image>([^<]+)<\/image>/.exec(text) || [])[1] || (/<version>([^<]+)<\/version>/.exec(text) || [])[1] || '';
-    log.info('enigma2', `receiver reachable: ${model}`, { version });
-    return { configured: true, ok: true, model, version, message: `WebIF ok (${model}${version ? `, ${version}` : ''})` };
   } catch (err) {
-    logError('enigma2', `cannot reach the receiver at ${cfg.host}:${cfg.port}`, err);
-    return { configured: true, ok: false, message: String(err?.message || err) };
+    result = { configured: true, ok: false, message: String(err?.message || err) };
   }
+  // Cache the outcome either way: a receiver that is down is polled just as
+  // often as one that is up, and the healthcheck must not amplify that.
+  statusCache = { at: Date.now(), value: result };
+  logReachability(result);
+  return result;
 }
 
 async function webifGet(urlPath) {
@@ -223,7 +313,10 @@ export async function pushBouquet(entries, { name = null, dryRun = false } = {})
     return { ok: true, dryRun: true, bouquet, bouquetsLine: bouquet.bouquetsLine };
   }
 
-  const reachable = await status();
+  // A push must not trust a cached "reachable": a box that went to standby
+  // since the last check would fail halfway through the upload. This also
+  // refreshes the state the dashboard shows.
+  const reachable = await status({ force: true });
   if (!reachable.ok) {
     return { ok: false, error: `receiver not reachable: ${reachable.message}`, bouquet };
   }
