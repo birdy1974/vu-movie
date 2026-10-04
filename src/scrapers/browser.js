@@ -1653,5 +1653,6 @@ export function hasSession(siteId) {
 
 export default {
   getBrowser, sniff, searchSite, browserInfo, closeBrowser, closeContexts,
+  flaresolverrStatus,
   sessionFile, hasSession,
 };
