@@ -91,6 +91,8 @@ export async function listStreams() {
     createdAt: r.created_at,
     expiresAt: r.expires_at,
     subtitleId: r.subtitle_id,
+    season: r.upstream?.season || null,
+    episode: r.upstream?.episode || null,
     transcode: r.profile?.transcode ?? null,
     container: r.profile?.container || getConfig().transcode.container,
   }));

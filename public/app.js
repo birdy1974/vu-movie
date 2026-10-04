@@ -5,7 +5,24 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
 const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
+const SEARCH_STATE_KEY = 'vu-movie.search-state.v1';
+const ACTIVE_PAGE_KEY = 'vu-movie.active-page';
+const SELECTED_STREAM_KEY = 'vu-movie.selected-stream';
+const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'logs', 'set'];
+const FIND_TABS = ['title', 'url', 'browse'];
 const RESULT_VIEWS = ['list', 'poster', 'thumbnails'];
+
+function readStoredJson(key) {
+  try {
+    const value = localStorage.getItem(key);
+    return value ? JSON.parse(value) : null;
+  } catch { return null; }
+}
+
+function readStoredText(key) {
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
+
 function getInitialResultsView() {
   try {
     const saved = localStorage.getItem(RESULT_VIEW_KEY);
@@ -31,16 +48,23 @@ const state = {
   streams: [],
   providers: [],
   subResults: [],
+  findSubtitleResults: [],
+  selectedSubtitle: null,
   config: null,
   logs: [],
   jobs: [],
   sessions: [],
+  pendingRestoreSelection: false,
+  pendingRestoreUrlResolve: false,
+  lastResolveMode: '',
 };
 
 let searchRequestId = 0;
 let selectionRequestId = 0;
 let detailRequestId = 0;
 let resolveRequestId = 0;
+let streamRequestId = 0;
+let findSubtitleRequestId = 0;
 let searchAbortController = null;
 let detailAbortController = null;
 let resolveAbortController = null;
@@ -95,14 +119,29 @@ const tag = (text, kind = '') => `<span class="tag ${kind}">${escapeHtml(text)}<
 /* ---------------- navigation ---------------- */
 
 function go(page) {
+  if (!APP_PAGES.includes(page)) return;
   $$('#nav button').forEach((b) => b.classList.toggle('on', b.dataset.p === page));
   $$('main > section').forEach((s) => s.classList.toggle('hide', s.id !== `p-${page}`));
+  try { localStorage.setItem(ACTIVE_PAGE_KEY, page); } catch { /* storage may be disabled */ }
   if (page === 'dash') { loadHealth(); loadJobs(); loadStreams(); }
-  // openStream() is the stream-page renderer; `loadStream` never existed, so
-  // navigating to Stream with a title already open threw a ReferenceError.
-  if (page === 'stream' && state.stream) openStream(state.stream.id);
+  // If this is the first visit after upgrading (or browser storage was cleared),
+  // the most recently saved stream is a useful fallback for an empty Stream tab.
+  if (page === 'stream' && !state.stream && !readStoredText(SELECTED_STREAM_KEY) && state.streams[0]?.id) {
+    openStream(state.streams[0].id, { navigate: false });
+  }
+  // openStream() normally navigates after fetching; the fallback above opts out
+  // of navigation so it cannot re-enter go('stream') recursively.
+  if (page === 'find' && state.pendingRestoreUrlResolve) {
+    state.pendingRestoreUrlResolve = false;
+    doResolveFromUrl();
+  } else if (page === 'find' && state.pendingRestoreSelection) {
+    state.pendingRestoreSelection = false;
+    const selectedIndex = state.results.indexOf(state.selected);
+    if (selectedIndex >= 0) selectResult(selectedIndex);
+  }
   if (page === 'logs') loadLogs();
   if (page === 'set') loadSettings();
+  if (page === 'e2') loadEnigmaForm();
   if (page === 'subs') loadProviders();
 }
 $$('#nav button').forEach((b) => b.addEventListener('click', () => go(b.dataset.p)));
@@ -232,6 +271,10 @@ async function loadJobs() {
 async function loadStreams() {
   const { streams } = await api('/api/streams');
   state.streams = streams;
+  if (!state.stream && !readStoredText(SELECTED_STREAM_KEY) && streams[0]?.id
+      && !$('#p-stream').classList.contains('hide')) {
+    openStream(streams[0].id, { navigate: false, silent: true });
+  }
   $('#dash-stream-count').textContent = `${streams.length} saved`;
   $('#dash-streams').innerHTML = streams.length ? `<table>
     <thead><tr><th>Title</th><th>Source</th><th>Quality</th><th>Mode</th><th>Created</th><th></th></tr></thead><tbody>
@@ -246,10 +289,14 @@ async function loadStreams() {
 
 /* ================= FIND / SCRAPE ================= */
 
-$$('#find-tabs button').forEach((b) => b.addEventListener('click', () => {
-  $$('#find-tabs button').forEach((x) => x.classList.toggle('on', x === b));
-  ['title', 'url', 'browse'].forEach((t) => $(`#tab-${t}`).classList.toggle('hide', t !== b.dataset.t));
-}));
+function setFindTab(tab, persist = true) {
+  if (!FIND_TABS.includes(tab)) return;
+  $$('#find-tabs button').forEach((button) => button.classList.toggle('on', button.dataset.t === tab));
+  FIND_TABS.forEach((name) => $(`#tab-${name}`).classList.toggle('hide', name !== tab));
+  if (persist) saveSearchState();
+}
+
+$$('#find-tabs button').forEach((button) => button.addEventListener('click', () => setFindTab(button.dataset.t)));
 
 async function loadSources() {
   const { sources } = await api('/api/sources');
@@ -264,8 +311,13 @@ async function loadSources() {
       ? state.selectedSources.filter((x) => x !== id)
       : [...state.selectedSources, id];
     chip.classList.toggle('on');
+    saveSearchState();
   }));
   $('#browse-links').innerHTML = sources.map((s) => `<a class="btn sm" href="${escapeHtml(s.home)}" target="_blank" rel="noreferrer">${escapeHtml(s.name)} ↗</a>`).join('');
+  if (state.results.length) {
+    updateResultProviderFilter();
+    renderResults();
+  }
   renderSourceHealth();
 }
 
@@ -283,8 +335,63 @@ function renderProviderErrors(errors = []) {
   node.classList.remove('hide');
 }
 
+function currentSubtitleTarget() {
+  const selected = state.selected || {};
+  const findTab = $('#find-tabs button.on')?.dataset.t || 'title';
+  const urlForm = findTab === 'url';
+  const title = String(selected.title || (urlForm ? $('#u-title').value : '') || '').trim();
+  if (!title) return null;
+  const requestedKind = urlForm ? $('#u-kind').value : $('#q-type').value;
+  const kind = ['movie', 'series'].includes(selected.kind)
+    ? selected.kind
+    : ['movie', 'series'].includes(requestedKind) ? requestedKind : 'movie';
+  const year = Number(selected.year) || (urlForm ? Number($('#u-year').value) : 0) || null;
+  const season = kind === 'series'
+    ? Number(state.selectedSeason || selected.selectedSeason || (urlForm ? $('#u-season').value : 0)) || 1
+    : null;
+  const episode = kind === 'series'
+    ? Number(state.selectedEpisode || selected.selectedEpisode || (urlForm ? $('#u-episode').value : 0)) || 1
+    : null;
+  return {
+    title,
+    year,
+    kind,
+    season,
+    episode,
+    imdb: selected.imdb || selected.imdbId || selected.ids?.imdb || null,
+    tmdb: selected.tmdb || selected.tmdbId || selected.ids?.tmdb || null,
+    release: selected.release || selected.releaseName || null,
+  };
+}
+
+function clearFindSubtitleSearch() {
+  findSubtitleRequestId += 1;
+  state.findSubtitleResults = [];
+  state.selectedSubtitle = null;
+  const panel = $('#sel-subtitle-panel');
+  if (panel) panel.classList.add('hide');
+  if ($('#sel-subtitle-count')) $('#sel-subtitle-count').textContent = '';
+  if ($('#sel-subtitle-target')) $('#sel-subtitle-target').textContent = '';
+  if ($('#sel-subtitle-results')) $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px">no subtitle search yet</div>';
+  if ($('#sel-subtitle-selection')) {
+    $('#sel-subtitle-selection').textContent = '';
+    $('#sel-subtitle-selection').classList.add('hide');
+  }
+}
+
+function setFindSubtitlesAction() {
+  if (!currentSubtitleTarget()) {
+    $('#sel-actions').innerHTML = '';
+    return;
+  }
+  $('#sel-actions').innerHTML = '<button class="btn" data-find-subtitles>▭ find subtitles</button>';
+  $('#sel-actions [data-find-subtitles]').addEventListener('click', searchSelectedSubtitles);
+}
+
 function resetSelectedTitle() {
+  clearFindSubtitleSearch();
   state.selected = null;
+  if ($('#results-title-select')) $('#results-title-select').value = '';
   state.selectedSeason = 0;
   state.selectedEpisode = 0;
   state.selectedSeasons = [];
@@ -300,9 +407,110 @@ function resetSelectedTitle() {
   $('#candidates').innerHTML = '<div class="meta">No candidates yet.</div>';
 }
 
+async function searchSelectedSubtitles() {
+  const target = currentSubtitleTarget();
+  if (!target) return toast('Enter a title or title metadata before searching subtitles', 'warn');
+  const requestId = ++findSubtitleRequestId;
+  state.findSubtitleResults = [];
+  state.selectedSubtitle = null;
+  $('#sel-subtitle-panel').classList.remove('hide');
+  $('#sel-subtitle-count').textContent = 'searching…';
+  $('#sel-subtitle-target').textContent = `Searching ${target.title}${target.year ? ` (${target.year})` : ''}${target.kind === 'series' ? ` · S${target.season || '?'}E${target.episode || '?'}` : ''}`;
+  $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px"><span class="spin"></span> searching subtitle providers…</div>';
+  $('#sel-subtitle-selection').textContent = '';
+  $('#sel-subtitle-selection').classList.add('hide');
+  try {
+    const res = await api('/api/subtitles/search', { method: 'POST', body: target });
+    if (requestId !== findSubtitleRequestId) return;
+    state.findSubtitleResults = res.results || [];
+    $('#sel-subtitle-count').textContent = `${state.findSubtitleResults.length} candidate${state.findSubtitleResults.length === 1 ? '' : 's'}`;
+    renderFindSubtitleResults();
+  } catch (error) {
+    if (requestId !== findSubtitleRequestId) return;
+    $('#sel-subtitle-count').textContent = 'search failed';
+    $('#sel-subtitle-results').innerHTML = `<div class="note err" style="margin:12px">${escapeHtml(error?.message || 'Subtitle search failed')}</div>`;
+  }
+}
+
+function renderFindSubtitleResults() {
+  const results = state.findSubtitleResults || [];
+  if (!results.length) {
+    $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px">No applicable subtitles found. Check the configured providers and languages.</div>';
+    return;
+  }
+  $('#sel-subtitle-results').innerHTML = `<table>
+    <thead><tr><th>Language</th><th>Provider</th><th>Release / match</th><th>Score</th><th>Downloads</th><th></th></tr></thead><tbody>
+    ${results.slice(0, 40).map((result, index) => {
+      const selected = state.selectedSubtitle === result;
+      const matches = [
+        result.hashMatch ? tag('hash match', 'ok') : '',
+        result.episodeMatch ? tag('episode match', 'ok') : '',
+        result.year ? tag(String(result.year)) : '',
+      ].filter(Boolean).join(' ');
+      const release = result.release || result.title || 'Untitled release';
+      return `<tr${selected ? ' class="subtitle-choice-selected"' : ''}>
+        <td>${tag((result.language || '?').toUpperCase(), (result.language || '').startsWith('nl') ? 'ok' : 'info')}</td>
+        <td>${escapeHtml(result.providerId || '—')}</td>
+        <td class="mono" style="font-size:11.5px">${escapeHtml(String(release).slice(0, 90))}${matches ? `<div style="margin-top:4px">${matches}</div>` : ''}</td>
+        <td>${Number.isFinite(Number(result.score)) ? Number(result.score) : '—'}${result.rating ? `<div class="meta">rating ${escapeHtml(result.rating)}</div>` : ''}</td>
+        <td class="mono">${Number(result.downloads) || 0}</td>
+        <td><button class="btn sm ${selected ? 'pri' : ''}" data-select-subtitle="${index}">${selected ? 'selected' : 'select'}</button></td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+  $$('#sel-subtitle-results button[data-select-subtitle]').forEach((button) => {
+    button.addEventListener('click', () => chooseFindSubtitle(Number(button.dataset.selectSubtitle)));
+  });
+}
+
+function matchingExistingStream(target) {
+  const normalize = (value) => String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\b(?:19|20)\d{2}\b/g, '').replace(/[^a-z0-9]+/g, '');
+  const candidates = [state.stream, ...(state.streams || [])].filter(Boolean);
+  const seen = new Set();
+  return candidates.find((stream) => {
+    if (stream.id && seen.has(String(stream.id))) return false;
+    if (stream.id) seen.add(String(stream.id));
+    if (normalize(stream.title) !== normalize(target.title)) return false;
+    if (target.year && stream.year && Number(target.year) !== Number(stream.year)) return false;
+    if (target.kind && stream.kind && target.kind !== stream.kind) return false;
+    if (target.kind === 'series') {
+      const season = stream.upstream?.season ?? stream.season;
+      const episode = stream.upstream?.episode ?? stream.episode;
+      if (target.season && Number(season) !== Number(target.season)) return false;
+      if (target.episode && Number(episode) !== Number(target.episode)) return false;
+    }
+    return true;
+  }) || null;
+}
+
+async function chooseFindSubtitle(index) {
+  const result = state.findSubtitleResults[index];
+  if (!result) return;
+  state.selectedSubtitle = result;
+  renderFindSubtitleResults();
+  const target = currentSubtitleTarget();
+  const existingStream = target && matchingExistingStream(target);
+  if (!existingStream) {
+    $('#sel-subtitle-selection').textContent = `Selected: ${result.release || result.title || result.providerId} · ${String(result.language || '?').toUpperCase()}. It will be attached when you create a stream for this title.`;
+    $('#sel-subtitle-selection').classList.remove('hide');
+    toast('Subtitle selected. It will be attached when you create this stream.', 'ok', 8000);
+    return;
+  }
+  $('#sel-subtitle-selection').textContent = 'Selected subtitle is being downloaded and attached to the matching stream…';
+  $('#sel-subtitle-selection').classList.remove('hide');
+  const attached = await downloadSubtitle(result, existingStream.id);
+  if (attached) {
+    try { await loadStreams(); } catch { /* api() already shows the error */ }
+  }
+  $('#sel-subtitle-selection').textContent = attached
+    ? `Attached: ${result.release || result.title || result.providerId} · ${String(result.language || '?').toUpperCase()}`
+    : `Could not attach ${result.release || result.title || result.providerId}. See the error notification for details.`;
+}
+
 async function doSearch() {
   const query = $('#q').value.trim();
   if (!query) return toast('Enter a title first', 'warn');
+  state.lastResolveMode = 'search';
+  state.pendingRestoreUrlResolve = false;
 
   searchAbortController?.abort();
   const controller = new AbortController();
@@ -343,6 +551,7 @@ async function doSearch() {
     if (requestId === searchRequestId) {
       if (searchAbortController === controller) searchAbortController = null;
       if ($('#find-hint').textContent.includes('searching…')) $('#find-hint').textContent = 'Search cancelled';
+      saveSearchState();
     }
   }
 }
@@ -523,6 +732,7 @@ function resetResultFilters() {
   if (title) title.value = '';
   if (provider) provider.value = '';
   updateResultProviderFilter();
+  updateResultTitleSelect();
 }
 
 function visibleResultGroups() {
@@ -536,6 +746,26 @@ function visibleResultGroups() {
       normalizeResultText(entry.result.title).includes(titleFilter))) return null;
     return { ...group, matches };
   }).filter(Boolean);
+}
+
+function updateResultTitleSelect(groups = visibleResultGroups()) {
+  const select = $('#results-title-select');
+  if (!select) return;
+  const previous = select.value;
+  const options = groups.map((group) => {
+    const primary = preferredResultEntry(group.matches);
+    const result = primary?.result || {};
+    const title = String(result.title || 'Untitled');
+    const year = group.year && resultYearKey(result) !== String(group.year) ? ` (${group.year})` : '';
+    const kind = ['movie', 'series'].includes(group.kind) ? ` · ${group.kind}` : '';
+    const providerCount = new Set(group.matches.map((entry) => resultProviderKey(entry.result))).size;
+    const providers = providerCount ? ` · ${providerCount} source${providerCount === 1 ? '' : 's'}` : '';
+    return `<option value="${escapeHtml(group.key)}">${escapeHtml(`${title}${year}${kind}${providers}`)}</option>`;
+  }).join('');
+  select.innerHTML = `<option value="">Select a found title…</option>${options}`;
+  const selectedGroup = groups.find((group) => group.allResults.some((entry) => entry.result === state.selected));
+  const value = selectedGroup?.key || (groups.some((group) => group.key === previous) ? previous : '');
+  select.value = value;
 }
 
 function providerChoicesMarkup(group) {
@@ -611,6 +841,7 @@ function renderResults() {
   const results = $('#results');
   results.className = `results results-${state.resultsView}`;
   if (!state.results.length) {
+    updateResultTitleSelect([]);
     $('#results-count').textContent = '0 titles';
     results.innerHTML = state.providerErrors.length
       ? '<div class="note err">Search returned no titles because one or more providers failed. See the provider errors above; this is not a confirmed no-results response.</div>'
@@ -618,6 +849,7 @@ function renderResults() {
     return;
   }
   const groups = visibleResultGroups();
+  updateResultTitleSelect(groups);
   const matchCount = groups.reduce((sum, group) => sum + group.matches.length, 0);
   $('#results-count').textContent = `${groups.length} title${groups.length === 1 ? '' : 's'} · ${matchCount} provider result${matchCount === 1 ? '' : 's'}`;
   if (!groups.length) {
@@ -670,6 +902,109 @@ function renderSelectedInfo(result) {
     ? `<img src="${escapeHtml(posterUrl)}" alt="" style="width:100%;border-radius:8px">`
     : `<b>${escapeHtml(result.title)}</b>`;
   attachPosterImageFallbacks($('#sel-poster'));
+}
+
+function saveSearchState() {
+  const selectedIndex = state.selected ? state.results.indexOf(state.selected) : -1;
+  const urlForm = {
+    url: $('#u-url')?.value || '',
+    title: $('#u-title')?.value || '',
+    year: $('#u-year')?.value || '',
+    kind: $('#u-kind')?.value || 'movie',
+    season: $('#u-season')?.value || '',
+    episode: $('#u-episode')?.value || '',
+    browser: $('#u-browser')?.checked ?? true,
+    probe: $('#u-probe')?.checked ?? true,
+  };
+  try {
+    localStorage.setItem(SEARCH_STATE_KEY, JSON.stringify({
+      query: $('#q')?.value || '',
+      type: $('#q-type')?.value || '',
+      selectedSources: state.selectedSources,
+      moviebox: $('#q-moviebox')?.checked ?? true,
+      results: state.results,
+      providerErrors: state.providerErrors,
+      selectedResultIndex: selectedIndex >= 0 ? selectedIndex : null,
+      resolveMode: state.lastResolveMode,
+      selectedSeason: state.selectedSeason,
+      selectedEpisode: state.selectedEpisode,
+      titleFilter: $('#results-title-filter')?.value || '',
+      providerFilter: $('#results-provider-filter')?.value || '',
+      findTab: $('#find-tabs button.on')?.dataset.t || 'title',
+      urlForm,
+    }));
+  } catch { /* storage may be disabled or full */ }
+}
+
+function restoreSearchState(saved = readStoredJson(SEARCH_STATE_KEY)) {
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
+  state.pendingRestoreSelection = false;
+  state.pendingRestoreUrlResolve = false;
+  state.lastResolveMode = saved.resolveMode === 'url' ? 'url' : '';
+
+  $('#q').value = typeof saved.query === 'string' ? saved.query : '';
+  if (['', 'movie', 'series'].includes(saved.type)) $('#q-type').value = saved.type;
+  $('#q-moviebox').checked = saved.moviebox !== false;
+  state.selectedSources = Array.isArray(saved.selectedSources)
+    ? saved.selectedSources.filter((id) => typeof id === 'string')
+    : [];
+  state.results = Array.isArray(saved.results)
+    ? saved.results.filter((result) => result && typeof result === 'object' && !Array.isArray(result))
+    : [];
+  state.providerErrors = Array.isArray(saved.providerErrors) ? saved.providerErrors : [];
+
+  const selectedIndex = Number.isInteger(saved.selectedResultIndex)
+    && saved.selectedResultIndex >= 0 && saved.selectedResultIndex < state.results.length
+    ? saved.selectedResultIndex
+    : -1;
+  state.selected = selectedIndex >= 0 ? state.results[selectedIndex] : null;
+  state.selectedSeason = Number(saved.selectedSeason) || 0;
+  state.selectedEpisode = Number(saved.selectedEpisode) || 0;
+
+  const urlForm = saved.urlForm && typeof saved.urlForm === 'object' ? saved.urlForm : {};
+  $('#u-url').value = String(urlForm.url || '');
+  $('#u-title').value = String(urlForm.title || '');
+  $('#u-year').value = String(urlForm.year || '');
+  $('#u-kind').value = urlForm.kind === 'series' ? 'series' : 'movie';
+  $('#u-season').value = String(urlForm.season || '');
+  $('#u-episode').value = String(urlForm.episode || '');
+  $('#u-browser').checked = urlForm.browser !== false;
+  $('#u-probe').checked = urlForm.probe !== false;
+  setFindTab(FIND_TABS.includes(saved.findTab) ? saved.findTab : 'title', false);
+
+  renderProviderErrors(state.providerErrors);
+  updateResultProviderFilter();
+  $('#results-title-filter').value = String(saved.titleFilter || '');
+  $('#results-provider-filter').value = String(saved.providerFilter || '');
+  renderResults();
+
+  if (state.results.length || state.providerErrors.length) {
+    const titleCount = groupSearchResults(state.results).length;
+    $('#find-hint').textContent = `Restored ${titleCount} saved title${titleCount === 1 ? '' : 's'} and ${state.results.length} provider result${state.results.length === 1 ? '' : 's'}`;
+  } else if (saved.query) {
+    $('#find-hint').textContent = 'No saved results. Run the search again to reload them.';
+  }
+
+  if (state.selected) {
+    renderSelectedInfo(state.selected);
+    $('#sel-note').textContent = 'Saved title restored. Select it to refresh its stream candidates.';
+    $('#sel-episode-controls').classList.add('hide');
+    $('#sel-actions').innerHTML = '';
+    $('#candidates').innerHTML = '<div class="meta">Select the saved title to resolve fresh stream candidates.</div>';
+    state.pendingRestoreSelection = true;
+  } else if (state.lastResolveMode === 'url' && saved.findTab === 'url' && $('#u-url').value.trim()) {
+    state.pendingRestoreUrlResolve = true;
+  }
+}
+
+function restoreAppState() {
+  restoreSearchState();
+  const storedPage = readStoredText(ACTIVE_PAGE_KEY);
+  const activePage = APP_PAGES.includes(storedPage) ? storedPage : 'dash';
+  if (activePage !== 'dash') go(activePage);
+
+  const streamId = readStoredText(SELECTED_STREAM_KEY);
+  if (streamId) openStream(streamId, { navigate: false, silent: true });
 }
 
 function positiveNumber(value, fallback = null) {
@@ -768,6 +1103,7 @@ function updateSelectedFromMovieBox(result, payload) {
   result.runtime = details.duration || details.runtime || result.runtime;
   if (!result.poster && cover && /^https?:\/\//i.test(String(cover))) result.poster = cover;
   renderSelectedInfo(result);
+  saveSearchState();
   return details;
 }
 
@@ -796,6 +1132,7 @@ function renderSeriesControls(seasons, selectionId, statusMessage = '') {
 
   seasonSelect.onchange = () => {
     if (selectionId !== selectionRequestId) return;
+    clearFindSubtitleSearch();
     state.selectedSeason = Number(seasonSelect.value) || 1;
     state.selectedEpisode = 0;
     renderEpisodeOptions(seasons.find((season) => season.number === state.selectedSeason));
@@ -803,6 +1140,7 @@ function renderSeriesControls(seasons, selectionId, statusMessage = '') {
   };
   $('#sel-episode').onchange = () => {
     if (selectionId !== selectionRequestId) return;
+    clearFindSubtitleSearch();
     state.selectedEpisode = Number($('#sel-episode').value) || 1;
     resolveSelectedMovieBox(selectionId);
   };
@@ -817,6 +1155,7 @@ async function resolveSelectedMovieBox(selectionId) {
   const result = state.selected;
   result.selectedSeason = state.selectedSeason;
   result.selectedEpisode = state.selectedEpisode;
+  saveSearchState();
   await resolve({
     url: result.url,
     title: result.title,
@@ -879,11 +1218,15 @@ async function selectResult(index) {
   const r = state.results[index];
   if (!r) return;
   const selectionId = invalidateSelectionRequests();
+  state.lastResolveMode = 'result';
+  state.pendingRestoreUrlResolve = false;
   state.selected = r;
   state.selectedSeason = 0;
   state.selectedEpisode = 0;
   state.selectedSeasons = [];
   state.candidates = [];
+  updateResultTitleSelect(visibleResultGroups());
+  saveSearchState();
   $$('#results .moviecard').forEach((card) => {
     const active = (card.dataset.resultIndices || '').split(',').includes(String(index));
     card.classList.toggle('sel', active);
@@ -896,6 +1239,7 @@ async function selectResult(index) {
     button.classList.toggle('on', active);
     button.setAttribute('aria-pressed', String(active));
   });
+  clearFindSubtitleSearch();
   renderSelectedInfo(r);
   $('#sel-episode-controls').classList.add('hide');
   $('#sel-note').textContent = 'Resolving candidates — every URL is probed with ffprobe before it is offered.';
@@ -911,11 +1255,14 @@ async function selectResult(index) {
 async function doResolveFromUrl() {
   const url = $('#u-url').value.trim();
   if (!url) return toast('Paste a URL first', 'warn');
+  state.lastResolveMode = 'url';
+  state.pendingRestoreSelection = false;
   const selectionId = invalidateSelectionRequests();
   resetSelectedTitle();
   $('#sel-name').textContent = $('#u-title').value.trim() || url;
   $('#sel-meta').textContent = 'Pasted URL resolve';
   $('#sel-note').textContent = 'Scraping the supplied URL…';
+  saveSearchState();
   await resolve({
     url,
     title: $('#u-title').value.trim() || null,
@@ -952,6 +1299,7 @@ async function resolve(payload, selectionId = null) {
   } catch (err) {
     if (!isCurrent() || isAbortError(err)) return;
     $('#candidates').innerHTML = `<div class="note err">Resolve failed: ${escapeHtml(err.message)}</div>`;
+    setFindSubtitlesAction();
   } finally {
     if (requestId === resolveRequestId && resolveAbortController === controller) resolveAbortController = null;
   }
@@ -960,6 +1308,7 @@ async function resolve(payload, selectionId = null) {
 function renderCandidates(res) {
   const list = res.candidates || [];
   $('#sel-note').innerHTML = `Resolve timings: ${Object.entries(res.timeline || {}).map(([k, v]) => `${k} ${v}ms`).join(' · ') || '—'}`;
+  setFindSubtitlesAction();
   if (!list.length) {
     $('#candidates').innerHTML = `<div class="note err">No playable stream found.<br>${escapeHtml(res.error || '')}</div>`;
     return;
@@ -975,27 +1324,30 @@ function renderCandidates(res) {
       <td><button class="btn sm ${c.ok ? 'pri' : ''}" data-c="${c.index}">use</button></td>
     </tr>`).join('')}</tbody></table>`;
   $$('#candidates button[data-c]').forEach((b) => b.addEventListener('click', () => createStream(state.candidates[Number(b.dataset.c)])));
-  $('#sel-actions').innerHTML = `<button class="btn" onclick="App.go('subs')">▭ find subtitles</button>`;
 }
 
 async function createStream(candidate) {
   const sel = state.selected || {};
+  const streamKind = sel.kind || $('#u-kind').value;
+  const selectedSubtitleTarget = state.selectedSubtitle ? currentSubtitleTarget() : null;
+  const seasonForStream = state.selected
+    ? (state.selectedSeason || sel.selectedSeason || selectedSubtitleTarget?.season)
+    : (Number($('#u-season').value) || selectedSubtitleTarget?.season);
+  const episodeForStream = state.selected
+    ? (state.selectedEpisode || sel.selectedEpisode || selectedSubtitleTarget?.episode)
+    : (Number($('#u-episode').value) || selectedSubtitleTarget?.episode);
   try {
     const res = await api('/api/streams', {
       method: 'POST',
       body: {
         title: sel.title || $('#u-title').value || 'Untitled',
         year: sel.year || Number($('#u-year').value) || null,
-        kind: sel.kind || $('#u-kind').value,
+        kind: streamKind,
         poster: sel.poster || null,
         description: sel.description || null,
         sourceId: candidate.sourceId,
-        season: sel.kind === 'series'
-          ? (Number(state.selectedSeason || sel.selectedSeason) || null)
-          : (sel.kind ? null : Number($('#u-season').value) || null),
-        episode: sel.kind === 'series'
-          ? (Number(state.selectedEpisode || sel.selectedEpisode) || null)
-          : (sel.kind ? null : Number($('#u-episode').value) || null),
+        season: streamKind === 'series' ? (Number(seasonForStream) || null) : null,
+        episode: streamKind === 'series' ? (Number(episodeForStream) || null) : null,
         candidate: {
           url: candidate.url,
           quality: candidate.quality,
@@ -1008,10 +1360,19 @@ async function createStream(candidate) {
           via: candidate.via,
         },
         profile: {},
+        ...(state.selectedSubtitle ? { subtitleResult: state.selectedSubtitle } : {}),
       },
     });
+    streamRequestId += 1;
     state.stream = res.stream;
+    try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
     toast(`Stream created: ${res.stream.title}`, 'ok');
+    if (state.selectedSubtitle) {
+      toast(res.subtitleError
+        ? `Subtitle selected, but could not attach: ${res.subtitleError}`
+        : `Selected subtitle attached: ${state.selectedSubtitle.release || state.selectedSubtitle.title || state.selectedSubtitle.providerId}`,
+      res.subtitleError ? 'warn' : 'ok', 9000);
+    }
     renderStream(res);
     go('stream');
     loadStreams();
@@ -1020,13 +1381,29 @@ async function createStream(candidate) {
 
 /* ================= STREAM ================= */
 
-async function openStream(id) {
+async function openStream(id, { navigate = true, silent = false } = {}) {
+  const requestId = ++streamRequestId;
   try {
-    const res = await api(`/api/streams/${id}`);
+    const res = await api(`/api/streams/${encodeURIComponent(String(id))}`, { silent });
+    if (requestId !== streamRequestId) return;
     state.stream = res.stream;
+    try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
     renderStream(res);
-    go('stream');
-  } catch { /* toast */ }
+    if (navigate) go('stream');
+  } catch (err) {
+    if (requestId !== streamRequestId) return;
+    if (err.message === 'stream not found') {
+      if (readStoredText(SELECTED_STREAM_KEY) === String(id)) {
+        try { localStorage.removeItem(SELECTED_STREAM_KEY); } catch { /* storage may be disabled */ }
+      }
+      if (!state.stream || String(state.stream.id) === String(id)) {
+        state.stream = null;
+        $('#stream-body').classList.add('hide');
+        $('#stream-empty').classList.remove('hide');
+      }
+    }
+    // api() already shows errors unless this is a quiet startup restore.
+  }
 }
 
 function renderStream(res) {
@@ -1053,12 +1430,21 @@ function renderStream(res) {
   $('#st-client-urls').innerHTML = rows.map(([label, url]) => `
     <div class="field" style="flex:1;min-width:260px;margin-bottom:0">
       <label>${escapeHtml(label)}</label>
-      <div class="row"><input class="mono" readonly value="${escapeHtml(url || '')}" style="flex:1">
-      <button class="btn sm" onclick="App.copy('${escapeHtml(url || '')}')">copy</button></div>
+      <div class="row"><input type="text" class="mono" data-client-url readonly value="${escapeHtml(url || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1">
+      <button type="button" class="btn sm" data-copy-client-url>copy</button></div>
     </div>`).join('')
     + (urls.directNote
       ? `<div class="note mut" style="flex-basis:100%;margin-top:4px">Direct upstream link ${escapeHtml(urls.directNote)}.</div>`
       : '');
+  $$('#st-client-urls input[data-client-url]').forEach((input) => {
+    input.addEventListener('click', () => input.select());
+  });
+  $$('#st-client-urls button[data-copy-client-url]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const input = button.parentElement.querySelector('input[data-client-url]');
+      if (input) App.copy(input.value);
+    });
+  });
 
   const p = s.profile || {};
   if (p.resolution) $('#pf-res').value = String(p.resolution);
@@ -1072,7 +1458,7 @@ function renderStream(res) {
   if (p.audioChannels) { try { $('#pf-ac').value = String(p.audioChannels); } catch { /* keep default */ } }
   $('#pf-always').checked = Boolean(p.alwaysTranscode);
   $('#pf-mode').value = p.mode || 'auto';
-  $('#pf-subs').value = p.subtitles || 'none';
+  $('#pf-subs').value = p.subtitles || 'soft';
   $('#pf-note').innerHTML = (p.reasons || []).length
     ? `Decision: <b>${p.transcode ? 'encode' : 'stream copy'}</b> — ${escapeHtml((p.reasons || []).join('; '))}`
     : 'Profile will be decided when the stream starts.';
@@ -1240,44 +1626,78 @@ async function searchSubtitles() {
   $$('#sub-results button[data-sub]').forEach((b) => b.addEventListener('click', () => downloadSubtitle(state.subResults[Number(b.dataset.sub)])));
 }
 
-async function downloadSubtitle(result) {
+async function downloadSubtitle(result, streamId = ($('#sub-autostream').checked ? state.stream?.id : null)) {
   try {
     const res = await api('/api/subtitles/download', {
       method: 'POST',
-      body: {
-        result, offsetMs: Number($('#sub-offset').value) || 0,
-        streamId: state.stream?.id || null,
-        push: false,
-      },
+      body: { result, offsetMs: Number($('#sub-offset').value) || 0, streamId: streamId || null, push: streamId ? null : false },
     });
-    $('#sub-attached').textContent = `${res.language} · ${res.cues} cues · ${res.provider}`;
-    toast(`Subtitle ready: ${res.language} ${res.cues} cues (${res.provider})`, 'ok');
-    if (state.stream) {
-      const fresh = await api(`/api/streams/${state.stream.id}`);
-      state.stream = fresh.stream;
+    if (streamId) {
+      $('#sub-attached').textContent = `${res.language} · ${res.cues} cues · ${res.provider}`;
+      if (state.stream?.id === streamId) {
+        const fresh = await api(`/api/streams/${encodeURIComponent(String(streamId))}`);
+        state.stream = fresh.stream;
+        renderStream(fresh);
+      }
       toast('Subtitle attached to the stream profile (soft mux). Restart the session to apply.', 'info', 9000);
+    } else {
+      toast(`Subtitle downloaded: ${res.language} ${res.cues} cues (${res.provider})`, 'ok');
     }
-  } catch { /* toast */ }
+    return true;
+  } catch {
+    return false; // api() already shows the failure
+  }
 }
 
 /* ================= ENIGMA2 ================= */
 
-async function loadEnigmaStatus() {
+async function loadEnigmaForm() {
   try {
-    const { status } = await api('/api/enigma2/status');
-    $('#e2-status').textContent = status.message || (status.ok ? 'ok' : 'unreachable');
+    const { config } = await api('/api/config');
+    const e = config.enigma2 || {};
+    $('#e2-host').value = e.host || '';
+    $('#e2-port').value = e.port || 80;
+    $('#e2-user').value = e.username || 'root';
+    $('#e2-name').value = e.bouquetName || 'vu-movie';
+    $('#e2-service').value = String(e.serviceType || 4097);
+    $('#e2-ftp').checked = Boolean(e.ftpEnabled);
+    $('#e2-pass').value = '';
+    $('#e2-pass').placeholder = e.password ? '(blank keeps saved password)' : '(empty if none)';
+  } catch { /* api() shows the error */ }
+}
+
+async function loadEnigmaStatus() {
+  const button = $('#btn-e2-test');
+  const originalText = button.textContent;
+  if (!$('#e2-host').value.trim()) await loadEnigmaForm();
+  const host = $('#e2-host').value.trim();
+  const port = Number($('#e2-port').value) || 80;
+  const username = $('#e2-user').value.trim();
+  const password = $('#e2-pass').value;
+
+  button.disabled = true;
+  button.textContent = 'testing…';
+  $('#e2-status').textContent = 'testing connection…';
+  $('#e2-status').className = 'tag info';
+  $('#e2-log').textContent = `Testing OpenWebif at ${host || '(no host configured)'}:${port}…`;
+  try {
+    const { status } = await api('/api/enigma2/test', {
+      method: 'POST', body: { host, port, username, ...(password ? { password } : {}) },
+    });
+    const message = status.message || (status.ok ? 'WebIF reachable' : 'receiver unreachable');
+    $('#e2-status').textContent = message;
     $('#e2-status').className = `tag ${status.ok ? 'ok' : status.configured ? 'err' : 'warn'}`;
-    if (status.configured && status.ok) {
-      const cfgRes = await api('/api/config');
-      const e = cfgRes.config.enigma2;
-      $('#e2-host').value = e.host || '';
-      $('#e2-port').value = e.port || 80;
-      $('#e2-user').value = e.username || 'root';
-      $('#e2-name').value = e.bouquetName || 'vu-movie';
-      $('#e2-service').value = String(e.serviceType || 4097);
-      $('#e2-ftp').checked = Boolean(e.ftpEnabled);
-    }
-  } catch { /* toast */ }
+    $('#e2-log').textContent = message;
+    toast(status.ok ? `Connection successful: ${message}` : `Connection test failed: ${message}`, status.ok ? 'ok' : 'warn', 9000);
+  } catch (error) {
+    const message = error?.message || 'connection test failed';
+    $('#e2-status').textContent = 'test failed';
+    $('#e2-status').className = 'tag err';
+    $('#e2-log').textContent = message;
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
 }
 
 async function previewBouquet() {
@@ -1291,20 +1711,18 @@ async function previewBouquet() {
 }
 
 async function saveEnigmaSettings() {
-  await api('/api/config', {
-    method: 'PUT',
-    body: {
-      enigma2: {
-        host: $('#e2-host').value.trim(),
-        port: Number($('#e2-port').value) || 80,
-        username: $('#e2-user').value.trim(),
-        password: $('#e2-pass').value,
-        bouquetName: $('#e2-name').value.trim() || 'vu-movie',
-        serviceType: Number($('#e2-service').value) || 4097,
-        ftpEnabled: $('#e2-ftp').checked,
-      },
-    },
-  });
+  const enigma2 = {
+    host: $('#e2-host').value.trim(),
+    port: Number($('#e2-port').value) || 80,
+    username: $('#e2-user').value.trim(),
+    bouquetName: $('#e2-name').value.trim() || 'vu-movie',
+    serviceType: Number($('#e2-service').value) || 4097,
+    ftpEnabled: $('#e2-ftp').checked,
+  };
+  // Password is write-only in the API response. An empty input means "leave the
+  // saved credential alone"; users can still replace it by entering a new one.
+  if ($('#e2-pass').value) enigma2.password = $('#e2-pass').value;
+  await api('/api/config', { method: 'PUT', body: { enigma2 } });
   toast('Enigma2 settings saved', 'ok');
   loadEnigmaStatus();
 }
@@ -1472,20 +1890,73 @@ async function saveSettings() {
 
 /* ================= wiring ================= */
 
+async function copyText(text) {
+  const value = String(text ?? '');
+  if (!value) {
+    toast('Nothing to copy', 'warn');
+    return false;
+  }
+
+  // The Clipboard API is restricted to secure contexts. vu-movie is commonly
+  // opened over plain HTTP on a home LAN, so keep a synchronous fallback for
+  // those browsers (and for browsers that deny clipboard-write permissions).
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast('Copied to the clipboard', 'ok', 2500);
+      return true;
+    } catch { /* fall through to execCommand while the click is still active */ }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', '');
+  Object.assign(textarea.style, {
+    position: 'fixed', top: '0', left: '-9999px', opacity: '0', pointerEvents: 'none',
+  });
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, value.length);
+  let copied = false;
+  try { copied = document.execCommand('copy'); } catch { /* unsupported browser */ }
+  textarea.remove();
+
+  if (copied) {
+    toast('Copied to the clipboard', 'ok', 2500);
+    return true;
+  }
+  toast('Copy failed — select the text manually', 'warn');
+  return false;
+}
+
 const App = {
   go, openStream, cancelJob: async (id) => { await api(`/api/jobs/${id}/cancel`, { method: 'POST' }); loadJobs(); },
-  copy: async (text) => {
-    try { await navigator.clipboard.writeText(text); toast('Copied to the clipboard', 'ok', 2500); }
-    catch { toast('Copy failed — select the text manually', 'warn'); }
-  },
+  copy: copyText,
   loadJobs, loadStreams, loadHealth,
 };
 window.App = App;
 
 function wire() {
   $('#btn-search').addEventListener('click', doSearch);
-  $('#results-title-filter').addEventListener('input', renderResults);
-  $('#results-provider-filter').addEventListener('change', renderResults);
+  $('#results-title-filter').addEventListener('input', () => { renderResults(); saveSearchState(); });
+  $('#results-title-select').addEventListener('change', () => {
+    const group = visibleResultGroups().find((candidate) => candidate.key === $('#results-title-select').value);
+    const preferred = group && preferredResultEntry(group.matches);
+    if (preferred) selectResult(preferred.index);
+  });
+  $('#results-provider-filter').addEventListener('change', () => { renderResults(); saveSearchState(); });
+  const saveUrlForm = () => {
+    clearFindSubtitleSearch();
+    state.lastResolveMode = '';
+    state.pendingRestoreUrlResolve = false;
+    saveSearchState();
+    setFindSubtitlesAction();
+  };
+  ['u-url', 'u-title', 'u-year', 'u-season', 'u-episode'].forEach((id) =>
+    $(`#${id}`).addEventListener('input', saveUrlForm));
+  ['u-kind', 'u-browser', 'u-probe'].forEach((id) =>
+    $(`#${id}`).addEventListener('change', saveUrlForm));
   $('#results-view').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-view]');
     if (button) setResultsView(button.dataset.view);
@@ -1493,6 +1964,7 @@ function wire() {
   updateResultsViewButtons();
   $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   $('#btn-resolve').addEventListener('click', doResolveFromUrl);
+  $('#btn-sel-subs-close').addEventListener('click', () => $('#sel-subtitle-panel').classList.add('hide'));
 
   ['pf-vbr', 'pf-abr'].forEach((id) => $(`#${id}`).addEventListener('input', () => {
     $(`#${id}-l`).textContent = `${$(`#${id}`).value} kbps`;
@@ -1503,7 +1975,7 @@ function wire() {
   $('#btn-profile-apply').addEventListener('click', applyProfile);
   $('#btn-profile-reset').addEventListener('click', async () => {
     if (!state.stream) return;
-    await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile: { mode: 'auto', container: 'mpegts', alwaysTranscode: false, resolution: 1080, videoBitrate: 2500, audioBitrate: 128, fps: 'source', aspect: 'source', subtitles: 'none' } } });
+    await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile: { mode: 'auto', container: 'mpegts', alwaysTranscode: false, resolution: 1080, videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', aspect: 'source', subtitles: 'soft' } } });
     openStream(state.stream.id);
   });
   $('#btn-vlc').addEventListener('click', async () => {
@@ -1628,6 +2100,7 @@ function wire() {
 }
 
 wire();
+restoreAppState();
 loadHealth();
 loadSources();
 loadStreams();

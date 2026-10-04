@@ -199,8 +199,9 @@ The ones that matter most on a DS918+:
 | `TRANSCODE_MODE` | `auto` | `copy` never encodes; `vaapi` forces hardware encode |
 | `ALWAYS_TRANSCODE` | `false` | `true` re-encodes even a perfect source |
 | `MAX_CONCURRENT_TRANSCODES` | `1` | the J3455 cannot do two 1080p encodes |
-| `DEFAULT_RESOLUTION` / `DEFAULT_VIDEO_BITRATE` | `1080` / `2500` | 1080p @ 2.5 Mbit looks fine and keeps the GPU cool |
-| `DEFAULT_FPS` | `source` | forcing 25 fps on 23.976 material causes judder |
+| `DEFAULT_RESOLUTION` / `DEFAULT_VIDEO_BITRATE` | `1080` / `8000` | the requested 1080p H.264 VAAPI target is 8 Mbit/s |
+| `DEFAULT_AUDIO_BITRATE` / `DEFAULT_AUDIO_CHANNELS` | `192` / `6` | AAC audio target from the supplied MPEG-TS command |
+| `DEFAULT_FPS` | `25` | fixed output rate for the requested live-transcode profile |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | passed through by `docker-compose.yml` |
 | `BROWSER_CONCURRENCY` | `1` | one headless Chromium is ~300 MB |
 | `DB_SLOW_QUERY_MS` | `1500` | warns when one query is slower; the first read after a start is cold-disk I/O, not a database fault |

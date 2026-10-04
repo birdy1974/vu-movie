@@ -104,13 +104,11 @@ export function patchBouquetsTv(existingText, bouquetFile) {
  * OpenWebif transport
  * ------------------------------------------------------------------ */
 
-function webifBase() {
-  const cfg = getConfig().enigma2;
-  return `http://${cfg.host}:${cfg.port}`;
+function webifBase(cfg = getConfig().enigma2) {
+  return `http://${cfg.host}:${cfg.port || 80}`;
 }
 
-function authHeader() {
-  const cfg = getConfig().enigma2;
+function authHeader(cfg = getConfig().enigma2) {
   if (!cfg.username) return {};
   const token = Buffer.from(`${cfg.username}:${cfg.password || ''}`).toString('base64');
   return { Authorization: `Basic ${token}` };
@@ -196,6 +194,43 @@ function logReachability(result) {
   else log.debug('enigma2', 'receiver still unreachable', { cached: true, message: result.message });
 }
 
+async function requestStatus(cfg, timeoutMs) {
+  if (!cfg.host) return { configured: false, ok: false, message: 'no receiver configured (Settings → Enigma2)' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const res = await fetch(`${webifBase(cfg)}/web/about`, { headers: authHeader(cfg), signal: controller.signal });
+    const text = await res.text();
+    if (!res.ok) {
+      return { configured: true, ok: false, status: res.status, message: `WebIF HTTP ${res.status} (check user/password)` };
+    }
+    // OpenWebif's /web/about answers with <e2model>, <e2enigmaversion>,
+    // <e2imageversion>, <e2webifversion>; plain <model>/<version> only turn
+    // up on some images. Read both, otherwise `version` is silently "".
+    const model = xmlTag(text, ['model', 'e2model']) || 'unknown';
+    const version = xmlTag(text, ['e2enigmaversion', 'e2imageversion', 'e2distroversion', 'e2webifversion', 'image', 'version']);
+    return { configured: true, ok: true, model, version, message: `WebIF ok (${model}${version ? `, ${version}` : ''})` };
+  } catch (err) {
+    const message = controller.signal.aborted
+      ? `connection timed out after ${Math.ceil(timeoutMs / 1000)}s`
+      : String(err?.message || err);
+    return { configured: true, ok: false, message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Test the values currently entered in Settings without persisting them. */
+export async function testConnection(overrides = {}, { timeoutMs = 6000 } = {}) {
+  const saved = getConfig().enigma2;
+  const cfg = { ...saved, ...overrides };
+  // The UI deliberately leaves a stored password blank; blank means reuse the
+  // saved credential for a test. Saving settings can still clear it explicitly.
+  if (!overrides.password) cfg.password = saved.password;
+  return requestStatus(cfg, timeoutMs);
+}
+
 export async function status({ timeoutMs = 6000, maxAgeMs = STATUS_TTL_MS, force = false } = {}) {
   const cfg = getConfig().enigma2;
   if (!cfg.host) return { configured: false, ok: false, message: 'no receiver configured (Settings → Enigma2)' };
@@ -203,26 +238,7 @@ export async function status({ timeoutMs = 6000, maxAgeMs = STATUS_TTL_MS, force
   if (!force && statusCache.value && age < maxAgeMs) {
     return { ...statusCache.value, cached: true, ageMs: age };
   }
-  let result;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const res = await fetch(`${webifBase()}/web/about`, { headers: authHeader(), signal: controller.signal });
-    clearTimeout(timer);
-    const text = await res.text();
-    if (!res.ok) {
-      result = { configured: true, ok: false, status: res.status, message: `WebIF HTTP ${res.status} (check user/password)` };
-    } else {
-      // OpenWebif's /web/about answers with <e2model>, <e2enigmaversion>,
-      // <e2imageversion>, <e2webifversion>; plain <model>/<version> only turn
-      // up on some images. Read both, otherwise `version` is silently "".
-      const model = xmlTag(text, ['model', 'e2model']) || 'unknown';
-      const version = xmlTag(text, ['e2enigmaversion', 'e2imageversion', 'e2distroversion', 'e2webifversion', 'image', 'version']);
-      result = { configured: true, ok: true, model, version, message: `WebIF ok (${model}${version ? `, ${version}` : ''})` };
-    }
-  } catch (err) {
-    result = { configured: true, ok: false, message: String(err?.message || err) };
-  }
+  const result = await requestStatus(cfg, timeoutMs);
   // Cache the outcome either way: a receiver that is down is polled just as
   // often as one that is up, and the healthcheck must not amplify that.
   statusCache = { at: Date.now(), value: result };

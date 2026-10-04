@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef, status, resetStatusCache, xmlTag,
+  buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef, status, testConnection, resetStatusCache, xmlTag,
   cachedStatus,
 } from '../src/enigma2/index.js';
 import { getConfig } from '../src/core/config.js';
@@ -138,6 +138,29 @@ test('receiver status reports the model and image version', async (t) => {
   // The UI's "test connection" always asks for real.
   await status({ timeoutMs: 1000, force: true });
   assert.equal(calls, 2);
+});
+
+test('testConnection checks unsaved form values and reuses a stored password when left blank', async (t) => {
+  const original = globalThis.fetch;
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, port: cfg.port, username: cfg.username, password: cfg.password };
+  Object.assign(cfg, { host: 'saved-host', port: 80, username: 'saved-user', password: 'saved-secret' });
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url: String(url), headers: options.headers };
+    return new Response(ABOUT_XML, { status: 200, headers: { 'content-type': 'text/xml' } });
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  const result = await testConnection({ host: '192.168.1.22', port: 8081, username: 'operator' }, { timeoutMs: 1000 });
+  assert.equal(result.ok, true);
+  assert.equal(request.url, 'http://192.168.1.22:8081/web/about');
+  assert.equal(request.headers.Authorization, `Basic ${Buffer.from('operator:saved-secret').toString('base64')}`);
+  assert.equal(cfg.host, 'saved-host', 'testing must not persist or mutate the receiver settings');
 });
 
 test('repeated polls do not spam INFO with an unchanged receiver', async (t) => {
