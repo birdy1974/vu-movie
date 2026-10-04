@@ -8,7 +8,17 @@ const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
 const SEARCH_STATE_KEY = 'vu-movie.search-state.v1';
 const ACTIVE_PAGE_KEY = 'vu-movie.active-page';
 const SELECTED_STREAM_KEY = 'vu-movie.selected-stream';
-const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'logs', 'set'];
+const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'tpl', 'logs', 'set'];
+const OUTPUT_LABELS = {
+  vlcTs: 'VLC / any player (.ts)',
+  vlcMkv: 'VLC / any player (.mkv)',
+  m3u8: 'Playlist (.m3u8)',
+  m3u: 'Playlist (.m3u)',
+  enigma2: 'Enigma2 / Duo2',
+  direct: 'Direct upstream link (302)',
+  download: 'Download to NAS',
+};
+const OUTPUT_TYPES = ['vlcTs', 'vlcMkv', 'm3u8', 'm3u', 'enigma2', 'direct', 'download'];
 const FIND_TABS = ['title', 'url', 'browse'];
 const RESULT_VIEWS = ['list', 'poster', 'thumbnails'];
 
@@ -146,6 +156,7 @@ function go(page) {
   if (page === 'set') loadSettings();
   if (page === 'e2') loadEnigmaForm();
   if (page === 'subs') loadProviders();
+  if (page === 'tpl') { loadFfmpegTemplates().then(renderTemplatesPage); }
 }
 $$('#nav button').forEach((b) => b.addEventListener('click', () => go(b.dataset.p)));
 
@@ -1405,8 +1416,12 @@ async function loadFfmpegTemplates(force = false) {
     const result = await api('/api/ffmpeg/templates', { silent: true });
     state.ffmpegTemplates = Array.isArray(result.templates) ? result.templates : [];
     state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+    state.ffmpegDefaults = result.ffmpegDefaults && typeof result.ffmpegDefaults === 'object' ? result.ffmpegDefaults : {};
     state.ffmpegTemplatesLoaded = true;
-    if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
+    if (state.stream) {
+      renderFfmpegTemplateControls(state.stream.profile || {});
+      renderOutputTemplates(state.stream.profile?.outputTemplates || {});
+    }
     return true;
   } catch {
     return false;
@@ -1507,16 +1522,266 @@ async function deleteFfmpegTemplate() {
   if (!window.confirm(`Delete FFmpeg template “${existing.name}”?`)) return;
   const templates = state.ffmpegTemplates.filter((item) => item.id !== id);
   const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === id ? '' : state.defaultFfmpegTemplateId;
+  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
+  for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === id) ffmpegDefaults[output] = '';
   const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT', body: { templates, defaultFfmpegTemplateId },
+    method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults },
   });
   state.ffmpegTemplates = result.templates;
   state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  state.ffmpegDefaults = result.ffmpegDefaults || {};
   $('#pf-template-select').value = TEMPLATE_CUSTOM_VALUE;
   $('#pf-template-name').value = 'Custom template';
   updateFfmpegTemplateButtons();
   toast('FFmpeg template deleted', 'ok');
   updateCommandPreview();
+}
+
+/* ================= TRANSCODE TEMPLATES (dedicated page) ================= */
+
+/** All templates know which output types they want to drive. */
+state.tplEditor = null;
+state.ffmpegDefaults = state.ffmpegDefaults || {};
+
+function tplEditorSelect(template) {
+  state.tplEditor = template ? { ...template, output: { ...(template.output || {}) } } : null;
+  renderTplEditor();
+}
+
+function tplOutputLabel(key) { return OUTPUT_LABELS[key] || key; }
+
+function tplShortCommand(command = '') {
+  const trimmed = String(command || '').replace(/\s+/g, ' ').trim();
+  return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
+}
+
+function renderTemplatesPage() {
+  const list = $('#tpl-list');
+  if (!list) return;
+  if (!state.ffmpegTemplates.length) {
+    list.innerHTML = '<div class="meta" style="padding:14px">No templates saved yet — click “New template” or save one from the Stream tab.</div>';
+  } else {
+    list.innerHTML = state.ffmpegTemplates.map((item) => {
+      const outputs = OUTPUT_TYPES.filter((output) => item.output && item.output[output]).map((output) => tplOutputLabel(output));
+      const isDefault = state.defaultFfmpegTemplateId === item.id;
+      const isEditor = state.tplEditor && state.tplEditor.id === item.id;
+      return `
+        <div class="template-list-row${isEditor ? ' selected' : ''}" data-tpl-row="${escapeHtml(item.id)}">
+          <div style="min-width:0;flex:1">
+            <div class="tname">${escapeHtml(item.name || 'unnamed')}${isDefault ? ' <span class="tag alt">default</span>' : ''}</div>
+            <div class="tmeta">${escapeHtml(item.container || '—')} · ${outputs.length ? outputs.map((o) => `<span class="tag">${escapeHtml(o)}</span>`).join('') : '<span class="mut">no outputs assigned</span>'}</div>
+            <div class="tmeta mono" style="margin-top:3px">${escapeHtml(tplShortCommand(item.command))}</div>
+          </div>
+          <div class="tactions">
+            <button class="btn sm" data-tpl-edit="${escapeHtml(item.id)}">edit</button>
+            <button class="btn sm ghost" data-tpl-default="${escapeHtml(item.id)}">${isDefault ? 'default' : 'set default'}</button>
+            <button class="btn sm ghost" data-tpl-delete="${escapeHtml(item.id)}">delete</button>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  // Default template selector in the page header.
+  const defSel = $('#tpl-default');
+  defSel.replaceChildren(
+    new Option('(no default — guided profile builder)', ''),
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+  );
+  defSel.value = state.defaultFfmpegTemplateId || '';
+  $('#btn-tpl-set-default').disabled = !state.tplEditor?.id
+    || state.defaultFfmpegTemplateId === state.tplEditor.id;
+
+  renderTplEditor();
+}
+
+function renderTplEditor() {
+  const editor = state.tplEditor || null;
+  const titleEl = $('#tpl-editor-title');
+  const nameEl = $('#tpl-editor-name');
+  const descEl = $('#tpl-editor-description');
+  const cmdEl = $('#tpl-editor-command');
+  const containerEl = $('#tpl-editor-container');
+  const outputsEl = $('#tpl-editor-outputs');
+  if (!editor) {
+    titleEl.textContent = 'Template editor';
+    nameEl.value = '';
+    descEl.value = '';
+    cmdEl.value = '';
+    containerEl.value = 'mpegts';
+    outputsEl.innerHTML = OUTPUT_TYPES.map((output) => `
+      <label class="row" data-output="${output}">
+        <input type="checkbox" disabled>
+        <span>
+          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
+          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
+        </span>
+      </label>`).join('');
+    $('#btn-tpl-save').disabled = true;
+    $('#btn-tpl-save-top').disabled = true;
+    $('#btn-tpl-delete').disabled = true;
+    $('#tpl-editor-status').textContent = 'Click “+ New template” or pick one from the list.';
+    return;
+  }
+  titleEl.textContent = `Editing “${editor.name || 'untitled'}”`;
+  nameEl.value = editor.name || '';
+  descEl.value = editor.description || '';
+  cmdEl.value = editor.command || '';
+  containerEl.value = editor.container || 'mpegts';
+  outputsEl.innerHTML = OUTPUT_TYPES.map((output) => {
+    const on = Boolean(editor.output && editor.output[output]);
+    return `
+      <label class="row${on ? ' on' : ''}" data-output="${output}">
+        <input type="checkbox" data-output-check="${output}" ${on ? 'checked' : ''}>
+        <span>
+          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
+          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
+        </span>
+      </label>`;
+  }).join('');
+  $('#btn-tpl-save').disabled = false;
+  $('#btn-tpl-save-top').disabled = false;
+  $('#btn-tpl-delete').disabled = !editor.id || state.defaultFfmpegTemplateId === editor.id;
+  $('#tpl-editor-status').textContent = editor.id
+    ? (state.defaultFfmpegTemplateId === editor.id ? 'This template is the global default.' : 'Save to apply changes.')
+    : 'New template — save to add it to the library.';
+}
+
+function tplOutputHint(output) {
+  switch (output) {
+    case 'vlcTs': return '.ts URL · desktop player';
+    case 'vlcMkv': return '.mkv URL · desktop player';
+    case 'm3u8': return 'HLS playlist URL';
+    case 'm3u': return 'M3U playlist file';
+    case 'enigma2': return 'Bouquet entry for VU+ / Duo2';
+    case 'direct': return 'Direct 302 redirect';
+    case 'download': return 'Saved-to-disk copy';
+    default: return '';
+  }
+}
+
+function tplCollectFromEditor() {
+  const editor = state.tplEditor || {};
+  const outputs = {};
+  for (const output of OUTPUT_TYPES) {
+    const checkbox = $(`#tpl-editor-outputs input[data-output-check="${output}"]`);
+    if (checkbox && checkbox.checked) outputs[output] = editor.id || '__self__';
+  }
+  return {
+    id: editor.id || newFfmpegTemplateId(),
+    name: $('#tpl-editor-name').value.trim(),
+    description: $('#tpl-editor-description').value.trim(),
+    container: $('#tpl-editor-container').value,
+    command: $('#tpl-editor-command').value.trim(),
+    output: outputs,
+  };
+}
+
+async function tplSave({ makeDefault = false } = {}) {
+  const item = tplCollectFromEditor();
+  if (!item.name) return toast('Give the template a name first', 'warn');
+  if (!item.command) return toast('The template command is empty', 'warn');
+  if (!['mpegts', 'matroska', 'hls'].includes(item.container)) return toast('Pick a container', 'warn');
+  const existing = state.ffmpegTemplates.find((t) => t.id === item.id);
+  const next = existing
+    ? state.ffmpegTemplates.map((t) => (t.id === item.id ? item : t))
+    : [...state.ffmpegTemplates, item];
+  const defaultFfmpegTemplateId = makeDefault
+    ? item.id
+    : (state.defaultFfmpegTemplateId || '');
+  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
+  // If this template is no longer the editor's owner of an output, drop the assignment.
+  for (const [output, owner] of Object.entries(ffmpegDefaults)) {
+    if (owner !== item.id) continue;
+    if (!item.output[output]) ffmpegDefaults[output] = '';
+  }
+  // Promote any freshly ticked outputs to "this template is the default" so
+  // operators don't have to flip them in two places after editing.
+  for (const [output, owner] of Object.entries(item.output)) {
+    if (owner === '__self__') ffmpegDefaults[output] = item.id;
+    if (owner === item.id) ffmpegDefaults[output] = item.id;
+  }
+  const result = await api('/api/ffmpeg/templates', {
+    method: 'PUT', body: { templates: next, defaultFfmpegTemplateId, ffmpegDefaults },
+  });
+  state.ffmpegTemplates = result.templates;
+  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  state.ffmpegDefaults = result.ffmpegDefaults || {};
+  state.ffmpegTemplatesLoaded = true;
+  tplEditorSelect(result.templates.find((t) => t.id === item.id) || null);
+  if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
+  renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
+  toast(makeDefault ? 'Template saved and set as default' : 'Template saved', 'ok');
+  updateCommandPreview();
+}
+
+async function tplDelete() {
+  const editor = state.tplEditor;
+  if (!editor?.id) { tplEditorSelect(null); return; }
+  if (!window.confirm(`Delete template “${editor.name || editor.id}”?`)) return;
+  const templates = state.ffmpegTemplates.filter((t) => t.id !== editor.id);
+  const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === editor.id ? '' : state.defaultFfmpegTemplateId;
+  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
+  for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === editor.id) ffmpegDefaults[output] = '';
+  const result = await api('/api/ffmpeg/templates', {
+    method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults },
+  });
+  state.ffmpegTemplates = result.templates;
+  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  state.ffmpegDefaults = result.ffmpegDefaults || {};
+  tplEditorSelect(null);
+  if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
+  renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
+  toast('Template deleted', 'ok');
+}
+
+async function tplSetDefaultFromList(id) {
+  const existing = state.ffmpegTemplates.find((t) => t.id === id);
+  if (!existing) return;
+  const result = await api('/api/ffmpeg/templates', {
+    method: 'PUT',
+    body: {
+      templates: state.ffmpegTemplates,
+      defaultFfmpegTemplateId: state.defaultFfmpegTemplateId === id ? '' : id,
+      ffmpegDefaults: state.ffmpegDefaults,
+    },
+  });
+  state.ffmpegTemplates = result.templates;
+  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  state.ffmpegDefaults = result.ffmpegDefaults || {};
+  renderTemplatesPage();
+  toast(state.defaultFfmpegTemplateId === id ? 'Set as default' : 'Default cleared', 'ok');
+}
+
+/* ---- per-output template pickers on the Stream tab ---- */
+
+function renderOutputTemplates(current = {}) {
+  const grid = $('#pf-output-templates');
+  if (!grid) return;
+  const cur = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  const opts = [
+    new Option('(inherit)', ''),
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+  ];
+  grid.innerHTML = OUTPUT_TYPES.map((output) => {
+    const sel = document.createElement('select');
+    sel.dataset.output = output;
+    sel.replaceChildren(...opts);
+    sel.value = cur[output] || '';
+    return `<div class="field">
+      <label>${escapeHtml(tplOutputLabel(output))}</label>
+      ${sel.outerHTML}
+      <div class="meta">${escapeHtml(tplOutputHint(output))}</div>
+    </div>`;
+  }).join('');
+}
+
+function readOutputTemplatesFromForm() {
+  const result = {};
+  for (const select of $$('#pf-output-templates select[data-output]')) {
+    const value = select.value;
+    if (value) result[select.dataset.output] = value;
+  }
+  return result;
 }
 
 function readProfileForm() {
@@ -1533,6 +1798,7 @@ function readProfileForm() {
     alwaysTranscode: $('#pf-always').checked,
     deinterlace: $('#pf-deint').checked,
     ...currentTemplateProfileFields(),
+    outputTemplates: readOutputTemplatesFromForm(),
   };
 }
 
@@ -1574,6 +1840,13 @@ function renderStream(res) {
     ${tag(s.profile?.ffmpegTemplateName || s.profile?.encoder || 'copy')} ${tag(s.profile?.container || 'mpegts', 'info')}
     ${(s.profile?.reasons || []).slice(0, 2).map((r) => tag(r)).join('')}`;
 
+  // Populate the per-output command preview dropdown with the labels from the
+  // backend. The user picks which output to render the ffmpeg command for.
+  const cmdOut = $('#pf-cmd-output');
+  if (cmdOut && !cmdOut.options.length) {
+    cmdOut.replaceChildren(...OUTPUT_TYPES.map((output) => new Option(OUTPUT_LABELS[output] || output, output)));
+  }
+
   const rows = [
     ['VLC / any player (.ts)', urls.ts],
     ['VLC / any player (.mkv)', urls.mkv],
@@ -1604,6 +1877,7 @@ function renderStream(res) {
 
   const p = s.profile || {};
   renderFfmpegTemplateControls(p);
+  renderOutputTemplates(p.outputTemplates || {});
   if (p.resolution) $('#pf-res').value = String(p.resolution);
   if (p.aspect) $('#pf-aspect').value = p.aspect === 'source' ? 'source' : p.aspect;
   if (p.container) { try { $('#pf-container').value = p.container; } catch { /* hls etc. */ } }
@@ -1674,8 +1948,9 @@ function updateCommandPreview() {
   commandTimer = setTimeout(async () => {
     if (!state.stream) return;
     try {
+      const outputType = $('#pf-cmd-output')?.value || '';
       const res = await api(`/api/streams/${state.stream.id}/command`, {
-        method: 'POST', body: { profile: readProfileForm() }, silent: true,
+        method: 'POST', body: { profile: { ...readProfileForm(), outputType } }, silent: true,
       });
       if (revision !== commandPreviewRevision) return;
       $('#cmd-preview').textContent = res.command;
@@ -1685,6 +1960,10 @@ function updateCommandPreview() {
         $('#pf-note').innerHTML = `${res.profile.transcode ? '<b>encode</b>' : '<b>stream copy</b>'} — ${escapeHtml((res.profile.reasons || []).join('; '))}
           ${res.profile.transcode && res.profile.encoder === 'vaapi' && !res.hw.available ? '<br><span class="tag warn">vaapi unavailable here — this command will use software encoding</span>' : ''}`;
       }
+      const tplLabel = res.template && res.template.templateId
+        ? `${escapeHtml(res.template.name || res.template.templateId)} (${escapeHtml(res.template.source || 'guided')})`
+        : (res.template && res.template.source === 'stream-custom' ? 'custom inline command' : 'guided profile builder');
+      $('#pf-cmd-template').textContent = tplLabel;
     } catch (error) {
       if (revision !== commandPreviewRevision) return;
       if ($('#pf-template-select').value) {
@@ -2126,6 +2405,86 @@ function wire() {
   $('#btn-template-save').addEventListener('click', () => saveFfmpegTemplate({ update: true }));
   $('#btn-template-default').addEventListener('click', () => saveFfmpegTemplate({ update: true, makeDefault: true }));
   $('#btn-template-delete').addEventListener('click', deleteFfmpegTemplate);
+  $('#pf-cmd-output')?.addEventListener('change', updateCommandPreview);
+  $('#pf-output-templates')?.addEventListener('change', updateCommandPreview);
+
+  // Dedicated Transcode templates page
+  $('#btn-tpl-new')?.addEventListener('click', () => {
+    tplEditorSelect({ id: '', name: '', description: '', container: 'mpegts', command: starterFfmpegTemplate('mpegts'), output: {} });
+  });
+  $('#btn-tpl-save')?.addEventListener('click', () => tplSave());
+  $('#btn-tpl-save-top')?.addEventListener('click', () => tplSave());
+  $('#btn-tpl-delete')?.addEventListener('click', tplDelete);
+  $('#btn-tpl-set-default')?.addEventListener('click', () => {
+    if (!state.tplEditor?.id) return;
+    tplSetDefaultFromList(state.tplEditor.id);
+  });
+  $('#tpl-list')?.addEventListener('click', (event) => {
+    const editId = event.target.closest('[data-tpl-edit]')?.dataset.tplEdit;
+    const delId = event.target.closest('[data-tpl-delete]')?.dataset.tplDelete;
+    const defId = event.target.closest('[data-tpl-default]')?.dataset.tplDefault;
+    if (editId) {
+      const item = state.ffmpegTemplates.find((t) => t.id === editId);
+      if (item) tplEditorSelect(item);
+    } else if (delId) {
+      const item = state.ffmpegTemplates.find((t) => t.id === delId);
+      if (!item) return;
+      if (!window.confirm(`Delete template “${item.name}”?`)) return;
+      const templates = state.ffmpegTemplates.filter((t) => t.id !== delId);
+      const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === delId ? '' : state.defaultFfmpegTemplateId;
+      const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
+      for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === delId) ffmpegDefaults[output] = '';
+      api('/api/ffmpeg/templates', { method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults } }).then((res) => {
+        state.ffmpegTemplates = res.templates;
+        state.defaultFfmpegTemplateId = res.defaultFfmpegTemplateId || '';
+        state.ffmpegDefaults = res.ffmpegDefaults || {};
+        if (state.tplEditor?.id === delId) tplEditorSelect(null);
+        renderTemplatesPage();
+        toast('Template deleted', 'ok');
+      });
+    } else if (defId) {
+      tplSetDefaultFromList(defId);
+    }
+  });
+  $('#tpl-editor-outputs')?.addEventListener('change', (event) => {
+    const target = event.target;
+    if (!target.matches('input[data-output-check]')) return;
+    const output = target.dataset.outputCheck;
+    if (!state.tplEditor) return;
+    state.tplEditor.output = { ...(state.tplEditor.output || {}) };
+    if (target.checked) state.tplEditor.output[output] = state.tplEditor.id || '__self__';
+    else delete state.tplEditor.output[output];
+    renderTplEditor();
+  });
+  $('#tpl-editor-command')?.addEventListener('input', () => {
+    if (!state.tplEditor) return;
+    state.tplEditor.command = $('#tpl-editor-command').value;
+    $('#tpl-editor-status').textContent = 'Save to apply changes.';
+  });
+  $('#tpl-editor-name')?.addEventListener('input', () => {
+    if (!state.tplEditor) return;
+    state.tplEditor.name = $('#tpl-editor-name').value;
+  });
+  $('#tpl-editor-description')?.addEventListener('input', () => {
+    if (!state.tplEditor) return;
+    state.tplEditor.description = $('#tpl-editor-description').value;
+  });
+  $('#tpl-editor-container')?.addEventListener('change', () => {
+    if (!state.tplEditor) return;
+    state.tplEditor.container = $('#tpl-editor-container').value;
+  });
+  $('#tpl-default')?.addEventListener('change', async () => {
+    const value = $('#tpl-default').value;
+    const result = await api('/api/ffmpeg/templates', {
+      method: 'PUT',
+      body: { templates: state.ffmpegTemplates, defaultFfmpegTemplateId: value, ffmpegDefaults: state.ffmpegDefaults },
+    });
+    state.ffmpegTemplates = result.templates;
+    state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+    state.ffmpegDefaults = result.ffmpegDefaults || {};
+    renderTemplatesPage();
+    toast(value ? 'Default template set' : 'Default template cleared', 'ok');
+  });
   $('#btn-profile-apply').addEventListener('click', applyProfile);
   $('#btn-profile-reset').addEventListener('click', async () => {
     if (!state.stream) return;

@@ -20,6 +20,7 @@
       <button data-p="stream">▶ Stream</button>
       <button data-p="subs">▭ Subtitles</button>
       <button data-p="e2">☰ Enigma2</button>
+      <button data-p="tpl">⚒ Transcode templates</button>
       <button data-p="logs">≡ Logs</button>
       <button data-p="set">⚙ Settings</button>
     </nav>
@@ -258,12 +259,22 @@
                 </div>
               </div>
             </div>
+            <div class="field output-templates-box">
+              <label>FFmpeg template per output</label>
+              <p class="sub" style="margin:4px 0 6px">Override the template for a single output without changing the others. The Enigma2 / Duo2 slot is independent of the VLC .ts slot — useful when the receiver wants H.264 720p but your desktop player can take the original 1080p HEVC.</p>
+              <div id="pf-output-templates" class="output-templates-grid"></div>
+            </div>
             <div class="note" id="pf-note"></div>
             <div class="row">
               <button class="btn pri" id="btn-profile-apply">save profile</button>
               <button class="btn ghost" id="btn-profile-reset">reset</button>
             </div>
             <h3 style="margin-top:14px">Generated ffmpeg command (live)</h3>
+            <div class="row" style="margin-bottom:8px">
+              <label for="pf-cmd-output" class="mut" style="margin:0">Preview for</label>
+              <select id="pf-cmd-output" style="width:auto"></select>
+              <span class="mut" id="pf-cmd-template"></span>
+            </div>
             <pre id="cmd-preview">…</pre>
           </div>
 
@@ -400,6 +411,65 @@
             <div class="row"><label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="all" checked> all streams</label>
               <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="selected"> only the selected stream</label></div>
             <div class="note">Stream URLs point at this NAS, so the box keeps working after the upstream token expired — vu-movie re-resolves the source on demand.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TRANSCODE TEMPLATES ============ -->
+    <section id="p-tpl" class="hide">
+      <h1>Transcode templates</h1>
+      <p class="sub">Save a different FFmpeg command for each output the box hands out. The Enigma2 bouquet gets its own slot, so the VU+ Duo2 never inherits a 4K HEVC template that VLC needs but the receiver cannot decode.</p>
+      <div class="gl">
+        <div class="card pad0">
+          <div class="cardhead">
+            <span><i class="bi bi-gear-wide-connected"></i> Templates</span>
+            <button class="btn sm pri" id="btn-tpl-new">+ New template</button>
+          </div>
+          <div class="cardbody pad12">
+            <label class="muted-label" for="tpl-default">Default template (used when an output has no specific assignment)</label>
+            <div class="row">
+              <select class="form-select form-select-sm" id="tpl-default" style="flex:1"></select>
+              <button class="btn sm ghost" id="btn-tpl-set-default" disabled>set default</button>
+            </div>
+            <p class="sub" style="margin:8px 0 0">Saved templates and their commands are also editable inline on the Stream tab.</p>
+          </div>
+          <div class="cardbody" id="tpl-list" style="max-height:calc(100vh - 320px);overflow:auto"></div>
+        </div>
+
+        <div class="card pad0">
+          <div class="cardhead">
+            <span id="tpl-editor-title">Template editor</span>
+            <button class="btn sm pri" id="btn-tpl-save-top">save</button>
+          </div>
+          <div class="cardbody pad12">
+            <div class="f2">
+              <div class="field"><label>Name</label>
+                <input id="tpl-editor-name" maxlength="100" placeholder="e.g. HEVC passthrough to MPEG-TS"></div>
+              <div class="field"><label>Container</label>
+                <select id="tpl-editor-container">
+                  <option value="mpegts">MPEG-TS (VLC + Enigma2)</option>
+                  <option value="matroska">MATROSKA / MKV</option>
+                  <option value="hls">HLS</option>
+                </select></div>
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label>Description (optional)</label>
+              <input id="tpl-editor-description" maxlength="280" placeholder="when to use this template">
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label>Full FFmpeg command</label>
+              <textarea id="tpl-editor-command" class="mono" rows="8" spellcheck="false"></textarea>
+              <p class="sub" style="margin:6px 0 0">Use exactly one <code>&lt;url&gt;</code> (or <code>{{url}}</code>) immediately after <code>-i</code>. Output to <code>pipe:1</code>, or use <code>&lt;output&gt;</code> for HLS so segments land in the relay directory. The app inserts source headers and safe network defaults when absent.</p>
+            </div>
+            <h3 style="margin-top:14px">Used by</h3>
+            <p class="sub" style="margin:4px 0 8px">Tick the output types this template should drive. At playback time the relay picks the right template per request — Enigma2 gets its own, .ts and .mkv are separate, and so are the playlists and the direct 302.</p>
+            <div id="tpl-editor-outputs" class="output-grid"></div>
+            <div class="row" style="margin-top:14px">
+              <button class="btn pri" id="btn-tpl-save">save template</button>
+              <button class="btn ghost" id="btn-tpl-delete">delete</button>
+              <span class="mut" id="tpl-editor-status"></span>
+            </div>
           </div>
         </div>
       </div>

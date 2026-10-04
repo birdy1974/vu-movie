@@ -33,8 +33,15 @@ export async function createStream({
 
   let profileInput = { ...(profile || {}) };
   if (!existingId && !Object.hasOwn(profileInput, 'ffmpegTemplate') && !Object.hasOwn(profileInput, 'ffmpegTemplateId')) {
+    // Apply the per-output default template map. The `vlcTs` slot is what the
+    // Stream tab used to set automatically (the legacy single default). When
+    // nothing is configured we leave the profile empty so the guided builder
+    // applies on first render.
+    const defaults = cfg.transcode.ffmpegDefaults && typeof cfg.transcode.ffmpegDefaults === 'object'
+      ? cfg.transcode.ffmpegDefaults : {};
+    const desiredTemplateId = defaults.vlcTs || cfg.transcode.defaultFfmpegTemplateId || '';
     const defaultTemplate = (cfg.transcode.ffmpegTemplates || []).find((item) =>
-      item?.id === cfg.transcode.defaultFfmpegTemplateId && typeof item.command === 'string' && item.command.trim());
+      item?.id === desiredTemplateId && typeof item.command === 'string' && item.command.trim());
     if (defaultTemplate) {
       profileInput = {
         ...profileInput,
@@ -124,13 +131,18 @@ export async function removeStream(id) {
 /**
  * Build every client-facing URL for a stream.
  * `baseUrl` normally comes from the request (so it works behind any LAN name).
+ *
+ * `outputType` is one of the OUTPUT_TYPES values: `vlcTs`, `vlcMkv`, `m3u8`, `m3u`,
+ * `enigma2`, `direct`, `download`. When the caller passes one, the chosen
+ * container and extension are derived from the FFmpeg template assigned to that
+ * output (stream → global default → guided builder).
  */
-export function urlsFor(stream, baseUrl, { container = null } = {}) {
+export function urlsFor(stream, baseUrl, { container = null, outputType = null } = {}) {
   const cfg = getConfig();
   const base = String(baseUrl || cfg.app.baseUrl || `http://localhost:${cfg.app.port}`).replace(/\/$/, '');
   const slug = slugify(`${stream.title || 'stream'}${stream.year ? `-${stream.year}` : ''}`);
   const c = container || stream.profile?.container || cfg.transcode.container;
-  const ext = c === 'matroska' ? 'mkv' : 'ts';
+  const ext = c === 'matroska' ? 'mkv' : c === 'hls' ? 'm3u8' : 'ts';
   /**
    * The `direct` endpoint 302s to the upstream URL, which only works when the
    * CDN accepts an anonymous fetch. MovieBox (and every signed-cookie source)
@@ -142,20 +154,63 @@ export function urlsFor(stream, baseUrl, { container = null } = {}) {
    * the only offer.
    */
   const directUsable = directPlaybackAvailable(stream);
+  const token = stream.token;
   return {
-    raw: `${base}/s/${stream.token}/${slug}.${ext}`,
-    ts: `${base}/s/${stream.token}/${slug}.ts`,
-    mkv: `${base}/s/${stream.token}/${slug}.mkv`,
-    hls: `${base}/s/${stream.token}/${slug}.m3u8`,
-    playlist: `${base}/s/${stream.token}/${slug}.m3u`,
-    direct: directUsable ? `${base}/s/${stream.token}/direct` : null,
+    raw: `${base}/s/${token}/${slug}.${ext}`,
+    ts: `${base}/s/${token}/${slug}.ts`,
+    mkv: `${base}/s/${token}/${slug}.mkv`,
+    hls: `${base}/s/${token}/${slug}.m3u8`,
+    playlist: `${base}/s/${token}/${slug}.m3u`,
+    direct: directUsable ? `${base}/s/${token}/direct` : null,
     directNote: directUsable
       ? null
       : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
-    download: `${base}/dl/${stream.token}/${slug}.${ext}`,
-    watch: `${base}/watch/${stream.token}`,
-    forBox: `${base}/s/${stream.token}/${slug}.ts`,
+    download: `${base}/dl/${token}/${slug}.${ext}`,
+    watch: `${base}/watch/${token}`,
+    // The bouquet service-ref encodes the URL with `encodeE2Url`, which
+    // strips query strings — the receiver cannot reach a URL with
+    // `?enigma2=1`. We use a `.ts.enigma2` path suffix that survives the
+    // service-ref encoding and lets the relay bind the receiver request to
+    // the `enigma2` template slot. The plain `.ts` URL stays for desktop
+    // VLC and other clients.
+    forBox: `${base}/s/${token}/${slug}.ts.enigma2`,
+    outputType: outputType || '',
   };
+}
+
+/**
+ * Resolve which output type an HTTP path corresponds to. Used by the stream
+ * endpoints to pick the right FFmpeg template. The Enigma2/Duo2 endpoint is
+ * separate from the generic VLC .ts slot, so the operator can assign a tighter
+ * template (e.g. a 4:3-only, low-bitrate one) that does not also bind the
+ * desktop player.
+ */
+export function outputTypeForPath(reqPath) {
+  const name = String(reqPath || '').split('?')[0].toLowerCase();
+  // Enigma2 receivers cannot carry query strings through their service-ref
+  // encoding (the bouquet builder strips them). The bouquet entry therefore
+  // uses a `.ts.enigma2` path segment that the relay maps to the `enigma2`
+  // output slot. The `?enigma2=1` query parameter is also accepted for callers
+  // that do pass headers/queries through (e.g. direct test calls).
+  if (name.endsWith('/direct')) return 'direct';
+  if (name.endsWith('.ts.enigma2') || name.endsWith('/enigma2.ts')) return 'enigma2';
+  if (name.endsWith('.m3u8')) return 'm3u8';
+  if (name.endsWith('.m3u')) return 'm3u';
+  if (name.endsWith('.mkv')) return 'vlcMkv';
+  if (name.endsWith('.ts')) return 'vlcTs';
+  return '';
+}
+
+/**
+ * True when the request URL is one an Enigma2 receiver would fetch (the
+ * user-bouquet `forBox` slot). The path uses the .ts extension today, so the
+ * caller must look at the special `enigma2=1` query parameter that the bouquet
+ * builder appends, or fall back to the `vlcTs` output type.
+ */
+export function outputTypeForEnigma2Request(req) {
+  const flag = String(req?.query?.enigma2 || req?.headers?.['x-vu-enigma'] || '');
+  if (flag === '1' || flag === 'true') return 'enigma2';
+  return '';
 }
 
 /**

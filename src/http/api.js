@@ -91,6 +91,29 @@ function resolveTemplateProfile(input = {}) {
   };
 }
 
+/** Output types the per-output template picker knows about. */
+const OUTPUT_TYPES = ['vlcTs', 'vlcMkv', 'm3u8', 'm3u', 'enigma2', 'direct', 'download'];
+const OUTPUT_LABELS = {
+  vlcTs: 'VLC / any player (.ts)',
+  vlcMkv: 'VLC / any player (.mkv)',
+  m3u8: 'Playlist (.m3u8)',
+  m3u: 'Playlist (.m3u)',
+  enigma2: 'Enigma2 / Duo2',
+  direct: 'Direct upstream link (302)',
+  download: 'Download to NAS',
+};
+export { OUTPUT_TYPES, OUTPUT_LABELS };
+
+function normaliseTemplateOutput(o) {
+  const out = {};
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return out;
+  for (const [key, value] of Object.entries(o)) {
+    if (!OUTPUT_TYPES.includes(key)) continue;
+    out[key] = String(value || '').trim();
+  }
+  return out;
+}
+
 function validateTemplateLibrary(body = {}) {
   const input = body.templates;
   if (!Array.isArray(input)) throw inputError('templates must be an array');
@@ -109,7 +132,9 @@ function validateTemplateLibrary(body = {}) {
     if (!['mpegts', 'matroska', 'hls'].includes(container)) throw inputError(`Template "${name}" has an unsupported container`);
     const result = validateFfmpegTemplate(command, { container });
     if (!result.ok) throw inputError(`Template "${name}": ${result.errors.join('; ')}`);
-    return { id, name, container, command };
+    const output = normaliseTemplateOutput(item.output);
+    const description = String(item.description || '').trim().slice(0, 280);
+    return { id, name, container, command, output, description };
   });
   const currentDefault = getConfig().transcode.defaultFfmpegTemplateId || '';
   const defaultFfmpegTemplateId = body.defaultFfmpegTemplateId === undefined
@@ -118,7 +143,11 @@ function validateTemplateLibrary(body = {}) {
   if (defaultFfmpegTemplateId && !seen.has(defaultFfmpegTemplateId)) {
     throw inputError('The default template must be one of the saved templates');
   }
-  return { templates, defaultFfmpegTemplateId };
+  const ffmpegDefaults = normaliseTemplateOutput(body.ffmpegDefaults);
+  for (const [output, tplId] of Object.entries(ffmpegDefaults)) {
+    if (tplId && !seen.has(tplId)) throw inputError(`Default template for ${OUTPUT_LABELS[output] || output} must be one of the saved templates`);
+  }
+  return { templates, defaultFfmpegTemplateId, ffmpegDefaults };
 }
 
 function commandOutput(profile, stream) {
@@ -229,16 +258,27 @@ router.get('/ffmpeg/templates', wrap(async (req, res) => {
     ok: true,
     templates: transcode.ffmpegTemplates || [],
     defaultFfmpegTemplateId: transcode.defaultFfmpegTemplateId || '',
+    ffmpegDefaults: transcode.ffmpegDefaults || {},
+    outputTypes: OUTPUT_TYPES,
+    outputLabels: OUTPUT_LABELS,
   });
 }));
 
 router.put('/ffmpeg/templates', wrap(async (req, res) => {
-  const { templates, defaultFfmpegTemplateId } = validateTemplateLibrary(req.body || {});
-  saveConfig({ transcode: { ffmpegTemplates: templates, defaultFfmpegTemplateId } });
-  log.info('api', 'FFmpeg template library saved', {
-    templates: templates.length, hasDefault: Boolean(defaultFfmpegTemplateId),
+  const { templates, defaultFfmpegTemplateId, ffmpegDefaults } = validateTemplateLibrary(req.body || {});
+  saveConfig({
+    transcode: {
+      ffmpegTemplates: templates,
+      defaultFfmpegTemplateId,
+      ffmpegDefaults,
+    },
   });
-  res.json({ ok: true, templates, defaultFfmpegTemplateId });
+  log.info('api', 'FFmpeg template library saved', {
+    templates: templates.length,
+    hasDefault: Boolean(defaultFfmpegTemplateId),
+    perOutputDefaults: Object.values(ffmpegDefaults || {}).filter(Boolean).length,
+  });
+  res.json({ ok: true, templates, defaultFfmpegTemplateId, ffmpegDefaults });
 }));
 
 router.post('/config/hwaccel/test', wrap(async (req, res) => {
@@ -531,13 +571,20 @@ async function attachSubtitleToStream(stream, fetched) {
 
 /** The bouquet entry shape shared by preview, push and auto-push. */
 function bouquetEntries(streams, baseUrl) {
-  return streams.map((s) => ({
-    title: s.title, year: s.year, url: store.urlsFor(s, baseUrl).ts,
-    description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${s.upstream?.quality || s.quality || 'source'}`,
-    subtitle: s.profile?.subtitles && s.profile.subtitles !== 'none' ? (s.profile.subtitleLanguage || '').slice(0, 3) : null,
-    season: s.upstream?.season || null,
-    series: s.title,
-  }));
+  return streams.map((s) => {
+    // `urlsFor().forBox` already returns a `.ts.enigma2` URL — that suffix
+    // survives `encodeE2Url` in the Enigma2 service-ref builder, so the
+    // receiver request lands on the `enigma2` template slot instead of the
+    // generic VLC/.ts slot.
+    const url = store.urlsFor(s, baseUrl).forBox;
+    return {
+      title: s.title, year: s.year, url,
+      description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${s.upstream?.quality || s.quality || 'source'}`,
+      subtitle: s.profile?.subtitles && s.profile.subtitles !== 'none' ? (s.profile.subtitleLanguage || '').slice(0, 3) : null,
+      season: s.upstream?.season || null,
+      series: s.title,
+    };
+  });
 }
 
 router.get('/streams/:id', wrap(async (req, res) => {
@@ -561,12 +608,27 @@ router.delete('/streams/:id', wrap(async (req, res) => {
 router.post('/streams/:id/profile', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const input = resolveTemplateProfile({ ...(stream.profile || {}), ...(req.body?.profile || {}) });
+  const incoming = req.body?.profile || {};
+  // Preserve the per-output template map when present, otherwise the legacy
+  // single-template fields would erase it on save (and every output but the one
+  // typed into the form would suddenly fall back to the global default).
+  const merged = { ...(stream.profile || {}), ...incoming };
+  if (incoming.outputTemplates === null) delete merged.outputTemplates;
+  const input = resolveTemplateProfile(merged);
   if (input.ffmpegTemplate) {
     const result = validateFfmpegTemplate(input.ffmpegTemplate, { container: input.container || getConfig().transcode.container });
     if (!result.ok) throw inputError(result.errors.join('; '));
   }
   const profile = normaliseProfile(input, stream.upstream?.probe || null);
+  // Validate every per-output template id the user is saving — a stale id from
+  // a deleted template would silently bind to nothing.
+  if (profile.outputTemplates && typeof profile.outputTemplates === 'object') {
+    const libraryIds = new Set((getConfig().transcode.ffmpegTemplates || []).map((t) => t.id));
+    for (const [output, tplId] of Object.entries(profile.outputTemplates)) {
+      if (!tplId) { delete profile.outputTemplates[output]; continue; }
+      if (!libraryIds.has(tplId)) throw inputError(`Output template for ${output} no longer exists`);
+    }
+  }
   stream.profile = profile;
   await store.createStream({
     ...stream,
@@ -577,12 +639,102 @@ router.post('/streams/:id/profile', wrap(async (req, res) => {
   log.info('api', `profile updated for stream ${stream.id}`, {
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     resolution: profile.resolution, container: profile.container,
+    perOutputTemplates: Object.values(profile.outputTemplates || {}).filter(Boolean).length,
   });
   res.json({ ok: true, profile, urls: store.urlsFor(stream, baseUrlFrom(req)) });
 }));
 
-async function renderStreamCommand(stream, profileInput) {
-  const resolved = resolveTemplateProfile(profileInput);
+/**
+ * Resolve the FFmpeg template that should be used for the given output type.
+ *
+ * Precedence (highest first):
+ *   1. an explicit `outputTemplates[outputType]` set on the stream profile
+ *   2. an explicit `ffmpegTemplate` / `ffmpegTemplateId` set on the stream profile
+ *   3. the global `ffmpegDefaults[outputType]`
+ *   4. the global `defaultFfmpegTemplateId`
+ *   5. nothing — guided profile builder
+ *
+ * Returns an object with at least `templateId` (or empty string), `command`,
+ * `container`, `name`. `source` is one of "stream-output", "stream", "global-output",
+ * "global", "guided" so the UI can show *why* a given template is in use.
+ */
+function resolveOutputTemplate(profile = {}, outputType = '') {
+  const cfgTrans = getConfig().transcode || {};
+  const templates = Array.isArray(cfgTrans.ffmpegTemplates) ? cfgTrans.ffmpegTemplates : [];
+  const defaults = cfgTrans.ffmpegDefaults && typeof cfgTrans.ffmpegDefaults === 'object' ? cfgTrans.ffmpegDefaults : {};
+  const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
+    ? profile.outputTemplates : {};
+
+  const pickFromLibrary = (id) => templates.find((item) => item?.id === id && typeof item.command === 'string');
+
+  let picked = null;
+  let source = 'guided';
+  let templateId = '';
+  let perOutputKey = '';
+
+  // Per-output bindings always win: a stream that explicitly assigns
+  // `enigma2` to a 720p template expects exactly that, regardless of which
+  // template the stream was created with.
+  if (outputType && streamOutputTemplates[outputType]) {
+    picked = pickFromLibrary(streamOutputTemplates[outputType]);
+    if (picked) { templateId = picked.id; source = 'stream-output'; perOutputKey = outputType; }
+  }
+  // Global per-output defaults come next: every stream that did not override
+  // its own Enigma2 template still uses the operator's chosen 720p command.
+  if (!picked && outputType && defaults[outputType]) {
+    picked = pickFromLibrary(defaults[outputType]);
+    if (picked) { templateId = picked.id; source = 'global-output'; perOutputKey = outputType; }
+  }
+  // The stream's legacy single-template id is the fallback: it applied to
+  // every output when no per-output binding existed. New streams that come in
+  // with a per-output default get the global one only if they did not
+  // override it; existing streams with a single ffmpegTemplateId keep that
+  // behaviour unless the operator edits their per-output map.
+  if (!picked && profile.ffmpegTemplateId) {
+    picked = pickFromLibrary(profile.ffmpegTemplateId);
+    if (picked) { templateId = picked.id; source = 'stream'; }
+  }
+  if (!picked && cfgTrans.defaultFfmpegTemplateId) {
+    picked = pickFromLibrary(cfgTrans.defaultFfmpegTemplateId);
+    if (picked) { templateId = picked.id; source = 'global'; }
+  }
+  if (!picked && profile.ffmpegTemplate && typeof profile.ffmpegTemplate === 'string' && profile.ffmpegTemplate.trim()) {
+    // An inline custom command — used as is. No template id, but a command.
+    return {
+      templateId: '',
+      name: profile.ffmpegTemplateName || 'Custom template',
+      container: profile.container || '',
+      command: profile.ffmpegTemplate,
+      source: 'stream-custom',
+      perOutputKey,
+    };
+  }
+  if (!picked) return { templateId: '', name: '', container: '', command: '', source: 'guided', perOutputKey: '' };
+  return {
+    templateId: picked.id,
+    name: picked.name || '',
+    container: picked.container || '',
+    command: picked.command,
+    source,
+    perOutputKey,
+  };
+}
+
+function applyOutputTemplateToProfile(profileInput, template) {
+  if (!template || !template.command) return profileInput;
+  return {
+    ...profileInput,
+    container: template.container || profileInput.container,
+    ffmpegTemplate: template.command,
+    ffmpegTemplateId: template.templateId || '',
+    ffmpegTemplateName: template.name || '',
+  };
+}
+
+async function renderStreamCommand(stream, profileInput, { outputType = '' } = {}) {
+  const baseProfile = { ...(stream.profile || {}), ...(profileInput || {}) };
+  const template = resolveOutputTemplate(baseProfile, outputType);
+  const resolved = applyOutputTemplateToProfile(baseProfile, template);
   const profile = normaliseProfile(resolved, stream.upstream?.probe || null);
   if (profile.ffmpegTemplate) {
     const result = validateFfmpegTemplate(profile.ffmpegTemplate, { container: profile.container });
@@ -601,6 +753,7 @@ async function renderStreamCommand(stream, profileInput) {
     profile,
     hw: { available: hw.available, reason: hw.reason, fpsVariant: hw.fpsVariant, encoder: hw.encoder },
     command: argsToCommand(args),
+    template: { ...template, outputType },
   };
 }
 
@@ -619,15 +772,26 @@ router.get('/streams/:id/command', wrap(async (req, res) => {
     ...(req.query.subtitles ? { subtitles: String(req.query.subtitles) } : {}),
     ...(req.query.alwaysTranscode !== undefined ? { alwaysTranscode: req.query.alwaysTranscode === 'true' } : {}),
     ...(req.query.mode ? { mode: String(req.query.mode) } : {}),
+    ...(req.query.outputType ? { _outputType: String(req.query.outputType) } : {}),
   };
-  const rendered = await renderStreamCommand(stream, { ...(stream.profile || {}), ...overrides });
+  const { _outputType, ...restOverrides } = overrides;
+  const rendered = await renderStreamCommand(
+    stream,
+    { ...(stream.profile || {}), ...restOverrides },
+    { outputType: _outputType || '' },
+  );
   res.json({ ok: true, ...rendered });
 }));
 
 router.post('/streams/:id/command', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const rendered = await renderStreamCommand(stream, { ...(stream.profile || {}), ...(req.body?.profile || {}) });
+  const { outputType = '', ...profileOverrides } = req.body?.profile || {};
+  const rendered = await renderStreamCommand(
+    stream,
+    { ...(stream.profile || {}), ...profileOverrides },
+    { outputType: outputType || '' },
+  );
   res.json({ ok: true, ...rendered });
 }));
 

@@ -43,6 +43,71 @@ export function getSession(streamId) {
   return sessions.get(streamId) || null;
 }
 
+/**
+ * Resolve the FFmpeg template that should drive this session. The lookup
+ * mirrors `resolveOutputTemplate` in src/http/api.js but keeps it local to the
+ * relay so the playback hot path never has to walk through the API router.
+ *
+ *   1. stream profile outputTemplates[outputType]
+ *   2. stream profile.ffmpegTemplate / ffmpegTemplateId (legacy single default)
+ *   3. global ffmpegDefaults[outputType]
+ *   4. global defaultFfmpegTemplateId
+ *
+ * Returns null when nothing matches — that means the guided profile builder is
+ * authoritative and the resulting session will use stream copy or a transcode
+ * profile as configured by the operator.
+ */
+function resolveOutputTemplateForSession(profile = {}, outputType = '') {
+  const cfgTrans = getConfig().transcode || {};
+  const templates = Array.isArray(cfgTrans.ffmpegTemplates) ? cfgTrans.ffmpegTemplates : [];
+  const defaults = cfgTrans.ffmpegDefaults && typeof cfgTrans.ffmpegDefaults === 'object' ? cfgTrans.ffmpegDefaults : {};
+  const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
+    ? profile.outputTemplates : {};
+
+  const findById = (id) => templates.find((item) => item?.id === id && typeof item.command === 'string' && item.command.trim());
+
+  let picked = null;
+  let source = 'guided';
+
+  // Per-output bindings first, then global per-output defaults, then the
+  // stream's legacy single-template fallback, then the global default. The
+  // same precedence is mirrored in `resolveOutputTemplate` in the API
+  // (preview / command render). Do not change one without the other.
+  if (outputType && streamOutputTemplates[outputType]) {
+    picked = findById(streamOutputTemplates[outputType]);
+    if (picked) source = 'stream-output';
+  }
+  if (!picked && outputType && defaults[outputType]) {
+    picked = findById(defaults[outputType]);
+    if (picked) source = 'global-output';
+  }
+  if (!picked && profile.ffmpegTemplateId) {
+    picked = findById(profile.ffmpegTemplateId);
+    if (picked) source = 'stream';
+  }
+  if (!picked && cfgTrans.defaultFfmpegTemplateId) {
+    picked = findById(cfgTrans.defaultFfmpegTemplateId);
+    if (picked) source = 'global';
+  }
+  if (!picked && profile.ffmpegTemplate && typeof profile.ffmpegTemplate === 'string' && profile.ffmpegTemplate.trim()) {
+    return {
+      templateId: '',
+      name: profile.ffmpegTemplateName || 'Custom template',
+      container: profile.container || '',
+      command: profile.ffmpegTemplate,
+      source: 'stream-custom',
+    };
+  }
+  if (!picked) return null;
+  return {
+    templateId: picked.id,
+    name: picked.name || '',
+    container: picked.container || '',
+    command: picked.command,
+    source,
+  };
+}
+
 export function stopSession(streamId, reason = 'requested') {
   const session = sessions.get(streamId);
   if (!session) return false;
@@ -90,13 +155,32 @@ function cleanupHlsDir(session) {
 export async function ensureSession(stream, opts = {}) {
   const existing = sessions.get(stream.id);
   if (existing && existing.alive) {
-    log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size });
+    log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size, outputType: existing.outputType });
     return existing;
   }
 
   const cfg = getConfig();
+  const outputType = opts.outputType || '';
   const container = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
-  const profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
+  let profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
+
+  // Apply the per-output FFmpeg template selection: stream output override →
+  // stream default → global output default → global default. An empty result
+  // falls through to the guided profile builder (i.e. no template is used).
+  const template = resolveOutputTemplateForSession(profileInput, outputType);
+  if (template) {
+    profileInput = {
+      ...profileInput,
+      container: template.container || profileInput.container,
+      ffmpegTemplate: template.command,
+      ffmpegTemplateId: template.templateId || '',
+      ffmpegTemplateName: template.name || '',
+    };
+    log.debug('relay', `using template for output "${outputType || 'default'}"`, {
+      templateId: template.templateId, name: template.name, source: template.source,
+    });
+  }
+
   const profile = normaliseProfile(profileInput, stream.upstream?.probe || null);
   // Bounded wait: a slow GPU self-test must not stall playback forever. The
   // placeholder reports available:false, so we fall back to software encoding
@@ -140,6 +224,9 @@ export async function ensureSession(stream, opts = {}) {
     container: wantsHls ? 'hls' : profile.container,
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     encoder: profile.ffmpegTemplate ? 'custom template' : profile.transcode ? (hw.available && profile.encoder === 'vaapi' ? 'h264_vaapi' : profile.encoder || 'libx264') : 'copy',
+    outputType,
+    templateId: profile.ffmpegTemplateId || '',
+    templateSource: template?.source || '',
     profile: effectiveProfile,
     hlsDir,
     command,
@@ -160,6 +247,9 @@ export async function ensureSession(stream, opts = {}) {
   spawnFfmpeg(session);
   log.info('relay', `session ${session.id} started`, {
     mode: session.mode, encoder: session.encoder, container: session.container,
+    outputType: session.outputType || '',
+    templateId: session.templateId || '',
+    templateSource: session.templateSource || '',
     reasons: profile.reasons?.join('; '), hw: hw.available ? 'vaapi' : 'software',
   });
   log.debug('relay', 'ffmpeg command', { command: truncate(command, 900) });
@@ -420,6 +510,9 @@ export function publicSession(session) {
     container: session.container,
     mode: session.mode,
     encoder: session.encoder,
+    outputType: session.outputType || '',
+    templateId: session.templateId || '',
+    templateSource: session.templateSource || '',
     clients: session.clients.size,
     startedAt: new Date(session.startedAt).toISOString(),
     uptimeSec: Math.round((Date.now() - session.startedAt) / 1000),

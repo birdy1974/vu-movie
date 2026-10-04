@@ -69,7 +69,9 @@ test('template library, default selection, stream profile persistence, and previ
   });
   assert.equal(saved.response.status, 200);
   assert.equal(saved.json.defaultFfmpegTemplateId, 'default-ts');
-  assert.deepEqual(saved.json.templates, templates);
+  // Templates are normalised server-side: empty `output` map and `description`
+  // are added to every saved record so the editor can render uniformly.
+  assert.deepEqual(saved.json.templates, templates.map((t) => ({ ...t, output: {}, description: '' })));
 
   const invalidLibrary = await requestJson(base, '/ffmpeg/templates', {
     method: 'PUT', body: {

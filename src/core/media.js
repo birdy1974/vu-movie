@@ -1131,6 +1131,18 @@ export function normaliseProfile(input = {}, probeInfo = null) {
     ffmpegTemplateName: typeof input.ffmpegTemplateName === 'string' ? input.ffmpegTemplateName : '',
   };
 
+  // Per-output template id map. The relay looks up the right template per
+  // request URL: vlcTs / vlcMkv / m3u8 / m3u / enigma2 / direct / download.
+  // Empty / unknown values are pruned so a UI bug cannot keep a stale id
+  // around after a template is removed from the library.
+  if (input.outputTemplates && typeof input.outputTemplates === 'object' && !Array.isArray(input.outputTemplates)) {
+    const outputTemplates = {};
+    for (const [output, value] of Object.entries(input.outputTemplates)) {
+      if (typeof value === 'string' && value.trim()) outputTemplates[output] = value.trim();
+    }
+    p.outputTemplates = outputTemplates;
+  }
+
   // Decide whether an encode is needed at all.
   const v = probeInfo?.video;
   const needsDownscale = v?.height ? v.height > p.resolution : false;

@@ -151,6 +151,14 @@ export const DEFAULTS = {
     container: process.env.DEFAULT_CONTAINER || 'mpegts',
     /** Named, reusable outgoing FFmpeg templates edited from the Stream page. */
     ffmpegTemplates: [],
+    /**
+     * Per-output default template id. An output is one of:
+     *   vlcTs / vlcMkv / m3u8 / m3u / enigma2 / direct / download
+     * Empty falls back to the guided profile builder (or to `defaultFfmpegTemplateId`
+     * when that is set, so the old single-template default keeps behaving the same
+     * way until the operator opts in to a per-output layout).
+     */
+    ffmpegDefaults: {},
     /** Empty means use the guided profile builder for newly-created streams. */
     defaultFfmpegTemplateId: '',
     encoderFallback: process.env.ENCODER_FALLBACK || 'libx264 -preset veryfast -crf 22',

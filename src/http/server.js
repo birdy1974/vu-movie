@@ -104,6 +104,20 @@ export function createApp() {
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const ext = extensionOf(req.params.name);
 
+    // The Enigma2 / Duo2 receiver hits a `.ts` URL by way of its service-ref,
+    // but the bouquet builder encodes the URL with `encodeE2Url` which strips
+    // the query string. We therefore use a path suffix that survives the
+    // service-ref encoding: the receiver fetches `{slug}.ts.enigma2`, which
+    // Express matches as `name = {slug}.ts.enigma2`. The relay still serves
+    // mpegts bytes; the suffix only tells the relay which template slot to
+    // bind. The `?enigma2=1` query parameter is also honoured for callers
+    // that do pass queries through (and for the diagnostic / test paths).
+    const pathOutputType = store.outputTypeForPath(req.path);
+    const queryIsEnigma2 = store.outputTypeForEnigma2Request(req) === 'enigma2';
+    const baseOutputType = pathOutputType === 'enigma2' ? 'vlcTs' : pathOutputType;
+    const isEnigma2 = pathOutputType === 'enigma2' || queryIsEnigma2;
+    const outputType = isEnigma2 ? 'enigma2' : baseOutputType;
+
     // direct redirect (hybrid mode from decision D2) — zero load on the NAS.
     // Only valid for sources that need no request headers: a 302 cannot carry
     // the signed Cookie/Referer that MovieBox and friends demand, so those URLs
@@ -125,15 +139,20 @@ export function createApp() {
     if (ext === 'm3u' || ext === 'm3u8') {
       const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
       if (ext === 'm3u8' && (stream.profile?.container === 'hls')) {
-        const session = await relay.ensureSession(stream, { container: 'hls' });
+        const session = await relay.ensureSession(stream, { container: 'hls', outputType: outputType || 'm3u8' });
         if (session.kind === 'hls') {
           log.info('http', 'client asked for the HLS playlist', { stream: stream.id });
           return res.redirect(302, `/hls/${stream.token}/index.m3u8`);
         }
       }
+      // Pick the right per-output URL for the embedded stream entry. .m3u and
+      // .m3u8 themselves never carry audio/video; the link inside them does.
+      // The Enigma2 build sends the receiver there, so it gets the .ts that
+      // has the Enigma2-specific template bound (if any).
+      const innerUrl = isEnigma2 ? urls.forBox : urls.ts;
       const csv = exporter.buildM3U([{
         title: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
-        url: urls.ts,
+        url: innerUrl,
         logo: stream.poster,
         quality: stream.upstream?.quality,
         group: 'vu-movie',
@@ -144,17 +163,20 @@ export function createApp() {
       return res.send(csv);
     }
 
-    if (!['ts', 'mkv', 'mp4', 'mpegts', 'matroska'].includes(ext)) {
+    // `.ts.enigma2` lands here with `ext === 'enigma2'`. Treat it as a `.ts`
+    // mpegts request — only the outputType differs.
+    const effectiveExt = (ext === 'enigma2' || pathOutputType === 'enigma2') ? 'ts' : ext;
+    if (!['ts', 'mkv', 'mp4', 'mpegts', 'matroska'].includes(effectiveExt)) {
       log.warn('http', 'unsupported stream extension requested', { ext, name: req.params.name });
       return res.status(400).send(`vu-movie: unsupported extension ".${ext}" (use .ts, .mkv, .m3u8 or .m3u)`);
     }
 
-    const container = ext === 'mkv' || ext === 'matroska' ? 'matroska' : 'mpegts';
+    const container = effectiveExt === 'mkv' || effectiveExt === 'matroska' ? 'matroska' : 'mpegts';
     // Bounded wait so a slow GPU self-test cannot hold a playback request open.
     const hw = await hardware({ waitMs: 15000 });
     let session;
     try {
-      session = await relay.ensureSession(stream, { container });
+      session = await relay.ensureSession(stream, { container, outputType });
     } catch (err) {
       logError('http', 'could not start the stream session', err, { stream: stream.id });
       return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
@@ -168,6 +190,7 @@ export function createApp() {
     log.info('http', `client is playing "${stream.title}"`, {
       ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
       mode: session.mode, encoder: session.encoder, container, hw: hw.available ? 'vaapi' : 'software',
+      outputType, isEnigma2,
     });
     const { finish } = relay.attachClient(session, req, res);
     res.on('close', () => finish('socket closed'));
