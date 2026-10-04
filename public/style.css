@@ -177,3 +177,26 @@ button.provider-choice:focus-visible{outline:2px solid var(--acc);outline-offset
 .chip{display:inline-flex;align-items:center;gap:5px;background:var(--bg2);border:1px solid var(--line);
   border-radius:999px;padding:2px 9px;font-size:11.5px;cursor:pointer}
 .chip.on{border-color:var(--acc);color:#fff}
+.output-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:6px}
+.output-grid label.row{all:unset;cursor:pointer;padding:7px 10px;border-radius:9px;border:1px solid var(--line);
+  background:var(--bg2);color:var(--fg);font-size:12.5px;display:flex;gap:8px;align-items:center}
+.output-grid label.row:hover{border-color:#3a4d70;background:#22304a}
+.output-grid label.row.on{border-color:var(--acc);background:rgba(14,165,233,.13);color:#fff}
+.output-grid label.row .output-name{font-weight:600;line-height:1.2}
+.output-grid label.row .output-meta{font-size:10.5px;color:var(--mut);line-height:1.2}
+.output-templates-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:10px}
+.output-templates-grid .field{margin:0}
+.output-templates-grid select{font-size:12px}
+.template-list-row{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(36,49,73,.55)}
+.template-list-row:last-child{border-bottom:0}
+.template-list-row .tname{font-weight:600;line-height:1.2}
+.template-list-row .tmeta{color:var(--mut);font-size:11.5px;line-height:1.3;margin-top:4px}
+.template-list-row .tbadge{margin-top:5px;display:flex;gap:4px;flex-wrap:wrap}
+.template-list-row .tactions{margin-left:auto;display:flex;gap:6px;align-items:center;flex-shrink:0}
+.template-list-row.selected{background:rgba(14,165,233,.1)}
+.tpl-test-verdict{font-weight:700;font-size:14px;line-height:1.4;padding:8px 12px;border-radius:9px;border:1px solid var(--line);background:var(--bg2);color:var(--mut)}
+.tpl-test-verdict.ok{border-color:#1d5a44;background:rgba(52,211,153,.1);color:#9df0cf}
+.tpl-test-verdict.err{border-color:#5a2020;background:rgba(248,113,113,.1);color:#ffc7c7}
+.tpl-test-verdict.warn{border-color:#5a4a1d;background:rgba(251,191,36,.1);color:#f8dfa3}
+.tpl-test-progress{font-family:var(--mono);font-size:11.5px;color:var(--mut);display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:6px}
+.tpl-test-progress b{color:var(--fg);font-weight:600}

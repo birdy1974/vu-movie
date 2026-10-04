@@ -169,6 +169,31 @@ picks it up next to the recording.
 5. Press **Push to Duo2** to add the title to the bouquet (it appears in the
    channel list without a reboot).
 
+### Per-output transcode templates
+
+The **Transcode templates** tab holds a library of named FFmpeg commands. Each
+template can be assigned to one of the seven output slots independently, so a
+single title can hand out a 1080p HEVC pass-through to VLC, a 720p H.264
+re-encode to the VU+ Duo2, an HLS playlist to the browser, and a passthrough
+Matroska to the download button — all from the same upstream. The relay picks
+the right template per request URL:
+
+| Slot           | URL                                | Typical use                              |
+| -------------- | ---------------------------------- | ---------------------------------------- |
+| `vlcTs`        | `/s/{token}/{slug}.ts`             | Desktop VLC / generic TS player          |
+| `vlcMkv`       | `/s/{token}/{slug}.mkv`            | Desktop VLC, MKV                         |
+| `m3u8`         | `/s/{token}/{slug}.m3u8`           | Browser HLS                              |
+| `m3u`          | `/s/{token}/{slug}.m3u`            | M3U playlist                             |
+| `enigma2`      | `/s/{token}/{slug}.ts.enigma2`     | VU+ Duo2 (bouquet service-ref)           |
+| `direct`       | `/s/{token}/direct`                | 302 to the upstream URL when safe        |
+| `download`     | `/dl/{token}/{slug}.{ext}`         | Saved-to-disk copy                       |
+
+A stream can also override any individual slot from the Stream tab
+("FFmpeg template per output") without changing the others. The bouquet builder
+writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
+the query string when it builds the service reference — a 720p H.264 template
+bound to the `enigma2` slot is what actually runs on the Duo2.
+
 ---
 
 ## Configuration

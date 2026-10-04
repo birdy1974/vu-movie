@@ -20,6 +20,8 @@
       <button data-p="stream">▶ Stream</button>
       <button data-p="subs">▭ Subtitles</button>
       <button data-p="e2">☰ Enigma2</button>
+      <button data-p="tpl">⚒ Transcode templates</button>
+      <button data-p="tpl-test">▷ Test</button>
       <button data-p="logs">≡ Logs</button>
       <button data-p="set">⚙ Settings</button>
     </nav>
@@ -189,6 +191,7 @@
             <button class="btn" id="btn-download">⤓ download to NAS</button>
             <button class="btn" id="btn-playlist">⤓ .m3u playlist</button>
             <button class="btn ghost" id="btn-direct">⇱ direct link (302)</button>
+            <button class="btn ghost" id="btn-test-template">▷ test template</button>
             <button class="btn ghost" id="btn-refresh-stream">⟳ refresh</button>
           </div>
         </div>
@@ -258,12 +261,22 @@
                 </div>
               </div>
             </div>
+            <div class="field output-templates-box">
+              <label>FFmpeg template per output</label>
+              <p class="sub" style="margin:4px 0 6px">Override the template for a single output without changing the others. The Enigma2 / Duo2 slot is independent of the VLC .ts slot — useful when the receiver wants H.264 720p but your desktop player can take the original 1080p HEVC.</p>
+              <div id="pf-output-templates" class="output-templates-grid"></div>
+            </div>
             <div class="note" id="pf-note"></div>
             <div class="row">
               <button class="btn pri" id="btn-profile-apply">save profile</button>
               <button class="btn ghost" id="btn-profile-reset">reset</button>
             </div>
             <h3 style="margin-top:14px">Generated ffmpeg command (live)</h3>
+            <div class="row" style="margin-bottom:8px">
+              <label for="pf-cmd-output" class="mut" style="margin:0">Preview for</label>
+              <select id="pf-cmd-output" style="width:auto"></select>
+              <span class="mut" id="pf-cmd-template"></span>
+            </div>
             <pre id="cmd-preview">…</pre>
           </div>
 
@@ -401,6 +414,119 @@
               <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="selected"> only the selected stream</label></div>
             <div class="note">Stream URLs point at this NAS, so the box keeps working after the upstream token expired — vu-movie re-resolves the source on demand.</div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TRANSCODE TEMPLATES ============ -->
+    <section id="p-tpl" class="hide">
+      <h1>Transcode templates</h1>
+      <p class="sub">Save a different FFmpeg command for each output the box hands out. The Enigma2 bouquet gets its own slot, so the VU+ Duo2 never inherits a 4K HEVC template that VLC needs but the receiver cannot decode.</p>
+      <div class="gl">
+        <div class="card pad0">
+          <div class="cardhead">
+            <span><i class="bi bi-gear-wide-connected"></i> Templates</span>
+            <button class="btn sm pri" id="btn-tpl-new">+ New template</button>
+          </div>
+          <div class="cardbody pad12">
+            <label class="muted-label" for="tpl-default">Default template (used when an output has no specific assignment)</label>
+            <div class="row">
+              <select class="form-select form-select-sm" id="tpl-default" style="flex:1"></select>
+              <button class="btn sm ghost" id="btn-tpl-set-default" disabled>set default</button>
+            </div>
+            <p class="sub" style="margin:8px 0 0">Saved templates and their commands are also editable inline on the Stream tab.</p>
+          </div>
+          <div class="cardbody" id="tpl-list" style="max-height:calc(100vh - 320px);overflow:auto"></div>
+        </div>
+
+        <div class="card pad0">
+          <div class="cardhead">
+            <span id="tpl-editor-title">Template editor</span>
+            <button class="btn sm pri" id="btn-tpl-save-top">save</button>
+          </div>
+          <div class="cardbody pad12">
+            <div class="f2">
+              <div class="field"><label>Name</label>
+                <input id="tpl-editor-name" maxlength="100" placeholder="e.g. HEVC passthrough to MPEG-TS"></div>
+              <div class="field"><label>Container</label>
+                <select id="tpl-editor-container">
+                  <option value="mpegts">MPEG-TS (VLC + Enigma2)</option>
+                  <option value="matroska">MATROSKA / MKV</option>
+                  <option value="hls">HLS</option>
+                </select></div>
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label>Description (optional)</label>
+              <input id="tpl-editor-description" maxlength="280" placeholder="when to use this template">
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label>Full FFmpeg command</label>
+              <textarea id="tpl-editor-command" class="mono" rows="8" spellcheck="false"></textarea>
+              <p class="sub" style="margin:6px 0 0">Use exactly one <code>&lt;url&gt;</code> (or <code>{{url}}</code>) immediately after <code>-i</code>. Output to <code>pipe:1</code>, or use <code>&lt;output&gt;</code> for HLS so segments land in the relay directory. The app inserts source headers and safe network defaults when absent.</p>
+            </div>
+            <h3 style="margin-top:14px">Used by</h3>
+            <p class="sub" style="margin:4px 0 8px">Tick the output types this template should drive. At playback time the relay picks the right template per request — Enigma2 gets its own, .ts and .mkv are separate, and so are the playlists and the direct 302.</p>
+            <div id="tpl-editor-outputs" class="output-grid"></div>
+            <div class="row" style="margin-top:14px">
+              <button class="btn pri" id="btn-tpl-save">save template</button>
+              <button class="btn ghost" id="btn-tpl-delete">delete</button>
+              <button class="btn" id="btn-tpl-test">▷ test</button>
+              <span class="mut" id="tpl-editor-status"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TEMPLATE TEST PANEL ============ -->
+    <section id="p-tpl-test" class="hide">
+      <h1>Test FFmpeg template</h1>
+      <p class="sub">Run a saved or inline FFmpeg command against a real stream for a few seconds and inspect the live output, stderr tail and exit code before you bind the template to an output.</p>
+      <div class="card">
+        <div class="f2">
+          <div class="field">
+            <label for="tpl-test-template">Template</label>
+            <select id="tpl-test-template"></select>
+            <div class="meta">Pick a saved template or <code>(inline command…)</code> to test one you have not saved yet.</div>
+          </div>
+          <div class="field">
+            <label for="tpl-test-stream">Test against stream</label>
+            <select id="tpl-test-stream"></select>
+            <div class="meta">The template runs against this stream's upstream URL + headers for the window you choose.</div>
+          </div>
+        </div>
+        <div class="f2" style="margin-top:8px">
+          <div class="field">
+            <label for="tpl-test-duration">Run for (seconds)</label>
+            <input id="tpl-test-duration" type="number" min="1" max="30" step="1" value="5">
+            <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div>
+          </div>
+          <div class="field">
+            <label for="tpl-test-output">Verdict</label>
+            <div id="tpl-test-verdict" class="tpl-test-verdict">(not run yet)</div>
+            <div class="meta" id="tpl-test-summary">Press <b>Run test</b> to spawn ffmpeg against the chosen stream.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="tpl-test-command">Inline command (only for the "inline command…" option)</label>
+          <textarea id="tpl-test-command" class="mono" rows="6" spellcheck="false" placeholder="ffmpeg -hide_banner -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -f mpegts pipe:1"></textarea>
+        </div>
+        <div class="row">
+          <button class="btn pri" id="btn-tpl-test-run">▷ run test</button>
+          <button class="btn ghost" id="btn-tpl-test-reset">reset</button>
+          <span class="mut" id="tpl-test-status"></span>
+        </div>
+      </div>
+      <div class="gl" style="margin-top:14px">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Command preview</h2>
+            <span class="mut" id="tpl-test-cmd-meta"></span></div>
+          <pre id="tpl-test-cmd" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px">…</pre>
+        </div>
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">ffmpeg stderr (live)</h2>
+            <span class="mut" id="tpl-test-progress-meta"></span></div>
+          <pre id="tpl-test-stderr" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px;max-height:340px;overflow:auto">—</pre>
         </div>
       </div>
     </section>

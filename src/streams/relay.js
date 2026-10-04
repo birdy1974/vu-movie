@@ -26,11 +26,155 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { log, logError, truncate } from '../core/log.js';
+import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
+  validateFfmpegTemplate, buildFfmpegTemplateArgs,
 } from '../core/media.js';
+
+/**
+ * Run an FFmpeg template (or built profile) for a short window against the
+ * actual upstream of a saved stream. Used by the UI to verify a template
+ * before saving it / binding it to an output slot.
+ *
+ *   `template`     — full FFmpeg command (with <url> / {{url}} / <output>).
+ *                    The URL is replaced with the stream's upstream URL and
+ *                    source headers + reconnect defaults are injected; the
+ *                    final argument is forced to a temp file so the test never
+ *                    blocks on a pipe.
+ *   `stream`       — record from streams/store (carries upstream / probe).
+ *   `container`    — 'mpegts' | 'matroska' | 'hls' (defaults to template -f).
+ *   `durationMs`   — how long to run ffmpeg before sending SIGTERM (default 5 s,
+ *                    max 30 s — longer just wastes time on a smoke test).
+ *   `outputType`   — informational only (logged + included in the response).
+ *
+ * Returns: { ok, exitCode, signal, durationMs, bytesOut, stderr, progress,
+ *            command, templateId, outputType, target }
+ */
+export async function runTemplateTest({ template, stream, container = null, durationMs = 5000, outputType = '', templateId = '' } = {}) {
+  const cfg = getConfig();
+  const startedAt = Date.now();
+  const limitMs = Math.min(Math.max(Number(durationMs) || 5000, 500), 30000);
+  if (!template || typeof template !== 'string' || !template.trim()) {
+    return { ok: false, error: 'template is empty', exitCode: null, durationMs: 0, bytesOut: 0, stderr: '', progress: {}, command: '', outputType };
+  }
+  if (!stream?.upstream?.url) {
+    return { ok: false, error: 'stream has no upstream URL', exitCode: null, durationMs: 0, bytesOut: 0, stderr: '', progress: {}, command: '', outputType };
+  }
+  // Validate first so a malformed command does not run at all. We throw so the
+  // HTTP layer converts it to a 422 — operators want a hard failure when they
+  // test a template that cannot possibly work, not a "result: ok:false" that
+  // looks like a transient runtime error.
+  const validation = validateFfmpegTemplate(template, { container: container || cfg.transcode.container });
+  if (!validation.ok) {
+    const err = new Error(`Template is not valid: ${validation.errors.join('; ')}`);
+    err.status = 422;
+    err.details = validation.errors;
+    throw err;
+  }
+
+  // The test writes to a unique temp file (or HLS dir) so the run never blocks
+  // on a pipe: we just sample what reaches disk and stop ffmpeg after the
+  // window expires.
+  const tmpRoot = path.join(cfg.storage.tmp, 'tpl-test');
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  const runId = `${stream.id}-${Date.now().toString(36)}`;
+  const target = path.join(tmpRoot, `${runId}.ts`);
+  const effectiveContainer = container || validation.container || 'mpegts';
+
+  // Render the args exactly the way the relay would (so what they preview is
+  // what runs). The probe is reused so VA-API availability + filters match.
+  const hw = await hardware({ waitMs: 5000 }).catch(() => ({ available: false, reason: 'hardware probe unavailable', fpsVariant: null, encoder: null }));
+  let args;
+  let command;
+  try {
+    args = buildFfmpegTemplateArgs({
+      template,
+      source: { url: stream.upstream.url, headers: stream.upstream.headers || {}, kind: stream.upstream.kind || undefined },
+      profile: { container: effectiveContainer },
+      mode: 'file',
+      output: { container: effectiveContainer, target },
+    });
+    command = argsToCommand(args);
+  } catch (err) {
+    return { ok: false, error: errorText(err), exitCode: null, durationMs: 0, bytesOut: 0, stderr: '', progress: {}, command: '', outputType };
+  }
+
+  log.info('relay', `template test start`, {
+    templateId, outputType, stream: stream.id, container: effectiveContainer, durationMs: limitMs,
+    command: truncate(command, 400),
+  });
+
+  return await new Promise((resolve) => {
+    const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
+    let bytesOut = 0;
+    let stderrTail = [];
+    const progress = {};
+    let stderrBuffer = '';
+    let lastProgressAt = 0;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGTERM'); } catch { /* gone */ }
+    }, limitMs);
+
+    child.stdout.on('data', (chunk) => { bytesOut += chunk.length; });
+    child.stderr.on('data', (chunk) => {
+      stderrBuffer += chunk.toString();
+      const lines = stderrBuffer.split('\n');
+      stderrBuffer = lines.pop() || '';
+      for (const line of lines) {
+        if (/^[a-z_]+=/.test(line)) {
+          const parsed = parseProgressLine(line, progress);
+          Object.assign(progress, parsed);
+          lastProgressAt = Date.now();
+          continue;
+        }
+        if (!line.trim()) continue;
+        stderrTail.push(line);
+        if (stderrTail.length > 60) stderrTail.shift();
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      resolve({
+        ok: false, error: errorText(err), exitCode: null,
+        durationMs: Date.now() - startedAt, bytesOut, stderr: stderrTail.join('\n'),
+        progress, command, templateId, outputType, target: null, timedOut: false,
+      });
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      const durationMs = Date.now() - startedAt;
+      // Cleanup the test output file — we only need the bytesOut / progress
+      // stats for the verdict, not the file itself.
+      try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      // "ok" = ffmpeg produced bytes within the test window without an error
+      // pattern in the stderr. exitCode 0 is a clean finish, SIGTERM is the
+      // timer firing (still a positive signal — the pipeline ran).
+      const sawError = stderrTail.some((l) => /\b(error|failed|invalid|unable|cannot|denied|not found|impossible|could not|invalid data|broken pipe)\b/i.test(l));
+      const ok = bytesOut > 0 && !sawError && (code === 0 || signal === 'SIGTERM' || signal === 'SIGINT');
+      log.info('relay', `template test done`, {
+        templateId, outputType, stream: stream.id, ok, bytesOut, exitCode: code, signal,
+        elapsedMs: durationMs, timedOut,
+      });
+      resolve({
+        ok,
+        exitCode: code, signal, durationMs, bytesOut,
+        stderr: stderrTail.join('\n'),
+        progress: { ...progress, lastProgressAt: lastProgressAt || null },
+        command, templateId, outputType, target, timedOut,
+      });
+    });
+  });
+}
+
+/* ---------- end of test-runner block ---------- */
 
 /** streamId → session */
 const sessions = new Map();
@@ -41,6 +185,71 @@ export function listSessions() {
 
 export function getSession(streamId) {
   return sessions.get(streamId) || null;
+}
+
+/**
+ * Resolve the FFmpeg template that should drive this session. The lookup
+ * mirrors `resolveOutputTemplate` in src/http/api.js but keeps it local to the
+ * relay so the playback hot path never has to walk through the API router.
+ *
+ *   1. stream profile outputTemplates[outputType]
+ *   2. stream profile.ffmpegTemplate / ffmpegTemplateId (legacy single default)
+ *   3. global ffmpegDefaults[outputType]
+ *   4. global defaultFfmpegTemplateId
+ *
+ * Returns null when nothing matches — that means the guided profile builder is
+ * authoritative and the resulting session will use stream copy or a transcode
+ * profile as configured by the operator.
+ */
+function resolveOutputTemplateForSession(profile = {}, outputType = '') {
+  const cfgTrans = getConfig().transcode || {};
+  const templates = Array.isArray(cfgTrans.ffmpegTemplates) ? cfgTrans.ffmpegTemplates : [];
+  const defaults = cfgTrans.ffmpegDefaults && typeof cfgTrans.ffmpegDefaults === 'object' ? cfgTrans.ffmpegDefaults : {};
+  const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
+    ? profile.outputTemplates : {};
+
+  const findById = (id) => templates.find((item) => item?.id === id && typeof item.command === 'string' && item.command.trim());
+
+  let picked = null;
+  let source = 'guided';
+
+  // Per-output bindings first, then global per-output defaults, then the
+  // stream's legacy single-template fallback, then the global default. The
+  // same precedence is mirrored in `resolveOutputTemplate` in the API
+  // (preview / command render). Do not change one without the other.
+  if (outputType && streamOutputTemplates[outputType]) {
+    picked = findById(streamOutputTemplates[outputType]);
+    if (picked) source = 'stream-output';
+  }
+  if (!picked && outputType && defaults[outputType]) {
+    picked = findById(defaults[outputType]);
+    if (picked) source = 'global-output';
+  }
+  if (!picked && profile.ffmpegTemplateId) {
+    picked = findById(profile.ffmpegTemplateId);
+    if (picked) source = 'stream';
+  }
+  if (!picked && cfgTrans.defaultFfmpegTemplateId) {
+    picked = findById(cfgTrans.defaultFfmpegTemplateId);
+    if (picked) source = 'global';
+  }
+  if (!picked && profile.ffmpegTemplate && typeof profile.ffmpegTemplate === 'string' && profile.ffmpegTemplate.trim()) {
+    return {
+      templateId: '',
+      name: profile.ffmpegTemplateName || 'Custom template',
+      container: profile.container || '',
+      command: profile.ffmpegTemplate,
+      source: 'stream-custom',
+    };
+  }
+  if (!picked) return null;
+  return {
+    templateId: picked.id,
+    name: picked.name || '',
+    container: picked.container || '',
+    command: picked.command,
+    source,
+  };
 }
 
 export function stopSession(streamId, reason = 'requested') {
@@ -90,13 +299,32 @@ function cleanupHlsDir(session) {
 export async function ensureSession(stream, opts = {}) {
   const existing = sessions.get(stream.id);
   if (existing && existing.alive) {
-    log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size });
+    log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size, outputType: existing.outputType });
     return existing;
   }
 
   const cfg = getConfig();
+  const outputType = opts.outputType || '';
   const container = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
-  const profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
+  let profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
+
+  // Apply the per-output FFmpeg template selection: stream output override →
+  // stream default → global output default → global default. An empty result
+  // falls through to the guided profile builder (i.e. no template is used).
+  const template = resolveOutputTemplateForSession(profileInput, outputType);
+  if (template) {
+    profileInput = {
+      ...profileInput,
+      container: template.container || profileInput.container,
+      ffmpegTemplate: template.command,
+      ffmpegTemplateId: template.templateId || '',
+      ffmpegTemplateName: template.name || '',
+    };
+    log.debug('relay', `using template for output "${outputType || 'default'}"`, {
+      templateId: template.templateId, name: template.name, source: template.source,
+    });
+  }
+
   const profile = normaliseProfile(profileInput, stream.upstream?.probe || null);
   // Bounded wait: a slow GPU self-test must not stall playback forever. The
   // placeholder reports available:false, so we fall back to software encoding
@@ -140,6 +368,9 @@ export async function ensureSession(stream, opts = {}) {
     container: wantsHls ? 'hls' : profile.container,
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     encoder: profile.ffmpegTemplate ? 'custom template' : profile.transcode ? (hw.available && profile.encoder === 'vaapi' ? 'h264_vaapi' : profile.encoder || 'libx264') : 'copy',
+    outputType,
+    templateId: profile.ffmpegTemplateId || '',
+    templateSource: template?.source || '',
     profile: effectiveProfile,
     hlsDir,
     command,
@@ -160,6 +391,9 @@ export async function ensureSession(stream, opts = {}) {
   spawnFfmpeg(session);
   log.info('relay', `session ${session.id} started`, {
     mode: session.mode, encoder: session.encoder, container: session.container,
+    outputType: session.outputType || '',
+    templateId: session.templateId || '',
+    templateSource: session.templateSource || '',
     reasons: profile.reasons?.join('; '), hw: hw.available ? 'vaapi' : 'software',
   });
   log.debug('relay', 'ffmpeg command', { command: truncate(command, 900) });
@@ -420,6 +654,9 @@ export function publicSession(session) {
     container: session.container,
     mode: session.mode,
     encoder: session.encoder,
+    outputType: session.outputType || '',
+    templateId: session.templateId || '',
+    templateSource: session.templateSource || '',
     clients: session.clients.size,
     startedAt: new Date(session.startedAt).toISOString(),
     uptimeSec: Math.round((Date.now() - session.startedAt) / 1000),
@@ -437,4 +674,4 @@ export function stopAll(reason = 'shutdown') {
   for (const streamId of [...sessions.keys()]) stopSession(streamId, reason);
 }
 
-export default { ensureSession, attachClient, stopSession, listSessions, getSession, stopAll, publicSession };
+export default { ensureSession, attachClient, stopSession, listSessions, getSession, stopAll, publicSession, runTemplateTest };
