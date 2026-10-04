@@ -149,6 +149,10 @@ export const DEFAULTS = {
     fps: process.env.DEFAULT_FPS || '25',
     /** mpegts is what VLC + Enigma2 want; matroska is available per your request. */
     container: process.env.DEFAULT_CONTAINER || 'mpegts',
+    /** Named, reusable outgoing FFmpeg templates edited from the Stream page. */
+    ffmpegTemplates: [],
+    /** Empty means use the guided profile builder for newly-created streams. */
+    defaultFfmpegTemplateId: '',
     encoderFallback: process.env.ENCODER_FALLBACK || 'libx264 -preset veryfast -crf 22',
     /** Seconds of "no clients" before an idle stream session is killed. */
     idleStopSeconds: Number(process.env.STREAM_IDLE_SECONDS || 45),
@@ -194,8 +198,8 @@ export const DEFAULTS = {
     rootDir: process.env.ENIGMA2_ROOT || '/etc/enigma2',
     /** 4097 = GStreamer/exteplayer3 (safest for IPTV on a Duo2). */
     serviceType: Number(process.env.ENIGMA2_SERVICE_TYPE || 4097),
-    /** FTP fallback when OpenWebif upload is unavailable. */
-    ftpEnabled: String(process.env.ENIGMA2_FTP || 'false').toLowerCase() === 'true',
+    /** FTP file transport for bouquet/subtitle uploads; OpenWebif only reloads/queries. */
+    ftpEnabled: String(process.env.ENIGMA2_FTP || 'true').toLowerCase() === 'true',
     ftpPort: Number(process.env.ENIGMA2_FTP_PORT || 21),
     /** Re-push the bouquet automatically after every scrape. */
     autoPush: String(process.env.ENIGMA2_AUTO_PUSH || 'false').toLowerCase() === 'true',
@@ -479,6 +483,10 @@ const SECRET_PATHS = [
 /** Returns a copy with passwords/keys masked, for the UI. */
 export function publicConfig() {
   const clone = structuredClone(current);
+  // Custom commands can contain credentials or private origin details. They are
+  // served only by /api/ffmpeg/templates to the template editor, never the
+  // general settings/health config response.
+  delete clone.transcode.ffmpegTemplates;
   const mask = (v) => (v ? '••••••••' : '');
   clone.app.password = mask(clone.app.password);
   clone.db.url = clone.db.url ? clone.db.url.replace(/:[^:@/]*@/, ':***@') : '';

@@ -743,6 +743,220 @@ export function headerArgs(headers = {}) {
   return lines.length ? ['-headers', lines.join('\r\n') + '\r\n'] : [];
 }
 
+const URL_TEMPLATE_TOKENS = new Set(['<url>', '{{url}}']);
+const OUTPUT_TEMPLATE_TOKENS = new Set(['<output>', '{{output}}']);
+const TEMPLATE_CONTAINERS = new Set(['mpegts', 'matroska', 'hls']);
+
+/**
+ * Split a command template into argv without invoking a shell. Single/double
+ * quotes and backslash escapes are understood; variable expansion, command
+ * substitution, globs, redirects and shell operators are deliberately inert.
+ */
+export function parseFfmpegTemplateTokens(command) {
+  const text = String(command ?? '');
+  if (text.length > 24000) throw new Error('FFmpeg template is too long (maximum 24,000 characters)');
+  const words = [];
+  let word = '';
+  let started = false;
+  let quote = '';
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (quote === "'") {
+      if (char === "'") quote = '';
+      else word += char;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') { quote = ''; continue; }
+      if (char === '\\' && i + 1 < text.length) {
+        const next = text[i + 1];
+        if (next === '\n') { i += 1; continue; }
+        if ('"\\$`'.includes(next)) { word += next; i += 1; continue; }
+      }
+      word += char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (started) { words.push(word); word = ''; started = false; }
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (char === '\\') {
+      if (i + 1 >= text.length) throw new Error('FFmpeg template ends with an unfinished backslash escape');
+      if (text[i + 1] === '\n') { i += 1; continue; }
+      word += text[i + 1];
+      i += 1;
+      started = true;
+    } else {
+      word += char;
+      started = true;
+    }
+  }
+  if (quote) throw new Error('FFmpeg template has an unclosed quote');
+  if (started) words.push(word);
+  return words;
+}
+
+function ffmpegTemplateArgs(command) {
+  const tokens = parseFfmpegTemplateTokens(command);
+  if (tokens.length && /^(?:.*\/)?ffmpeg(?:\.exe)?$/i.test(tokens[0])) tokens.shift();
+  else if (tokens.length && !tokens[0].startsWith('-')) {
+    throw new Error('Template must start with ffmpeg or an FFmpeg option (shell commands are not supported)');
+  }
+  return tokens;
+}
+
+function lastOptionValue(tokens, flag) {
+  const index = tokens.lastIndexOf(flag);
+  return index >= 0 ? tokens[index + 1] : null;
+}
+
+/** Validate a complete, reusable FFmpeg command template before saving/running it. */
+export function validateFfmpegTemplate(command, { container = '' } = {}) {
+  const errors = [];
+  let args = [];
+  try { args = ffmpegTemplateArgs(command); }
+  catch (error) { return { ok: false, errors: [error.message], container: null }; }
+  if (!args.length) return { ok: false, errors: ['FFmpeg template is empty'], container: null };
+
+  const urlIndexes = args.flatMap((arg, index) => URL_TEMPLATE_TOKENS.has(arg) ? [index] : []);
+  if (urlIndexes.length !== 1) errors.push('Use exactly one <url> placeholder as the value of -i');
+  const urlIndex = urlIndexes[0] ?? -1;
+  if (urlIndex < 1 || args[urlIndex - 1] !== '-i') errors.push('The <url> placeholder must immediately follow -i');
+
+  const outputIndexes = args.flatMap((arg, index) => OUTPUT_TEMPLATE_TOKENS.has(arg) ? [index] : []);
+  if (outputIndexes.length > 1) errors.push('Use at most one <output> placeholder');
+  const usesOutput = outputIndexes.length === 1;
+  const target = args.at(-1);
+  if (usesOutput && outputIndexes[0] !== args.length - 1) errors.push('<output> must be the final command argument');
+  if (!usesOutput && !['pipe:1', '-'].includes(target)) errors.push('The output must be pipe:1, -, or a final <output> placeholder');
+
+  const format = lastOptionValue(args, '-f');
+  if (!format || format.startsWith('-')) errors.push('Set an output format with -f (mpegts, matroska, or hls)');
+  else if (!TEMPLATE_CONTAINERS.has(format)) errors.push(`Unsupported outgoing container "${format}"`);
+  if (container && format && format !== container) errors.push(`The command uses -f ${format}, but the selected container is ${container}`);
+  if (format === 'hls' && !usesOutput) errors.push('HLS templates must end with <output> so segments go to the relay directory');
+  if (container === 'hls' && !usesOutput) errors.push('HLS templates must use the final <output> placeholder');
+
+  for (const flag of ['-i', '-f', '-headers', '-user_agent', '-referer']) {
+    const index = args.indexOf(flag);
+    if (index >= 0 && (!args[index + 1] || args[index + 1].startsWith('-')) && flag !== '-i') {
+      errors.push(`${flag} needs a value`);
+    }
+  }
+  return { ok: errors.length === 0, errors, container: format || null };
+}
+
+function mergeTemplateHeaders(existing, sourceHeaders) {
+  const linesByName = new Map();
+  const unparsed = [];
+  const addLine = (line, prefer = true) => {
+    const text = String(line || '').trimEnd();
+    if (!text) return;
+    const colon = text.indexOf(':');
+    if (colon < 1) { unparsed.push(text); return; }
+    const name = text.slice(0, colon).trim();
+    if (!name) { unparsed.push(text); return; }
+    const key = name.toLowerCase();
+    if (prefer || !linesByName.has(key)) linesByName.set(key, text);
+  };
+  for (const [name, value] of Object.entries(headerObject(sourceHeaders))) {
+    if (value !== undefined && value !== null && value !== '') addLine(`${name}: ${value}`, false);
+  }
+  for (const line of String(existing || '').split(/\r?\n/)) addLine(line, true);
+  const result = [...linesByName.values(), ...unparsed].join('\r\n');
+  return result ? `${result}\r\n` : '';
+}
+
+/**
+ * Render a template to an argv list. Source URLs and private request headers are
+ * inserted as individual argv values, never interpolated into shell text.
+ */
+export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode = 'live', output = { target: 'pipe:1' } }) {
+  const container = output.container || profile.container || 'mpegts';
+  const validation = validateFfmpegTemplate(template, { container });
+  if (!validation.ok) {
+    const error = new Error(validation.errors.join('; '));
+    error.status = 422;
+    error.details = validation.errors;
+    throw error;
+  }
+  if (!source?.url) {
+    const error = new Error('FFmpeg template needs a resolved source URL');
+    error.status = 422;
+    throw error;
+  }
+
+  const tokens = ffmpegTemplateArgs(template);
+  const urlMarker = tokens.findIndex((arg) => URL_TEMPLATE_TOKENS.has(arg));
+  const target = output.target || 'pipe:1';
+  const args = tokens.map((arg) => URL_TEMPLATE_TOKENS.has(arg) ? String(source.url)
+    : OUTPUT_TEMPLATE_TOKENS.has(arg) ? String(target) : arg);
+  let inputIndex = urlMarker - 1;
+  const isHttp = /^https?:/i.test(String(source.url));
+  const prefix = [];
+  const hasOption = (flag) => args.includes(flag);
+  const addInputOption = (flag, value = null, when = true) => {
+    if (!when || hasOption(flag)) return;
+    prefix.push(flag);
+    if (value !== null) prefix.push(value);
+  };
+
+  addInputOption('-hide_banner');
+  addInputOption('-nostdin');
+  addInputOption('-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning');
+  if (isHttp) {
+    addInputOption('-fflags', '+genpts+discardcorrupt');
+    addInputOption('-err_detect', 'ignore_err');
+    addInputOption('-reconnect', '1');
+    addInputOption('-reconnect_at_eof', '1');
+    addInputOption('-reconnect_streamed', '1');
+    addInputOption('-reconnect_delay_max', '5');
+    addInputOption('-rw_timeout', '10000000');
+    if (mode === 'live') {
+      addInputOption('-analyzeduration', '1000000');
+      addInputOption('-probesize', '1000000');
+      addInputOption('-live_start_index', '-3', streamKind(source.url) === 'hls');
+    }
+
+    const headers = headerObject(source.headers);
+    const headerIndex = args.findIndex((arg, index) => arg === '-headers' && index < inputIndex);
+    const explicitUserAgent = args.slice(0, inputIndex).includes('-user_agent');
+    const explicitReferer = args.slice(0, inputIndex).includes('-referer');
+    const automaticHeaders = { ...headers };
+    if (explicitUserAgent) {
+      for (const key of Object.keys(automaticHeaders)) if (key.toLowerCase() === 'user-agent') delete automaticHeaders[key];
+    }
+    if (explicitReferer) {
+      for (const key of Object.keys(automaticHeaders)) if (key.toLowerCase() === 'referer') delete automaticHeaders[key];
+    }
+    if (headerIndex >= 0 && headerIndex + 1 < inputIndex) {
+      args[headerIndex + 1] = mergeTemplateHeaders(args[headerIndex + 1], automaticHeaders);
+    } else {
+      prefix.push(...headerArgs(automaticHeaders));
+    }
+    const existingHeadersText = headerIndex >= 0 ? String(args[headerIndex + 1] || '') : '';
+    const hasUserAgentHeader = /(?:^|\r?\n)\s*user-agent\s*:/i.test(existingHeadersText)
+      || Object.keys(automaticHeaders).some((key) => key.toLowerCase() === 'user-agent' && automaticHeaders[key]);
+    if (!explicitUserAgent && !hasUserAgentHeader) {
+      const userAgent = Object.entries(headers).find(([key]) => key.toLowerCase() === 'user-agent')?.[1]
+        || getConfig().scraper.userAgent;
+      prefix.push('-user_agent', String(userAgent));
+    }
+  }
+  args.splice(inputIndex, 0, ...prefix);
+
+  if (mode === 'live') {
+    const outputIndex = args.length - 1;
+    const progress = [];
+    if (!args.includes('-progress')) progress.push('-progress', 'pipe:2');
+    if (!args.includes('-nostats')) progress.push('-nostats');
+    args.splice(outputIndex, 0, ...progress);
+  }
+  return args;
+}
+
 export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000 } = {}) {
   const h = headerObject(headers);
   return [
@@ -912,6 +1126,9 @@ export function normaliseProfile(input = {}, probeInfo = null) {
     deinterlace: Boolean(input.deinterlace),
     hardware: input.hardware ?? true,
     scaleMethod: input.scaleMethod || 'auto',
+    ffmpegTemplate: typeof input.ffmpegTemplate === 'string' ? input.ffmpegTemplate : '',
+    ffmpegTemplateId: typeof input.ffmpegTemplateId === 'string' ? input.ffmpegTemplateId : '',
+    ffmpegTemplateName: typeof input.ffmpegTemplateName === 'string' ? input.ffmpegTemplateName : '',
   };
 
   // Decide whether an encode is needed at all.
@@ -956,6 +1173,12 @@ export function normaliseProfile(input = {}, probeInfo = null) {
 export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', output = { target: 'pipe:1' } }) {
   const p = profile || {};
   const container = output.container || p.container || 'mpegts';
+  if (mode === 'live' && String(p.ffmpegTemplate || '').trim()) {
+    return buildFfmpegTemplateArgs({
+      template: p.ffmpegTemplate, source, profile: p, mode,
+      output: { ...output, container },
+    });
+  }
   const args = ['-hide_banner', '-nostdin', '-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning'];
   const isHttp = /^https?:/i.test(source.url || '');
   const kind = source.kind || streamKind(source.url);
@@ -1164,9 +1387,22 @@ export function escapeFilterPath(p) {
   return String(p).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/,/g, '\\,');
 }
 
-/** Human readable command string (used by the UI "generated command" box). */
+/**
+ * Render a copy-pasteable POSIX-shell command for the UI/logs.
+ *
+ * URLs commonly contain `&` query separators. Leaving those bare makes Bash
+ * background the command at the first `&`, truncating signed URLs (which then
+ * fail with HTTP 403) and treating later ffmpeg flags as separate commands.
+ * Use a conservative unquoted character allowlist and single-quote everything
+ * else so shell operators, globs, whitespace, newlines and `$` stay literal.
+ */
 export function argsToCommand(args) {
-  return ['ffmpeg', ...args.map((a) => (/[\s"'\\$]/.test(a) ? `"${String(a).replace(/"/g, '\\"')}"` : a))].join(' ');
+  const shellArg = (value) => {
+    const text = String(value);
+    if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) return text;
+    return `'${text.replace(/'/g, "'\\''")}'`;
+  };
+  return ['ffmpeg', ...args.map(shellArg)].join(' ');
 }
 
 /** Parse `-progress` key=value lines into a stats object. */

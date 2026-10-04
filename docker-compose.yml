@@ -67,7 +67,7 @@ services:
       ENIGMA2_PASSWORD: "${ENIGMA2_PASSWORD:-}"
       ENIGMA2_BOUQUET: "${ENIGMA2_BOUQUET:-vu-movie}"
       ENIGMA2_SERVICE_TYPE: "${ENIGMA2_SERVICE_TYPE:-4097}"
-      ENIGMA2_FTP: "${ENIGMA2_FTP:-false}"
+      ENIGMA2_FTP: "${ENIGMA2_FTP:-true}"
       # --- subtitles ---
       SUBTITLE_LANGUAGES: "${SUBTITLE_LANGUAGES:-nl,en}"
       SUBTITLE_PUSH: "${SUBTITLE_PUSH:-false}"

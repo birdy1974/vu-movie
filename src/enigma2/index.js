@@ -11,9 +11,10 @@
  *   bouquets.tv  (one line per bouquet, added only once)
  *     #SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.vumovie.tv" ORDER BY bouquet
  *
- * Delivery is OpenWebif over HTTP (your decision D5): upload → servicelistreload
- * → verify with getservices. A curl/FTP fallback exists for boxes where WebIF's
- * upload is disabled or password protected in a way we cannot satisfy.
+ * File writes use the receiver's FTP server (OpenWebif has no portable upload
+ * endpoint); OpenWebif handles servicelistreload and getservices verification.
+ * Every file is staged under a temporary name and renamed in-place, and the
+ * previous bouquets.tv is kept as one restore point.
  *
  * Service type 4097 (GStreamer/exteplayer3) is the safe default for IPTV on a
  * Duo2. The service reference numbers must be unique per entry or Enigma2 will
@@ -23,6 +24,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { log, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
@@ -228,7 +230,36 @@ export async function testConnection(overrides = {}, { timeoutMs = 6000 } = {}) 
   // The UI deliberately leaves a stored password blank; blank means reuse the
   // saved credential for a test. Saving settings can still clear it explicitly.
   if (!overrides.password) cfg.password = saved.password;
-  return requestStatus(cfg, timeoutMs);
+
+  const webif = await requestStatus(cfg, timeoutMs);
+  let upload = {
+    configured: false,
+    ok: false,
+    message: 'FTP file upload is disabled and no mounted receiver share was found',
+  };
+  if (cfg.ftpEnabled) {
+    try {
+      const names = createFtpFileTransport(cfg).list();
+      upload = {
+        configured: true,
+        ok: true,
+        files: names.size,
+        hasBouquetsTv: names.has('bouquets.tv'),
+        message: `FTP ok (${names.size} files in ${cfg.rootDir || '/etc/enigma2'})`,
+      };
+    } catch (err) {
+      upload = { configured: true, ok: false, message: String(err?.message || err) };
+    }
+  } else if (cfg.rootDir && fs.existsSync(cfg.rootDir)) {
+    upload = { configured: false, ok: true, via: 'mount', message: `FTP disabled; mounted directory found at ${cfg.rootDir}` };
+  }
+
+  return {
+    ...webif,
+    ok: webif.ok && upload.ok !== false,
+    upload,
+    message: `${webif.message}; ${upload.message}`,
+  };
 }
 
 export async function status({ timeoutMs = 6000, maxAgeMs = STATUS_TTL_MS, force = false } = {}) {
@@ -253,72 +284,210 @@ async function webifGet(urlPath) {
   return text;
 }
 
-/**
- * Upload one file to the box.
- * Order of attempts: WebIF upload endpoint → curl/FTP → local mounted share.
- */
-async function uploadFile(fileName, content) {
-  const cfg = getConfig().enigma2;
-  const attempts = [];
+/* ------------------------------------------------------------------ *
+ * Receiver file transport
+ *
+ * OpenWebif can reload/query services, but it does not provide a portable
+ * upload API for files under /etc/enigma2. In particular, /web/upload is not a
+ * standard route, and POSTing multipart data to /file?action=upload produces
+ * "Request did not return bytes" on OpenPLi. Use the receiver's FTP server for
+ * file I/O; OpenWebif is retained for reload and verification only.
+ *
+ * Each FTP write is staged in the same directory and renamed into place. This
+ * prevents Enigma2 from seeing a half-written bouquets.tv while it is reading
+ * the service list. A one-file backup of bouquets.tv is kept before updates.
+ * ------------------------------------------------------------------ */
 
-  // 1) OpenWebif file-manager upload (newer images expose /web/upload)
-  for (const endpoint of [cfg.uploadEndpoint, '/web/upload', '/file?action=upload'].filter(Boolean)) {
-    try {
-      const form = new FormData();
-      form.append('file', new Blob([content]), fileName);
-      form.append('path', cfg.rootDir);
-      form.append('filename', fileName);
-      const res = await fetch(`${webifBase()}${endpoint}`, { method: 'POST', headers: authHeader(), body: form });
-      const text = await res.text().catch(() => '');
-      if (res.ok && !/error|not found/i.test(text.slice(0, 200))) {
-        log.info('enigma2', `uploaded ${fileName} via WebIF ${endpoint}`, { bytes: content.length });
-        return { ok: true, via: `webif:${endpoint}` };
-      }
-      attempts.push(`${endpoint} → HTTP ${res.status} ${truncate(text, 80)}`);
-    } catch (err) {
-      attempts.push(`${endpoint} → ${String(err?.message || err)}`);
-    }
-  }
+const FTP_TIMEOUT_MS = 25_000;
+const FTP_CONNECT_TIMEOUT_SECONDS = 8;
+const FTP_MAX_BUFFER = 1024 * 1024;
+const FTP_TEMP_PREFIX = '.spm-upload-';
+const BOUQUETS_BACKUP = 'bouquets.tv.spm-backup';
 
-  // 2) FTP via curl (works on boxes where the WebIF upload is disabled)
-  if (cfg.ftpEnabled) {
-    const tmp = path.join(os.tmpdir(), fileName);
-    fs.writeFileSync(tmp, content);
-    const target = `ftp://${cfg.host}:${cfg.ftpPort}/${cfg.rootDir.replace(/^\//, '')}/${fileName}`;
-    const res = spawnSync('curl', [
-      '-sS', '--fail', '--ftp-create-dirs', '-u', `${cfg.username}:${cfg.password || ''}`,
-      '-T', tmp, target,
-    ], { encoding: 'utf8', timeout: 30000 });
-    fs.rmSync(tmp, { force: true });
-    if (!res.error && res.status === 0) {
-      log.info('enigma2', `uploaded ${fileName} via FTP`, { target });
-      return { ok: true, via: 'ftp' };
-    }
-    attempts.push(`ftp → ${res.error ? res.error.message : truncate(String(res.stderr || `exit ${res.status}`), 120)}`);
-  }
-
-  // 3) A mounted share (some people map /etc/enigma2 over NFS/SMB).
-  //    `mountDir` was never a config key, so this path could never run; the
-  //    directory to mount is the one bouquets live in on the box.
-  if (cfg.rootDir && fs.existsSync(cfg.rootDir)) {
-    try {
-      fs.writeFileSync(path.join(cfg.rootDir, fileName), content);
-      log.info('enigma2', `wrote ${fileName} into mounted share`, { dir: cfg.rootDir });
-      return { ok: true, via: 'mount' };
-    } catch (err) {
-      attempts.push(`mount → ${String(err?.message || err)}`);
-    }
-  }
-
-  log.error('enigma2', `could not upload ${fileName} by any transport`, { attempts });
-  return { ok: false, attempts, error: attempts.join(' | ') };
+function ftpHostPart(rawHost) {
+  let host = String(rawHost || '').trim().replace(/^(?:https?|ftp):\/\//i, '').split('/')[0];
+  if (host.startsWith('[')) host = host.slice(0, host.indexOf(']') >= 0 ? host.indexOf(']') + 1 : undefined);
+  else if ((host.match(/:/g) || []).length > 1) host = `[${host}]`;
+  else host = host.replace(/:\d+$/, '');
+  if (!host) throw new Error('no Enigma2 FTP host configured');
+  return host;
 }
+
+function remoteDirectorySegments(rootDir) {
+  const segments = String(rootDir || '/etc/enigma2').replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segments.some((segment) => segment === '.' || segment === '..')) {
+    throw new Error(`unsafe Enigma2 root directory: ${rootDir}`);
+  }
+  return segments;
+}
+
+function safeRemoteFileName(name) {
+  const fileName = String(name || '');
+  if (!/^[A-Za-z0-9._-]+$/.test(fileName) || fileName === '.' || fileName === '..') {
+    throw new Error(`unsafe Enigma2 file name: ${fileName}`);
+  }
+  return fileName;
+}
+
+function ftpUrl(cfg, fileName = null) {
+  const port = Number(cfg.ftpPort || 21);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid Enigma2 FTP port: ${cfg.ftpPort}`);
+  const parts = remoteDirectorySegments(cfg.rootDir);
+  if (fileName !== null) parts.push(safeRemoteFileName(fileName));
+  const host = ftpHostPart(cfg.host);
+  const suffix = parts.map((part) => encodeURIComponent(part)).join('/');
+  return `ftp://${host}:${port}/${suffix}${fileName === null ? '/' : ''}`;
+}
+
+function ftpCommandPath(cfg, fileName) {
+  return `/${[...remoteDirectorySegments(cfg.rootDir), safeRemoteFileName(fileName)].join('/')}`;
+}
+
+function outputText(value) {
+  if (Buffer.isBuffer(value)) return value.toString('utf8');
+  return String(value ?? '');
+}
+
+/**
+ * A small FTP adapter implemented with the system curl already shipped in the
+ * runtime image. `runCommand` is injectable so tests can assert the FTP command
+ * sequence without needing a receiver or a real FTP daemon.
+ */
+export function createFtpFileTransport(cfg = getConfig().enigma2, { runCommand = null } = {}) {
+  const username = cfg.username || 'root';
+  const password = cfg.password || '';
+  const baseArgs = [
+    '--silent', '--show-error', '--fail', '--ftp-pasv',
+    '--connect-timeout', String(FTP_CONNECT_TIMEOUT_SECONDS),
+    '--max-time', String(Math.ceil(FTP_TIMEOUT_MS / 1000)),
+    '--user', `${username}:${password}`,
+  ];
+  const run = runCommand || ((args, options) => spawnSync('curl', args, options));
+
+  function invoke(label, args) {
+    let result;
+    try {
+      result = run(args, { timeout: FTP_TIMEOUT_MS + 5000, maxBuffer: FTP_MAX_BUFFER });
+    } catch (err) {
+      throw new Error(`FTP ${label} failed: ${String(err?.message || err)}`);
+    }
+    if (result?.error || result?.status !== 0) {
+      let detail = outputText(result?.stderr).trim() || result?.error?.message || `curl exited ${result?.status ?? 'without a status'}`;
+      if (password) detail = detail.split(password).join('[redacted]');
+      throw new Error(`FTP ${label} failed: ${truncate(detail, 220)}`);
+    }
+    return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(outputText(result.stdout), 'utf8');
+  }
+
+  function quote(commands, label) {
+    const args = [...baseArgs];
+    for (const command of commands) args.push('--quote', command);
+    // Use absolute command paths below instead of relying on curl's ordering
+    // of --quote commands versus the URL's own CWD/transfer commands.
+    args.push(ftpUrl(cfg));
+    return invoke(label, args);
+  }
+
+  function list() {
+    const bytes = invoke(`listing ${cfg.rootDir || '/etc/enigma2'}`, [...baseArgs, '--list-only', ftpUrl(cfg)]);
+    const names = outputText(bytes).split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
+    return new Set(names.map((name) => name.replace(/\/+$/, '').split('/').at(-1)));
+  }
+
+  function read(name, knownNames = null) {
+    const fileName = safeRemoteFileName(name);
+    const existing = knownNames ? new Set(knownNames) : list();
+    if (!existing.has(fileName)) return null;
+    return outputText(invoke(`reading ${fileName}`, [...baseArgs, ftpUrl(cfg, fileName)]));
+  }
+
+  function writeAtomic(name, content) {
+    const fileName = safeRemoteFileName(name);
+    const temporary = `${FTP_TEMP_PREFIX}${fileName}-${randomUUID()}`;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-ftp-'));
+    const localFile = path.join(tempDir, 'payload');
+    try {
+      fs.writeFileSync(localFile, Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8'), { mode: 0o600 });
+      invoke(`uploading ${fileName}`, [...baseArgs, '--upload-file', localFile, ftpUrl(cfg, temporary)]);
+      const temporaryPath = ftpCommandPath(cfg, temporary);
+      const targetPath = ftpCommandPath(cfg, fileName);
+      try {
+        quote([`RNFR ${temporaryPath}`, `RNTO ${targetPath}`], `renaming ${fileName}`);
+      } catch (renameError) {
+        // Some FTP servers refuse RNTO over an existing file. Match the
+        // receiver-safe fallback used by stalker-proxy-manager: remove the old
+        // target only after the complete new file is staged, then rename.
+        try {
+          quote([`DELE ${targetPath}`], `replacing ${fileName}`);
+          quote([`RNFR ${temporaryPath}`, `RNTO ${targetPath}`], `renaming ${fileName}`);
+        } catch (replaceError) {
+          try { quote([`DELE ${temporaryPath}`], `cleaning temporary ${fileName}`); } catch { /* best effort */ }
+          throw new Error(`${renameError.message}; FTP replacement failed: ${replaceError.message}`);
+        }
+      }
+    } catch (err) {
+      // A failed STOR or rename should not leave a partial/temporary bouquet on
+      // the receiver. The final file remains untouched unless the server only
+      // supports delete-then-rename (the fallback above).
+      try { quote([`DELE ${ftpCommandPath(cfg, temporary)}`], `cleaning temporary ${fileName}`); } catch { /* best effort */ }
+      throw err;
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  return { via: 'ftp', list, read, writeAtomic };
+}
+
+function createMountedFileTransport(rootDir) {
+  const directory = path.resolve(rootDir);
+  return {
+    via: 'mount',
+    list() { return new Set(fs.readdirSync(directory)); },
+    read(name, knownNames = null) {
+      const fileName = safeRemoteFileName(name);
+      const existing = knownNames ? new Set(knownNames) : this.list();
+      return existing.has(fileName) ? fs.readFileSync(path.join(directory, fileName), 'utf8') : null;
+    },
+    writeAtomic(name, content) {
+      const fileName = safeRemoteFileName(name);
+      const temporary = path.join(directory, `.${fileName}.${randomUUID()}.tmp`);
+      try {
+        fs.writeFileSync(temporary, content, { mode: 0o644 });
+        fs.renameSync(temporary, path.join(directory, fileName));
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
+    },
+  };
+}
+
+/** Select FTP (the normal Enigma2 file transport) or an explicitly mounted share. */
+function openReceiverFileTransport(cfg, injected = null) {
+  if (injected) return { transport: injected, names: injected.list() };
+  let ftpError = null;
+  if (cfg.ftpEnabled) {
+    const ftp = createFtpFileTransport(cfg);
+    try { return { transport: ftp, names: ftp.list() }; }
+    catch (err) { ftpError = err; }
+  }
+  if (cfg.rootDir && fs.existsSync(cfg.rootDir)) {
+    const mount = createMountedFileTransport(cfg.rootDir);
+    try { return { transport: mount, names: mount.list() }; }
+    catch (err) {
+      if (!ftpError) ftpError = err;
+    }
+  }
+  if (ftpError) throw ftpError;
+  throw new Error('FTP uploads are disabled and no mounted /etc/enigma2 share is available. Enable FTP in Settings → Enigma2; OpenWebif can reload bouquets but cannot upload these files.');
+}
+
 
 /**
  * Push a bouquet for the given entries.
  * @param {object[]} entries [{ title, url, year, description, subtitle, season, series }]
  */
-export async function pushBouquet(entries, { name = null, dryRun = false } = {}) {
+export async function pushBouquet(entries, { name = null, dryRun = false } = {}, { fileTransport = null } = {}) {
   const cfg = getConfig().enigma2;
   const bouquetName = name || cfg.bouquetName;
   const bouquet = buildBouquet({ name: bouquetName, serviceType: cfg.serviceType, entries });
@@ -331,45 +500,64 @@ export async function pushBouquet(entries, { name = null, dryRun = false } = {})
     return { ok: true, dryRun: true, bouquet, bouquetsLine: bouquet.bouquetsLine };
   }
 
-  // A push must not trust a cached "reachable": a box that went to standby
-  // since the last check would fail halfway through the upload. This also
-  // refreshes the state the dashboard shows.
-  const reachable = await status({ force: true });
-  if (!reachable.ok) {
-    return { ok: false, error: `receiver not reachable: ${reachable.message}`, bouquet };
-  }
-
-  const upload = await uploadFile(bouquet.fileName, bouquet.text);
-  if (!upload.ok) return { ok: false, error: `upload failed: ${upload.error}`, bouquet, transport: upload };
-
-  // bouquets.tv: read → patch → upload (idempotent)
-  let bouquetsTv = '';
+  // OpenWebif is not a file-upload service. FTP (or an explicitly mounted
+  // share) must be reachable before we touch anything on the receiver. In
+  // particular, never treat an unreadable bouquets.tv as empty: that could
+  // silently replace a user's satellite/favourites bouquet index.
+  let transport = null;
+  let transportName = null;
+  let bouquetUploaded = false;
   try {
-    const res = await fetch(`${webifBase()}/file?action=get&path=${encodeURIComponent(`${cfg.rootDir}/bouquets.tv`)}`, { headers: authHeader() });
-    if (res.ok) bouquetsTv = await res.text();
-  } catch (err) {
-    log.warn('enigma2', 'could not read bouquets.tv (will upload without patching)', { error: String(err?.message || err) });
-  }
-  const patched = patchBouquetsTv(bouquetsTv, bouquet.fileName);
-  if (patched.changed) {
-    const up2 = await uploadFile('bouquets.tv', patched.text);
-    if (!up2.ok) {
-      return { ok: false, error: `bouquet uploaded but bouquets.tv could not be patched: ${up2.error}`, bouquet };
+    const opened = openReceiverFileTransport(cfg, fileTransport);
+    transport = opened.transport;
+    transportName = transport.via || 'receiver-file-transport';
+    const reachable = await status({ force: true });
+    if (!reachable.ok) {
+      // OpenWebif is only needed for reload/verification. Do not discard a
+      // successful FTP path just because an image has WebIF disabled/misrouted.
+      log.warn('enigma2', 'OpenWebif is unreachable; FTP upload will continue, but automatic reload may fail', { error: reachable.message });
     }
-    log.info('enigma2', 'bouquets.tv patched with our entry');
-  } else {
-    log.info('enigma2', 'bouquets.tv already references our bouquet — left unchanged');
+    const bouquetsTv = transport.read('bouquets.tv', opened.names);
+
+    if (bouquetsTv !== null) {
+      transport.writeAtomic(BOUQUETS_BACKUP, bouquetsTv);
+      log.info('enigma2', 'saved bouquets.tv restore point', { via: transportName, backup: BOUQUETS_BACKUP });
+    } else {
+      log.warn('enigma2', 'receiver has no bouquets.tv; creating it without a backup');
+    }
+
+    // The index never points to a bouquet file that has not been fully staged.
+    transport.writeAtomic(bouquet.fileName, bouquet.text);
+    bouquetUploaded = true;
+    log.info('enigma2', `uploaded ${bouquet.fileName}`, { via: transportName, bytes: Buffer.byteLength(bouquet.text) });
+
+    const patched = patchBouquetsTv(bouquetsTv || '', bouquet.fileName);
+    if (patched.changed) {
+      transport.writeAtomic('bouquets.tv', patched.text);
+      log.info('enigma2', 'bouquets.tv patched with our entry; existing bouquets preserved', { via: transportName });
+    } else {
+      log.info('enigma2', 'bouquets.tv already references our bouquet — left unchanged');
+    }
+  } catch (err) {
+    const detail = String(err?.message || err);
+    const message = bouquetUploaded
+      ? `bouquet uploaded but bouquets.tv could not be updated: ${detail}`
+      : `upload failed: ${detail}`;
+    log.error('enigma2', message, { via: transportName });
+    return { ok: false, error: message, bouquet, ...(transportName ? { transport: transportName } : {}), partial: bouquetUploaded };
   }
 
-  // Reload + verify
+  // OpenWebif is control-plane only. Mode 2 reloads bouquets without needlessly
+  // re-reading lamedb; endpoint aliases vary between images, so try both.
   let reloadOk = false;
-  for (const mode of ['2', '0']) {
+  for (const endpoint of ['/api/servicelistreload?mode=2', '/web/servicelistreload?mode=2']) {
     try {
-      await webifGet(`/web/servicelistreload?mode=${mode}`);
+      await webifGet(endpoint);
       reloadOk = true;
-      log.info('enigma2', `servicelistreload mode=${mode} ok`);
+      log.info('enigma2', `service list reloaded via ${endpoint}`);
+      break;
     } catch (err) {
-      log.warn('enigma2', `servicelistreload mode=${mode} failed`, { error: String(err?.message || err) });
+      log.warn('enigma2', `servicelistreload failed via ${endpoint}`, { error: String(err?.message || err) });
     }
   }
 
@@ -387,13 +575,13 @@ export async function pushBouquet(entries, { name = null, dryRun = false } = {})
     log.warn('enigma2', 'could not verify the bouquet with getservices', { error: String(err?.message || err) });
   }
 
-  await repo.saveBouquet({ name: bouquetName, entries: bouquet.entries, pushed_at: new Date().toISOString(), payload: { via: upload.via, verified } });
+  await repo.saveBouquet({ name: bouquetName, entries: bouquet.entries, pushed_at: new Date().toISOString(), payload: { via: transportName, verified } });
 
   return {
     ok: true,
     entries: bouquet.entries,
     verified,
-    transport: upload.via,
+    transport: transportName,
     reloadOk,
     bouquet,
   };
