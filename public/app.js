@@ -54,6 +54,9 @@ const state = {
   logs: [],
   jobs: [],
   sessions: [],
+  ffmpegTemplates: [],
+  ffmpegTemplatesLoaded: false,
+  defaultFfmpegTemplateId: '',
   pendingRestoreSelection: false,
   pendingRestoreUrlResolve: false,
   lastResolveMode: '',
@@ -1365,6 +1368,7 @@ async function createStream(candidate) {
     });
     streamRequestId += 1;
     state.stream = res.stream;
+    await loadFfmpegTemplates();
     try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
     toast(`Stream created: ${res.stream.title}`, 'ok');
     if (state.selectedSubtitle) {
@@ -1381,12 +1385,164 @@ async function createStream(candidate) {
 
 /* ================= STREAM ================= */
 
+const TEMPLATE_CUSTOM_VALUE = '__custom__';
+
+function newFfmpegTemplateId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `template-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function starterFfmpegTemplate(container = 'mpegts') {
+  const muxer = ['mpegts', 'matroska', 'hls'].includes(container) ? container : 'mpegts';
+  const base = `ffmpeg -hide_banner -nostdin -loglevel warning -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy`;
+  if (muxer === 'hls') return `${base} -f hls -hls_time 2 -hls_list_size 10 -hls_flags delete_segments+omit_endlist <output>`;
+  return `${base} -f ${muxer}${muxer === 'matroska' ? ' -live 1' : ''} pipe:1`;
+}
+
+async function loadFfmpegTemplates(force = false) {
+  if (state.ffmpegTemplatesLoaded && !force) return true;
+  try {
+    const result = await api('/api/ffmpeg/templates', { silent: true });
+    state.ffmpegTemplates = Array.isArray(result.templates) ? result.templates : [];
+    state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+    state.ffmpegTemplatesLoaded = true;
+    if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateFfmpegTemplateButtons() {
+  const select = $('#pf-template-select');
+  const value = select.value;
+  const saved = state.ffmpegTemplates.find((item) => item.id === value);
+  const active = value !== '';
+  $('#pf-template-editor').classList.toggle('hide', !active);
+  $('#btn-template-save-new').disabled = !active || !$('#pf-template-command').value.trim();
+  $('#btn-template-save').disabled = !saved;
+  $('#btn-template-delete').disabled = !saved;
+  $('#btn-template-default').disabled = !saved || state.defaultFfmpegTemplateId === saved.id;
+  $('#btn-template-default').textContent = saved && state.defaultFfmpegTemplateId === saved.id
+    ? 'default for new streams' : 'set as default for new streams';
+}
+
+function renderFfmpegTemplateControls(profile = {}) {
+  const select = $('#pf-template-select');
+  const options = [
+    new Option('Guided profile builder', ''),
+    new Option('Custom command…', TEMPLATE_CUSTOM_VALUE),
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+  ];
+  select.replaceChildren(...options);
+  const saved = state.ffmpegTemplates.find((item) => item.id === profile.ffmpegTemplateId);
+  select.value = saved ? saved.id : profile.ffmpegTemplate ? TEMPLATE_CUSTOM_VALUE : '';
+  $('#pf-template-command').value = profile.ffmpegTemplate || (saved?.command || '');
+  $('#pf-template-name').value = profile.ffmpegTemplateName || saved?.name || (profile.ffmpegTemplate ? 'Custom template' : '');
+  updateFfmpegTemplateButtons();
+}
+
+function selectFfmpegTemplate() {
+  const value = $('#pf-template-select').value;
+  const saved = state.ffmpegTemplates.find((item) => item.id === value);
+  if (saved) {
+    $('#pf-template-command').value = saved.command;
+    $('#pf-template-name').value = saved.name;
+    $('#pf-container').value = saved.container;
+  } else if (value === TEMPLATE_CUSTOM_VALUE) {
+    if (!$('#pf-template-command').value.trim()) {
+      $('#pf-template-command').value = starterFfmpegTemplate($('#pf-container').value);
+    }
+    if (!$('#pf-template-name').value.trim()) $('#pf-template-name').value = 'Custom template';
+  } else {
+    $('#pf-template-command').value = '';
+    $('#pf-template-name').value = '';
+  }
+  updateFfmpegTemplateButtons();
+  updateCommandPreview();
+}
+
+function currentTemplateProfileFields() {
+  const value = $('#pf-template-select').value;
+  const active = value !== '';
+  return {
+    ffmpegTemplate: active ? $('#pf-template-command').value.trim() : '',
+    ffmpegTemplateId: active && value !== TEMPLATE_CUSTOM_VALUE ? value : '',
+    ffmpegTemplateName: active ? $('#pf-template-name').value.trim() : '',
+  };
+}
+
+async function saveFfmpegTemplate({ update = false, makeDefault = false } = {}) {
+  const selectedId = $('#pf-template-select').value;
+  const existing = state.ffmpegTemplates.find((item) => item.id === selectedId);
+  if (update && !existing) return toast('Select a saved template before updating it', 'warn');
+  const name = $('#pf-template-name').value.trim();
+  const command = $('#pf-template-command').value.trim();
+  const container = $('#pf-container').value;
+  if (!name) return toast('Give the FFmpeg template a name first', 'warn');
+  if (!command) return toast('The FFmpeg template command is empty', 'warn');
+  const item = { id: existing?.id || newFfmpegTemplateId(), name, command, container };
+  const templates = existing
+    ? state.ffmpegTemplates.map((template) => template.id === existing.id ? item : template)
+    : [...state.ffmpegTemplates, item];
+  const defaultFfmpegTemplateId = makeDefault ? item.id : state.defaultFfmpegTemplateId;
+  const result = await api('/api/ffmpeg/templates', {
+    method: 'PUT', body: { templates, defaultFfmpegTemplateId },
+  });
+  state.ffmpegTemplates = result.templates;
+  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  state.ffmpegTemplatesLoaded = true;
+  renderFfmpegTemplateControls({
+    ffmpegTemplate: command, ffmpegTemplateId: item.id, ffmpegTemplateName: item.name,
+  });
+  $('#pf-container').value = container;
+  toast(makeDefault ? 'Template saved and set as the default for new streams' : 'FFmpeg template saved', 'ok');
+  updateCommandPreview();
+}
+
+async function deleteFfmpegTemplate() {
+  const id = $('#pf-template-select').value;
+  const existing = state.ffmpegTemplates.find((item) => item.id === id);
+  if (!existing) return;
+  if (!window.confirm(`Delete FFmpeg template “${existing.name}”?`)) return;
+  const templates = state.ffmpegTemplates.filter((item) => item.id !== id);
+  const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === id ? '' : state.defaultFfmpegTemplateId;
+  const result = await api('/api/ffmpeg/templates', {
+    method: 'PUT', body: { templates, defaultFfmpegTemplateId },
+  });
+  state.ffmpegTemplates = result.templates;
+  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
+  $('#pf-template-select').value = TEMPLATE_CUSTOM_VALUE;
+  $('#pf-template-name').value = 'Custom template';
+  updateFfmpegTemplateButtons();
+  toast('FFmpeg template deleted', 'ok');
+  updateCommandPreview();
+}
+
+function readProfileForm() {
+  return {
+    mode: $('#pf-mode').value,
+    resolution: Number($('#pf-res').value),
+    aspect: $('#pf-aspect').value,
+    container: $('#pf-container').value,
+    videoBitrate: Number($('#pf-vbr').value),
+    audioBitrate: Number($('#pf-abr').value),
+    audioChannels: Number($('#pf-ac').value),
+    fps: $('#pf-fps').value,
+    subtitles: $('#pf-subs').value,
+    alwaysTranscode: $('#pf-always').checked,
+    deinterlace: $('#pf-deint').checked,
+    ...currentTemplateProfileFields(),
+  };
+}
+
 async function openStream(id, { navigate = true, silent = false } = {}) {
   const requestId = ++streamRequestId;
   try {
     const res = await api(`/api/streams/${encodeURIComponent(String(id))}`, { silent });
     if (requestId !== streamRequestId) return;
     state.stream = res.stream;
+    await loadFfmpegTemplates();
     try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
     renderStream(res);
     if (navigate) go('stream');
@@ -1414,8 +1570,8 @@ function renderStream(res) {
   $('#st-title').textContent = `${s.title}${s.year ? ` (${s.year})` : ''}`;
   $('#st-meta').innerHTML = `${tag(s.upstream?.quality || 'unknown', 'ok')} ${tag(s.upstream?.kind || 'file')} ${tag(s.source_id || s.sourceId || '—')}
     ${s.expires_at ? `<span class="mut">token until ${new Date(s.expires_at).toLocaleString()}</span>` : '<span class="mut">token never expires</span>'}`;
-  $('#st-tags').innerHTML = `${tag(s.profile?.transcode ? 'transcode' : 'stream copy', s.profile?.transcode ? 'alt' : 'ok')}
-    ${tag(s.profile?.encoder || 'copy')} ${tag(s.profile?.container || 'mpegts', 'info')}
+  $('#st-tags').innerHTML = `${tag(s.profile?.ffmpegTemplate ? 'custom FFmpeg template' : s.profile?.transcode ? 'transcode' : 'stream copy', s.profile?.ffmpegTemplate || s.profile?.transcode ? 'alt' : 'ok')}
+    ${tag(s.profile?.ffmpegTemplateName || s.profile?.encoder || 'copy')} ${tag(s.profile?.container || 'mpegts', 'info')}
     ${(s.profile?.reasons || []).slice(0, 2).map((r) => tag(r)).join('')}`;
 
   const rows = [
@@ -1447,6 +1603,7 @@ function renderStream(res) {
   });
 
   const p = s.profile || {};
+  renderFfmpegTemplateControls(p);
   if (p.resolution) $('#pf-res').value = String(p.resolution);
   if (p.aspect) $('#pf-aspect').value = p.aspect === 'source' ? 'source' : p.aspect;
   if (p.container) { try { $('#pf-container').value = p.container; } catch { /* hls etc. */ } }
@@ -1459,9 +1616,11 @@ function renderStream(res) {
   $('#pf-always').checked = Boolean(p.alwaysTranscode);
   $('#pf-mode').value = p.mode || 'auto';
   $('#pf-subs').value = p.subtitles || 'soft';
-  $('#pf-note').innerHTML = (p.reasons || []).length
-    ? `Decision: <b>${p.transcode ? 'encode' : 'stream copy'}</b> — ${escapeHtml((p.reasons || []).join('; '))}`
-    : 'Profile will be decided when the stream starts.';
+  $('#pf-note').innerHTML = p.ffmpegTemplate
+    ? `Using <b>${escapeHtml(p.ffmpegTemplateName || 'custom FFmpeg template')}</b>; its command controls the outgoing stream. Guided profile fields are ignored while a template is selected.`
+    : (p.reasons || []).length
+      ? `Decision: <b>${p.transcode ? 'encode' : 'stream copy'}</b> — ${escapeHtml((p.reasons || []).join('; '))}`
+      : 'Profile will be decided when the stream starts.';
 
   renderProbe(s.upstream?.probe);
   if (state.health?.hwaccel) {
@@ -1508,56 +1667,42 @@ function renderMonitor(session) {
 }
 
 let commandTimer = null;
+let commandPreviewRevision = 0;
 function updateCommandPreview() {
   clearTimeout(commandTimer);
+  const revision = ++commandPreviewRevision;
   commandTimer = setTimeout(async () => {
     if (!state.stream) return;
-    const params = new URLSearchParams({
-      mode: $('#pf-mode').value,
-      resolution: $('#pf-res').value,
-      aspect: $('#pf-aspect').value,
-      container: $('#pf-container').value,
-      videoBitrate: $('#pf-vbr').value,
-      audioBitrate: $('#pf-abr').value,
-      // was missing: the preview always showed `-ac 2` even with "6 (surround)"
-      // selected, while applyProfile() saved 6 — the command and the saved
-      // profile disagreed until you pressed Apply.
-      audioChannels: $('#pf-ac').value,
-      fps: $('#pf-fps').value,
-      subtitles: $('#pf-subs').value,
-      alwaysTranscode: String($('#pf-always').checked),
-    });
     try {
-      const res = await api(`/api/streams/${state.stream.id}/command?${params}`);
+      const res = await api(`/api/streams/${state.stream.id}/command`, {
+        method: 'POST', body: { profile: readProfileForm() }, silent: true,
+      });
+      if (revision !== commandPreviewRevision) return;
       $('#cmd-preview').textContent = res.command;
-      $('#pf-note').innerHTML = `${res.profile.transcode ? '<b>encode</b>' : '<b>stream copy</b>'} — ${escapeHtml((res.profile.reasons || []).join('; '))}
-        ${res.profile.transcode && res.profile.encoder === 'vaapi' && !res.hw.available ? '<br><span class="tag warn">vaapi unavailable here — this command will use software encoding</span>' : ''}`;
-    } catch { /* preview is best-effort */ }
+      if (res.profile.ffmpegTemplate) {
+        $('#pf-note').innerHTML = `Using <b>${escapeHtml(res.profile.ffmpegTemplateName || 'custom FFmpeg template')}</b>; the template controls this outgoing command. The guided fields above are ignored.`;
+      } else {
+        $('#pf-note').innerHTML = `${res.profile.transcode ? '<b>encode</b>' : '<b>stream copy</b>'} — ${escapeHtml((res.profile.reasons || []).join('; '))}
+          ${res.profile.transcode && res.profile.encoder === 'vaapi' && !res.hw.available ? '<br><span class="tag warn">vaapi unavailable here — this command will use software encoding</span>' : ''}`;
+      }
+    } catch (error) {
+      if (revision !== commandPreviewRevision) return;
+      if ($('#pf-template-select').value) {
+        $('#cmd-preview').textContent = `Template error: ${error.message}`;
+        $('#pf-note').innerHTML = `<b>Template not valid for this outgoing stream:</b> ${escapeHtml(error.message)}`;
+      }
+    }
   }, 250);
 }
 
 async function applyProfile() {
   if (!state.stream) return;
-  const body = {
-    profile: {
-      mode: $('#pf-mode').value,
-      resolution: Number($('#pf-res').value),
-      aspect: $('#pf-aspect').value,
-      container: $('#pf-container').value,
-      videoBitrate: Number($('#pf-vbr').value),
-      audioBitrate: Number($('#pf-abr').value),
-      audioChannels: Number($('#pf-ac').value),
-      fps: $('#pf-fps').value,
-      subtitles: $('#pf-subs').value,
-      alwaysTranscode: $('#pf-always').checked,
-      deinterlace: $('#pf-deint').checked,
-    },
-  };
-  const res = await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body });
-  toast(`Profile saved (${res.profile.transcode ? 'transcode' : 'copy'})`, 'ok');
-  const fresh = await api(`/api/streams/${state.stream.id}`);
-  state.stream = fresh.stream;
-  renderStream(fresh);
+  const profile = readProfileForm();
+  const res = await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile } });
+  toast(profile.ffmpegTemplate
+    ? `Profile saved (FFmpeg template: ${profile.ffmpegTemplateName || 'custom'})`
+    : `Profile saved (${res.profile.transcode ? 'transcode' : 'copy'})`, 'ok');
+  await openStream(state.stream.id, { navigate: false });
 }
 
 /* ================= SUBTITLES ================= */
@@ -1679,10 +1824,10 @@ async function loadEnigmaStatus() {
   button.textContent = 'testing…';
   $('#e2-status').textContent = 'testing connection…';
   $('#e2-status').className = 'tag info';
-  $('#e2-log').textContent = `Testing OpenWebif at ${host || '(no host configured)'}:${port}…`;
+  $('#e2-log').textContent = `Testing OpenWebif and FTP file access at ${host || '(no host configured)'}…`;
   try {
     const { status } = await api('/api/enigma2/test', {
-      method: 'POST', body: { host, port, username, ...(password ? { password } : {}) },
+      method: 'POST', body: { host, port, username, ftpEnabled: $('#e2-ftp').checked, ...(password ? { password } : {}) },
     });
     const message = status.message || (status.ok ? 'WebIF reachable' : 'receiver unreachable');
     $('#e2-status').textContent = message;
@@ -1972,10 +2117,19 @@ function wire() {
   }));
   ['pf-mode', 'pf-res', 'pf-aspect', 'pf-container', 'pf-fps', 'pf-subs', 'pf-always', 'pf-deint', 'pf-ac']
     .forEach((id) => $(`#${id}`).addEventListener('change', updateCommandPreview));
+  $('#pf-template-select').addEventListener('change', selectFfmpegTemplate);
+  $('#pf-template-command').addEventListener('input', () => {
+    updateFfmpegTemplateButtons();
+    updateCommandPreview();
+  });
+  $('#btn-template-save-new').addEventListener('click', () => saveFfmpegTemplate());
+  $('#btn-template-save').addEventListener('click', () => saveFfmpegTemplate({ update: true }));
+  $('#btn-template-default').addEventListener('click', () => saveFfmpegTemplate({ update: true, makeDefault: true }));
+  $('#btn-template-delete').addEventListener('click', deleteFfmpegTemplate);
   $('#btn-profile-apply').addEventListener('click', applyProfile);
   $('#btn-profile-reset').addEventListener('click', async () => {
     if (!state.stream) return;
-    await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile: { mode: 'auto', container: 'mpegts', alwaysTranscode: false, resolution: 1080, videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', aspect: 'source', subtitles: 'soft' } } });
+    await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile: { mode: 'auto', container: 'mpegts', alwaysTranscode: false, resolution: 1080, videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', aspect: 'source', subtitles: 'soft', ffmpegTemplate: '', ffmpegTemplateId: '', ffmpegTemplateName: '' } } });
     openStream(state.stream.id);
   });
   $('#btn-vlc').addEventListener('click', async () => {

@@ -70,7 +70,7 @@
     "bouquetName": "vu-movie",
     "rootDir": "/etc/enigma2",
     "serviceType": 4097,
-    "ftpEnabled": false,
+    "ftpEnabled": true,
     "ftpPort": 21,
     "autoPush": false
   },

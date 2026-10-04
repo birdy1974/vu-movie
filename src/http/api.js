@@ -17,7 +17,7 @@ import { getConfig, publicConfig, saveConfig, cfg } from '../core/config.js';
 import { dbState, isPostgres } from '../core/db.js';
 import {
   hardware, hardwareStatus, hardwarePending, binariesStatus,
-  diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand,
+  diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand, validateFfmpegTemplate,
 } from '../core/media.js';
 import { jobEvents, findJob, listAllJobs, jobStats, cancelJob } from '../core/jobs.js';
 import * as registry from '../scrapers/registry.js';
@@ -70,6 +70,63 @@ function parseStreamIds(input) {
   if (!input) return [];
   if (Array.isArray(input)) return input;
   return String(input).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function inputError(message) {
+  const error = new Error(message);
+  error.status = 422;
+  return error;
+}
+
+function resolveTemplateProfile(input = {}) {
+  const profile = { ...(input || {}) };
+  if (profile.ffmpegTemplate || !profile.ffmpegTemplateId) return profile;
+  const template = (getConfig().transcode.ffmpegTemplates || []).find((item) => item?.id === profile.ffmpegTemplateId);
+  if (!template) throw inputError(`FFmpeg template "${profile.ffmpegTemplateId}" was not found`);
+  return {
+    ...profile,
+    container: template.container || profile.container,
+    ffmpegTemplate: template.command,
+    ffmpegTemplateName: template.name || '',
+  };
+}
+
+function validateTemplateLibrary(body = {}) {
+  const input = body.templates;
+  if (!Array.isArray(input)) throw inputError('templates must be an array');
+  if (input.length > 50) throw inputError('You can save at most 50 FFmpeg templates');
+  const seen = new Set();
+  const templates = input.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw inputError(`Template ${index + 1} must be an object`);
+    const id = String(item.id || '').trim();
+    const name = String(item.name || '').trim();
+    const command = String(item.command || '').trim();
+    const container = String(item.container || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw inputError(`Template ${index + 1} has an invalid id`);
+    if (seen.has(id)) throw inputError(`Duplicate FFmpeg template id: ${id}`);
+    seen.add(id);
+    if (!name || name.length > 100) throw inputError(`Template ${name || index + 1} needs a name of 1–100 characters`);
+    if (!['mpegts', 'matroska', 'hls'].includes(container)) throw inputError(`Template "${name}" has an unsupported container`);
+    const result = validateFfmpegTemplate(command, { container });
+    if (!result.ok) throw inputError(`Template "${name}": ${result.errors.join('; ')}`);
+    return { id, name, container, command };
+  });
+  const currentDefault = getConfig().transcode.defaultFfmpegTemplateId || '';
+  const defaultFfmpegTemplateId = body.defaultFfmpegTemplateId === undefined
+    ? currentDefault
+    : String(body.defaultFfmpegTemplateId || '').trim();
+  if (defaultFfmpegTemplateId && !seen.has(defaultFfmpegTemplateId)) {
+    throw inputError('The default template must be one of the saved templates');
+  }
+  return { templates, defaultFfmpegTemplateId };
+}
+
+function commandOutput(profile, stream) {
+  if (profile.container === 'hls') {
+    const hlsDir = path.join(getConfig().storage.tmp, 'hls-preview', String(stream.token || stream.id));
+    return { container: 'hls', target: path.join(hlsDir, 'index.m3u8'), hlsDir, hlsTime: 2, hlsListSize: 10 };
+  }
+  return { container: profile.container, target: 'pipe:1' };
 }
 
 /* ---------- health / logs / config ---------- */
@@ -164,6 +221,24 @@ router.put('/config', wrap(async (req, res) => {
   if (patch.app?.logLevel) setLogLevel(patch.app.logLevel);
   if (patch.enigma2) enigma2.resetStatusCache();
   res.json({ ok: true, config: publicConfig(), changed: Object.keys(patch) });
+}));
+
+router.get('/ffmpeg/templates', wrap(async (req, res) => {
+  const transcode = getConfig().transcode;
+  res.json({
+    ok: true,
+    templates: transcode.ffmpegTemplates || [],
+    defaultFfmpegTemplateId: transcode.defaultFfmpegTemplateId || '',
+  });
+}));
+
+router.put('/ffmpeg/templates', wrap(async (req, res) => {
+  const { templates, defaultFfmpegTemplateId } = validateTemplateLibrary(req.body || {});
+  saveConfig({ transcode: { ffmpegTemplates: templates, defaultFfmpegTemplateId } });
+  log.info('api', 'FFmpeg template library saved', {
+    templates: templates.length, hasDefault: Boolean(defaultFfmpegTemplateId),
+  });
+  res.json({ ok: true, templates, defaultFfmpegTemplateId });
 }));
 
 router.post('/config/hwaccel/test', wrap(async (req, res) => {
@@ -486,41 +561,74 @@ router.delete('/streams/:id', wrap(async (req, res) => {
 router.post('/streams/:id/profile', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const profile = normaliseProfile({ ...(stream.profile || {}), ...(req.body?.profile || {}) }, stream.upstream?.probe || null);
+  const input = resolveTemplateProfile({ ...(stream.profile || {}), ...(req.body?.profile || {}) });
+  if (input.ffmpegTemplate) {
+    const result = validateFfmpegTemplate(input.ffmpegTemplate, { container: input.container || getConfig().transcode.container });
+    if (!result.ok) throw inputError(result.errors.join('; '));
+  }
+  const profile = normaliseProfile(input, stream.upstream?.probe || null);
   stream.profile = profile;
-  await store.createStream({ ...stream, candidate: { url: stream.upstream.url, headers: stream.upstream.headers, probe: stream.upstream.probe, sourceId: stream.source_id }, profile, title: stream.title, year: stream.year, kind: stream.kind });
+  await store.createStream({
+    ...stream,
+    candidate: { url: stream.upstream.url, headers: stream.upstream.headers, probe: stream.upstream.probe, sourceId: stream.source_id },
+    profile, title: stream.title, year: stream.year, kind: stream.kind,
+  });
   relay.stopSession(stream.id, 'profile changed');
-  log.info('api', `profile updated for stream ${stream.id}`, { mode: profile.transcode ? 'transcode' : 'copy', resolution: profile.resolution, container: profile.container });
+  log.info('api', `profile updated for stream ${stream.id}`, {
+    mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
+    resolution: profile.resolution, container: profile.container,
+  });
   res.json({ ok: true, profile, urls: store.urlsFor(stream, baseUrlFrom(req)) });
 }));
 
-/** The exact ffmpeg command for the current profile — shown in the UI and copy-pasteable. */
+async function renderStreamCommand(stream, profileInput) {
+  const resolved = resolveTemplateProfile(profileInput);
+  const profile = normaliseProfile(resolved, stream.upstream?.probe || null);
+  if (profile.ffmpegTemplate) {
+    const result = validateFfmpegTemplate(profile.ffmpegTemplate, { container: profile.container });
+    if (!result.ok) throw inputError(result.errors.join('; '));
+  }
+  // Custom templates own all codec/muxer options, so they do not need to wait
+  // for the VAAPI self-test just to render a command preview.
+  const hw = profile.ffmpegTemplate
+    ? { available: null, reason: 'custom FFmpeg template is authoritative', fpsVariant: null, encoder: null }
+    : await hardware({ waitMs: 15000 });
+  const args = buildFfmpegArgs({
+    source: { url: stream.upstream?.url, headers: stream.upstream?.headers || {}, kind: stream.upstream?.kind || undefined, container: stream.upstream?.probe?.container || null },
+    profile, hw, mode: 'live', output: commandOutput(profile, stream),
+  });
+  return {
+    profile,
+    hw: { available: hw.available, reason: hw.reason, fpsVariant: hw.fpsVariant, encoder: hw.encoder },
+    command: argsToCommand(args),
+  };
+}
+
+/** The exact ffmpeg command for the current profile or selected template. */
 router.get('/streams/:id/command', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  // Bounded wait: the command preview must render even while the GPU self-test
-  // is still running (it falls back to the software shape with a clear note).
-  const hw = await hardware({ waitMs: 15000 });
-  const overrides = req.query.resolution || req.query.container || req.query.container === undefined
-    ? {
-      ...(req.query.resolution ? { resolution: Number(req.query.resolution) } : {}),
-      ...(req.query.aspect ? { aspect: String(req.query.aspect) } : {}),
-      ...(req.query.container ? { container: String(req.query.container) } : {}),
-      ...(req.query.videoBitrate ? { videoBitrate: Number(req.query.videoBitrate) } : {}),
-      ...(req.query.audioBitrate ? { audioBitrate: Number(req.query.audioBitrate) } : {}),
-      ...(req.query.audioChannels ? { audioChannels: Number(req.query.audioChannels) } : {}),
-      ...(req.query.fps ? { fps: String(req.query.fps) } : {}),
-      ...(req.query.subtitles ? { subtitles: String(req.query.subtitles) } : {}),
-      ...(req.query.alwaysTranscode !== undefined ? { alwaysTranscode: req.query.alwaysTranscode === 'true' } : {}),
-      ...(req.query.mode ? { mode: String(req.query.mode) } : {}),
-    }
-    : {};
-  const profile = normaliseProfile({ ...(stream.profile || {}), ...overrides }, stream.upstream?.probe || null);
-  const args = buildFfmpegArgs({
-    source: { url: stream.upstream?.url, headers: stream.upstream?.headers || {}, kind: stream.upstream?.kind || undefined, container: stream.upstream?.probe?.container || null },
-    profile, hw, mode: 'live', output: { container: profile.container, target: 'pipe:1' },
-  });
-  res.json({ ok: true, profile, hw: { available: hw.available, reason: hw.reason, fpsVariant: hw.fpsVariant, encoder: hw.encoder }, command: argsToCommand(args) });
+  const overrides = {
+    ...(req.query.resolution ? { resolution: Number(req.query.resolution) } : {}),
+    ...(req.query.aspect ? { aspect: String(req.query.aspect) } : {}),
+    ...(req.query.container ? { container: String(req.query.container) } : {}),
+    ...(req.query.videoBitrate ? { videoBitrate: Number(req.query.videoBitrate) } : {}),
+    ...(req.query.audioBitrate ? { audioBitrate: Number(req.query.audioBitrate) } : {}),
+    ...(req.query.audioChannels ? { audioChannels: Number(req.query.audioChannels) } : {}),
+    ...(req.query.fps ? { fps: String(req.query.fps) } : {}),
+    ...(req.query.subtitles ? { subtitles: String(req.query.subtitles) } : {}),
+    ...(req.query.alwaysTranscode !== undefined ? { alwaysTranscode: req.query.alwaysTranscode === 'true' } : {}),
+    ...(req.query.mode ? { mode: String(req.query.mode) } : {}),
+  };
+  const rendered = await renderStreamCommand(stream, { ...(stream.profile || {}), ...overrides });
+  res.json({ ok: true, ...rendered });
+}));
+
+router.post('/streams/:id/command', wrap(async (req, res) => {
+  const stream = await store.getStream(req.params.id);
+  if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
+  const rendered = await renderStreamCommand(stream, { ...(stream.profile || {}), ...(req.body?.profile || {}) });
+  res.json({ ok: true, ...rendered });
 }));
 
 router.get('/streams/:id/session', wrap(async (req, res) => {
@@ -721,6 +829,7 @@ router.post('/enigma2/test', wrap(async (req, res) => {
   if (body.port !== undefined) connection.port = Number(body.port) || 80;
   if (typeof body.username === 'string') connection.username = body.username.trim();
   if (typeof body.password === 'string' && body.password) connection.password = body.password;
+  if (typeof body.ftpEnabled === 'boolean') connection.ftpEnabled = body.ftpEnabled;
   // Test the form values directly; this does not save them or expose secrets.
   res.json({ ok: true, status: await enigma2.testConnection(connection) });
 }));

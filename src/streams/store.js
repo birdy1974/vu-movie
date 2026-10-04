@@ -18,25 +18,43 @@ const token = () => crypto.randomBytes(12).toString('base64url');
 
 /** Create (and persist) a stream record from a resolved candidate. */
 export async function createStream({
+  id: existingId = null, token: existingToken = null,
+  created_at: existingCreatedAt = null, expires_at: existingExpiresAt,
+  playlist_name: existingPlaylistName = null, subtitle_id: existingSubtitleId = null,
+  payload: existingPayload = null, source_id: existingSourceId = null,
   title, year = null, kind = 'movie', poster = null, description = null, sourceId = null,
   candidate, profile = {}, subtitleId = null, season = null, episode = null,
 }) {
   const cfg = getConfig();
   const now = new Date();
-  const expires = cfg.app.tokenTtlMinutes > 0
-    ? new Date(now.getTime() + cfg.app.tokenTtlMinutes * 60000)
-    : null;
+  const expires = existingExpiresAt !== undefined
+    ? existingExpiresAt
+    : cfg.app.tokenTtlMinutes > 0 ? new Date(now.getTime() + cfg.app.tokenTtlMinutes * 60000) : null;
 
-  const normalised = normaliseProfile(profile, candidate?.probe || null);
+  let profileInput = { ...(profile || {}) };
+  if (!existingId && !Object.hasOwn(profileInput, 'ffmpegTemplate') && !Object.hasOwn(profileInput, 'ffmpegTemplateId')) {
+    const defaultTemplate = (cfg.transcode.ffmpegTemplates || []).find((item) =>
+      item?.id === cfg.transcode.defaultFfmpegTemplateId && typeof item.command === 'string' && item.command.trim());
+    if (defaultTemplate) {
+      profileInput = {
+        ...profileInput,
+        container: defaultTemplate.container || profileInput.container,
+        ffmpegTemplate: defaultTemplate.command,
+        ffmpegTemplateId: defaultTemplate.id,
+        ffmpegTemplateName: defaultTemplate.name || '',
+      };
+    }
+  }
+  const normalised = normaliseProfile(profileInput, candidate?.probe || null);
   const record = {
-    id: shortId(),
-    token: token(),
+    id: existingId || shortId(),
+    token: existingToken || token(),
     title: title || candidate?.meta?.title || 'Untitled',
     year,
     kind,
     poster,
     description,
-    source_id: candidate?.sourceId || sourceId || null,
+    source_id: candidate?.sourceId || sourceId || existingSourceId || null,
     upstream: {
       url: candidate?.url,
       kind: candidate?.kind || null,
@@ -50,11 +68,11 @@ export async function createStream({
       via: candidate?.via || null,
     },
     profile: normalised,
-    subtitle_id: subtitleId,
-    playlist_name: `${title || 'vu-movie'}${year ? ` (${year})` : ''}`,
-    created_at: now.toISOString(),
-    expires_at: expires ? expires.toISOString() : null,
-    payload: { sourceId: candidate?.sourceId || null, meta: candidate?.meta || {} },
+    subtitle_id: subtitleId ?? existingSubtitleId ?? null,
+    playlist_name: existingPlaylistName || `${title || 'vu-movie'}${year ? ` (${year})` : ''}`,
+    created_at: existingCreatedAt || now.toISOString(),
+    expires_at: expires ? (expires instanceof Date ? expires.toISOString() : expires) : null,
+    payload: existingPayload || { sourceId: candidate?.sourceId || null, meta: candidate?.meta || {} },
     updated_at: now.toISOString(),
   };
 

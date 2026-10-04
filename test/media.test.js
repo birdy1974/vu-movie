@@ -7,12 +7,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
   targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
+  parseFfmpegTemplateTokens, validateFfmpegTemplate,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -329,9 +331,90 @@ test('parseProgressLine reads ffmpeg -progress output', () => {
   assert.equal(stats.outTimeMs, 52100);
 });
 
-test('argsToCommand is copy-pasteable', () => {
+test('FFmpeg templates validate placeholders and refuse shell commands', () => {
+  const pipe = 'ffmpeg -i <url> -map 0:v:0 -c:v copy -c:a copy -f mpegts pipe:1';
+  assert.deepEqual(validateFfmpegTemplate(pipe, { container: 'mpegts' }), {
+    ok: true, errors: [], container: 'mpegts',
+  });
+  assert.equal(validateFfmpegTemplate(pipe, { container: 'matroska' }).ok, false);
+  assert.equal(validateFfmpegTemplate('ffmpeg -i https://example.test/movie.mp4 -f mpegts pipe:1').ok, false);
+  assert.equal(validateFfmpegTemplate('ffmpeg -i <url> -f hls pipe:1', { container: 'hls' }).ok, false);
+  assert.equal(validateFfmpegTemplate('sh -c "echo bad"').ok, false, 'templates cannot change the executable');
+  assert.deepEqual(parseFfmpegTemplateTokens(`ffmpeg -metadata "title=Director's cut; echo"`), [
+    'ffmpeg', '-metadata', "title=Director's cut; echo",
+  ]);
+});
+
+test('custom live templates preserve the signed URL and merge source auth headers', () => {
+  const url = 'https://cdn.example.com/movie.mp4?sig=a1b2&expires=1791117426';
+  const template = [
+    'ffmpeg -headers "User-Agent: Template UA',
+    'X-Template: yes" -i <url> -map 0:v:0 -vf "drawtext=text=\'Director & Daughter\'" -c:v libx264 -f mpegts pipe:1',
+  ].join('\r\n');
+  const profile = normaliseProfile({ container: 'mpegts', ffmpegTemplate: template }, PROBE_1080P_H264);
+  const args = buildFfmpegArgs({
+    source: { url, headers: { Referer: 'https://player.example/watch', Cookie: 'sid=secret', 'User-Agent': 'Source UA' }, kind: 'file' },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.equal(args[args.indexOf('-i') + 1], url, 'query ampersands stay in one argv value');
+  const headers = args[args.indexOf('-headers') + 1];
+  assert.match(headers, /Referer: https:\/\/player\.example\/watch/);
+  assert.match(headers, /Cookie: sid=secret/);
+  assert.match(headers, /User-Agent: Template UA/);
+  assert.match(headers, /X-Template: yes/);
+  assert.equal(args[args.indexOf('-vf') + 1], "drawtext=text='Director & Daughter'");
+  assert.ok(args.includes('-progress') && args.includes('pipe:2'));
+  assert.equal(args.at(-1), 'pipe:1');
+  assert.equal(args.filter((arg) => arg === '-headers').length, 1);
+  assert.ok(!args.includes('-user_agent'), 'the explicit template User-Agent is respected');
+});
+
+test('custom HLS templates receive the relay playlist output path', () => {
+  const template = 'ffmpeg -i {{url}} -map 0:v:0 -c:v copy -f hls -hls_time 2 {{output}}';
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn.example.com/master.m3u8', headers: {}, kind: 'hls' },
+    profile: normaliseProfile({ container: 'hls', ffmpegTemplate: template }, PROBE_1080P_H264),
+    hw: HW, mode: 'live', output: { container: 'hls', target: '/tmp/hls/abc/index.m3u8' },
+  });
+  assert.equal(args[args.indexOf('-i') + 1], 'https://cdn.example.com/master.m3u8');
+  assert.equal(args.at(-1), '/tmp/hls/abc/index.m3u8');
+  assert.equal(args[args.indexOf('-f') + 1], 'hls');
+});
+
+test('custom template is only used for live output, not a file download', () => {
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts', ffmpegTemplate: 'ffmpeg -i <url> -c:v copy -f mpegts pipe:1' }, PROBE_1080P_H264);
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn.example.com/movie.mp4', headers: {}, kind: 'file' },
+    profile, hw: HW, mode: 'file', output: { container: 'mpegts', target: '/downloads/movie.ts' },
+  });
+  assert.equal(args.at(-1), '/downloads/movie.ts');
+});
+
+test('argsToCommand is copy-pasteable, including signed URLs and multiline headers', () => {
   const cmd = argsToCommand(['-i', 'https://x/y.m3u8', '-vf', 'scale_vaapi=w=1280:h=720', '-f', 'mpegts', 'pipe:1']);
   assert.equal(cmd, 'ffmpeg -i https://x/y.m3u8 -vf scale_vaapi=w=1280:h=720 -f mpegts pipe:1');
   const quoted = argsToCommand(['-vf', 'subtitles=filename=/downloads/my movie.srt']);
-  assert.ok(quoted.includes('"subtitles=filename=/downloads/my movie.srt"'), quoted);
+  assert.ok(quoted.includes("'subtitles=filename=/downloads/my movie.srt'"), quoted);
+
+  const signedUrl = 'https://cdn.example.com/movie.mp4?sign=abc123&t=1791117426';
+  const headers = 'Referer: https://moviebox.example/play/title\r\nUser-Agent: Test Agent';
+  const signed = argsToCommand(['-headers', headers, '-i', signedUrl, '-map', '0:v:0']);
+  assert.equal(signed, `ffmpeg -headers '${headers}' -i '${signedUrl}' -map 0:v:0`);
+  assert.ok(!signed.includes('&t=1791117426 -map'), 'the query ampersand is inside shell quotes');
+
+  const apostrophe = argsToCommand(['-metadata', "title=Director's cut $HOME; echo"]);
+  assert.equal(apostrophe, "ffmpeg -metadata 'title=Director'\\''s cut $HOME; echo'");
+  assert.equal(argsToCommand(['~/movie.mp4']), "ffmpeg '~/movie.mp4'");
+});
+
+test('argsToCommand round-trips shell-sensitive values through POSIX sh', () => {
+  const args = [
+    '-headers', 'Referer: https://moviebox.example/play/title\r\nUser-Agent: Test Agent',
+    '-i', 'https://cdn.example.com/movie.mp4?sign=abc123&t=1791117426',
+    '-metadata', "title=Director's cut $HOME; echo", '~/movie.mp4', '-map', '0:v:0',
+  ];
+  const command = argsToCommand(args);
+  const result = spawnSync('/bin/sh', ['-c', `set -- ${command}; printf '%s\\0' "$@"`], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.split('\0').slice(0, -1), ['ffmpeg', ...args]);
 });

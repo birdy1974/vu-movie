@@ -45,7 +45,7 @@ sudo mkdir -p /volume1/docker/vu-movie && cd /volume1/docker/vu-movie
 
 # 2. configuration
 cp .env.example .env
-vi .env                      # set ENIGMA2_HOST + ENIGMA2_PASSWORD at least
+vi .env                      # set ENIGMA2_HOST + ENIGMA2_PASSWORD; keep ENIGMA2_FTP=true
 
 # 3. build and start
 docker compose up -d --build
@@ -128,9 +128,16 @@ picks it up next to the recording.
 * Generates `userbouquet.<name>.tv` with `#SERVICE 4097:…` entries (GStreamer
   service type, so no tuner is used), `#DESCRIPTION` lines, and per-season
   separators for series.
-* Pushes it to the box over **OpenWebif**, patches `bouquets.tv`, reloads with
-  `servicelistreload?mode=2` and verifies the entries came back —
-  FTP/SCP fallback when the WebIF upload endpoint is unavailable.
+* Writes bouquet files over **FTP** (OpenWebif has no portable file-upload API),
+  using a temporary file + same-directory rename. Before changing `bouquets.tv`
+  it saves one restore point and patches the existing index without removing
+  satellite/favourites bouquets.
+* Uses **OpenWebif only to reload** the bouquet list (`mode=2`) and verify the
+  services. The receiver's FTP service must be enabled and able to write to
+  `/etc/enigma2` (normally the root login on port 21). FTP is plaintext, so keep
+  it on a trusted LAN. FTP is enabled by default for fresh installs; after
+  upgrading an older config, enable **Settings →
+  Enigma2 → use FTP for bouquet/subtitle files**.
 * Preview the exact file in the UI before anything is uploaded.
 
 ### Operations
@@ -248,7 +255,9 @@ The ones that matter most on a DS918+:
   15 s) both read `/api/health`, and a VU+ should not be woken up that often for
   a value that changes roughly never. The box is checked on demand
   (`GET /api/enigma2/status`, the *test connection* button) and before every
-  bouquet push; reachability is logged when it **changes**, not per poll.
+  bouquet push (FTP is checked first; OpenWebif reachability is advisory because
+  it is only used for reload/verification); reachability is logged when it
+  **changes**, not per poll.
 
 ```bash
 docker compose logs -f vu-movie          # structured app logs
@@ -315,7 +324,7 @@ src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox cli
                 failure diagnostics (DNS/egress/TLS verdicts)
 src/streams/    stream store (tokens/URLs), relay (ffmpeg sessions), downloads, M3U
 src/subtitles/  5 providers + custom templates, SRT/VTT/encoding tools, receiver push
-src/enigma2/    bouquet builder/patcher + OpenWebif upload and verification
+src/enigma2/    bouquet builder + atomic FTP writes; OpenWebif reload/verification
 src/http/       REST API + server (static UI, playable /s, /dl, /hls, /watch)
 public/         the entire UI (no build step): index.html, app.js, style.css
 migrations/     SQL schema (applied automatically at startup)

@@ -1,9 +1,10 @@
 /** Enigma2 bouquet generation — the exact syntax the receiver parses. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   buildBouquet, patchBouquetsTv, encodeE2Url, serviceRef, status, testConnection, resetStatusCache, xmlTag,
-  cachedStatus,
+  cachedStatus, createFtpFileTransport, pushBouquet,
 } from '../src/enigma2/index.js';
 import { getConfig } from '../src/core/config.js';
 import { getRecentLogs } from '../src/core/log.js';
@@ -143,8 +144,8 @@ test('receiver status reports the model and image version', async (t) => {
 test('testConnection checks unsaved form values and reuses a stored password when left blank', async (t) => {
   const original = globalThis.fetch;
   const cfg = getConfig().enigma2;
-  const saved = { host: cfg.host, port: cfg.port, username: cfg.username, password: cfg.password };
-  Object.assign(cfg, { host: 'saved-host', port: 80, username: 'saved-user', password: 'saved-secret' });
+  const saved = { host: cfg.host, port: cfg.port, username: cfg.username, password: cfg.password, ftpEnabled: cfg.ftpEnabled, rootDir: cfg.rootDir };
+  Object.assign(cfg, { host: 'saved-host', port: 80, username: 'saved-user', password: 'saved-secret', ftpEnabled: false, rootDir: '/__vu_movie_test_no_e2_mount__' });
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url: String(url), headers: options.headers };
@@ -157,7 +158,9 @@ test('testConnection checks unsaved form values and reuses a stored password whe
   });
 
   const result = await testConnection({ host: '192.168.1.22', port: 8081, username: 'operator' }, { timeoutMs: 1000 });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false, 'a WebIF connection alone cannot push a bouquet without an upload transport');
+  assert.equal(result.upload.configured, false, 'the connection test reports the saved upload mode too');
+  assert.match(result.message, /WebIF ok/);
   assert.equal(request.url, 'http://192.168.1.22:8081/web/about');
   assert.equal(request.headers.Authorization, `Basic ${Buffer.from('operator:saved-secret').toString('base64')}`);
   assert.equal(cfg.host, 'saved-host', 'testing must not persist or mutate the receiver settings');
@@ -246,4 +249,131 @@ test('no receiver configured reports that, without probing', () => {
     cfg.host = saved.host;
     resetStatusCache();
   }
+});
+
+test('FTP file transport stages files and atomically replaces existing targets', () => {
+  const cfg = { host: '192.168.1.50', ftpPort: 21, username: 'root', password: 'boxpw', rootDir: '/etc/enigma2' };
+  const files = new Map([['bouquets.tv', '#NAME User - bouquets (TV)\n']]);
+  const calls = [];
+  let refuseRenameOverExisting = true;
+  const ok = (stdout = Buffer.alloc(0)) => ({ status: 0, stdout, stderr: Buffer.alloc(0) });
+  const fail = (message) => ({ status: 19, stdout: Buffer.alloc(0), stderr: Buffer.from(`curl: (19) ${message}`) });
+
+  const runCommand = (args) => {
+    calls.push([...args]);
+    const url = new URL(args.at(-1));
+    const remoteName = decodeURIComponent(url.pathname.split('/').filter(Boolean).at(-1) || '');
+    if (args.includes('--list-only')) return ok(Buffer.from([...files.keys()].join('\r\n')));
+
+    const uploadAt = args.indexOf('--upload-file');
+    if (uploadAt >= 0) {
+      files.set(remoteName, fs.readFileSync(args[uploadAt + 1], 'utf8'));
+      return ok();
+    }
+
+    const quoteCommands = [];
+    for (let i = 0; i < args.length; i += 1) if (args[i] === '--quote') quoteCommands.push(args[i + 1]);
+    if (quoteCommands.length) {
+      let from = null;
+      for (const command of quoteCommands) {
+        const [verb, ...rest] = command.split(' ');
+        const name = rest.join(' ').split('/').at(-1);
+        if (verb === 'RNFR') from = name;
+        else if (verb === 'RNTO') {
+          if (refuseRenameOverExisting && files.has(name)) return fail('550 RNTO target already exists');
+          if (!from || !files.has(from)) return fail('550 RNFR source does not exist');
+          files.set(name, files.get(from));
+          files.delete(from);
+          from = null;
+        } else if (verb === 'DELE') {
+          if (!files.has(name)) return fail('550 file does not exist');
+          files.delete(name);
+          refuseRenameOverExisting = false;
+        }
+      }
+      return ok();
+    }
+
+    if (files.has(remoteName)) return ok(Buffer.from(files.get(remoteName), 'utf8'));
+    return fail('550 file does not exist');
+  };
+
+  const transport = createFtpFileTransport(cfg, { runCommand });
+  const names = transport.list();
+  assert.equal(transport.read('bouquets.tv', names), '#NAME User - bouquets (TV)\n');
+  transport.writeAtomic('bouquets.tv', '#NAME User - bouquets (TV)\n#SERVICE new\n');
+
+  assert.equal(files.get('bouquets.tv'), '#NAME User - bouquets (TV)\n#SERVICE new\n');
+  assert.deepEqual([...files.keys()], ['bouquets.tv'], 'the staged remote file is renamed away and no temp file remains');
+  const uploaded = calls.filter((args) => args.includes('--upload-file'));
+  assert.equal(uploaded.length, 1);
+  assert.match(new URL(uploaded[0].at(-1)).pathname, /\.spm-upload-bouquets\.tv-/);
+  const renameCalls = calls.filter((args) => args.includes('--quote'));
+  assert.ok(renameCalls.some((args) => args.some((arg) => arg.startsWith('RNTO ') && arg.endsWith('/bouquets.tv'))));
+  assert.ok(renameCalls.some((args) => args.some((arg) => arg.startsWith('DELE ') && arg.endsWith('/bouquets.tv'))), 'rename-over-existing falls back to delete + rename');
+});
+
+test('bouquet push uses FTP for files, preserves bouquets.tv, then reloads through OpenWebif', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, port: cfg.port, username: cfg.username, password: cfg.password, rootDir: cfg.rootDir, ftpPort: cfg.ftpPort, ftpEnabled: cfg.ftpEnabled };
+  Object.assign(cfg, { host: '192.168.1.50', port: 80, username: 'root', password: 'boxpw', rootDir: '/etc/enigma2', ftpPort: 21, ftpEnabled: true });
+  const foreign = '#NAME Bouquets (TV)\n#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.favourites.tv" ORDER BY bouquet\n';
+  const files = new Map([['bouquets.tv', foreign], ['userbouquet.favourites.tv', '#NAME Favourites\n']]);
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = String(url);
+    requests.push({ url: requestUrl, method: options.method || 'GET' });
+    if (requestUrl.endsWith('/web/about')) return new Response(ABOUT_XML, { status: 200 });
+    if (requestUrl.includes('servicelistreload')) return new Response('OK', { status: 200 });
+    if (requestUrl.includes('/web/getservices')) return new Response('<e2services><e2service>fixture</e2service></e2services>', { status: 200 });
+    return new Response('not found', { status: 404 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    Object.assign(cfg, saved);
+    resetStatusCache();
+  });
+
+  const fileTransport = {
+    via: 'ftp',
+    list: () => new Set(files.keys()),
+    read: (name, knownNames) => new Set(knownNames).has(name) ? files.get(name) : null,
+    writeAtomic: (name, content) => { files.set(name, content); },
+  };
+  const result = await pushBouquet([
+    { title: 'Fixture movie', url: 'http://nas:8080/s/token/fixture.ts' },
+  ], { name: 'vu-movie' }, { fileTransport });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.transport, 'ftp');
+  assert.equal(result.reloadOk, true);
+  assert.equal(result.verified, 1);
+  assert.equal(files.get('bouquets.tv.spm-backup'), foreign, 'the old index is retained as a restore point');
+  assert.ok(files.get('bouquets.tv').includes('userbouquet.favourites.tv'), 'foreign bouquets remain in the index');
+  assert.ok(files.get('bouquets.tv').includes('userbouquet.vu-movie.tv'), 'the new bouquet is added');
+  assert.ok(files.get('userbouquet.vu-movie.tv').includes('Fixture movie'));
+  assert.ok(requests.some(({ url }) => url.includes('/api/servicelistreload?mode=2')));
+  assert.ok(requests.some(({ url }) => url.includes('/web/getservices')));
+  assert.ok(requests.every(({ method }) => method === 'GET'), 'OpenWebif is never sent an unsupported multipart upload');
+  assert.ok(requests.every(({ url }) => !url.includes('/file?action=upload') && !url.endsWith('/web/upload')));
+});
+
+test('FTP disabled reports the real upload requirement instead of probing unsupported WebIF endpoints', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const cfg = getConfig().enigma2;
+  const saved = { host: cfg.host, ftpEnabled: cfg.ftpEnabled, rootDir: cfg.rootDir };
+  Object.assign(cfg, { host: '192.168.1.50', ftpEnabled: false, rootDir: '/definitely-not-a-mounted-enigma2-share' });
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return new Response('unused', { status: 404 }); };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    Object.assign(cfg, saved);
+  });
+
+  const result = await pushBouquet([{ title: 'Fixture movie', url: 'http://nas:8080/s/token/fixture.ts' }]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Enable FTP/);
+  assert.match(result.error, /OpenWebif can reload/);
+  assert.equal(calls, 0, 'the obsolete /web/upload and /file?action=upload requests are not made');
 });
