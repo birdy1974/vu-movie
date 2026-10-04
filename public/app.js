@@ -8,7 +8,7 @@ const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
 const SEARCH_STATE_KEY = 'vu-movie.search-state.v1';
 const ACTIVE_PAGE_KEY = 'vu-movie.active-page';
 const SELECTED_STREAM_KEY = 'vu-movie.selected-stream';
-const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'tpl', 'logs', 'set'];
+const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'tpl', 'tpl-test', 'logs', 'set'];
 const OUTPUT_LABELS = {
   vlcTs: 'VLC / any player (.ts)',
   vlcMkv: 'VLC / any player (.mkv)',
@@ -157,6 +157,7 @@ function go(page) {
   if (page === 'e2') loadEnigmaForm();
   if (page === 'subs') loadProviders();
   if (page === 'tpl') { loadFfmpegTemplates().then(renderTemplatesPage); }
+  if (page === 'tpl-test') { Promise.all([loadFfmpegTemplates(), loadStreams()]).then(loadTplTestStreams); }
 }
 $$('#nav button').forEach((b) => b.addEventListener('click', () => go(b.dataset.p)));
 
@@ -1575,6 +1576,7 @@ function renderTemplatesPage() {
           <div class="tactions">
             <button class="btn sm" data-tpl-edit="${escapeHtml(item.id)}">edit</button>
             <button class="btn sm ghost" data-tpl-default="${escapeHtml(item.id)}">${isDefault ? 'default' : 'set default'}</button>
+            <button class="btn sm ghost" data-tpl-test-row="${escapeHtml(item.id)}">▷ test</button>
             <button class="btn sm ghost" data-tpl-delete="${escapeHtml(item.id)}">delete</button>
           </div>
         </div>`;
@@ -1750,6 +1752,216 @@ async function tplSetDefaultFromList(id) {
   state.ffmpegDefaults = result.ffmpegDefaults || {};
   renderTemplatesPage();
   toast(state.defaultFfmpegTemplateId === id ? 'Set as default' : 'Default cleared', 'ok');
+}
+
+/* ---------------- TEMPLATE TEST PANEL ---------------- */
+
+const TPL_TEST_INLINE_VALUE = '__inline__';
+state.tplTest = { inFlight: false, lastResult: null };
+
+function tplTestVerdictClass(result) {
+  if (!result) return '';
+  if (result.ok) return 'ok';
+  if (result.error) return 'err';
+  return 'warn';
+}
+
+function tplTestSummary(result) {
+  if (!result) return 'Press “Run test” to spawn ffmpeg against the chosen stream.';
+  if (result.error) {
+    return `ffmpeg could not be spawned: ${escapeHtml(result.error)}`;
+  }
+  const parts = [
+    result.bytesOut ? `${fmtBytes(result.bytesOut)} produced` : 'no bytes produced',
+    `ran for ${(result.durationMs / 1000).toFixed(1)} s`,
+    result.exitCode != null ? `exit ${result.exitCode}` : '',
+    result.signal ? `signal ${result.signal}` : '',
+    result.timedOut ? 'timed out (test window reached)' : '',
+  ].filter(Boolean);
+  const verdict = result.ok ? 'Looks healthy.' : (parts[0] === 'no bytes produced' ? 'No data reached the output — the template is not transcoding this stream.' : 'ffmpeg exited with an error.');
+  return `${verdict} ${parts.join(' · ')}.`;
+}
+
+function fmtProgressValue(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return '—';
+    if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
+    return String(value);
+  }
+  return String(value);
+}
+
+function tplTestProgressMeta(result) {
+  if (!result || !result.progress || !Object.keys(result.progress).length) return '';
+  const p = result.progress;
+  const items = [
+    p.bitrate ? `bitrate: ${p.bitrate}` : null,
+    p.fps ? `fps: ${p.fps}` : null,
+    p.speed ? `speed: ${p.speed}` : null,
+    p.frame != null ? `frame: ${p.frame}` : null,
+    p.outTimeMs != null ? `time: ${(Number(p.outTimeMs) / 1000).toFixed(1)}s` : null,
+    p.dropFrames != null ? `dropped: ${p.dropFrames}` : null,
+  ].filter(Boolean);
+  return items.join(' · ');
+}
+
+function renderTplTestPanel() {
+  const tmplSel = $('#tpl-test-template');
+  const streamSel = $('#tpl-test-stream');
+  const verdict = $('#tpl-test-verdict');
+  const summary = $('#tpl-test-summary');
+  const cmdEl = $('#tpl-test-cmd');
+  const stderrEl = $('#tpl-test-stderr');
+  const cmdMeta = $('#tpl-test-cmd-meta');
+  const progMeta = $('#tpl-test-progress-meta');
+  const statusEl = $('#tpl-test-status');
+  const inlineCommandEl = $('#tpl-test-command');
+  const runBtn = $('#btn-tpl-test-run');
+  const resetBtn = $('#btn-tpl-test-reset');
+
+  if (!tmplSel) return;
+
+  // Template picker: every saved template + an "inline command…" option.
+  const selected = tmplSel.value || '';
+  tmplSel.replaceChildren(
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+    new Option('(inline command…)', TPL_TEST_INLINE_VALUE),
+  );
+  if (![...tmplSel.options].some((opt) => opt.value === selected)) tmplSel.value = '';
+  else tmplSel.value = selected;
+  if (!tmplSel.value) tmplSel.value = state.tplTest.lastResult?.templateId || (state.ffmpegTemplates[0]?.id || TPL_TEST_INLINE_VALUE);
+
+  // Stream picker: every saved stream (the test runs against the stream's
+  // actual upstream URL + headers, including signed cookies).
+  const streamPicked = streamSel.value || '';
+  streamSel.replaceChildren(
+    new Option('(pick a stream)', ''),
+    ...state.streams.map((s) => new Option(`${s.title}${s.year ? ` (${s.year})` : ''} · ${s.upstream?.quality || s.quality || 'source'}`, s.id)),
+  );
+  if (streamPicked && [...streamSel.options].some((opt) => opt.value === streamPicked)) {
+    streamSel.value = streamPicked;
+  } else if (state.stream?.id) {
+    streamSel.value = state.stream.id;
+  }
+
+  // Inline command visibility follows the picker.
+  if (inlineCommandEl) {
+    const inline = tmplSel.value === TPL_TEST_INLINE_VALUE;
+    inlineCommandEl.disabled = !inline;
+    inlineCommandEl.parentElement?.classList.toggle('hide', !inline);
+    if (inline && !inlineCommandEl.value.trim() && state.tplEditor) {
+      inlineCommandEl.value = state.tplEditor.command || '';
+    }
+  }
+
+  const result = state.tplTest.lastResult;
+  if (result) {
+    verdict.className = `tpl-test-verdict ${tplTestVerdictClass(result)}`;
+    verdict.textContent = result.ok
+      ? `✓ ${result.templateName || 'Template'} ran cleanly`
+      : `✗ ${result.templateName || 'Template'} failed`;
+    summary.textContent = tplTestSummary(result);
+    cmdEl.textContent = result.command || '—';
+    cmdMeta.textContent = `${result.outputType ? `${OUTPUT_LABELS[result.outputType] || result.outputType} · ` : ''}${result.templateId ? `template ${result.templateId}` : 'inline'}`;
+    stderrEl.textContent = (result.stderr && result.stderr.trim()) || '(no stderr captured — ffmpeg probably had nothing to say, which is a good sign)';
+    progMeta.textContent = tplTestProgressMeta(result);
+  } else {
+    verdict.className = 'tpl-test-verdict';
+    verdict.textContent = '(not run yet)';
+    summary.textContent = 'Press “Run test” to spawn ffmpeg against the chosen stream.';
+    cmdEl.textContent = '—';
+    cmdMeta.textContent = '';
+    stderrEl.textContent = '—';
+    progMeta.textContent = '';
+  }
+
+  statusEl.textContent = state.tplTest.inFlight ? 'running ffmpeg…' : '';
+  runBtn.disabled = state.tplTest.inFlight;
+  runBtn.textContent = state.tplTest.inFlight ? '⧗ running…' : '▷ run test';
+  resetBtn.disabled = state.tplTest.inFlight;
+}
+
+async function loadTplTestStreams() {
+  try {
+    const result = await api('/api/streams', { silent: true });
+    state.streams = Array.isArray(result.streams) ? result.streams : state.streams;
+  } catch { /* toast handled */ }
+  renderTplTestPanel();
+}
+
+async function runTplTest() {
+  if (state.tplTest.inFlight) return;
+  const tmplSel = $('#tpl-test-template');
+  const streamSel = $('#tpl-test-stream');
+  const durationEl = $('#tpl-test-duration');
+  const inlineCommandEl = $('#tpl-test-command');
+  const templateId = tmplSel.value;
+  const streamId = streamSel.value;
+  if (!streamId) return toast('Pick a stream to test the template against', 'warn');
+  const durationMs = Math.max(500, Math.min(30000, Number(durationEl.value) * 1000 || 5000));
+  let body;
+  if (templateId === TPL_TEST_INLINE_VALUE) {
+    const command = (inlineCommandEl.value || '').trim();
+    if (!command) return toast('Inline command is empty', 'warn');
+    body = { streamId, durationMs, command, name: 'inline test' };
+  } else {
+    if (!templateId) return toast('Pick a template to render', 'warn');
+    body = { streamId, durationMs };
+  }
+
+  state.tplTest.inFlight = true;
+  renderTplTestPanel();
+  try {
+    const route = templateId === TPL_TEST_INLINE_VALUE
+      ? '/api/ffmpeg/test'
+      : `/api/ffmpeg/templates/${encodeURIComponent(templateId)}/test`;
+    const response = await api(route, { method: 'POST', body });
+    const result = response.result || {};
+    const templateMeta = response.template || {};
+    state.tplTest.lastResult = {
+      ...result,
+      templateId: templateMeta.id || templateId || '',
+      templateName: templateMeta.name || 'inline test',
+      outputType: '',
+    };
+    if (result.ok) toast('Template test succeeded', 'ok');
+    else if (result.error) toast(`Template test failed: ${result.error}`, 'err');
+    else toast('Template test produced no output', 'warn');
+  } catch (err) {
+    state.tplTest.lastResult = {
+      ok: false, error: err.message, command: '', stderr: '',
+      durationMs: 0, bytesOut: 0, exitCode: null, signal: null,
+      templateId, templateName: '', outputType: '',
+    };
+  } finally {
+    state.tplTest.inFlight = false;
+    renderTplTestPanel();
+  }
+}
+
+function resetTplTest() {
+  state.tplTest.lastResult = null;
+  renderTplTestPanel();
+}
+
+/** Helper for the per-stream profile test button on the Stream tab. */
+async function testCurrentStreamTemplate() {
+  if (!state.stream) return;
+  await loadFfmpegTemplates(true);
+  await loadTplTestStreams();
+  // Pick the saved template the stream uses; otherwise fall back to inline.
+  const profile = state.stream.profile || {};
+  const tmplSel = $('#tpl-test-template');
+  const streamSel = $('#tpl-test-stream');
+  if (profile.ffmpegTemplateId && state.ffmpegTemplates.find((t) => t.id === profile.ffmpegTemplateId)) {
+    tmplSel.value = profile.ffmpegTemplateId;
+  } else if (profile.ffmpegTemplate && profile.ffmpegTemplate.trim()) {
+    tmplSel.value = TPL_TEST_INLINE_VALUE;
+    $('#tpl-test-command').value = profile.ffmpegTemplate;
+  }
+  streamSel.value = state.stream.id;
+  go('tpl-test');
 }
 
 /* ---- per-output template pickers on the Stream tab ---- */
@@ -2407,6 +2619,7 @@ function wire() {
   $('#btn-template-delete').addEventListener('click', deleteFfmpegTemplate);
   $('#pf-cmd-output')?.addEventListener('change', updateCommandPreview);
   $('#pf-output-templates')?.addEventListener('change', updateCommandPreview);
+  $('#btn-test-template')?.addEventListener('click', testCurrentStreamTemplate);
 
   // Dedicated Transcode templates page
   $('#btn-tpl-new')?.addEventListener('click', () => {
@@ -2415,6 +2628,18 @@ function wire() {
   $('#btn-tpl-save')?.addEventListener('click', () => tplSave());
   $('#btn-tpl-save-top')?.addEventListener('click', () => tplSave());
   $('#btn-tpl-delete')?.addEventListener('click', tplDelete);
+  $('#btn-tpl-test')?.addEventListener('click', () => {
+    if (!state.tplEditor) return;
+    const editor = state.tplEditor;
+    const tmplSel = $('#tpl-test-template');
+    if (editor.id && state.ffmpegTemplates.find((t) => t.id === editor.id)) {
+      tmplSel.value = editor.id;
+    } else {
+      tmplSel.value = TPL_TEST_INLINE_VALUE;
+      $('#tpl-test-command').value = editor.command || '';
+    }
+    go('tpl-test');
+  });
   $('#btn-tpl-set-default')?.addEventListener('click', () => {
     if (!state.tplEditor?.id) return;
     tplSetDefaultFromList(state.tplEditor.id);
@@ -2423,9 +2648,13 @@ function wire() {
     const editId = event.target.closest('[data-tpl-edit]')?.dataset.tplEdit;
     const delId = event.target.closest('[data-tpl-delete]')?.dataset.tplDelete;
     const defId = event.target.closest('[data-tpl-default]')?.dataset.tplDefault;
+    const testRowId = event.target.closest('[data-tpl-test-row]')?.dataset.tplTestRow;
     if (editId) {
       const item = state.ffmpegTemplates.find((t) => t.id === editId);
       if (item) tplEditorSelect(item);
+    } else if (testRowId) {
+      $('#tpl-test-template').value = testRowId;
+      go('tpl-test');
     } else if (delId) {
       const item = state.ffmpegTemplates.find((t) => t.id === delId);
       if (!item) return;
@@ -2485,6 +2714,26 @@ function wire() {
     renderTemplatesPage();
     toast(value ? 'Default template set' : 'Default template cleared', 'ok');
   });
+
+  // Template test page
+  $('#tpl-test-template')?.addEventListener('change', () => {
+    state.tplTest.lastResult = null;
+    renderTplTestPanel();
+  });
+  $('#tpl-test-stream')?.addEventListener('change', () => {
+    state.tplTest.lastResult = null;
+    renderTplTestPanel();
+  });
+  $('#tpl-test-duration')?.addEventListener('input', () => {
+    if (state.tplTest.lastResult) state.tplTest.lastResult = null;
+    renderTplTestPanel();
+  });
+  $('#tpl-test-command')?.addEventListener('input', () => {
+    if (state.tplTest.lastResult) state.tplTest.lastResult = null;
+    renderTplTestPanel();
+  });
+  $('#btn-tpl-test-run')?.addEventListener('click', runTplTest);
+  $('#btn-tpl-test-reset')?.addEventListener('click', resetTplTest);
   $('#btn-profile-apply').addEventListener('click', applyProfile);
   $('#btn-profile-reset').addEventListener('click', async () => {
     if (!state.stream) return;

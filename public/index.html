@@ -21,6 +21,7 @@
       <button data-p="subs">▭ Subtitles</button>
       <button data-p="e2">☰ Enigma2</button>
       <button data-p="tpl">⚒ Transcode templates</button>
+      <button data-p="tpl-test">▷ Test</button>
       <button data-p="logs">≡ Logs</button>
       <button data-p="set">⚙ Settings</button>
     </nav>
@@ -190,6 +191,7 @@
             <button class="btn" id="btn-download">⤓ download to NAS</button>
             <button class="btn" id="btn-playlist">⤓ .m3u playlist</button>
             <button class="btn ghost" id="btn-direct">⇱ direct link (302)</button>
+            <button class="btn ghost" id="btn-test-template">▷ test template</button>
             <button class="btn ghost" id="btn-refresh-stream">⟳ refresh</button>
           </div>
         </div>
@@ -468,9 +470,63 @@
             <div class="row" style="margin-top:14px">
               <button class="btn pri" id="btn-tpl-save">save template</button>
               <button class="btn ghost" id="btn-tpl-delete">delete</button>
+              <button class="btn" id="btn-tpl-test">▷ test</button>
               <span class="mut" id="tpl-editor-status"></span>
             </div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TEMPLATE TEST PANEL ============ -->
+    <section id="p-tpl-test" class="hide">
+      <h1>Test FFmpeg template</h1>
+      <p class="sub">Run a saved or inline FFmpeg command against a real stream for a few seconds and inspect the live output, stderr tail and exit code before you bind the template to an output.</p>
+      <div class="card">
+        <div class="f2">
+          <div class="field">
+            <label for="tpl-test-template">Template</label>
+            <select id="tpl-test-template"></select>
+            <div class="meta">Pick a saved template or <code>(inline command…)</code> to test one you have not saved yet.</div>
+          </div>
+          <div class="field">
+            <label for="tpl-test-stream">Test against stream</label>
+            <select id="tpl-test-stream"></select>
+            <div class="meta">The template runs against this stream's upstream URL + headers for the window you choose.</div>
+          </div>
+        </div>
+        <div class="f2" style="margin-top:8px">
+          <div class="field">
+            <label for="tpl-test-duration">Run for (seconds)</label>
+            <input id="tpl-test-duration" type="number" min="1" max="30" step="1" value="5">
+            <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div>
+          </div>
+          <div class="field">
+            <label for="tpl-test-output">Verdict</label>
+            <div id="tpl-test-verdict" class="tpl-test-verdict">(not run yet)</div>
+            <div class="meta" id="tpl-test-summary">Press <b>Run test</b> to spawn ffmpeg against the chosen stream.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="tpl-test-command">Inline command (only for the "inline command…" option)</label>
+          <textarea id="tpl-test-command" class="mono" rows="6" spellcheck="false" placeholder="ffmpeg -hide_banner -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -f mpegts pipe:1"></textarea>
+        </div>
+        <div class="row">
+          <button class="btn pri" id="btn-tpl-test-run">▷ run test</button>
+          <button class="btn ghost" id="btn-tpl-test-reset">reset</button>
+          <span class="mut" id="tpl-test-status"></span>
+        </div>
+      </div>
+      <div class="gl" style="margin-top:14px">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Command preview</h2>
+            <span class="mut" id="tpl-test-cmd-meta"></span></div>
+          <pre id="tpl-test-cmd" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px">…</pre>
+        </div>
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">ffmpeg stderr (live)</h2>
+            <span class="mut" id="tpl-test-progress-meta"></span></div>
+          <pre id="tpl-test-stderr" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px;max-height:340px;overflow:auto">—</pre>
         </div>
       </div>
     </section>

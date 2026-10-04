@@ -281,6 +281,91 @@ router.put('/ffmpeg/templates', wrap(async (req, res) => {
   res.json({ ok: true, templates, defaultFfmpegTemplateId, ffmpegDefaults });
 }));
 
+/**
+ * Run a saved or inline FFmpeg template against a real stream for a short
+ * window so the operator can confirm it works before binding it to an output
+ * slot. Three endpoints:
+ *   POST /api/ffmpeg/templates/:id/test   — looks up a saved template by id
+ *   POST /api/ffmpeg/test                 — accepts a raw template string
+ *
+ * Both share the same body shape:
+ *   { streamId, durationMs?, outputType?, container? }
+ *
+ * When `streamId` is omitted but `url` / `headers` are present, an ephemeral
+ * stream record is constructed so the test can run against an arbitrary URL
+ * without needing a saved stream — useful for one-off probes.
+ */
+function parseTestBody(body = {}) {
+  const streamId = String(body.streamId || '').trim();
+  const url = String(body.url || '').trim();
+  if (!streamId && !url) throw inputError('streamId or url is required');
+  const durationMs = Number(body.durationMs);
+  const outputType = String(body.outputType || '').trim();
+  return { streamId, url, durationMs: Number.isFinite(durationMs) ? durationMs : 5000, outputType };
+}
+
+async function runTemplateTestForRequest(req, template, templateId = '') {
+  const { streamId, url, durationMs, outputType } = parseTestBody(req.body || {});
+  let stream = null;
+  if (streamId) {
+    stream = await store.getStream(streamId);
+    if (!stream) throw inputError(`stream "${streamId}" not found`);
+  } else {
+    // Ephemeral: take a custom URL and headers from the body. The token is
+    // synthesised so the result log can label it.
+    const headers = (body => {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+      const out = {};
+      for (const [k, v] of Object.entries(body)) if (typeof v === 'string' && v) out[k] = v;
+      return out;
+    })(req.body?.headers || {});
+    stream = {
+      id: `probe-${Date.now().toString(36)}`,
+      token: `probe-${Date.now().toString(36)}`,
+      title: 'ad-hoc template test',
+      upstream: { url, headers, kind: null, probe: null },
+      profile: {},
+    };
+  }
+  const result = await relay.runTemplateTest({
+    template,
+    container: String(req.body?.container || '').trim() || null,
+    durationMs,
+    outputType,
+    stream,
+    templateId,
+  });
+  log.info('api', 'template test finished', {
+    templateId, streamId: stream.id, url: stream.upstream?.url, outputType, ok: result.ok,
+    bytesOut: result.bytesOut, durationMs: result.durationMs, exitCode: result.exitCode, signal: result.signal,
+  });
+  return result;
+}
+
+router.post('/ffmpeg/templates/:id/test', wrap(async (req, res) => {
+  const template = (getConfig().transcode.ffmpegTemplates || []).find((t) => t?.id === req.params.id);
+  if (!template) return res.status(404).json({ ok: false, error: `FFmpeg template "${req.params.id}" not found` });
+  const result = await runTemplateTestForRequest(req, template.command, template.id);
+  res.json({
+    ok: true,
+    result,
+    template: { id: template.id, name: template.name, container: template.container, output: template.output || {} },
+  });
+}));
+
+router.post('/ffmpeg/test', wrap(async (req, res) => {
+  const command = String(req.body?.command || '').trim();
+  if (!command) throw inputError('command is required');
+  const name = String(req.body?.name || 'inline').trim().slice(0, 100) || 'inline';
+  const container = String(req.body?.container || '').trim() || null;
+  const result = await runTemplateTestForRequest(req, command, '');
+  res.json({
+    ok: true,
+    result,
+    template: { id: '', name, container: container || null, output: {} },
+  });
+}));
+
 router.post('/config/hwaccel/test', wrap(async (req, res) => {
   const hw = await hardware({ force: true });
   log.info('api', 'hardware self-test requested from the UI', {
