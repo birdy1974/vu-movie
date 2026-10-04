@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import browser, {
   isNetworkNavigationError, isSameSiteNavigation, flaresolverrEndpoint, parseFlareSolverrResult, looksLikeMedia,
   describeFlareSolverrError, sanitizeSolverUrl, flaresolverrConfigIssue, describeSolverNotUsable,
   DEFAULT_FLARESOLVERR_URL,
 } from '../src/scrapers/browser.js';
+
+test('browser facade exposes the FlareSolverr status helper used at startup', () => {
+  assert.equal(typeof browser.flaresolverrStatus, 'function');
+});
 
 test('browser navigation reachability errors are recognized as terminal', () => {
   assert.equal(isNetworkNavigationError('page.goto: net::ERR_CONNECTION_REFUSED at https://overlook.cx/movies/123'), true);
