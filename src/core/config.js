@@ -143,10 +143,10 @@ export const DEFAULTS = {
     device: process.env.VAAPI_DEVICE || '/dev/dri/renderD128',
     resolution: Number(process.env.DEFAULT_RESOLUTION || 1080),
     aspect: process.env.DEFAULT_ASPECT || 'source',
-    videoBitrate: Number(process.env.DEFAULT_VIDEO_BITRATE || 2500),
-    audioBitrate: Number(process.env.DEFAULT_AUDIO_BITRATE || 128),
-    audioChannels: Number(process.env.DEFAULT_AUDIO_CHANNELS || 2),
-    fps: process.env.DEFAULT_FPS || 'source',
+    videoBitrate: Number(process.env.DEFAULT_VIDEO_BITRATE || 8000),
+    audioBitrate: Number(process.env.DEFAULT_AUDIO_BITRATE || 192),
+    audioChannels: Number(process.env.DEFAULT_AUDIO_CHANNELS || 6),
+    fps: process.env.DEFAULT_FPS || '25',
     /** mpegts is what VLC + Enigma2 want; matroska is available per your request. */
     container: process.env.DEFAULT_CONTAINER || 'mpegts',
     encoderFallback: process.env.ENCODER_FALLBACK || 'libx264 -preset veryfast -crf 22',
@@ -358,6 +358,8 @@ function envOverrides() {
   if (process.env.DEFAULT_RESOLUTION) set('transcode.resolution', Number(process.env.DEFAULT_RESOLUTION));
   if (process.env.DEFAULT_VIDEO_BITRATE) set('transcode.videoBitrate', Number(process.env.DEFAULT_VIDEO_BITRATE));
   if (process.env.DEFAULT_AUDIO_BITRATE) set('transcode.audioBitrate', Number(process.env.DEFAULT_AUDIO_BITRATE));
+  if (process.env.DEFAULT_AUDIO_CHANNELS) set('transcode.audioChannels', Number(process.env.DEFAULT_AUDIO_CHANNELS));
+  if (process.env.DEFAULT_FPS) set('transcode.fps', process.env.DEFAULT_FPS);
   if (process.env.DEFAULT_CONTAINER) set('transcode.container', process.env.DEFAULT_CONTAINER);
   if (process.env.ENIGMA2_HOST) set('enigma2.host', process.env.ENIGMA2_HOST);
   if (process.env.ENIGMA2_USER) set('enigma2.username', process.env.ENIGMA2_USER);

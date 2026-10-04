@@ -118,8 +118,11 @@
             <div class="results-head-tools">
               <span class="mut" id="results-count"></span>
               <div class="results-filters" aria-label="Filter search results">
-                <label class="results-filter" for="results-title-filter"><span>Title</span>
-                  <input id="results-title-filter" type="search" placeholder="Filter titles…" autocomplete="off" aria-label="Filter results by title">
+                <label class="results-filter" for="results-title-filter"><span>Title filter</span>
+                  <input id="results-title-filter" type="text" placeholder="Type to filter found titles…" autocomplete="off" aria-label="Filter found titles by text">
+                </label>
+                <label class="results-filter" for="results-title-select"><span>Found titles</span>
+                  <select id="results-title-select" aria-label="Select a found title"><option value="">Select a found title…</option></select>
                 </label>
                 <label class="results-filter" for="results-provider-filter"><span>Provider</span>
                   <select id="results-provider-filter" aria-label="Filter results by provider"><option value="">All providers</option></select>
@@ -151,6 +154,16 @@
           </div>
           <div style="margin-top:12px" id="candidates"><div class="meta">No candidates yet.</div></div>
           <div class="row" style="margin-top:12px" id="sel-actions"></div>
+          <div id="sel-subtitle-panel" class="card pad0 hide" style="margin-top:12px">
+            <div class="cardhead">
+              <h3 style="margin:0">Matching subtitles</h3>
+              <div class="row"><span class="mut" id="sel-subtitle-count"></span>
+                <button class="btn sm ghost" id="btn-sel-subs-close">close</button></div>
+            </div>
+            <div class="meta" id="sel-subtitle-target" style="padding:10px 12px 0"></div>
+            <div id="sel-subtitle-results"><div class="meta" style="padding:14px">no subtitle search yet</div></div>
+            <div id="sel-subtitle-selection" class="note hide" style="margin:10px 12px 12px"></div>
+          </div>
           <div class="note" id="sel-note">Every candidate is probed with ffprobe before it is offered: dead mirrors, expired tokens and geo-blocks are filtered out instead of failing later in VLC.</div>
         </div>
       </div>
@@ -204,18 +217,18 @@
                   <option value="matroska">MATROSKA / MKV (best for downloads)</option>
                   <option value="hls">HLS (segments, browser/seekable)</option>
                 </select></div>
-              <div class="field"><label>Video bitrate <span class="mut" id="pf-vbr-l">2500 kbps</span></label>
-                <input type="range" id="pf-vbr" min="400" max="12000" step="100" value="2500"></div>
-              <div class="field"><label>Audio bitrate <span class="mut" id="pf-abr-l">128 kbps</span></label>
-                <input type="range" id="pf-abr" min="64" max="320" step="32" value="128"></div>
+              <div class="field"><label>Video bitrate <span class="mut" id="pf-vbr-l">8000 kbps</span></label>
+                <input type="range" id="pf-vbr" min="400" max="12000" step="100" value="8000"></div>
+              <div class="field"><label>Audio bitrate <span class="mut" id="pf-abr-l">192 kbps</span></label>
+                <input type="range" id="pf-abr" min="64" max="320" step="32" value="192"></div>
               <div class="field"><label>Audio channels</label>
-                <select id="pf-ac"><option value="2">2 (stereo, safe everywhere)</option><option value="6">6 (keep surround)</option></select></div>
+                <select id="pf-ac"><option value="2">2 (stereo, safe everywhere)</option><option value="6" selected>6 (keep surround)</option></select></div>
               <div class="field"><label>Frame rate</label>
-                <select id="pf-fps"><option value="source">keep source (no judder)</option><option value="25">force 25</option><option value="30">force 30</option></select></div>
+                <select id="pf-fps"><option value="source">keep source</option><option value="25" selected>force 25</option><option value="30">force 30</option></select></div>
               <div class="field"><label>Subtitles</label>
                 <select id="pf-subs">
                   <option value="none">none</option>
-                  <option value="soft">mux as a track (MPEG-TS → DVB subs)</option>
+                  <option value="soft" selected>mux as a track (MPEG-TS → DVB subs)</option>
                   <option value="burn">burn in (re-encode)</option>
                 </select></div>
               <div class="field"><label>Deinterlace (old DVD/TS sources)</label>

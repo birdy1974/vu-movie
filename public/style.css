@@ -73,6 +73,7 @@ th{text-align:left;color:var(--mut);font-weight:600;font-size:11.5px;text-transf
   padding:9px 12px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.015)}
 td{padding:9px 12px;border-bottom:1px solid rgba(36,49,73,.55);vertical-align:middle}
 tr:last-child td{border-bottom:0}
+#sel-subtitle-results tr.subtitle-choice-selected td{background:rgba(124,92,255,.14);border-bottom-color:rgba(124,92,255,.35)}
 pre{background:#080c13;border:1px solid var(--line);border-radius:10px;padding:11px 12px;overflow:auto;
   font-size:11.8px;line-height:1.5;margin:0;color:#cfe3ff;white-space:pre-wrap;word-break:break-word}
 .poster{width:100%;aspect-ratio:2/3;border-radius:10px;display:grid;place-items:end start;padding:10px;
@@ -94,6 +95,7 @@ pre{background:#080c13;border:1px solid var(--line);border-radius:10px;padding:1
 .results-filter{display:grid;gap:3px;margin:0;color:var(--mut);font-size:10.5px;line-height:1.1;white-space:nowrap}
 .results-filter input,.results-filter select{width:150px;height:32px;padding:5px 8px;font-size:12px}
 .results-filter input{width:170px}
+#results-title-select{width:230px}
 .results-view-switch{display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
 .results-view-switch button{all:unset;cursor:pointer;padding:5px 9px;border-radius:7px;color:var(--mut);font-size:11.5px;white-space:nowrap}
 .results-view-switch button:hover{color:var(--fg);background:var(--card2)}
@@ -141,6 +143,7 @@ button.provider-choice:focus-visible{outline:2px solid var(--acc);outline-offset
   .results-head-tools{width:100%;justify-content:space-between;gap:8px}
   .results-filters{order:2;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);width:100%}
   .results-filter input,.results-filter select{width:100%;min-width:0}
+  #results-title-select{width:100%}
   .results-view-switch button{padding:5px 7px;font-size:11px}
   .results-poster .results-cards{grid-template-columns:repeat(auto-fill,minmax(120px,1fr))}
   .results-thumbnails .results-cards{grid-template-columns:1fr}
@@ -148,6 +151,7 @@ button.provider-choice:focus-visible{outline:2px solid var(--acc);outline-offset
 .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:14px}
 .tabs button{all:unset;cursor:pointer;padding:8px 12px;color:var(--mut);border-bottom:2px solid transparent;font-size:13px}
 .tabs button.on{color:#fff;border-bottom-color:var(--acc)}
+#st-client-urls input[readonly]{cursor:text;-webkit-user-select:text;user-select:text}
 .hide{display:none!important}
 .note{font-size:12px;color:var(--mut);background:var(--bg2);border-left:3px solid var(--acc);
   padding:8px 11px;border-radius:0 8px 8px 0;margin:10px 0}

@@ -7,6 +7,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
   targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
@@ -87,10 +90,10 @@ test('copy/remux produces a single playable MPEG-TS on stdout', () => {
   assert.ok(!args.includes('h264_vaapi'), 'stream copy must not start an encoder');
 });
 
-test('VAAPI transcoding matches the documented command shape', () => {
+test('VAAPI transcoding matches the requested MPEG-TS command shape', () => {
   const profile = normaliseProfile({
-    mode: 'vaapi', resolution: 720, videoBitrate: 1000, audioBitrate: 128,
-    audioChannels: 2, fps: '25', container: 'mpegts',
+    mode: 'vaapi', resolution: 1080, videoBitrate: 8000, audioBitrate: 192,
+    audioChannels: 6, fps: '25', container: 'mpegts', subtitles: 'soft',
   }, PROBE_4K_HEVC);
   assert.equal(profile.transcode, true);
 
@@ -102,18 +105,36 @@ test('VAAPI transcoding matches the documented command shape', () => {
   assert.equal(args[args.indexOf('-init_hw_device') + 1], 'vaapi=intel:/dev/dri/renderD128');
   assert.equal(args[args.indexOf('-hwaccel') + 1], 'vaapi');
   assert.equal(args[args.indexOf('-hwaccel_output_format') + 1], 'vaapi');
-  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1280:h=720:format=nv12,fps=25,setsar=1');
+  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1920:h=1080:format=nv12,fps=25,setsar=1');
   assert.equal(args[args.indexOf('-c:v') + 1], 'h264_vaapi');
-  assert.equal(args[args.indexOf('-b:v') + 1], '1000k');
-  // Ladder from the DUO2 field test: 1.5× peak, bufsize = target bitrate.
-  assert.equal(args[args.indexOf('-maxrate') + 1], '1500k');
-  assert.equal(args[args.indexOf('-bufsize') + 1], '1000k');
+  assert.equal(args[args.indexOf('-b:v') + 1], '8000k');
+  // Ladder from the requested command: 1.5× peak, buffer = target bitrate.
+  assert.equal(args[args.indexOf('-maxrate') + 1], '12000k');
+  assert.equal(args[args.indexOf('-bufsize') + 1], '8000k');
+  assert.equal(args[args.indexOf('-profile:v') + 1], 'high');
+  assert.equal(args[args.indexOf('-level') + 1], '4.1');
+  assert.equal(args[args.indexOf('-g') + 1], '50');
+  assert.equal(args[args.indexOf('-r') + 1], '25');
+  assert.ok(args.indexOf('-r') > args.indexOf('-g'), 'output rate follows the GOP size');
   assert.equal(args[args.indexOf('-rc_mode') + 1], 'VBR');
   assert.equal(args[args.indexOf('-async_depth') + 1], '4');
   assert.equal(args[args.indexOf('-c:a') + 1], 'aac');
-  assert.equal(args[args.indexOf('-b:a') + 1], '128k');
+  assert.equal(args[args.indexOf('-b:a') + 1], '192k');
+  assert.equal(args[args.indexOf('-ac') + 1], '6');
+  assert.equal(args[args.indexOf('-ar') + 1], '48000');
   assert.equal(args[args.indexOf('-map') + 1], '0:v:0');
-  // live-specific flags from the same confirmed-working command
+  assert.equal(args[args.indexOf('-map', args.indexOf('-map') + 1) + 1], '0:a:0?');
+  assert.equal(args[args.indexOf('-map', args.indexOf('-map', args.indexOf('-map') + 1) + 1) + 1], '0:s?');
+  assert.ok(!args.includes('-sn'));
+  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub');
+  // The supplied option order matters to the command preview as well.
+  const orderedInputOptions = [
+    '-reconnect', '-fflags', '-err_detect', '-init_hw_device', '-hwaccel',
+    '-hwaccel_device', '-hwaccel_output_format', '-rw_timeout',
+    '-analyzeduration', '-probesize', '-i',
+  ].map((flag) => args.indexOf(flag));
+  assert.deepEqual(orderedInputOptions, [...orderedInputOptions].sort((a, b) => a - b));
+  assert.equal(args[args.indexOf('-rw_timeout') + 1], '10000000');
   assert.equal(args[args.indexOf('-analyzeduration') + 1], '1000000');
   assert.equal(args[args.indexOf('-probesize') + 1], '1000000');
   assert.equal(args[args.indexOf('-flush_packets') + 1], '1');
@@ -198,6 +219,24 @@ test('burning in subtitles forces the software subtitle filter', () => {
   const vf = args[args.indexOf('-vf') + 1];
   assert.ok(vf.includes('subtitles=filename=/downloads/subs/my movie.nl.srt'), vf);
   assert.ok(vf.includes('scale='));
+});
+
+test('soft-muxed subtitle sidecars are added as a second input and mapped', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-sidecar-test-'));
+  const subtitlePath = path.join(dir, 'selected subtitle.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts', subtitles: 'soft', subtitlePath }, PROBE_4K_HEVC);
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.m3u8', kind: 'hls' },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  const secondInput = args.indexOf('-i', args.indexOf('-i') + 1);
+  assert.equal(args[secondInput + 1], subtitlePath);
+  assert.equal(args[args.indexOf('-map', args.indexOf('-map', args.indexOf('-map') + 1) + 1) + 1], '0:s?');
+  assert.ok(args.includes('1:s:0?'), 'selected SRT sidecar is mapped to the output subtitles');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub');
 });
 
 test('soft muxing picks the right subtitle codec per container', () => {

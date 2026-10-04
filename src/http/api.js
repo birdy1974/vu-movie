@@ -369,8 +369,24 @@ router.post('/streams', wrap(async (req, res) => {
     profile: body.profile || {}, subtitleId: body.subtitleId || null,
     season: body.season || null, episode: body.episode || null,
   });
-  res.json({ ok: true, stream, urls: store.urlsFor(stream, baseUrlFrom(req)) });
-  afterStreamCreated(stream, baseUrlFrom(req));
+  const subtitleResult = body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
+  let subtitleError = null;
+  if (subtitleResult) {
+    try {
+      const fetched = await subs.fetchSubtitle(subtitleResult);
+      await attachSubtitleToStream(stream, fetched);
+      log.info('subtitles', `selected subtitle attached to "${stream.title}"`, { provider: fetched.provider, language: fetched.language });
+      if (getConfig().subtitles.pushToReceiver) {
+        const pushed = await pushSubtitleToReceiver({ stream, language: fetched.language });
+        if (!pushed.ok) log.warn('subtitles', 'could not push the selected subtitle to the receiver', { error: pushed.error });
+      }
+    } catch (err) {
+      subtitleError = errorText(err);
+      logError('subtitles', `selected subtitle could not be attached to "${stream.title}"`, err, { stream: stream.id });
+    }
+  }
+  res.json({ ok: true, stream, urls: store.urlsFor(stream, baseUrlFrom(req)), ...(subtitleError ? { subtitleError } : {}) });
+  afterStreamCreated(stream, baseUrlFrom(req), { skipSubtitleSearch: Boolean(subtitleResult) });
 }));
 
 /**
@@ -381,11 +397,12 @@ router.post('/streams', wrap(async (req, res) => {
  *
  * Both ran nowhere before — autoFetch() existed but was called by nothing, so
  * the toggles were decoration and a resolved title never got a subtitle unless
- * the user searched manually.
+ * the user searched manually. An explicitly selected subtitle takes priority
+ * and suppresses the automatic search for that stream.
  */
-function afterStreamCreated(stream, baseUrl) {
+function afterStreamCreated(stream, baseUrl, { skipSubtitleSearch = false } = {}) {
   const cfgObject = getConfig();
-  if (cfgObject.subtitles.autoSearch) {
+  if (cfgObject.subtitles.autoSearch && !skipSubtitleSearch) {
     autoAttachSubtitle(stream).catch((err) => {
       logError('subtitles', 'automatic subtitle search failed', err, { stream: stream.id, title: stream.title });
     });
@@ -612,7 +629,8 @@ router.post('/subtitles/download', wrap(async (req, res) => {
   let stream = null;
   if (streamId) {
     stream = await store.getStream(streamId);
-    if (stream) stored = await attachSubtitleToStream(stream, fetched);
+    if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
+    stored = await attachSubtitleToStream(stream, fetched);
   }
   // `push` wins when the caller says so explicitly; otherwise the setting is the
   // default ("setting to push subtitle file to satellite receiver" in
@@ -695,6 +713,17 @@ function spawnUpload(localFile, remoteName, remoteDir) {
 }
 
 /* ---------- enigma2 ---------- */
+
+router.post('/enigma2/test', wrap(async (req, res) => {
+  const body = req.body || {};
+  const connection = {};
+  if (typeof body.host === 'string') connection.host = body.host.trim();
+  if (body.port !== undefined) connection.port = Number(body.port) || 80;
+  if (typeof body.username === 'string') connection.username = body.username.trim();
+  if (typeof body.password === 'string' && body.password) connection.password = body.password;
+  // Test the form values directly; this does not save them or expose secrets.
+  res.json({ ok: true, status: await enigma2.testConnection(connection) });
+}));
 
 router.get('/enigma2/status', wrap(async (req, res) => {
   // Explicit "is the box there?" from the UI: always ask the receiver for real,

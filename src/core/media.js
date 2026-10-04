@@ -10,7 +10,7 @@
  *   - decode: H.264, HEVC 8/10-bit, VP9, VC-1, MPEG-2   (all fine)
  *   - encode: **H.264 only** via VAAPI. HEVC/VP9 encoding does not exist on this
  *     silicon, so "H.265 output" is CPU-only and unusably slow for live streams.
- *   - one 1080p H.264 encode at a time keeps up with real time at ~2-3 Mbit/s.
+ *   - one live 1080p H.264 encode at a time; the requested target is 8 Mbit/s.
  *
  * The ffmpeg argument list mirrors the command from the requirements, with the
  * corrections documented in docs/MOCKUP.md §5 (framerate handling + fallbacks).
@@ -906,7 +906,7 @@ export function normaliseProfile(input = {}, probeInfo = null) {
     audioCodec: input.audioCodec || 'aac',
     fps: input.fps || cfg.fps,                          // source | 25 | 30
     container: input.container || cfg.container,        // mpegts | matroska
-    subtitles: input.subtitles || 'none',               // none | soft | burn
+    subtitles: input.subtitles || 'soft',               // none | soft | burn
     subtitlePath: input.subtitlePath || null,
     subtitleLanguage: input.subtitleLanguage || 'nld',
     deinterlace: Boolean(input.deinterlace),
@@ -920,7 +920,7 @@ export function normaliseProfile(input = {}, probeInfo = null) {
   const unsupportedCodec = v?.codec ? !['h264', 'avc1'].includes(String(v.codec).toLowerCase()) : false;
   const forced = p.mode === 'copy' ? false : (p.alwaysTranscode || p.mode === 'vaapi' || p.mode === 'x264');
   const burnIn = p.subtitles === 'burn';
-  const softMux = p.subtitles === 'soft' && Boolean(p.subtitlePath);
+  const softMux = p.subtitles === 'soft';
 
   p.transcode = p.mode !== 'copy' && (forced || needsDownscale || unsupportedCodec || burnIn);
   p.softMux = softMux;
@@ -966,11 +966,13 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // hw.available), i.e. a command ffmpeg is guaranteed to reject. Fall back to
   // the software encoder, shaped by transcode.encoderFallback below.
   const encoder = p.transcode && p.encoder === 'vaapi' && !hw?.available ? 'libx264' : p.encoder;
+  const sidecarSubtitlePath = p.subtitles === 'soft' && p.subtitlePath && fs.existsSync(p.subtitlePath)
+    ? p.subtitlePath
+    : null;
 
-  // --- input resilience (identical to the command in the requirements) ---
+  // --- input resilience (keep the supplied command's option order) ---
   if (isHttp) {
     args.push(
-      '-rw_timeout', '10000000',
       '-reconnect', '1',
       '-reconnect_at_eof', '1',
       '-reconnect_streamed', '1',
@@ -978,16 +980,6 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     );
   }
   args.push('-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err');
-  const sourceHeaders = headerObject(source.headers);
-  if (isHttp) {
-    args.push('-user_agent', sourceHeaders['User-Agent'] || getConfig().scraper.userAgent);
-    args.push(...headerArgs(sourceHeaders));
-  }
-  // Live playback: a 1 MB probe window starts the picture sooner and stops
-  // ffmpeg scanning deep into a long VOD manifest (flag from the field-tested
-  // command the DUO2 test ran with).
-  if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
-  if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
 
   // --- hardware decode ---
   const useVaapi = p.transcode && encoder === 'vaapi';
@@ -1001,10 +993,23 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     // burn-in needs system-memory frames for the subtitles filter (hwdownload),
     // so in that case we deliberately do NOT keep frames in GPU memory.
     if (!burnIn) args.push('-hwaccel_output_format', 'vaapi');
-    args.push('-filter_hw_device', 'intel');
+    else args.push('-filter_hw_device', 'intel');
   }
 
+  if (isHttp) {
+    args.push('-rw_timeout', '10000000');
+    const sourceHeaders = headerObject(source.headers);
+    args.push('-user_agent', sourceHeaders['User-Agent'] || getConfig().scraper.userAgent);
+    args.push(...headerArgs(sourceHeaders));
+  }
+  // Live playback: a 1 MB probe window starts the picture sooner and stops
+  // ffmpeg scanning deep into a long VOD manifest (flag from the field-tested
+  // command the DUO2 test ran with).
+  if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
+  if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
+
   args.push('-i', source.url);
+  if (sidecarSubtitlePath) args.push('-i', sidecarSubtitlePath);
 
   // --- video filter chain ---
   const vf = [];
@@ -1016,7 +1021,8 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   } else if (needScale) {
     vf.push(`scale=w=${w}:h=${h}`);
   }
-  const wantsFps = Boolean(p.fps && p.fps !== 'source');
+  // A requested output rate requires a video encode; leave stream-copy sources untouched.
+  const wantsFps = Boolean(p.transcode && p.fps && p.fps !== 'source');
   // The fps filter can only run on VAAPI surfaces when the build supports it
   // (variant 1 in the self-test). Otherwise the conversion happens on output
   // via -fps_mode/-r, which is why it is NOT added to the filter chain here.
@@ -1037,7 +1043,10 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 
   // --- stream mapping ---
   args.push('-map', '0:v:0', '-map', '0:a:0?');
-  if (p.softMux) args.push('-map', '0:s:0?');
+  if (p.softMux) {
+    args.push('-map', '0:s?');
+    if (sidecarSubtitlePath) args.push('-map', '1:s:0?');
+  }
   args.push('-dn');
   if (!p.softMux) args.push('-sn');
 
@@ -1049,7 +1058,7 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
       args.push('-bsf:v', 'h264_mp4toannexb');
     }
   } else if (encoder === 'vaapi') {
-    const vb = Number(p.videoBitrate || 2500);
+    const vb = Number(p.videoBitrate || getConfig().transcode.videoBitrate || 8000);
     args.push(
       '-c:v', 'h264_vaapi',
       '-b:v', `${vb}k`,
@@ -1060,11 +1069,12 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
       '-profile:v', 'high',
       '-level', '4.1',
       '-g', String(Math.round(Number(p.fps && p.fps !== 'source' ? p.fps : 25) * 2)),
+      ...(wantsFps ? ['-r', String(p.fps)] : []),
       '-rc_mode', 'VBR',
       '-async_depth', '4',
     );
   } else if (encoder === 'libx264') {
-    const vb = Number(p.videoBitrate || 2500);
+    const vb = Number(p.videoBitrate || getConfig().transcode.videoBitrate || 8000);
     // transcode.encoderFallback (Settings → Transcode, ENCODER_FALLBACK) is the
     // software fallback *command*; it was declared, shown in the UI and read by
     // nothing — the preset/crf were hard-coded here. Split it into ffmpeg args;
@@ -1085,15 +1095,25 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // --- framerate conversion (only when not already done in the filter chain) ---
   if (wantsFps && !fpsInChain) {
     const variant = encoder === 'vaapi' ? hw?.fpsVariant : null;
-    if (variant === 3) args.push('-r', String(p.fps)); // legacy ffmpeg syntax
-    else args.push('-fps_mode', 'cfr', '-r', String(p.fps));
+    if (encoder === 'vaapi') {
+      // The VAAPI profile already carries the requested output -r immediately
+      // after -g (as in the supplied command); only older builds need fallback
+      // timestamp handling when their fps filter self-test failed.
+      if (variant !== 3) args.push('-fps_mode', 'cfr');
+    } else {
+      args.push('-fps_mode', 'cfr', '-r', String(p.fps));
+    }
   }
 
   // --- audio ---
   if (p.transcode) {
     args.push('-c:a', p.audioCodec || 'aac');
     if ((p.audioCodec || 'aac') !== 'copy') {
-      args.push('-b:a', `${p.audioBitrate || 128}k`, '-ac', String(p.audioChannels || 2), '-ar', '48000');
+      args.push(
+        '-b:a', `${p.audioBitrate || getConfig().transcode.audioBitrate || 192}k`,
+        '-ac', String(p.audioChannels || getConfig().transcode.audioChannels || 6),
+        '-ar', '48000',
+      );
     }
   } else {
     args.push('-c:a', 'copy');
@@ -1101,11 +1121,10 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 
   // --- subtitles (soft mux) ---
   if (p.softMux) {
-    if (container === 'matroska') {
-      args.push('-c:s', 'srt', '-metadata:s:s:0', `language=${p.subtitleLanguage || 'nld'}`);
-    } else {
+    if (container === 'matroska') args.push('-c:s', 'srt');
+    else {
       // MPEG-TS/HLS carry DVB subtitles — this is what Enigma2 understands.
-      args.push('-c:s', 'dvbsub', '-metadata:s:s:0', `language=${p.subtitleLanguage || 'nld'}`);
+      args.push('-c:s', 'dvbsub');
     }
   }
 
