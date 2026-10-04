@@ -726,22 +726,32 @@ export function streamKind(url) {
   return 'file';
 }
 
+/**
+ * Headers must be a name→value map. A bare list of names — the shape
+ * /find/resolve used to hand the UI — carries no values and would otherwise
+ * become `0: Referer` / `1: User-Agent` ffmpeg arguments, so it is ignored.
+ */
+export function headerObject(headers) {
+  return headers && typeof headers === 'object' && !Array.isArray(headers) ? headers : {};
+}
+
 /** ffmpeg expects all extra headers in one CRLF separated string. */
 export function headerArgs(headers = {}) {
-  const lines = Object.entries(headers)
+  const lines = Object.entries(headerObject(headers))
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
     .map(([k, v]) => `${k}: ${v}`);
   return lines.length ? ['-headers', lines.join('\r\n') + '\r\n'] : [];
 }
 
 export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000 } = {}) {
+  const h = headerObject(headers);
   return [
     '-v', 'error',
     '-print_format', 'json',
     '-show_format', '-show_streams',
     '-rw_timeout', String(timeoutMs * 1000),
-    '-user_agent', headers['User-Agent'] || getConfig().scraper.userAgent,
-    ...headerArgs(headers),
+    '-user_agent', h['User-Agent'] || getConfig().scraper.userAgent,
+    ...headerArgs(h),
     url,
   ];
 }
@@ -950,6 +960,13 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   const isHttp = /^https?:/i.test(source.url || '');
   const kind = source.kind || streamKind(source.url);
 
+  // An encoder this box cannot actually run must never reach the command line:
+  // a profile that asks for vaapi where the GPU self-test failed used to emit
+  // `-c:v h264_vaapi` *without* `-init_hw_device` (only the hwaccel block checks
+  // hw.available), i.e. a command ffmpeg is guaranteed to reject. Fall back to
+  // the software encoder, shaped by transcode.encoderFallback below.
+  const encoder = p.transcode && p.encoder === 'vaapi' && !hw?.available ? 'libx264' : p.encoder;
+
   // --- input resilience (identical to the command in the requirements) ---
   if (isHttp) {
     args.push(
@@ -961,14 +978,19 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     );
   }
   args.push('-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err');
+  const sourceHeaders = headerObject(source.headers);
   if (isHttp) {
-    args.push('-user_agent', source.headers?.['User-Agent'] || getConfig().scraper.userAgent);
-    args.push(...headerArgs(source.headers));
+    args.push('-user_agent', sourceHeaders['User-Agent'] || getConfig().scraper.userAgent);
+    args.push(...headerArgs(sourceHeaders));
   }
+  // Live playback: a 1 MB probe window starts the picture sooner and stops
+  // ffmpeg scanning deep into a long VOD manifest (flag from the field-tested
+  // command the DUO2 test ran with).
+  if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
   if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
 
   // --- hardware decode ---
-  const useVaapi = p.transcode && p.encoder === 'vaapi' && hw.available;
+  const useVaapi = p.transcode && encoder === 'vaapi';
   const burnIn = p.subtitles === 'burn' && p.subtitlePath;
   if (useVaapi) {
     args.push(
@@ -989,7 +1011,7 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   if (p.deinterlace) vf.push('yadif');
   const { w, h } = p.dimensions || { w: 1920, h: 1080 };
   const needScale = Boolean(p.transcode) && (p.mode !== 'copy');
-  if (needScale && p.encoder === 'vaapi' && !burnIn) {
+  if (needScale && encoder === 'vaapi' && !burnIn) {
     vf.push(`scale_vaapi=w=${w}:h=${h}:format=nv12`);
   } else if (needScale) {
     vf.push(`scale=w=${w}:h=${h}`);
@@ -998,13 +1020,16 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // The fps filter can only run on VAAPI surfaces when the build supports it
   // (variant 1 in the self-test). Otherwise the conversion happens on output
   // via -fps_mode/-r, which is why it is NOT added to the filter chain here.
-  const fpsInChain = wantsFps && (p.encoder !== 'vaapi' || burnIn || hw?.fpsVariant === 1);
+  const fpsInChain = wantsFps && (encoder !== 'vaapi' || burnIn || hw?.fpsVariant === 1);
   if (fpsInChain) vf.push(`fps=${p.fps}`);
+  // The confirmed-working VAAPI command ends the scale chain with setsar=1, so
+  // an odd source SAR cannot letterbox or shift the picture on VLC/the VU+.
+  if (needScale && encoder === 'vaapi' && !burnIn) vf.push('setsar=1');
   if (burnIn) {
     vf.push(`subtitles=filename=${escapeFilterPath(p.subtitlePath)}`);
-    if (p.encoder === 'vaapi') vf.push('format=nv12', 'hwupload');
+    if (encoder === 'vaapi') vf.push('format=nv12', 'hwupload');
     else vf.push('format=yuv420p');
-  } else if (p.transcode && p.encoder === 'libx264') {
+  } else if (p.transcode && encoder === 'libx264') {
     vf.push('format=yuv420p');
   }
   const filterString = vf.filter(Boolean).join(',');
@@ -1023,33 +1048,43 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     else if (container === 'mpegts' && (kind === 'file' || source.bsf === undefined) && /mp4|mov|m4v/i.test(String(source.container || ''))) {
       args.push('-bsf:v', 'h264_mp4toannexb');
     }
-  } else if (p.encoder === 'vaapi') {
+  } else if (encoder === 'vaapi') {
     const vb = Number(p.videoBitrate || 2500);
     args.push(
       '-c:v', 'h264_vaapi',
       '-b:v', `${vb}k`,
-      '-maxrate', `${Math.round(vb * 1.2)}k`,
-      '-bufsize', `${Math.round(vb * 1.8)}k`,
+      // VBR ladder from the confirmed-working command: 1.5× peak, bufsize = the
+      // target bitrate (low latency, so zapping does not wait for a big VBV).
+      '-maxrate', `${Math.round(vb * 1.5)}k`,
+      '-bufsize', `${vb}k`,
       '-profile:v', 'high',
       '-level', '4.1',
       '-g', String(Math.round(Number(p.fps && p.fps !== 'source' ? p.fps : 25) * 2)),
+      '-rc_mode', 'VBR',
+      '-async_depth', '4',
     );
-  } else if (p.encoder === 'libx264') {
+  } else if (encoder === 'libx264') {
     const vb = Number(p.videoBitrate || 2500);
+    // transcode.encoderFallback (Settings → Transcode, ENCODER_FALLBACK) is the
+    // software fallback *command*; it was declared, shown in the UI and read by
+    // nothing — the preset/crf were hard-coded here. Split it into ffmpeg args;
+    // a value that lost its codec name falls back to the documented default.
+    const fallbackArgs = String(getConfig().transcode.encoderFallback || '').trim().split(/\s+/).filter(Boolean);
+    const codecArgs = fallbackArgs.length >= 2 ? fallbackArgs : ['libx264', '-preset', 'veryfast', '-crf', '22'];
     args.push(
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+      '-c:v', ...codecArgs,
       '-maxrate', `${Math.round(vb * 1.2)}k`, '-bufsize', `${Math.round(vb * 1.8)}k`,
       '-profile:v', 'high', '-level', '4.1', '-pix_fmt', 'yuv420p',
       '-g', String(Math.round(Number(p.fps && p.fps !== 'source' ? p.fps : 25) * 2)),
     );
-  } else if (p.encoder === 'libx265') {
+  } else if (encoder === 'libx265') {
     // CPU only — Apollo Lake has no HEVC encoder. Kept for downloads, not live use.
     args.push('-c:v', 'libx265', '-preset', 'ultrafast', '-crf', '24', '-tag:v', 'hvc1');
   }
 
   // --- framerate conversion (only when not already done in the filter chain) ---
   if (wantsFps && !fpsInChain) {
-    const variant = p.encoder === 'vaapi' ? hw?.fpsVariant : null;
+    const variant = encoder === 'vaapi' ? hw?.fpsVariant : null;
     if (variant === 3) args.push('-r', String(p.fps)); // legacy ffmpeg syntax
     else args.push('-fps_mode', 'cfr', '-r', String(p.fps));
   }
@@ -1094,6 +1129,9 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     if (mode === 'live') args.push('-live', '1');
   } else {
     args.push('-f', 'mpegts', '-mpegts_flags', '+resend_headers');
+    // Flush every packet straight away so VLC/the VU+ start zapping without a
+    // muxer buffer delay (flag from the confirmed-working command).
+    if (mode === 'live') args.push('-flush_packets', '1');
   }
   args.push('-max_muxing_queue_size', '1024');
   if (mode === 'live') args.push('-progress', 'pipe:2', '-nostats');
@@ -1101,7 +1139,6 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   return args;
 }
 
-function vh(encoder, transcode) { return transcode ? encoder : 'copy'; }
 
 /** ffmpeg filter paths need escaping of : \ ' and , */
 export function escapeFilterPath(p) {

@@ -845,7 +845,7 @@ function buildCmd(){
   }else{
     const codec = (enc==='vaapi'&&vc==='h264')?'h264_vaapi':'libx264';
     const tail  = (enc==='vaapi'&&vc==='h264')
-      ? `-c:v h264_vaapi -b:v <span class="v">${vb}k</span> -maxrate ${Math.round(vb*1.2)}k -bufsize ${Math.round(vb*1.8)}k -profile:v high -level 4.1 -g 50`
+      ? `-c:v h264_vaapi -b:v <span class="v">${vb}k</span> -maxrate ${Math.round(vb*1.5)}k -bufsize ${vb}k -profile:v high -level 4.1 -g 50 -rc_mode VBR -async_depth 4`
       : `-c:v libx264 -preset veryfast -crf 22 -maxrate <span class="v">${vb}k</span> -bufsize ${Math.round(vb*1.8)}k`;
     L.push(`  -vf "<span class="k">${vf.join(',')}</span>" -map 0:v:0 -map 0:a:0? -sn -dn \\`);
     L.push(`  ${tail} ${fps!=='src'?`-r ${fps}`:''} \\`);

@@ -249,18 +249,56 @@ export function defaultMediaPattern(kind) {
 /** Cache of compiled recipe patterns (site id → [{re, kind}]). */
 const recipeMediaPatterns = new Map();
 
-function compiledPatternsFor(siteId) {
-  const cached = recipeMediaPatterns.get(siteId);
+/**
+ * The site registry lives in registry.js, which imports *this* module — so we
+ * cannot import it back without a cycle. Instead the registry hands us its
+ * loader once, and a bare `sniff()` call (or a unit test) simply falls back to
+ * the built-in patterns.
+ *
+ * Before this existed, compiledPatternsFor() called an undefined `loadSources()`
+ * and its catch swallowed the ReferenceError, so every per-site recipe pattern
+ * (the whole point of the v2 media-detection upgrade: manifests behind URLs with
+ * no extension) was silently ignored.
+ */
+let sourceLookup = null;
+
+export function registerSourceLookup(fn) {
+  sourceLookup = typeof fn === 'function' ? fn : null;
+  clearRecipeMediaPatternCache();
+}
+
+/** Called when sources are reloaded, so edited patterns take effect at once. */
+export function clearRecipeMediaPatternCache() {
+  recipeMediaPatterns.clear();
+}
+
+/**
+ * Compiled media patterns for a site: the ones the caller passed (the registry
+ * already has the recipe in hand) or, failing that, whatever the registry can
+ * look up.
+ */
+export function compiledPatternsFor(siteId, recipePatterns = null) {
+  const provided = Array.isArray(recipePatterns) && recipePatterns.length ? recipePatterns : null;
+  const key = `${siteId ?? ''}\u0000${provided ? JSON.stringify(provided) : ''}`;
+  const cached = recipeMediaPatterns.get(key);
   if (cached) return cached;
-  let patterns = [];
-  if (siteId) {
+
+  let patterns = provided || [];
+  if (!patterns.length && siteId && sourceLookup) {
     try {
-      const source = loadSources().find((s) => s.id === siteId);
+      const source = sourceLookup()?.find((s) => s.id === siteId);
       patterns = Array.isArray(source?.mediaPatterns) ? source.mediaPatterns : [];
-    } catch { /* registry not loaded (unit tests) — fall back to the built-ins */ }
+    } catch (err) {
+      // A failing lookup must never break sniffing — but say so in the log
+      // instead of hiding a coding error behind a bare catch (that is how this
+      // function spent its life returning [] and nobody noticed).
+      log.debug('browser', `could not resolve media patterns for ${siteId}`, { error: errorText(err) });
+      patterns = [];
+    }
   }
   const compiled = patterns.map(asMatcher).filter(Boolean);
-  recipeMediaPatterns.set(siteId, compiled);
+  recipeMediaPatterns.set(key, compiled);
+  if (compiled.length) log.debug('browser', `using ${compiled.length} recipe media pattern(s) for ${siteId || 'default'}`);
   return compiled;
 }
 
@@ -293,6 +331,7 @@ export function upgradeRecipe(site = {}) {
  * @param {number} [opts.quietMs]      stop after this long without new media
  * @param {boolean} [opts.click]       click a play button (default true)
  * @param {string} [opts.session]      cookie/session bucket (usually the site id)
+ * @param {string[]} [opts.mediaPatterns] recipe patterns for that site (skip the lookup)
  * @param {boolean} [opts.captureJson] collect JSON API responses for inspection
  * @param {AbortSignal} [opts.signal]
  */
@@ -369,7 +408,7 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
       const req = res.request();
-      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session);
+      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session, opts.mediaPatterns);
       if (looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns)) {
         if (!media.has(u)) {
           let reqHeaders;

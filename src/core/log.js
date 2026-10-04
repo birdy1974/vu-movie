@@ -30,9 +30,14 @@ export function setLogLevel(level) {
   const next = LEVELS[String(level).toLowerCase()];
   if (next) {
     threshold = next;
-    info('log', `log level set to ${level}`);
+    // log.* — not bare info()/warn(): those names do not exist in this module,
+    // so every call (Settings → Application → log level, POST /api/logs/level)
+    // threw `ReferenceError: info is not defined` *in the success path*, which
+    // made the settings save answer HTTP 500 even though the file had been
+    // written.
+    log.info('log', `log level set to ${level}`);
   } else {
-    warn('log', `ignoring unknown log level "${level}"`);
+    log.warn('log', `ignoring unknown log level "${level}"`);
   }
 }
 

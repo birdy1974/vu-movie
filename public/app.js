@@ -98,7 +98,9 @@ function go(page) {
   $$('#nav button').forEach((b) => b.classList.toggle('on', b.dataset.p === page));
   $$('main > section').forEach((s) => s.classList.toggle('hide', s.id !== `p-${page}`));
   if (page === 'dash') { loadHealth(); loadJobs(); loadStreams(); }
-  if (page === 'stream' && state.stream) loadStream(state.stream.id);
+  // openStream() is the stream-page renderer; `loadStream` never existed, so
+  // navigating to Stream with a title already open threw a ReferenceError.
+  if (page === 'stream' && state.stream) openStream(state.stream.id);
   if (page === 'logs') loadLogs();
   if (page === 'set') loadSettings();
   if (page === 'subs') loadProviders();
@@ -1065,6 +1067,9 @@ function renderStream(res) {
   if (p.fps) $('#pf-fps').value = p.fps === 'source' ? 'source' : String(p.fps);
   if (p.videoBitrate) { $('#pf-vbr').value = p.videoBitrate; $('#pf-vbr-l').textContent = `${p.videoBitrate} kbps`; }
   if (p.audioBitrate) { $('#pf-abr').value = p.audioBitrate; $('#pf-abr-l').textContent = `${p.audioBitrate} kbps`; }
+  // Without this the selector silently fell back to "2 (stereo)" after a reload,
+  // and the next Apply saved stereo over the 5.1 the user had chosen.
+  if (p.audioChannels) { try { $('#pf-ac').value = String(p.audioChannels); } catch { /* keep default */ } }
   $('#pf-always').checked = Boolean(p.alwaysTranscode);
   $('#pf-mode').value = p.mode || 'auto';
   $('#pf-subs').value = p.subtitles || 'none';
@@ -1128,6 +1133,10 @@ function updateCommandPreview() {
       container: $('#pf-container').value,
       videoBitrate: $('#pf-vbr').value,
       audioBitrate: $('#pf-abr').value,
+      // was missing: the preview always showed `-ac 2` even with "6 (surround)"
+      // selected, while applyProfile() saved 6 — the command and the saved
+      // profile disagreed until you pressed Apply.
+      audioChannels: $('#pf-ac').value,
       fps: $('#pf-fps').value,
       subtitles: $('#pf-subs').value,
       alwaysTranscode: String($('#pf-always').checked),
@@ -1393,7 +1402,7 @@ const SETTINGS_SECTIONS = [
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
       ['bouquetName', 'text'], ['rootDir', 'text'], ['serviceType', 'number'],
-      ['ftpEnabled', 'bool'], ['ftpPort', 'number'], ['autoPush', 'bool'], ['mountDir', 'text'],
+      ['ftpEnabled', 'bool'], ['ftpPort', 'number'], ['autoPush', 'bool'],
     ],
   },
   {
@@ -1489,7 +1498,7 @@ function wire() {
     $(`#${id}-l`).textContent = `${$(`#${id}`).value} kbps`;
     updateCommandPreview();
   }));
-  ['pf-mode', 'pf-res', 'pf-aspect', 'pf-container', 'pf-fps', 'pf-subs', 'pf-always', 'pf-deint']
+  ['pf-mode', 'pf-res', 'pf-aspect', 'pf-container', 'pf-fps', 'pf-subs', 'pf-always', 'pf-deint', 'pf-ac']
     .forEach((id) => $(`#${id}`).addEventListener('change', updateCommandPreview));
   $('#btn-profile-apply').addEventListener('click', applyProfile);
   $('#btn-profile-reset').addEventListener('click', async () => {

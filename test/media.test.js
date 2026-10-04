@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
-  targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, parseFps,
+  targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -43,6 +43,26 @@ test('headerArgs turns header objects into one -headers argument', () => {
   assert.ok(args[1].includes('Referer: https://a/'));
   assert.ok(args[1].includes('User-Agent: UA'));
   assert.deepEqual(headerArgs({}), []);
+  assert.deepEqual(headerArgs(undefined), []);
+});
+
+test('a bare list of header names never becomes numbered ffmpeg headers', () => {
+  // /find/resolve used to send ["Referer","User-Agent"] to the UI, which posted
+  // it back verbatim; the relay then sent `-headers "0: Referer\r\n1: User-Agent"`
+  // to ffmpeg and lost every cookie. The list must be ignored, not serialised.
+  assert.deepEqual(headerArgs(['Referer', 'User-Agent']), []);
+  assert.deepEqual(headerObject(['Referer', 'User-Agent']), {});
+  assert.deepEqual(headerObject(null), {});
+  assert.deepEqual(headerObject({ Referer: 'https://a/' }), { Referer: 'https://a/' });
+
+  const profile = normaliseProfile({ mode: 'copy' }, PROBE_1080P_H264);
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', headers: ['Referer', 'User-Agent'], kind: 'file' },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(!args.join(' ').includes('0: Referer'), 'no numbered header lines');
+  const ua = args[args.indexOf('-user_agent') + 1];
+  assert.ok(typeof ua === 'string' && ua.startsWith('Mozilla/5.0'), 'falls back to the configured UA');
 });
 
 test('copy/remux produces a single playable MPEG-TS on stdout', () => {
@@ -82,14 +102,38 @@ test('VAAPI transcoding matches the documented command shape', () => {
   assert.equal(args[args.indexOf('-init_hw_device') + 1], 'vaapi=intel:/dev/dri/renderD128');
   assert.equal(args[args.indexOf('-hwaccel') + 1], 'vaapi');
   assert.equal(args[args.indexOf('-hwaccel_output_format') + 1], 'vaapi');
-  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1280:h=720:format=nv12,fps=25');
+  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1280:h=720:format=nv12,fps=25,setsar=1');
   assert.equal(args[args.indexOf('-c:v') + 1], 'h264_vaapi');
   assert.equal(args[args.indexOf('-b:v') + 1], '1000k');
-  assert.equal(args[args.indexOf('-maxrate') + 1], '1200k');
-  assert.equal(args[args.indexOf('-bufsize') + 1], '1800k');
+  // Ladder from the DUO2 field test: 1.5× peak, bufsize = target bitrate.
+  assert.equal(args[args.indexOf('-maxrate') + 1], '1500k');
+  assert.equal(args[args.indexOf('-bufsize') + 1], '1000k');
+  assert.equal(args[args.indexOf('-rc_mode') + 1], 'VBR');
+  assert.equal(args[args.indexOf('-async_depth') + 1], '4');
   assert.equal(args[args.indexOf('-c:a') + 1], 'aac');
   assert.equal(args[args.indexOf('-b:a') + 1], '128k');
   assert.equal(args[args.indexOf('-map') + 1], '0:v:0');
+  // live-specific flags from the same confirmed-working command
+  assert.equal(args[args.indexOf('-analyzeduration') + 1], '1000000');
+  assert.equal(args[args.indexOf('-probesize') + 1], '1000000');
+  assert.equal(args[args.indexOf('-flush_packets') + 1], '1');
+});
+
+test('a vaapi profile on a box without a working GPU degrades to software', () => {
+  const profile = normaliseProfile({ mode: 'vaapi', resolution: 720, videoBitrate: 1000 }, PROBE_4K_HEVC);
+  assert.equal(profile.encoder, 'vaapi', 'the profile still asks for vaapi');
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.m3u8', kind: 'hls' },
+    profile, hw: { available: false }, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  // Before: `-c:v h264_vaapi` with no `-init_hw_device` — ffmpeg rejects that.
+  assert.equal(args[args.indexOf('-c:v') + 1], 'libx264');
+  assert.ok(!args.includes('h264_vaapi'));
+  assert.ok(!args.includes('-init_hw_device'));
+  assert.equal(args[args.indexOf('-preset') + 1], 'veryfast');
+  const vf = args[args.indexOf('-vf') + 1] || '';
+  assert.ok(!vf.includes('scale_vaapi'), `software path must not use VAAPI filters: ${vf}`);
+  assert.ok(vf.includes('scale=w=1280:h=720'), vf);
 });
 
 test('when the GPU cannot run the fps filter, ffmpeg converts on output instead', () => {
@@ -98,7 +142,7 @@ test('when the GPU cannot run the fps filter, ffmpeg converts on output instead'
     source: { url: 'https://cdn/x.m3u8', kind: 'hls' },
     profile, hw: { ...HW, fpsVariant: 2 }, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
   });
-  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1280:h=720:format=nv12');
+  assert.equal(args[args.indexOf('-vf') + 1], 'scale_vaapi=w=1280:h=720:format=nv12,setsar=1');
   assert.ok(!args.includes('fps=25'), 'the fps filter cannot run on VAAPI surfaces');
   assert.equal(args[args.indexOf('-fps_mode') + 1], 'cfr');
   assert.equal(args[args.indexOf('-r') + 1], '25');

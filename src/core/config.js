@@ -158,8 +158,15 @@ export const DEFAULTS = {
   subtitles: {
     /** Order matters: the first language with a good hit wins. */
     languages: (process.env.SUBTITLE_LANGUAGES || 'nl,en').split(',').map((s) => s.trim()).filter(Boolean),
+    /**
+     * Search (and attach) a subtitle automatically for every title the user
+     * resolves — the behaviour requirements.md asks for. Set
+     * SUBTITLE_AUTO_SEARCH=false to only search from the Subtitles page.
+     */
     autoSearch: String(process.env.SUBTITLE_AUTO_SEARCH || 'true').toLowerCase() !== 'false',
-    convertToUtf8: true,
+    // (No convertToUtf8 option: decodeSubtitle() in subtitles/util.js always
+    // detects UTF-8/UTF-16/CP1252 — the flag that existed was read by nothing.)
+    /** Default for "also copy the .srt to the receiver" when a subtitle is downloaded. */
     pushToReceiver: String(process.env.SUBTITLE_PUSH || 'false').toLowerCase() === 'true',
     receiverDir: process.env.SUBTITLE_RECEIVER_DIR || '/media/hdd/movie/vumovie',
     /** API keys — set here or through the UI (stored in /config only). */
@@ -187,7 +194,6 @@ export const DEFAULTS = {
     rootDir: process.env.ENIGMA2_ROOT || '/etc/enigma2',
     /** 4097 = GStreamer/exteplayer3 (safest for IPTV on a Duo2). */
     serviceType: Number(process.env.ENIGMA2_SERVICE_TYPE || 4097),
-    referer: process.env.STREAM_REFERER || '',
     /** FTP fallback when OpenWebif upload is unavailable. */
     ftpEnabled: String(process.env.ENIGMA2_FTP || 'false').toLowerCase() === 'true',
     ftpPort: Number(process.env.ENIGMA2_FTP_PORT || 21),

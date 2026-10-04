@@ -113,6 +113,7 @@ export async function ensureSession(stream, opts = {}) {
   // muxer overhead reasonable on a Celeron. Tunable through CONFIG.
   const hlsTime = Number(cfg.transcode.hlsSegmentSeconds) || 2;
   const hlsDir = wantsHls ? hlsDirFor(stream) : null;
+  if (hlsDir) enforceHlsBudget(hlsDir);
   const effectiveProfile = { ...profile, container: wantsHls ? 'hls' : profile.container };
 
   const args = buildFfmpegArgs({
@@ -140,7 +141,7 @@ export async function ensureSession(stream, opts = {}) {
     mode: profile.transcode ? 'transcode' : 'copy',
     encoder: profile.transcode ? (hw.available && profile.encoder === 'vaapi' ? 'h264_vaapi' : profile.encoder || 'libx264') : 'copy',
     profile: effectiveProfile,
-    hlsDir: wantsHls ? hlsDirFor(stream) : null,
+    hlsDir,
     command,
     args,
     clients: new Set(),
@@ -171,8 +172,72 @@ function hlsDirFor(stream) {
   return dir;
 }
 
-function spawnFfmpeg(session) {
+/**
+ * storage.cacheBudgetMb bounds the on-disk HLS cache. Every session removes its
+ * own directory on stop, but a crash or a SIGKILL can leave orphaned segments
+ * behind; this sweep runs right before a new HLS session starts and deletes the
+ * oldest *inactive* directories until the cache fits the budget. Directories of
+ * live sessions (and the one about to start) are never touched.
+ */
+export function enforceHlsBudget(keepDir = null) {
   const cfg = getConfig();
+  const budgetMb = Math.max(64, Number(cfg.storage.cacheBudgetMb) || 2048);
+  const root = path.join(cfg.storage.tmp, 'hls');
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+  const active = new Set([...sessions.values()].map((s) => s.hlsDir).filter(Boolean));
+  if (keepDir) active.add(keepDir);
+
+  const dirs = [];
+  let total = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(root, entry.name);
+    const { size, mtimeMs } = dirSize(dir);
+    total += size;
+    dirs.push({ dir, size, mtimeMs });
+  }
+  const budget = budgetMb * 1024 * 1024;
+  if (total <= budget) return;
+
+  dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  for (const { dir, size } of dirs) {
+    if (total <= budget) break;
+    if (active.has(dir)) continue;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      total -= size;
+      log.warn('relay', `removed stale HLS cache ${path.basename(dir)} (${Math.round(size / 1048576)} MB) to stay within the ${budgetMb} MB budget`);
+    } catch (err) {
+      log.debug('relay', 'could not remove a stale HLS cache directory', { dir, error: String(err?.message || err) });
+    }
+  }
+}
+
+/** Bytes + newest mtime under a directory (best effort; missing files count 0). */
+function dirSize(dir) {
+  let size = 0;
+  let mtimeMs = 0;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return { size, mtimeMs }; }
+  for (const entry of entries) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const sub = dirSize(p);
+      size += sub.size;
+      mtimeMs = Math.max(mtimeMs, sub.mtimeMs);
+    } else {
+      try {
+        const st = fs.statSync(p);
+        size += st.size;
+        mtimeMs = Math.max(mtimeMs, st.mtimeMs);
+      } catch { /* vanished while sweeping */ }
+    }
+  }
+  return { size, mtimeMs };
+}
+
+function spawnFfmpeg(session) {
   // ffmpegEnv() pins LIBVA_DRIVER_NAME to the driver the self-test proved to
   // work (iHD on some NAS, i965 on the DS918+) — without it ffmpeg would retry
   // the driver that failed on every session.

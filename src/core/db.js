@@ -288,8 +288,13 @@ export const repo = {
   },
 
   async deleteStream(id) {
-    mem.streams.delete(id);
-    if (pool) await query('delete from streams where id = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
+    // getStream() accepts the opaque token as a handle too (DELETE /api/streams/:id
+    // and the VLC/Enigma2 URLs hand out tokens), so the delete must match both —
+    // `delete ... where id = $1` silently deleted nothing for a token.
+    for (const [key, rec] of mem.streams) {
+      if (key === id || rec.id === id || rec.token === id) mem.streams.delete(key);
+    }
+    if (pool) await query('delete from streams where id = $1 or token = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
   },
 
   /* ---------------- titles / metadata ---------------- */

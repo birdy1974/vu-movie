@@ -295,7 +295,7 @@ test('findStreamsByTitle unions play-info and resource listings and dedupes by m
 
 test('a 200 with a non-JSON body is a host failure, not an empty result', async () => {
   const attempted = [];
-  const fakeFetch = async (url, init = {}) => {
+  const fakeFetch = async (url) => {
     const path = new URL(url).pathname;
     attempted.push(new URL(url).host);
     if (path.endsWith('/user-api/visitor-login')) {

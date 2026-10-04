@@ -60,7 +60,7 @@ export function writePlaylistFile(text, filename) {
  *
  * @returns the job (already queued)
  */
-export function startDownload(stream, { profile = {}, filename = null, baseUrl = null } = {}) {
+export function startDownload(stream, { profile = {}, filename = null } = {}) {
   const cfg = getConfig();
   const container = profile.container || stream.profile?.container || cfg.transcode.container;
   const ext = container === 'matroska' ? 'mkv' : container === 'mp4' ? 'mp4' : 'ts';

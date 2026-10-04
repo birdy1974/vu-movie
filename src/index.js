@@ -15,7 +15,7 @@
 
 import { log, logError, errorText } from './core/log.js';
 import { loadConfig, getConfig, ensureDirs, publicConfig } from './core/config.js';
-import { initDatabase, closeDatabase, dbState } from './core/db.js';
+import { initDatabase, closeDatabase } from './core/db.js';
 import { checkBinaries, hardware, hardwarePending, hardwareStatus } from './core/media.js';
 import { startServer } from './http/server.js';
 import relay from './streams/relay.js';
