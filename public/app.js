@@ -65,6 +65,7 @@ const state = {
   jobs: [],
   sessions: [],
   ffmpegTemplates: [],
+  ffmpegTemplateSchema: null,
   ffmpegTemplatesLoaded: false,
   defaultFfmpegTemplateId: '',
   pendingRestoreSelection: false,
@@ -1416,6 +1417,7 @@ async function loadFfmpegTemplates(force = false) {
   try {
     const result = await api('/api/ffmpeg/templates', { silent: true });
     state.ffmpegTemplates = Array.isArray(result.templates) ? result.templates : [];
+    if (result.schema && Array.isArray(result.schema.fields)) state.ffmpegTemplateSchema = result.schema;
     state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
     state.ffmpegDefaults = result.ffmpegDefaults && typeof result.ffmpegDefaults === 'object' ? result.ffmpegDefaults : {};
     state.ffmpegTemplatesLoaded = true;
@@ -1448,7 +1450,9 @@ function renderFfmpegTemplateControls(profile = {}) {
   const options = [
     new Option('Guided profile builder', ''),
     new Option('Custom command…', TEMPLATE_CUSTOM_VALUE),
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+    // A disabled template stays selectable for editing, but the label says so:
+    // at playback time the relay skips it and falls back to the guided builder.
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}${item.enabled === false ? ' (disabled)' : ''}`, item.id)),
   ];
   select.replaceChildren(...options);
   const saved = state.ffmpegTemplates.find((item) => item.id === profile.ffmpegTemplateId);
@@ -1543,10 +1547,61 @@ async function deleteFfmpegTemplate() {
 /** All templates know which output types they want to drive. */
 state.tplEditor = null;
 state.ffmpegDefaults = state.ffmpegDefaults || {};
+/** Structured FFmpeg fields of the template being edited (see ffmpeg-options.js). */
+state.tplOptions = null;
+state.tplMessages = [];
+/** False while the fields still have to be read out of the command text. */
+state.tplOptionsSynced = true;
+/** Fields a parse starts from (null = nothing is assumed). */
+state.tplParseBase = null;
+state.tplRenderedCommand = '';
+/** Guards against an old build/parse response overwriting a newer editor state. */
+let tplRequestSeq = 0;
+let tplBuildTimer = null;
+let tplParseTimer = null;
 
+/**
+ * Select a template for editing.
+ *
+ * The structured fields (state.tplOptions) are loaded from the template when it
+ * has them; a template without fields (saved from the Stream tab, or by an
+ * older version) has its command parsed into fields instead, so every existing
+ * template becomes editable here.
+ */
 function tplEditorSelect(template) {
-  state.tplEditor = template ? { ...template, output: { ...(template.output || {}) } } : null;
-  renderTplEditor();
+  state.tplEditor = template ? { ...template, output: { ...(template.output || {}) }, enabled: template.enabled !== false } : null;
+  state.tplMessages = [];
+  tplRequestSeq += 1;
+  if (!template) {
+    state.tplOptions = null;
+    renderTplEditor();
+    return;
+  }
+  const container = ['mpegts', 'matroska', 'hls'].includes(template.container) ? template.container : 'mpegts';
+  state.tplOptions = tplDefaultOptions(container);
+  state.tplRenderedCommand = String(template.command || '').trim();
+  state.tplOptionsSynced = false;
+  // Parsing starts from the *stored* fields when there are any (they can hold
+  // values a command cannot express, such as a dormant bitrate in CQP mode);
+  // for a hand-written command it starts from nothing, so no default is
+  // invented for a flag the operator never used.
+  state.tplParseBase = null;
+  if (template.options && typeof template.options === 'object') {
+    state.tplOptions = {
+      ...state.tplOptions,
+      ...template.options,
+      output_format: container,
+      advanced: Array.isArray(template.options.advanced) ? template.options.advanced.map((entry) => ({ ...entry })) : [],
+    };
+    state.tplOptionsSynced = true;
+    state.tplParseBase = state.tplOptions;
+    renderTplEditor();
+  } else {
+    renderTplEditor();
+    // No stored fields: read them out of the command and normalise the command
+    // from what was read, so the textarea and the controls always agree.
+    tplReadFieldsFromCommand({ rebuild: true, announce: true });
+  }
 }
 
 function tplOutputLabel(key) { return OUTPUT_LABELS[key] || key; }
@@ -1554,6 +1609,290 @@ function tplOutputLabel(key) { return OUTPUT_LABELS[key] || key; }
 function tplShortCommand(command = '') {
   const trimmed = String(command || '').replace(/\s+/g, ' ').trim();
   return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
+}
+
+function tplSchema() { return state.ffmpegTemplateSchema || null; }
+
+/**
+ * Default fields for a new template: a passthrough remux into the template's
+ * container — exactly what the Stream tab has always suggested — now editable
+ * as parameters instead of hand-written text.
+ */
+function tplDefaultOptions(container = 'mpegts') {
+  const fallback = {
+    hw_accel: 'none', device: '/dev/dri/renderD128', resolution: 'source', aspect: '16:9',
+    video_codec: 'copy', video_bitrate: '', maxrate: '', bufsize: '', fps: '', gop: '',
+    profile: '', level: '', vf_preset: 'none', low_power: false, rc_mode: 'VBR', global_quality: '',
+    async_depth: '', audio_codec: 'copy', audio_bitrate: '', audio_channels: '', audio_rate: '',
+    subs: 'drop', extra_input: '', extra_output: '', advanced: [],
+  };
+  const defaults = { ...fallback, ...((tplSchema()?.defaults) || {}), output_format: container, advanced: [] };
+  if (!Array.isArray(defaults.advanced)) defaults.advanced = [];
+  return defaults;
+}
+
+function tplOptionValue(key) {
+  const options = state.tplOptions || {};
+  if (key === 'output_format') return options.output_format || state.tplEditor?.container || 'mpegts';
+  const value = options[key];
+  return value === undefined || value === null ? '' : value;
+}
+
+/** One parameter control, built from the server-side schema. */
+function tplFieldControl(def) {
+  const id = `tpl-opt-${def.key}`;
+  const value = tplOptionValue(def.key);
+  const choices = Array.isArray(def.choices) ? def.choices : [];
+  const label = `<label for="${id}">${escapeHtml(def.label)}</label>`;
+  const hint = def.help ? `<p class="param-hint">${escapeHtml(def.help)}</p>` : '';
+  const presetLabel = (choice) => (choice === '' ? '(default)' : (def.labels && def.labels[choice]) || choice);
+  if (def.kind === 'bool') {
+    const current = value === true || value === 'true' ? 'true' : 'false';
+    return `<div class="param-field${current === 'true' ? ' on' : ''}" data-param="${def.key}">${label}
+      <select id="${id}" data-param-input="${def.key}">
+        <option value="false"${current === 'false' ? ' selected' : ''}>disabled</option>
+        <option value="true"${current === 'true' ? ' selected' : ''}>enabled</option>
+      </select>${hint}</div>`;
+  }
+  if (def.kind === 'enum' && def.custom === false) {
+    const extra = value !== '' && !choices.includes(value) ? [value] : [];
+    const options = [...choices, ...extra]
+      .map((choice) => `<option value="${escapeHtml(choice)}"${String(value) === String(choice) ? ' selected' : ''}>${escapeHtml(presetLabel(choice))}</option>`)
+      .join('');
+    return `<div class="param-field" data-param="${def.key}">${label}
+      <select id="${id}" data-param-input="${def.key}">${options}</select>${hint}</div>`;
+  }
+  const listId = `${id}-list`;
+  const datalist = choices.length
+    ? `<datalist id="${listId}">${choices.map((choice) => `<option value="${escapeHtml(choice)}">${escapeHtml(presetLabel(choice))}</option>`).join('')}</datalist>`
+    : '';
+  const inputMode = ['integer', 'number', 'positive', 'rate'].includes(def.kind) ? ' inputmode="decimal"' : '';
+  const className = def.kind === 'flags' || def.kind === 'rate' ? ' class="mono"' : '';
+  const placeholder = def.kind === 'resolution' ? 'source or 1280x720'
+    : def.kind === 'rate' ? 'e.g. 8000k' : def.kind === 'flags' ? 'additional ffmpeg flags' : '';
+  return `<div class="param-field" data-param="${def.key}">${label}
+    <input id="${id}" data-param-input="${def.key}"${className}${inputMode} value="${escapeHtml(String(value))}" placeholder="${escapeHtml(placeholder)}" list="${listId}" autocomplete="off">
+    ${datalist}${hint}</div>`;
+}
+
+function tplRenderParameters() {
+  const host = $('#tpl-editor-fields');
+  if (!host) return;
+  const schema = tplSchema();
+  if (!schema) {
+    host.innerHTML = '<div class="meta">the parameter schema could not be loaded — reload the page</div>';
+    return;
+  }
+  if (!state.tplEditor) {
+    host.innerHTML = '<div class="meta">Pick a template from the list (or press “+ New template”) to edit its parameters here.</div>';
+    return;
+  }
+  if (!state.tplOptions) state.tplOptions = tplDefaultOptions();
+  host.innerHTML = (schema.groups || []).map((group) => {
+    const fields = (schema.fields || []).filter((def) => def.group === group.id);
+    if (!fields.length) return '';
+    return `<div class="param-group">${escapeHtml(group.label)}</div>${fields.map(tplFieldControl).join('')}`;
+  }).join('');
+}
+
+function tplAdvancedDefinition(flag) {
+  return (tplSchema()?.advanced || []).find((entry) => entry.flag === flag) || null;
+}
+
+function tplRenderAdvanced() {
+  const host = $('#tpl-editor-adv-rows');
+  if (!host) return;
+  const rows = Array.isArray(state.tplOptions?.advanced) ? state.tplOptions.advanced : [];
+  const count = $('#tpl-editor-adv-count');
+  if (count) count.textContent = rows.length ? `· ${rows.length} set` : '· none set';
+  host.innerHTML = rows.length ? rows.map((entry, index) => {
+    const def = tplAdvancedDefinition(entry.flag);
+    const choices = def?.choices || [];
+    const listId = `tpl-adv-values-${index}`;
+    const datalist = choices.length
+      ? `<datalist id="${listId}">${choices.map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('')}</datalist>`
+      : '';
+    const title = def ? `${def.label} — ${def.help}` : 'custom ffmpeg flag';
+    return `<div class="adv-row" data-adv-index="${index}">
+      <div class="adv-flag" title="${escapeHtml(title)}">${escapeHtml(entry.flag)} <span class="adv-side">${escapeHtml(entry.side || 'output')}</span></div>
+      <input class="mono" data-adv-value="${index}" value="${escapeHtml(String(entry.value ?? ''))}" placeholder="value" list="${listId}" autocomplete="off">
+      <button type="button" class="btn sm ghost" data-adv-remove="${index}" title="remove this parameter">✕</button>
+      ${datalist}
+    </div>`;
+  }).join('') : '<div class="meta">No advanced parameters set — vu-movie\'s own safe defaults apply.</div>';
+
+  const picker = $('#tpl-adv-flag');
+  if (picker) {
+    const advanced = tplSchema()?.advanced || [];
+    const groups = [['input', 'input — before -i'], ['output', 'output — encoder / muxer']];
+    picker.replaceChildren(...groups.flatMap(([side, label]) => {
+      const entries = advanced.filter((entry) => entry.side === side);
+      if (!entries.length) return [];
+      const optgroup = document.createElement('optgroup');
+      optgroup.label = label;
+      for (const entry of entries) optgroup.append(new Option(`${entry.flag} — ${entry.label}`, entry.flag));
+      return [optgroup];
+    }), new Option('custom flag…', '__custom__'));
+  }
+  const customRow = $('#tpl-adv-custom-row');
+  if (customRow) customRow.classList.toggle('hide', picker?.value !== '__custom__');
+  const valueList = $('#tpl-adv-values');
+  if (valueList) {
+    const def = tplAdvancedDefinition($('#tpl-adv-flag')?.value);
+    valueList.innerHTML = (def?.choices || []).map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('');
+  }
+}
+
+function tplRenderMessages() {
+  const host = $('#tpl-editor-messages');
+  if (!host) return;
+  const messages = state.tplMessages || [];
+  host.innerHTML = messages.length
+    ? messages.map((entry) => `<div class="param-msg ${entry.level}">${escapeHtml(entry.text)}</div>`).join('')
+    : '';
+}
+
+function tplSetMessages(messages) {
+  state.tplMessages = messages.filter(Boolean);
+  tplRenderMessages();
+}
+
+function tplSetStatus(text) {
+  const el = $('#tpl-editor-sync-status');
+  if (el) el.textContent = text || '';
+}
+
+function tplOptionsForRequest() {
+  const options = { ...(state.tplOptions || {}) };
+  options.output_format = state.tplEditor?.container || options.output_format || 'mpegts';
+  options.advanced = (options.advanced || []).map((entry) => ({ ...entry }));
+  return options;
+}
+
+/**
+ * Fields → command: the server renders the command (one implementation, no
+ * second copy in the browser), the textarea shows the result.
+ */
+async function tplBuildCommandNow({ announce = true } = {}) {
+  if (!state.tplEditor || !state.tplOptions) return false;
+  const seq = ++tplRequestSeq;
+  const container = state.tplEditor.container || 'mpegts';
+  const meta = $('#tpl-editor-cmd-meta');
+  if (meta) meta.textContent = 'rendering…';
+  try {
+    const res = await api('/api/ffmpeg/templates/build', {
+      method: 'POST', silent: true,
+      body: { options: tplOptionsForRequest(), container },
+    });
+    if (seq !== tplRequestSeq) return false;
+    state.tplEditor.command = res.command;
+    state.tplRenderedCommand = res.command;
+    state.tplOptionsSynced = true;
+    state.tplParseBase = state.tplOptions;
+    const textarea = $('#tpl-editor-command');
+    if (textarea) textarea.value = res.command;
+    const messages = [
+      ...(res.errors || []).map((text) => ({ level: 'err', text })),
+      ...(res.warnings || []).map((text) => ({ level: 'warn', text })),
+    ];
+    tplSetMessages(messages);
+    if (meta) meta.textContent = `${res.command.split(/\s+/).length} tokens · ${container}`;
+    if (announce) {
+      tplSetStatus(res.errors?.length ? 'the parameters need attention' : 'command rendered from the parameters');
+    }
+    return true;
+  } catch (error) {
+    if (seq === tplRequestSeq && meta) meta.textContent = 'could not render the command';
+    if (seq === tplRequestSeq) tplSetMessages([{ level: 'err', text: `could not render the command: ${error.message || error}` }]);
+    return false;
+  }
+}
+
+/** command → fields (used when a template without stored fields is opened). */
+async function tplReadFieldsFromCommand({ rebuild = false, announce = true } = {}) {
+  if (!state.tplEditor) return false;
+  const command = ($('#tpl-editor-command')?.value ?? state.tplEditor.command ?? '').trim();
+  if (!command) return false;
+  const seq = ++tplRequestSeq;
+  tplSetStatus('reading parameters from the command…');
+  try {
+    const res = await api('/api/ffmpeg/templates/parse', {
+      method: 'POST', silent: true,
+      body: { command, container: state.tplEditor.container || 'mpegts', base: state.tplParseBase },
+    });
+    if (seq !== tplRequestSeq) return false;
+    state.tplOptions = {
+      ...tplDefaultOptions(state.tplEditor.container || 'mpegts'),
+      ...res.options,
+      output_format: state.tplEditor.container || 'mpegts',
+      advanced: Array.isArray(res.options?.advanced) ? res.options.advanced.map((entry) => ({ ...entry })) : [],
+    };
+    state.tplOptionsSynced = true;
+    state.tplParseBase = state.tplOptions;
+    renderTplEditor();
+    const messages = [
+      ...(res.warnings || []).map((text) => ({ level: 'warn', text })),
+      ...(res.errors || []).map((text) => ({ level: 'err', text })),
+    ];
+    tplSetMessages(messages);
+    if (announce) tplSetStatus('parameters read from the command');
+    if (!rebuild) return true;
+    const rebuilt = await tplBuildCommandNow({ announce: false });
+    // A command the fields cannot express byte for byte (an unusual -vf, no
+    // -c:a, …) comes back normalised. Say so instead of letting the textarea
+    // change under the operator's hands without explanation.
+    if (rebuilt && ($('#tpl-editor-command')?.value || '').trim() !== command) {
+      state.tplMessages = [
+        { level: 'info', text: 'The command was normalised so it matches the parameters (the parameters are what gets saved and run).' },
+        ...(state.tplMessages || []),
+      ];
+      tplRenderMessages();
+    }
+    return rebuilt;
+  } catch (error) {
+    if (seq === tplRequestSeq) tplSetMessages([{ level: 'err', text: `could not read the command: ${error.message || error}` }]);
+    return false;
+  }
+}
+
+function tplScheduleBuild() {
+  clearTimeout(tplBuildTimer);
+  tplBuildTimer = setTimeout(() => { tplBuildCommandNow(); }, 250);
+}
+
+function tplScheduleParse() {
+  clearTimeout(tplParseTimer);
+  tplParseTimer = setTimeout(() => { tplReadFieldsFromCommand({ rebuild: false }); }, 700);
+}
+
+/** One parameter changed: store it and let the server re-render the command. */
+function tplApplyOptionChange(key, value) {
+  if (!state.tplOptions) return;
+  const def = (tplSchema()?.fields || []).find((entry) => entry.key === key);
+  state.tplOptions[key] = def?.kind === 'bool' ? value === 'true' : value;
+  if (key === 'output_format') {
+    state.tplEditor.container = value;
+    const select = $('#tpl-editor-container');
+    if (select) select.value = value;
+  }
+  tplScheduleBuild();
+}
+
+function tplRenderEditorOutputs() {
+  const editor = state.tplEditor || null;
+  const outputsEl = $('#tpl-editor-outputs');
+  if (!outputsEl) return;
+  outputsEl.innerHTML = OUTPUT_TYPES.map((output) => {
+    const on = Boolean(editor?.output && editor.output[output]);
+    return `
+      <label class="row${on ? ' on' : ''}" data-output="${output}">
+        <input type="checkbox" data-output-check="${output}" ${on ? 'checked' : ''} ${editor ? '' : 'disabled'}>
+        <span>
+          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
+          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
+        </span>
+      </label>`;
+  }).join('');
 }
 
 function renderTemplatesPage() {
@@ -1566,11 +1905,13 @@ function renderTemplatesPage() {
       const outputs = OUTPUT_TYPES.filter((output) => item.output && item.output[output]).map((output) => tplOutputLabel(output));
       const isDefault = state.defaultFfmpegTemplateId === item.id;
       const isEditor = state.tplEditor && state.tplEditor.id === item.id;
+      const disabled = item.enabled === false;
+      const fields = item.options ? Object.keys(item.options).filter((key) => key !== 'advanced').length : 0;
       return `
-        <div class="template-list-row${isEditor ? ' selected' : ''}" data-tpl-row="${escapeHtml(item.id)}">
+        <div class="template-list-row${isEditor ? ' selected' : ''}${disabled ? ' disabled' : ''}" data-tpl-row="${escapeHtml(item.id)}">
           <div style="min-width:0;flex:1">
-            <div class="tname">${escapeHtml(item.name || 'unnamed')}${isDefault ? ' <span class="tag alt">default</span>' : ''}</div>
-            <div class="tmeta">${escapeHtml(item.container || '—')} · ${outputs.length ? outputs.map((o) => `<span class="tag">${escapeHtml(o)}</span>`).join('') : '<span class="mut">no outputs assigned</span>'}</div>
+            <div class="tname">${escapeHtml(item.name || 'unnamed')}${isDefault ? ' <span class="tag alt">default</span>' : ''}${disabled ? ' <span class="tag warn">disabled</span>' : ''}</div>
+            <div class="tmeta">${escapeHtml(item.container || '—')} · ${outputs.length ? outputs.map((o) => `<span class="tag">${escapeHtml(o)}</span>`).join('') : '<span class="mut">no outputs assigned</span>'}${fields ? ` · <span class="tag info">${fields} fields</span>` : ''}</div>
             <div class="tmeta mono" style="margin-top:3px">${escapeHtml(tplShortCommand(item.command))}</div>
           </div>
           <div class="tactions">
@@ -1603,21 +1944,25 @@ function renderTplEditor() {
   const descEl = $('#tpl-editor-description');
   const cmdEl = $('#tpl-editor-command');
   const containerEl = $('#tpl-editor-container');
-  const outputsEl = $('#tpl-editor-outputs');
+  const enabledEl = $('#tpl-editor-enabled');
   if (!editor) {
     titleEl.textContent = 'Template editor';
     nameEl.value = '';
     descEl.value = '';
     cmdEl.value = '';
     containerEl.value = 'mpegts';
-    outputsEl.innerHTML = OUTPUT_TYPES.map((output) => `
-      <label class="row" data-output="${output}">
-        <input type="checkbox" disabled>
-        <span>
-          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
-          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
-        </span>
-      </label>`).join('');
+    if (enabledEl) enabledEl.checked = true;
+    state.tplOptions = null;
+    state.tplOptionsSynced = true;
+    state.tplRenderedCommand = '';
+    state.tplParseBase = null;
+    tplRenderParameters();
+    tplRenderAdvanced();
+    tplSetMessages([]);
+    tplSetStatus('');
+    const meta = $('#tpl-editor-cmd-meta');
+    if (meta) meta.textContent = '';
+    tplRenderEditorOutputs();
     $('#btn-tpl-save').disabled = true;
     $('#btn-tpl-save-top').disabled = true;
     $('#btn-tpl-delete').disabled = true;
@@ -1629,17 +1974,13 @@ function renderTplEditor() {
   descEl.value = editor.description || '';
   cmdEl.value = editor.command || '';
   containerEl.value = editor.container || 'mpegts';
-  outputsEl.innerHTML = OUTPUT_TYPES.map((output) => {
-    const on = Boolean(editor.output && editor.output[output]);
-    return `
-      <label class="row${on ? ' on' : ''}" data-output="${output}">
-        <input type="checkbox" data-output-check="${output}" ${on ? 'checked' : ''}>
-        <span>
-          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
-          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
-        </span>
-      </label>`;
-  }).join('');
+  if (enabledEl) enabledEl.checked = editor.enabled !== false;
+  tplRenderParameters();
+  tplRenderAdvanced();
+  tplRenderMessages();
+  const meta = $('#tpl-editor-cmd-meta');
+  if (meta && !meta.textContent) meta.textContent = `${String(editor.command || '').split(/\s+/).filter(Boolean).length} tokens · ${editor.container || 'mpegts'}`;
+  tplRenderEditorOutputs();
   $('#btn-tpl-save').disabled = false;
   $('#btn-tpl-save-top').disabled = false;
   $('#btn-tpl-delete').disabled = !editor.id || state.defaultFfmpegTemplateId === editor.id;
@@ -1668,17 +2009,35 @@ function tplCollectFromEditor() {
     const checkbox = $(`#tpl-editor-outputs input[data-output-check="${output}"]`);
     if (checkbox && checkbox.checked) outputs[output] = editor.id || '__self__';
   }
-  return {
+  const container = $('#tpl-editor-container').value;
+  const item = {
     id: editor.id || newFfmpegTemplateId(),
     name: $('#tpl-editor-name').value.trim(),
     description: $('#tpl-editor-description').value.trim(),
-    container: $('#tpl-editor-container').value,
+    container,
     command: $('#tpl-editor-command').value.trim(),
+    enabled: $('#tpl-editor-enabled')?.checked !== false,
     output: outputs,
   };
+  // The fields are authoritative: the server renders the stored command from
+  // them, so what the editor shows is exactly what the relay will run.
+  if (state.tplOptions) {
+    item.options = { ...tplOptionsForRequest(), output_format: container };
+  }
+  return item;
 }
 
 async function tplSave({ makeDefault = false } = {}) {
+  if (!state.tplEditor) return;
+  clearTimeout(tplBuildTimer);
+  clearTimeout(tplParseTimer);
+  // The command text may have been edited (or pasted) less than a debounce ago.
+  // Re-read the fields from it first, so saving never throws away what is in
+  // the box in favour of the older parameter state.
+  const typed = $('#tpl-editor-command')?.value.trim() || '';
+  if (typed && (!state.tplOptionsSynced || typed !== state.tplRenderedCommand)) {
+    await tplReadFieldsFromCommand({ rebuild: true, announce: false });
+  }
   const item = tplCollectFromEditor();
   if (!item.name) return toast('Give the template a name first', 'warn');
   if (!item.command) return toast('The template command is empty', 'warn');
@@ -1710,6 +2069,7 @@ async function tplSave({ makeDefault = false } = {}) {
   state.ffmpegDefaults = result.ffmpegDefaults || {};
   state.ffmpegTemplatesLoaded = true;
   tplEditorSelect(result.templates.find((t) => t.id === item.id) || null);
+  renderTemplatesPage();
   if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
   renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
   toast(makeDefault ? 'Template saved and set as default' : 'Template saved', 'ok');
@@ -1731,6 +2091,7 @@ async function tplDelete() {
   state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
   state.ffmpegDefaults = result.ffmpegDefaults || {};
   tplEditorSelect(null);
+  renderTemplatesPage();
   if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
   renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
   toast('Template deleted', 'ok');
@@ -1825,7 +2186,7 @@ function renderTplTestPanel() {
   // Template picker: every saved template + an "inline command…" option.
   const selected = tmplSel.value || '';
   tmplSel.replaceChildren(
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
+    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}${item.enabled === false ? ' (disabled)' : ''}`, item.id)),
     new Option('(inline command…)', TPL_TEST_INLINE_VALUE),
   );
   if (![...tmplSel.options].some((opt) => opt.value === selected)) tmplSel.value = '';
@@ -2623,7 +2984,10 @@ function wire() {
 
   // Dedicated Transcode templates page
   $('#btn-tpl-new')?.addEventListener('click', () => {
-    tplEditorSelect({ id: '', name: '', description: '', container: 'mpegts', command: starterFfmpegTemplate('mpegts'), output: {} });
+    tplEditorSelect({ id: '', name: '', description: '', container: 'mpegts', command: '', enabled: true, output: {} });
+    // A new template starts from the defaults (a passthrough remux), rendered
+    // by the server so the textarea never shows a stale hand-written starter.
+    tplBuildCommandNow({ announce: false });
   });
   $('#btn-tpl-save')?.addEventListener('click', () => tplSave());
   $('#btn-tpl-save-top')?.addEventListener('click', () => tplSave());
@@ -2643,6 +3007,78 @@ function wire() {
   $('#btn-tpl-set-default')?.addEventListener('click', () => {
     if (!state.tplEditor?.id) return;
     tplSetDefaultFromList(state.tplEditor.id);
+  });
+
+  // Parameters: every control rewrites the command, the command fills the
+  // controls back in. Both directions go through the server, so the renderer
+  // exists exactly once (src/core/ffmpeg-options.js).
+  $('#tpl-editor-fields')?.addEventListener('input', (event) => {
+    const input = event.target.closest('[data-param-input]');
+    if (!input) return;
+    tplApplyOptionChange(input.dataset.paramInput, input.value);
+    const field = input.closest('.param-field');
+    if (field && input.tagName === 'SELECT') field.classList.toggle('on', input.value === 'true');
+  });
+  $('#tpl-editor-fields')?.addEventListener('change', (event) => {
+    const input = event.target.closest('[data-param-input]');
+    if (!input) return;
+    tplApplyOptionChange(input.dataset.paramInput, input.value);
+    const field = input.closest('.param-field');
+    if (field && input.tagName === 'SELECT') field.classList.toggle('on', input.value === 'true');
+  });
+  $('#btn-tpl-fields-to-cmd')?.addEventListener('click', () => tplBuildCommandNow());
+  $('#btn-tpl-cmd-to-fields')?.addEventListener('click', () => tplReadFieldsFromCommand({ rebuild: false }));
+  $('#btn-tpl-fields-reset')?.addEventListener('click', () => {
+    if (!state.tplEditor) return;
+    const container = state.tplEditor.container || 'mpegts';
+    state.tplOptions = tplDefaultOptions(container);
+    renderTplEditor();
+    tplBuildCommandNow({ announce: false });
+    tplSetStatus('parameters reset to the defaults');
+  });
+  $('#tpl-adv-flag')?.addEventListener('change', () => {
+    const custom = $('#tpl-adv-flag').value === '__custom__';
+    $('#tpl-adv-custom-row')?.classList.toggle('hide', !custom);
+    const def = tplAdvancedDefinition($('#tpl-adv-flag').value);
+    const list = $('#tpl-adv-values');
+    if (list) list.innerHTML = (def?.choices || []).map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('');
+    if (def) $('#tpl-adv-value').value = def.choices?.[0] || '';
+    if (custom) $('#tpl-adv-custom-flag')?.focus();
+  });
+  $('#btn-tpl-adv-add')?.addEventListener('click', () => {
+    if (!state.tplOptions) return;
+    const picked = $('#tpl-adv-flag').value;
+    const custom = picked === '__custom__';
+    const flag = custom ? $('#tpl-adv-custom-flag').value.trim() : picked;
+    if (!/^-[A-Za-z][\w:-]*$/.test(flag)) return toast('Enter a flag such as -rw_timeout', 'warn');
+    if (flag === '-i') return toast('-i is added by the form and cannot be used here', 'warn');
+    const def = tplAdvancedDefinition(flag);
+    const side = def ? def.side : ($('#tpl-adv-custom-side').value === 'input' ? 'input' : 'output');
+    state.tplOptions.advanced = [...(state.tplOptions.advanced || []), { flag, value: $('#tpl-adv-value').value.trim(), side }];
+    $('#tpl-adv-value').value = '';
+    if (custom) $('#tpl-adv-custom-flag').value = '';
+    tplRenderAdvanced();
+    tplScheduleBuild();
+  });
+  $('#tpl-editor-adv-rows')?.addEventListener('input', (event) => {
+    const input = event.target.closest('[data-adv-value]');
+    if (!input || !state.tplOptions?.advanced) return;
+    const entry = state.tplOptions.advanced[Number(input.dataset.advValue)];
+    if (!entry) return;
+    entry.value = input.value;
+    tplScheduleBuild();
+  });
+  $('#tpl-editor-adv-rows')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-adv-remove]');
+    if (!button || !state.tplOptions?.advanced) return;
+    state.tplOptions.advanced.splice(Number(button.dataset.advRemove), 1);
+    tplRenderAdvanced();
+    tplScheduleBuild();
+  });
+  $('#tpl-editor-enabled')?.addEventListener('change', () => {
+    if (!state.tplEditor) return;
+    state.tplEditor.enabled = $('#tpl-editor-enabled').checked;
+    $('#tpl-editor-status').textContent = 'Save to apply changes.';
   });
   $('#tpl-list')?.addEventListener('click', (event) => {
     const editId = event.target.closest('[data-tpl-edit]')?.dataset.tplEdit;
@@ -2683,12 +3119,14 @@ function wire() {
     state.tplEditor.output = { ...(state.tplEditor.output || {}) };
     if (target.checked) state.tplEditor.output[output] = state.tplEditor.id || '__self__';
     else delete state.tplEditor.output[output];
-    renderTplEditor();
+    tplRenderEditorOutputs();
   });
   $('#tpl-editor-command')?.addEventListener('input', () => {
     if (!state.tplEditor) return;
     state.tplEditor.command = $('#tpl-editor-command').value;
+    state.tplOptionsSynced = false;
     $('#tpl-editor-status').textContent = 'Save to apply changes.';
+    tplScheduleParse();
   });
   $('#tpl-editor-name')?.addEventListener('input', () => {
     if (!state.tplEditor) return;
@@ -2700,7 +3138,11 @@ function wire() {
   });
   $('#tpl-editor-container')?.addEventListener('change', () => {
     if (!state.tplEditor) return;
-    state.tplEditor.container = $('#tpl-editor-container').value;
+    const container = $('#tpl-editor-container').value;
+    state.tplEditor.container = container;
+    if (state.tplOptions) state.tplOptions.output_format = container;
+    tplRenderParameters();
+    tplScheduleBuild();
   });
   $('#tpl-default')?.addEventListener('change', async () => {
     const value = $('#tpl-default').value;

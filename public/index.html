@@ -448,22 +448,64 @@
             <div class="f2">
               <div class="field"><label>Name</label>
                 <input id="tpl-editor-name" maxlength="100" placeholder="e.g. HEVC passthrough to MPEG-TS"></div>
-              <div class="field"><label>Container</label>
+              <div class="field"><label>Output format / container</label>
                 <select id="tpl-editor-container">
                   <option value="mpegts">MPEG-TS (VLC + Enigma2)</option>
                   <option value="matroska">MATROSKA / MKV</option>
                   <option value="hls">HLS</option>
                 </select></div>
             </div>
-            <div class="field" style="margin-top:10px">
-              <label>Description (optional)</label>
-              <input id="tpl-editor-description" maxlength="280" placeholder="when to use this template">
+            <div class="f2" style="margin-top:2px">
+              <div class="field"><label>Description (optional)</label>
+                <input id="tpl-editor-description" maxlength="280" placeholder="when to use this template"></div>
+              <div class="field"><label>Available for playback</label>
+                <label class="row" style="gap:6px;margin:2px 0 0;color:var(--fg)">
+                  <input type="checkbox" id="tpl-editor-enabled" checked>
+                  <span class="meta" style="margin:0">disabled templates stay saved but are never picked for an output</span>
+                </label>
+              </div>
             </div>
-            <div class="field" style="margin-top:10px">
+
+            <div class="param-head">
+              <h3 style="margin:0">FFmpeg parameters</h3>
+              <div class="row" style="gap:6px;margin:0">
+                <button type="button" class="btn sm ghost" id="btn-tpl-fields-reset">reset to defaults</button>
+                <span class="mut" id="tpl-editor-sync-status"></span>
+              </div>
+            </div>
+            <p class="sub" style="margin:4px 0 10px">Every control below rewrites the final command live — the parameters are the same set the stalker-proxy-manager exposes. Changing the command by hand fills the controls back in, so an existing template stays editable.</p>
+            <div id="tpl-editor-fields" class="param-grid"><div class="meta">loading parameters…</div></div>
+
+            <details class="param-advanced" id="tpl-editor-advanced">
+              <summary>Advanced parameters <span class="mut" id="tpl-editor-adv-count"></span></summary>
+              <p class="sub" style="margin:8px 0">Anything else ffmpeg accepts. When a flag is not set, vu-movie adds its own safe default at spawn time (network timeouts, reconnect, probe size) — set it here to take over that value.</p>
+              <div class="row param-adv-add">
+                <select id="tpl-adv-flag" style="flex:1;min-width:220px"></select>
+                <input id="tpl-adv-value" class="mono" style="flex:1;min-width:140px" placeholder="value" list="tpl-adv-values">
+                <datalist id="tpl-adv-values"></datalist>
+                <button type="button" class="btn sm" id="btn-tpl-adv-add">+ add</button>
+              </div>
+              <div class="row param-adv-add hide" id="tpl-adv-custom-row">
+                <input id="tpl-adv-custom-flag" class="mono" style="flex:1;min-width:140px" placeholder="-my_flag" autocomplete="off">
+                <select id="tpl-adv-custom-side" style="flex:0 0 auto">
+                  <option value="input">input (before -i)</option>
+                  <option value="output" selected>output (encoder / muxer)</option>
+                </select>
+              </div>
+              <div id="tpl-editor-adv-rows" class="adv-rows"></div>
+            </details>
+
+            <div class="field" style="margin-top:14px">
               <label>Full FFmpeg command</label>
               <textarea id="tpl-editor-command" class="mono" rows="8" spellcheck="false"></textarea>
               <p class="sub" style="margin:6px 0 0">Use exactly one <code>&lt;url&gt;</code> (or <code>{{url}}</code>) immediately after <code>-i</code>. Output to <code>pipe:1</code>, or use <code>&lt;output&gt;</code> for HLS so segments land in the relay directory. The app inserts source headers and safe network defaults when absent.</p>
+              <div class="row" style="margin-top:8px">
+                <button type="button" class="btn sm" id="btn-tpl-fields-to-cmd">↻ rebuild command from fields</button>
+                <button type="button" class="btn sm ghost" id="btn-tpl-cmd-to-fields">↻ read fields from command</button>
+                <span class="mut" id="tpl-editor-cmd-meta"></span>
+              </div>
             </div>
+            <div id="tpl-editor-messages" class="param-messages"></div>
             <h3 style="margin-top:14px">Used by</h3>
             <p class="sub" style="margin:4px 0 8px">Tick the output types this template should drive. At playback time the relay picks the right template per request — Enigma2 gets its own, .ts and .mkv are separate, and so are the playlists and the direct 302.</p>
             <div id="tpl-editor-outputs" class="output-grid"></div>

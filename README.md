@@ -194,6 +194,76 @@ writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
 the query string when it builds the service reference — a 720p H.264 template
 bound to the `enigma2` slot is what actually runs on the Duo2.
 
+#### Building the command from fields
+
+The template editor is not just a text area: it carries the same structured
+parameter set as the sibling project
+[stalker-proxy-manager](https://github.com/birdy1974/stalker-proxy-manager), so
+a template can be assembled from dropdowns instead of memory. Every control
+rewrites the command live, and editing the command by hand fills the controls
+back in — an old hand-written template opens editable:
+
+| Group | Parameters |
+| ----- | ---------- |
+| Video | `hw_accel` (none/VAAPI/QSV), `device`, `resolution` (source, 360p–4320p, `WIDTHxHEIGHT`, `900p`), `aspect`, `video_codec`, `vf_preset` (17 deinterlace / diagnostics filters) |
+| Rate control & VAAPI tuning | `video_bitrate`, `maxrate`, `bufsize`, `fps`, `gop`, `profile`, `level`, `rc_mode` (AUTO/CQP/CBR/VBR/ICQ/QVBR/AVBR), `global_quality`, `low_power`, `async_depth` |
+| Audio | `audio_codec`, `audio_bitrate`, `audio_channels`, `audio_rate` |
+| Subtitles | `subs` (drop / DVB bitmap / copy all — the last one needs Matroska) |
+| Output | `output_format` (mpegts / matroska / hls — the template's container) |
+| Extra | `extra_input`, `extra_output` raw flag boxes |
+| Advanced | one row per flag: `-rw_timeout`, `-reconnect*`, `-probesize`, `-analyzeduration`, `-thread_queue_size`, `-fflags`, `-err_detect`, `-user_agent`, `-referer`, `-preset`, `-crf`, `-tune`, `-threads`, `-fps_mode`, `-max_muxing_queue_size`, `-muxdelay`, `-flush_packets`, `-mpegts_flags`, `-hls_time`, `-hls_init_time`, `-hls_list_size`, `-hls_flags`, `-live`, `-metadata`, `-bsf:v`, or any custom flag with its own value |
+
+The fields are stored next to the command they produced, and the server renders
+the command from them, so what the editor shows is exactly what the relay runs.
+A disabled template ("Available for playback" off) stays in the library but is
+never picked for an output — every lookup falls through to the next binding.
+
+Two pure endpoints back the editor (and are handy from `curl`):
+
+```bash
+# fields → command
+curl -s localhost:8080/api/ffmpeg/templates/build -H 'content-type: application/json' \
+  -d '{"container":"mpegts","options":{"video_codec":"h264_vaapi","hw_accel":"vaapi","resolution":"720p","video_bitrate":"4000k"}}'
+# command → fields
+curl -s localhost:8080/api/ffmpeg/templates/parse -H 'content-type: application/json' \
+  -d '{"command":"ffmpeg -i <url> -vf scale=640:360 -c:v libx264 -c:a aac -f mpegts pipe:1"}'
+```
+
+`GET /api/ffmpeg/templates` returns the parameter `schema` as well, which is
+what the browser draws the form from — the field list lives in exactly one
+place (`src/core/ffmpeg-options.js`).
+
+Hand-editing `/config/vumovie.json`? A template record looks like this — the
+`options` object is the same parameter set the editor shows, and the stored
+`command` is re-rendered from it on the next save:
+
+```jsonc
+"transcode": {
+  "ffmpegTemplates": [
+    {
+      "id": "vaapi-720",
+      "name": "VAAPI 720p H.264",
+      "container": "mpegts",
+      "description": "what the VU+ Duo2 gets",
+      "enabled": true,
+      "output": { "enigma2": "vaapi-720" },
+      "options": {
+        "hw_accel": "vaapi", "device": "/dev/dri/renderD128", "resolution": "720p",
+        "aspect": "16:9", "video_codec": "h264_vaapi", "video_bitrate": "4000k",
+        "maxrate": "4400k", "bufsize": "8000k", "fps": "25", "gop": "50",
+        "profile": "high", "level": "4.0", "rc_mode": "VBR", "low_power": true,
+        "async_depth": "4", "audio_codec": "ac3", "audio_bitrate": "384k",
+        "audio_channels": "2", "subs": "dvb", "output_format": "mpegts",
+        "advanced": [{ "flag": "-rw_timeout", "value": "10000000", "side": "input" }]
+      },
+      "command": "ffmpeg … -f mpegts pipe:1"
+    }
+  ],
+  "defaultFfmpegTemplateId": "vaapi-720",
+  "ffmpegDefaults": { "vlcTs": "vaapi-720", "enigma2": "vaapi-720" }
+}
+```
+
 ---
 
 ## Configuration
@@ -344,7 +414,8 @@ Useful endpoints while debugging: `GET /api/health`, `GET /api/logs?level=warn`,
 ### Repo layout
 
 ```
-src/core/       log, config, db+repo, job queue, media (ffmpeg probing + VAAPI) 
+src/core/       log, config, db+repo, job queue, media (ffmpeg probing + VAAPI),
+                ffmpeg-options (template fields → command → fields)
 src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox client,
                 failure diagnostics (DNS/egress/TLS verdicts)
 src/streams/    stream store (tokens/URLs), relay (ffmpeg sessions), downloads, M3U
