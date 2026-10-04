@@ -8,7 +8,7 @@
  */
 
 import crypto from 'node:crypto';
-import { log, logError } from '../core/log.js';
+import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
 import { normaliseProfile } from '../core/media.js';

@@ -50,7 +50,7 @@ test('nothing found comes back with an explanation, not just empty', async () =>
   assert.ok(resolved.error && resolved.error.length > 10, 'expected a human readable error');
 });
 
-test('probing keeps candidates when ffprobe is unavailable', async (t) => {
+test('probing keeps candidates when ffprobe is unavailable', async () => {
   // In the test sandbox ffprobe usually is not installed; when it is, this test
   // simply verifies the normal path (probe attempted, candidate still listed).
   const candidates = [{ url: '/mnt/media/movie.mp4', kind: 'file', label: 'direct' }];

@@ -171,6 +171,27 @@ the Settings page) → built-in defaults. Everything can be changed in the UI; t
 docs for each knob are in [.env.example](.env.example) and
 [config/vumovie.example.json](config/vumovie.example.json).
 
+### Editing `/config/vumovie.json` by hand
+
+* **Options are nested, never dotted.** Write
+  `"scraper": { "flaresolverrUrl": "http://flaresolverr:8192" }` — not
+  `"scraper.flaresolverrUrl": "…"`. JSON has no dotted paths and nothing reads a
+  flat `"a.b"` key, so the dotted spelling was silently ignored (and, worse,
+  unmasked: `publicConfig()` masks secrets by path, so a flat `"db.url"` printed
+  the Postgres password in the log banner). Such keys are now folded into the
+  nested objects when that spot is empty, kept out when it is already set, and
+  **named in a warning at boot** either way; unknown keys are dropped with a
+  warning too. Saving from the Settings page rewrites the file in the correct
+  shape, so the warning disappears after the first save.
+* **Only ask for a URL where a URL belongs.** A copied example line kept as the
+  *value* (e.g. `"flaresolverrUrl": "# e.g. http://flaresolverr:8191 (profile: cf)"`)
+  is not a URL; the app reports it as *"the configured FlareSolverr URL is a
+  comment, not a URL"* instead of pretending the variable is unset.
+* **Types are forgiving.** `"8080"` / `"true"` in a hand-edited file are coerced
+  to the type the option's default has, so they cannot end up compared or added
+  as strings.
+* A broken file never stops the container: it is logged and defaults + env win.
+
 The ones that matter most on a DS918+:
 
 | Variable | Default | Why |
@@ -182,6 +203,7 @@ The ones that matter most on a DS918+:
 | `DEFAULT_FPS` | `source` | forcing 25 fps on 23.976 material causes judder |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | passed through by `docker-compose.yml` |
 | `BROWSER_CONCURRENCY` | `1` | one headless Chromium is ~300 MB |
+| `DB_SLOW_QUERY_MS` | `1500` | warns when one query is slower; the first read after a start is cold-disk I/O, not a database fault |
 | `ENIGMA2_HOST` | — | your Duo2, e.g. `192.168.1.50` |
 
 ---

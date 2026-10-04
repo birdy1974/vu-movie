@@ -29,6 +29,10 @@ services:
       # Set to true to make the container refuse to start when Postgres is down
       # (default false: it degrades to an in-memory store and keeps streaming).
       REQUIRE_DB: "${REQUIRE_DB:-false}"
+      # Warn when a single query exceeds this (ms). The first reads after a start
+      # come off cold disks/cache and can cross it once; that is I/O, not a
+      # database problem, so the bar is deliberately above a warm cache miss.
+      DB_SLOW_QUERY_MS: "${DB_SLOW_QUERY_MS:-1500}"
       TZ: "${TZ:-Europe/Amsterdam}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       # LAN URL handed to VLC / the Duo2. Leave empty to auto-detect from the

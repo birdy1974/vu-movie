@@ -108,6 +108,10 @@ export function loadSources({ force = false } = {}) {
   }
 
   cache = sources;
+  // The sniffer needs each recipe's media patterns; give it a way to look them
+  // up (it cannot import this module — registry.js already imports browser.js)
+  // and drop any compiled patterns cached for the previous list.
+  browser.registerSourceLookup(() => loadSources());
   log.info('scraper', `source registry ready: ${sources.length} sites (${sources.filter((s) => s.enabled).length} enabled)`,
     { sites: sources.map((s) => s.id).join(',') });
   return sources;
@@ -681,6 +685,9 @@ export async function resolveTarget(input) {
           url,
           session: source?.id || 'default',
           playerPathPrefix: source?.resolve?.playerPathPrefix || null,
+          // Pass the patterns we already hold: the sniffer used to look them up
+          // through an undefined function and silently ignored every recipe.
+          mediaPatterns: source?.mediaPatterns || null,
           timeoutMs: getConfig().scraper.resolveTimeoutMs,
           signal,
         });
@@ -872,10 +879,8 @@ export function qualityFromUrl(url = '') {
  * 2-minute probe storm.
  */
 async function quickConnectProbe(url, { timeoutMs = 5000 } = {}) {
+  if (!URL.canParse(url)) return { ok: false, error: 'invalid url' };
   try {
-    const u = new URL(url);
-    const isTls = u.protocol === 'https:';
-    const port = Number(u.port) || (isTls ? 443 : 80);
     const res = await request(url, {
       method: 'GET',
       // Range: bytes=0-0 is enough to open a TCP+TLS connection and get a

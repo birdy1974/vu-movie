@@ -249,18 +249,56 @@ export function defaultMediaPattern(kind) {
 /** Cache of compiled recipe patterns (site id → [{re, kind}]). */
 const recipeMediaPatterns = new Map();
 
-function compiledPatternsFor(siteId) {
-  const cached = recipeMediaPatterns.get(siteId);
+/**
+ * The site registry lives in registry.js, which imports *this* module — so we
+ * cannot import it back without a cycle. Instead the registry hands us its
+ * loader once, and a bare `sniff()` call (or a unit test) simply falls back to
+ * the built-in patterns.
+ *
+ * Before this existed, compiledPatternsFor() called an undefined `loadSources()`
+ * and its catch swallowed the ReferenceError, so every per-site recipe pattern
+ * (the whole point of the v2 media-detection upgrade: manifests behind URLs with
+ * no extension) was silently ignored.
+ */
+let sourceLookup = null;
+
+export function registerSourceLookup(fn) {
+  sourceLookup = typeof fn === 'function' ? fn : null;
+  clearRecipeMediaPatternCache();
+}
+
+/** Called when sources are reloaded, so edited patterns take effect at once. */
+export function clearRecipeMediaPatternCache() {
+  recipeMediaPatterns.clear();
+}
+
+/**
+ * Compiled media patterns for a site: the ones the caller passed (the registry
+ * already has the recipe in hand) or, failing that, whatever the registry can
+ * look up.
+ */
+export function compiledPatternsFor(siteId, recipePatterns = null) {
+  const provided = Array.isArray(recipePatterns) && recipePatterns.length ? recipePatterns : null;
+  const key = `${siteId ?? ''}\u0000${provided ? JSON.stringify(provided) : ''}`;
+  const cached = recipeMediaPatterns.get(key);
   if (cached) return cached;
-  let patterns = [];
-  if (siteId) {
+
+  let patterns = provided || [];
+  if (!patterns.length && siteId && sourceLookup) {
     try {
-      const source = loadSources().find((s) => s.id === siteId);
+      const source = sourceLookup()?.find((s) => s.id === siteId);
       patterns = Array.isArray(source?.mediaPatterns) ? source.mediaPatterns : [];
-    } catch { /* registry not loaded (unit tests) — fall back to the built-ins */ }
+    } catch (err) {
+      // A failing lookup must never break sniffing — but say so in the log
+      // instead of hiding a coding error behind a bare catch (that is how this
+      // function spent its life returning [] and nobody noticed).
+      log.debug('browser', `could not resolve media patterns for ${siteId}`, { error: errorText(err) });
+      patterns = [];
+    }
   }
   const compiled = patterns.map(asMatcher).filter(Boolean);
-  recipeMediaPatterns.set(siteId, compiled);
+  recipeMediaPatterns.set(key, compiled);
+  if (compiled.length) log.debug('browser', `using ${compiled.length} recipe media pattern(s) for ${siteId || 'default'}`);
   return compiled;
 }
 
@@ -293,6 +331,7 @@ export function upgradeRecipe(site = {}) {
  * @param {number} [opts.quietMs]      stop after this long without new media
  * @param {boolean} [opts.click]       click a play button (default true)
  * @param {string} [opts.session]      cookie/session bucket (usually the site id)
+ * @param {string[]} [opts.mediaPatterns] recipe patterns for that site (skip the lookup)
  * @param {boolean} [opts.captureJson] collect JSON API responses for inspection
  * @param {AbortSignal} [opts.signal]
  */
@@ -369,7 +408,7 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       const u = res.url();
       const ct = res.headers()['content-type'] || '';
       const req = res.request();
-      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session);
+      const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session, opts.mediaPatterns);
       if (looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns)) {
         if (!media.has(u)) {
           let reqHeaders;
@@ -797,6 +836,15 @@ export function flaresolverrConfigIssue(value = getConfig().scraper.flaresolverr
     };
   }
   if (flaresolverrEndpoint(raw)) return null;
+  // A value that *is* a comment means someone copied a line from the example —
+  // the fix is in the config file, so say that instead of blaming .env.
+  if (/^(#|\/\/)/.test(raw)) {
+    return {
+      kind: 'unusable',
+      raw,
+      message: `the configured FlareSolverr URL is a comment, not a URL (${truncate(raw, 60)}) — set the nested "scraper": { "flaresolverrUrl": "http://flaresolverr:8192" } in /config/vumovie.json (a flat "scraper.flaresolverrUrl" key is ignored) or set FLARESOLVERR_URL, then recreate the container`,
+    };
+  }
   return {
     kind: 'unusable',
     raw,
@@ -950,6 +998,9 @@ export async function flaresolverrStatus({ probe = true, maxAgeMs = SOLVER_STATU
     version: probed.version || null,
     error: probed.ok === false ? (probed.error || null) : null,
     defaultReachable: probed.defaultReachable === true,
+    // The address the probe found when the operator has nothing configured —
+    // the boot log and the UI hint name it so the fix is copy-pasteable.
+    defaultUrl: probed.defaultUrl || null,
     hint: probed.configured
       ? (probed.ok ? null : probed.error)
       : describeSolverNotUsable(probed, null),
@@ -965,16 +1016,67 @@ export async function flaresolverrStatus({ probe = true, maxAgeMs = SOLVER_STATU
  *   - the variable is wrong/unparseable (fix the value),
  *   - the container is up but the variable is empty (set it),
  *   - nothing is running at all (start the service).
+ *
+ * Order matters: when the value is broken *and* a solver answers at the default
+ * address, the actionable fact is the broken value (the operator clearly tried
+ * to configure it). Checking `defaultReachable` first made that message
+ * unreachable and sent everyone looking in .env instead of at their config file,
+ * so the "set but unusable" case is handled first and the reachable instance is
+ * mentioned as an extra sentence rather than replacing the diagnosis.
  */
 export function describeSolverNotUsable(probe = null, host = null) {
   const challenge = host ? `${host} is showing a Cloudflare / bot challenge, but ` : '';
+  const answering = probe?.defaultReachable
+    ? ` A FlareSolverr instance is already answering at ${probe.defaultUrl || DEFAULT_FLARESOLVERR_URL} — point the value above at it.`
+    : '';
+  if (probe?.issue?.kind === 'unusable') {
+    return `${challenge}${probe.issue.message}${answering}`;
+  }
   if (probe?.defaultReachable) {
     return `${challenge}FLARESOLVERR_URL is empty while a FlareSolverr instance is already answering at ${probe.defaultUrl} — set FLARESOLVERR_URL=${probe.defaultUrl} in .env (or Settings → Scraper) and recreate the vu-movie container`;
   }
-  if (probe?.issue?.kind === 'unusable') {
-    return `${challenge}${probe.issue.message}`;
-  }
   return `${challenge}FLARESOLVERR_URL is not configured — start the flaresolverr service (docker compose up -d flaresolverr) and set FLARESOLVERR_URL=${DEFAULT_FLARESOLVERR_URL}; without it, sources behind Cloudflare are skipped (or visit the site once in a browser to get a clearance cookie)`;
+}
+
+/**
+ * One line for the boot log, and the level it deserves.
+ *
+ * Extracted from src/index.js so the branch order can be unit-tested: the
+ * `defaultReachable` branch used to be checked before `issue.kind === 'unusable'`,
+ * which hid the accurate "the value is a comment / not a URL" message exactly
+ * when an operator had *tried* to configure the solver (and, in the reported
+ * case, when the sidecar was running fine next to it).
+ */
+export function describeSolverBootState(status = {}) {
+  if (status.configured && status.ok) {
+    return { level: 'info', message: `FlareSolverr ready at ${status.url}`, fields: { version: status.version } };
+  }
+  if (status.configured) {
+    return {
+      level: 'warn',
+      message: `FlareSolverr is configured at ${status.url} but not answering — Cloudflare-protected sources will be skipped`,
+      fields: { error: status.error || null },
+    };
+  }
+  if (status.issue?.kind === 'unusable') {
+    return {
+      level: 'warn',
+      message: `FlareSolverr misconfigured: ${status.issue.message}`,
+      fields: status.defaultReachable ? { answeringAt: status.defaultUrl || DEFAULT_FLARESOLVERR_URL } : undefined,
+    };
+  }
+  if (status.defaultReachable) {
+    return {
+      level: 'warn',
+      message: `a FlareSolverr instance is answering at ${status.defaultUrl || 'the default address'} but FLARESOLVERR_URL is not set — set it and recreate the container`,
+      fields: undefined,
+    };
+  }
+  return {
+    level: 'info',
+    message: 'FlareSolverr is not configured — sources behind Cloudflare will be skipped (set FLARESOLVERR_URL to enable them)',
+    fields: undefined,
+  };
 }
 
 function flareSolverrCookies(cookies, pageUrl) {
@@ -1653,6 +1755,6 @@ export function hasSession(siteId) {
 
 export default {
   getBrowser, sniff, searchSite, browserInfo, closeBrowser, closeContexts,
-  flaresolverrStatus,
+  flaresolverrStatus, describeSolverBootState,
   sessionFile, hasSession,
 };

@@ -17,7 +17,7 @@ import { getConfig } from '../core/config.js';
 import { request } from '../scrapers/http.js';
 import {
   decodeSubtitle, cleanSrt, vttToSrt, applyOffset, countCues, scoreResult, normaliseLang,
-  extractSubtitleFromArchive, extractSubtitleFromBuffer, isZip, isRar,
+  extractSubtitleFromBuffer, isZip, isRar,
 } from './util.js';
 
 /* ------------------------------------------------------------------ *

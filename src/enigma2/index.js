@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { log, logError, truncate } from '../core/log.js';
+import { log, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
 
@@ -281,11 +281,13 @@ async function uploadFile(fileName, content) {
     attempts.push(`ftp → ${res.error ? res.error.message : truncate(String(res.stderr || `exit ${res.status}`), 120)}`);
   }
 
-  // 3) A mounted share (some people map /etc/enigma2 over NFS/SMB)
-  if (cfg.mountDir && fs.existsSync(cfg.mountDir)) {
+  // 3) A mounted share (some people map /etc/enigma2 over NFS/SMB).
+  //    `mountDir` was never a config key, so this path could never run; the
+  //    directory to mount is the one bouquets live in on the box.
+  if (cfg.rootDir && fs.existsSync(cfg.rootDir)) {
     try {
-      fs.writeFileSync(path.join(cfg.mountDir, fileName), content);
-      log.info('enigma2', `wrote ${fileName} into mounted share`, { dir: cfg.mountDir });
+      fs.writeFileSync(path.join(cfg.rootDir, fileName), content);
+      log.info('enigma2', `wrote ${fileName} into mounted share`, { dir: cfg.rootDir });
       return { ok: true, via: 'mount' };
     } catch (err) {
       attempts.push(`mount → ${String(err?.message || err)}`);

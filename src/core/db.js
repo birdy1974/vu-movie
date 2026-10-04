@@ -26,6 +26,14 @@ import { getConfig } from './config.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = process.env.MIGRATIONS_DIR || path.resolve(__dirname, '../../migrations');
 
+/**
+ * Log a warning when a single query takes longer than this (DB_SLOW_QUERY_MS).
+ * The first reads after a container start are cold (Postgres cache empty, NAS
+ * disks spun down); a one-off `select * from streams …` over many jsonb rows is
+ * expected to cross a few hundred milliseconds once and then be fast.
+ */
+const SLOW_QUERY_MS = Number(process.env.DB_SLOW_QUERY_MS) > 0 ? Number(process.env.DB_SLOW_QUERY_MS) : 1500;
+
 /** 'uninitialised' | 'connecting' | 'postgres' | 'memory' */
 let state = 'uninitialised';
 let pool = null;
@@ -89,7 +97,16 @@ export async function query(text, params = []) {
   try {
     const res = await pool.query(text, params);
     const ms = Date.now() - started;
-    if (ms > 500) log.warn('db', 'slow query', { ms, sql: text.slice(0, 120) });
+    // 500 ms used to be the bar, which made the first dashboard load after a
+    // start (cold Postgres cache + cold NAS disks, right after ffmpeg had also
+    // taken ~20 s to answer) look like a database problem when it is just I/O
+    // warming up. Anything above this line is worth a log entry; tune it with
+    // DB_SLOW_QUERY_MS.
+    if (ms > SLOW_QUERY_MS) {
+      log.warn('db', 'slow query', { ms, rows: res?.rowCount ?? null, thresholdMs: SLOW_QUERY_MS, sql: text.slice(0, 120) });
+    } else if (ms > SLOW_QUERY_MS / 3) {
+      log.debug('db', 'query took a while (warm-cache noise is normal right after a restart)', { ms, sql: text.slice(0, 120) });
+    }
     return res;
   } catch (err) {
     logError('db', 'query failed', err, { sql: text.slice(0, 160), params: params.length });
@@ -190,8 +207,11 @@ export async function initDatabase() {
 
   const res = await runMigrations();
   const tables = await pool.query(
+    // information_schema stores 'BASE TABLE' upper-case — comparing against
+    // 'base table' matched nothing, so this always logged "tables": 0 and a
+    // healthy schema looked empty in the boot log and in /api/health.
     `select count(*)::int as n from information_schema.tables
-      where table_schema = 'public' and table_type = 'base table'`,
+      where table_schema = 'public' and table_type = 'BASE TABLE'`,
   );
   log.info('db', 'schema ready', { tables: tables.rows[0]?.n, appliedNow: res.applied.length });
   return { mode: 'postgres', ...res };
@@ -268,8 +288,13 @@ export const repo = {
   },
 
   async deleteStream(id) {
-    mem.streams.delete(id);
-    if (pool) await query('delete from streams where id = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
+    // getStream() accepts the opaque token as a handle too (DELETE /api/streams/:id
+    // and the VLC/Enigma2 URLs hand out tokens), so the delete must match both —
+    // `delete ... where id = $1` silently deleted nothing for a token.
+    for (const [key, rec] of mem.streams) {
+      if (key === id || rec.id === id || rec.token === id) mem.streams.delete(key);
+    }
+    if (pool) await query('delete from streams where id = $1 or token = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
   },
 
   /* ---------------- titles / metadata ---------------- */
