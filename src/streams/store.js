@@ -40,8 +40,11 @@ export async function createStream({
     const defaults = cfg.transcode.ffmpegDefaults && typeof cfg.transcode.ffmpegDefaults === 'object'
       ? cfg.transcode.ffmpegDefaults : {};
     const desiredTemplateId = defaults.vlcTs || cfg.transcode.defaultFfmpegTemplateId || '';
+    // A disabled template is never picked automatically (it stays in the
+    // library so the operator can switch it back on from the editor).
     const defaultTemplate = (cfg.transcode.ffmpegTemplates || []).find((item) =>
-      item?.id === desiredTemplateId && typeof item.command === 'string' && item.command.trim());
+      item?.enabled !== false && item?.id === desiredTemplateId
+      && typeof item.command === 'string' && item.command.trim());
     if (defaultTemplate) {
       profileInput = {
         ...profileInput,

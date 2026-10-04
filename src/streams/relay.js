@@ -208,7 +208,9 @@ function resolveOutputTemplateForSession(profile = {}, outputType = '') {
   const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
     ? profile.outputTemplates : {};
 
-  const findById = (id) => templates.find((item) => item?.id === id && typeof item.command === 'string' && item.command.trim());
+  // Disabled templates are skipped here too, so a session never starts on a
+  // template the operator switched off (see resolveOutputTemplate in api.js).
+  const findById = (id) => templates.find((item) => item?.enabled !== false && item?.id === id && typeof item.command === 'string' && item.command.trim());
 
   let picked = null;
   let source = 'guided';

@@ -19,6 +19,10 @@ import {
   hardware, hardwareStatus, hardwarePending, binariesStatus,
   diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand, validateFfmpegTemplate,
 } from '../core/media.js';
+import {
+  buildTemplateCommand, parseTemplateCommand, renderTemplate, validateTemplateOptions,
+  normaliseTemplateOptions, templateOptionsSchema, TEMPLATE_CONTAINERS,
+} from '../core/ffmpeg-options.js';
 import { jobEvents, findJob, listAllJobs, jobStats, cancelJob } from '../core/jobs.js';
 import * as registry from '../scrapers/registry.js';
 import * as moviebox from '../scrapers/moviebox.js';
@@ -78,11 +82,20 @@ function inputError(message) {
   return error;
 }
 
+/** A template is usable unless it was explicitly disabled in the editor. */
+function templateUsable(item) {
+  return Boolean(item) && item.enabled !== false;
+}
+
 function resolveTemplateProfile(input = {}) {
   const profile = { ...(input || {}) };
   if (profile.ffmpegTemplate || !profile.ffmpegTemplateId) return profile;
   const template = (getConfig().transcode.ffmpegTemplates || []).find((item) => item?.id === profile.ffmpegTemplateId);
   if (!template) throw inputError(`FFmpeg template "${profile.ffmpegTemplateId}" was not found`);
+  if (!templateUsable(template)) {
+    log.warn('api', `FFmpeg template "${profile.ffmpegTemplateId}" is disabled — falling back to the guided profile builder`);
+    return { ...profile, ffmpegTemplateId: '' };
+  }
   return {
     ...profile,
     container: template.container || profile.container,
@@ -114,28 +127,49 @@ function normaliseTemplateOutput(o) {
   return out;
 }
 
+/**
+ * One template from the editor.
+ *
+ * `options` (the structured fields of the Transcode-templates tab) is
+ * authoritative when present: the command is rendered from it, so the stored
+ * command can never disagree with the fields the operator sees. A template
+ * without `options` (the Stream tab's inline "save as template", or a library
+ * saved by an older version) keeps its command verbatim.
+ */
+function validateTemplateItem(item, index, seen) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) throw inputError(`Template ${index + 1} must be an object`);
+  const id = String(item.id || '').trim();
+  const name = String(item.name || '').trim();
+  const container = String(item.container || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw inputError(`Template ${index + 1} has an invalid id`);
+  if (seen.has(id)) throw inputError(`Duplicate FFmpeg template id: ${id}`);
+  seen.add(id);
+  if (!name || name.length > 100) throw inputError(`Template ${name || index + 1} needs a name of 1–100 characters`);
+  if (!TEMPLATE_CONTAINERS.includes(container)) throw inputError(`Template "${name}" has an unsupported container`);
+  const enabled = item.enabled !== false;
+  const description = String(item.description || '').trim().slice(0, 280);
+  const output = normaliseTemplateOutput(item.output);
+
+  const hasOptions = item.options && typeof item.options === 'object' && !Array.isArray(item.options);
+  let options = null;
+  let command = String(item.command || '').trim();
+  if (hasOptions) {
+    const errors = validateTemplateOptions(item.options, { container });
+    if (errors.length) throw inputError(`Template "${name}": ${errors.join('; ')}`);
+    options = normaliseTemplateOptions(item.options, { container });
+    command = buildTemplateCommand(options, { container });
+  }
+  const result = validateFfmpegTemplate(command, { container });
+  if (!result.ok) throw inputError(`Template "${name}": ${result.errors.join('; ')}`);
+  return { id, name, container, command, output, description, enabled, options };
+}
+
 function validateTemplateLibrary(body = {}) {
   const input = body.templates;
   if (!Array.isArray(input)) throw inputError('templates must be an array');
   if (input.length > 50) throw inputError('You can save at most 50 FFmpeg templates');
   const seen = new Set();
-  const templates = input.map((item, index) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) throw inputError(`Template ${index + 1} must be an object`);
-    const id = String(item.id || '').trim();
-    const name = String(item.name || '').trim();
-    const command = String(item.command || '').trim();
-    const container = String(item.container || '').trim();
-    if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw inputError(`Template ${index + 1} has an invalid id`);
-    if (seen.has(id)) throw inputError(`Duplicate FFmpeg template id: ${id}`);
-    seen.add(id);
-    if (!name || name.length > 100) throw inputError(`Template ${name || index + 1} needs a name of 1–100 characters`);
-    if (!['mpegts', 'matroska', 'hls'].includes(container)) throw inputError(`Template "${name}" has an unsupported container`);
-    const result = validateFfmpegTemplate(command, { container });
-    if (!result.ok) throw inputError(`Template "${name}": ${result.errors.join('; ')}`);
-    const output = normaliseTemplateOutput(item.output);
-    const description = String(item.description || '').trim().slice(0, 280);
-    return { id, name, container, command, output, description };
-  });
+  const templates = input.map((item, index) => validateTemplateItem(item, index, seen));
   const currentDefault = getConfig().transcode.defaultFfmpegTemplateId || '';
   const defaultFfmpegTemplateId = body.defaultFfmpegTemplateId === undefined
     ? currentDefault
@@ -261,7 +295,51 @@ router.get('/ffmpeg/templates', wrap(async (req, res) => {
     ffmpegDefaults: transcode.ffmpegDefaults || {},
     outputTypes: OUTPUT_TYPES,
     outputLabels: OUTPUT_LABELS,
+    // The parameter form is drawn from this schema, so the browser never has
+    // to keep a second copy of the field list in sync with the server.
+    schema: templateOptionsSchema(),
   });
+}));
+
+/**
+ * The structured FFmpeg parameters of the Transcode-templates tab.
+ *
+ * `POST /build`  turns fields into the command (what the editor previews and
+ *                what the relay executes);
+ * `POST /parse`  turns an existing command back into fields, so templates
+ *                written by hand (or by an older version) become editable.
+ *
+ * Both are pure: they touch no stream, no ffmpeg process and no database, so
+ * the editor can call them on every keystroke without side effects.
+ */
+router.post('/ffmpeg/templates/build', wrap(async (req, res) => {
+  const options = req.body?.options;
+  if (!options || typeof options !== 'object' || Array.isArray(options)) throw inputError('options must be an object');
+  const container = String(req.body?.container || options.output_format || '').trim() || null;
+  const rendered = renderTemplate(options, { container });
+  // `ok` means "the request was understood": a field that still needs fixing
+  // comes back in `errors` *with* the rendered command, so the editor can show
+  // what the parameters currently produce while the operator finishes typing.
+  res.json({
+    ok: true,
+    ...rendered,
+    options: normaliseTemplateOptions(options, { container }),
+  });
+}));
+
+router.post('/ffmpeg/templates/parse', wrap(async (req, res) => {
+  const command = String(req.body?.command || '').trim();
+  if (!command) throw inputError('command is required');
+  const container = String(req.body?.container || '').trim() || null;
+  const base = req.body?.base && typeof req.body.base === 'object' && !Array.isArray(req.body.base) ? req.body.base : null;
+  const parsed = parseTemplateCommand(command, { base, container });
+  const errors = validateTemplateOptions(parsed.options, { container });
+  res.json({ ok: true, options: parsed.options, warnings: parsed.warnings, errors });
+}));
+
+/** The parameter schema on its own (the editor fetches the library with it). */
+router.get('/ffmpeg/templates/schema', wrap(async (req, res) => {
+  res.json({ ok: true, schema: templateOptionsSchema() });
 }));
 
 router.put('/ffmpeg/templates', wrap(async (req, res) => {
@@ -750,7 +828,9 @@ function resolveOutputTemplate(profile = {}, outputType = '') {
   const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
     ? profile.outputTemplates : {};
 
-  const pickFromLibrary = (id) => templates.find((item) => item?.id === id && typeof item.command === 'string');
+  // A disabled template is not a candidate: the output falls through to the
+  // next binding (or to the guided profile builder) instead of failing.
+  const pickFromLibrary = (id) => templates.find((item) => templateUsable(item) && item?.id === id && typeof item.command === 'string');
 
   let picked = null;
   let source = 'guided';
