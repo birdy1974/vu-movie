@@ -202,12 +202,143 @@ export const DEFAULTS = {
   },
 };
 
+/** Assign `value` at a dotted path, creating the intermediate objects. */
+function setPath(object, pathStr, value) {
+  const parts = pathStr.split('.');
+  let node = object;
+  for (const part of parts.slice(0, -1)) {
+    if (!node[part] || typeof node[part] !== 'object' || Array.isArray(node[part])) node[part] = {};
+    node = node[part];
+  }
+  node[parts.at(-1)] = value;
+  return object;
+}
+
+/** Every writable option, as a dotted path (e.g. "scraper.flaresolverrUrl"). */
+export function knownOptionPaths() {
+  const paths = [];
+  const walk = (node, prefix = '') => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (value && typeof value === 'object' && !Array.isArray(value)) walk(value, path);
+      else paths.push(path);
+    }
+  };
+  walk(DEFAULTS);
+  return paths;
+}
+
+/**
+ * JSON has no dotted paths — but `{"scraper.flaresolverrUrl": "…"}` keeps being
+ * written by hand, because that is exactly the spelling of the matching
+ * environment variable. Nothing in the app reads a flat `"a.b"` key: file
+ * config is merged as nested objects and only `envOverrides()` below ever used
+ * dotted paths internally.
+ *
+ * Two things made that trap expensive, so we now deal with it explicitly:
+ *   1. the value was silently ignored, so the operator "fixed" the config and
+ *      nothing changed (FlareSolverr stayed unused, and the boot log blamed a
+ *      missing environment variable);
+ *   2. `publicConfig()` masks secrets by nested path, so a flat `"db.url"` was
+ *      printed verbatim — Postgres password included — in the log banner and
+ *      returned by `GET /api/config`.
+ *
+ * Fold a dotted key into the nested shape when the nested spot is empty
+ * (it applies, as intended), keep the nested object when both exist (it is what
+ * the UI wrote) and report every key we dropped. Unknown dotted paths are
+ * dropped too. Callers decide what to log; values are never returned to callers
+ * that log, so secrets cannot end up in the log file by accident.
+ */
+export function foldDottedKeys(parsed) {
+  const empty = { config: {}, applied: [], ignored: [], unknown: [] };
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...empty, config: parsed || {} };
+
+  const knownList = knownOptionPaths();
+  const known = new Set(knownList);
+  const config = {};
+  const flat = [];
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key.includes('.')) flat.push([key, value]);
+    else config[key] = value;
+  }
+
+  const applied = [];  // folded: nothing was set at that path before
+  const ignored = [];  // the nested object already has a value — it wins
+  const unknown = [];  // no such option in DEFAULTS: dropped
+
+  for (const [key, value] of flat) {
+    const isLeaf = known.has(key);
+    const isBranch = !isLeaf && knownList.some((path) => path.startsWith(`${key}.`));
+    if (!isLeaf && !isBranch) { unknown.push(key); continue; }
+    const parts = key.split('.');
+    let node = config;
+    let blocked = false;
+    for (const part of parts.slice(0, -1)) {
+      if (node[part] === undefined) node[part] = {};
+      if (typeof node[part] !== 'object' || node[part] === null || Array.isArray(node[part])) { blocked = true; break; }
+      node = node[part];
+    }
+    const leaf = parts.at(-1);
+    if (blocked) { ignored.push(key); continue; }
+    if (isBranch) {
+      // `"subtitles.keys": { … }` — only meaningful as an object, and the
+      // nested keys already present win over the dotted copy.
+      if (!value || typeof value !== 'object' || Array.isArray(value)) { ignored.push(key); continue; }
+      if (node[leaf] === undefined) node[leaf] = value;
+      else if (node[leaf] && typeof node[leaf] === 'object' && !Array.isArray(node[leaf])) node[leaf] = merge(value, node[leaf]);
+      else { ignored.push(key); continue; }
+      applied.push(key);
+      continue;
+    }
+    if (node[leaf] !== undefined) { ignored.push(key); continue; }
+    node[leaf] = value;
+    applied.push(key);
+  }
+
+  return { config, applied, ignored, unknown };
+}
+
+/**
+ * Values that arrive from a hand-edited file as strings still have to match the
+ * type their default has: `"port": "8080"` would otherwise compare and add as a
+ * string ("8080" + 1 = "80801"). Only numbers and booleans are coerced, and
+ * only when the default says which type the option is. Anything else (including
+ * arrays and unknown keys) is passed through untouched.
+ */
+export function coerceConfigValues(node, defaults = DEFAULTS) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+  const out = { ...node };
+  for (const [key, value] of Object.entries(node)) {
+    const fallback = defaults?.[key];
+    if (value && typeof value === 'object' && !Array.isArray(value) && fallback && typeof fallback === 'object' && !Array.isArray(fallback)) {
+      out[key] = coerceConfigValues(value, fallback);
+      continue;
+    }
+    if (typeof fallback === 'number' && typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value.trim()))) {
+      out[key] = Number(value.trim());
+    } else if (typeof fallback === 'boolean' && typeof value !== 'boolean') {
+      const text = String(value).trim().toLowerCase();
+      if (['true', '1', 'yes', 'on'].includes(text)) out[key] = true;
+      else if (['false', '0', 'no', 'off'].includes(text)) out[key] = false;
+    }
+  }
+  return out;
+}
+
 /** Populated by loadConfig(); exported as a live binding via getConfig(). */
 let current = structuredClone(DEFAULTS);
 
 function envOverrides() {
   const o = {};
-  const set = (p, v) => { if (v !== undefined && v !== '') o[p] = v; };
+  // setPath(), not o[p] = v: assigning the *flat* "scraper.flaresolverrUrl" key
+  // does not change the nested option the app reads (merge() copies keys
+  // verbatim), so an environment variable silently failed to override a value
+  // that came from /config/vumovie.json — the opposite of the documented
+  // precedence. Worse, those flat keys lived on in `current`, so the next
+  // Settings save wrote them into the config file, where a later boot had to
+  // ignore them (that is how the reported file ended up full of "app.logLevel",
+  // "db.url", … while the nested value stayed stale).
+  const set = (p, v) => { if (v !== undefined && v !== '') setPath(o, p, v); };
   if (process.env.PORT) set('app.port', Number(process.env.PORT));
   if (process.env.BASE_URL) set('app.baseUrl', process.env.BASE_URL);
   if (process.env.LOG_LEVEL) set('app.logLevel', process.env.LOG_LEVEL);
@@ -238,25 +369,45 @@ function envOverrides() {
 }
 
 function readFileConfig() {
+  let parsed;
   try {
     if (!CONFIG_FILE || !fs.existsSync(CONFIG_FILE)) {
       log.debug('config', `no config file at ${CONFIG_FILE} — using defaults + environment`);
       return {};
     }
     const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw);
     log.info('config', `loaded ${CONFIG_FILE}`, { bytes: raw.length });
-    return parsed;
   } catch (err) {
     // A broken config file must not stop the container: log loudly, keep defaults.
     logError('config', `could not read ${CONFIG_FILE} — continuing with defaults + env`, err);
     return {};
   }
+
+  // Only file I/O and JSON.parse are guarded above: a bug in our own folding
+  // must not masquerade as "your config file is broken" (which silently
+  // discards every setting in it — that is how this trap started).
+  const { config, applied, ignored, unknown } = foldDottedKeys(parsed);
+  if (applied.length) {
+    log.warn('config', `${CONFIG_FILE} uses flat dotted key(s) — JSON has no dotted paths, so they were folded into the nested objects`,
+      { keys: applied.join(', ') });
+  }
+  if (ignored.length) {
+    log.warn('config', 'ignoring flat key(s) because the nested object already sets them — the nested value wins',
+      { keys: ignored.join(', ') });
+  }
+  if (unknown.length) {
+    log.warn('config', `unknown option(s) in ${CONFIG_FILE} were ignored — check the spelling (options are nested objects, e.g. "scraper": { "flaresolverrUrl": … })`,
+      { keys: unknown.join(', ') });
+  }
+  return config;
 }
 
 /** Load (or reload) configuration. Safe to call again after a UI save. */
 export function loadConfig() {
-  current = merge(merge(structuredClone(DEFAULTS), readFileConfig()), envOverrides());
+  // coerceConfigValues() keeps hand-edited strings ("720", "true") from leaking
+  // into arithmetic and comparisons as strings.
+  current = coerceConfigValues(merge(merge(structuredClone(DEFAULTS), readFileConfig()), envOverrides()));
   if (process.env.LOG_LEVEL) current.app.logLevel = process.env.LOG_LEVEL;
   return current;
 }
@@ -271,7 +422,22 @@ export function cfg(pathStr, fallback) {
 
 /** Write the config file atomically (used by PUT /api/config). */
 export function saveConfig(patch) {
-  const next = merge(current, patch || {});
+  // Fold dotted keys coming from an API client / older UI the same way the file
+  // reader does, so a patch can never create an ignored flat key on disk.
+  const { config: folded, ignored, unknown } = foldDottedKeys(patch || {});
+  if (ignored.length || unknown.length) {
+    log.warn('config', 'ignoring unusable option(s) in the config update', { ignored: ignored.join(', '), unknown: unknown.join(', ') });
+  }
+  // Flat "a.b" keys must not reach the file either — writing them there is what
+  // poisoned the operator's config in the first place. In normal operation this
+  // is a no-op; it exists so the file can never be written in a shape that the
+  // next boot has to interpret.
+  const merged = merge(current, folded);
+  const { config: next, applied: flattened, ignored: dropped } = foldDottedKeys(merged);
+  if (flattened.length || dropped.length) {
+    log.warn('config', 'removed flat dotted key(s) from the saved configuration — options are nested objects',
+      { folded: flattened.join(', '), dropped: dropped.join(', ') });
+  }
   current = next;
   try {
     fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
@@ -292,6 +458,16 @@ export function saveConfig(patch) {
  */
 function stripSecretsForDisk(cfgObject) { return cfgObject; }
 
+/** Options whose value must never reach the browser (or a log line). */
+const SECRET_PATHS = [
+  'app.password',
+  'enigma2.password',
+  'subtitles.keys.opensubtitlesCom',
+  'subtitles.keys.subdl',
+  'subtitles.credentials.opensubtitlesOrgPass',
+  'subtitles.credentials.addic7edPass',
+];
+
 /** Returns a copy with passwords/keys masked, for the UI. */
 export function publicConfig() {
   const clone = structuredClone(current);
@@ -303,6 +479,15 @@ export function publicConfig() {
   clone.subtitles.keys.subdl = mask(clone.subtitles.keys.subdl);
   clone.subtitles.credentials.opensubtitlesOrgPass = mask(clone.subtitles.credentials.opensubtitlesOrgPass);
   clone.subtitles.credentials.addic7edPass = mask(clone.subtitles.credentials.addic7edPass);
+  // Defence in depth: foldDottedKeys() now keeps flat "a.b" keys out of the
+  // effective config, but if one ever arrives through another door it must not
+  // be served — this is exactly how the Postgres password used to end up in the
+  // DEBUG banner and in GET /api/config.
+  for (const key of Object.keys(clone)) {
+    if (key.includes('.') && SECRET_PATHS.includes(key)) {
+      clone[key] = key === 'db.url' ? String(clone[key] || '').replace(/:[^:@/]*@/, ':***@') : mask(clone[key]);
+    }
+  }
   return clone;
 }
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Example of /config/vumovie.json. Copy to config/vumovie.json (or set CONFIG_FILE) and edit. Environment variables always win over this file.",
+  "_comment": "Example of /config/vumovie.json. Copy to config/vumovie.json (or set CONFIG_FILE) and edit. Environment variables always win over this file. Every option is a NESTED object — write \"scraper\": { \"flaresolverrUrl\": \"…\" }, never a flat \"scraper.flaresolverrUrl\" key: JSON has no dotted paths, so the flat spelling is ignored (the app now says so in the log instead of staying quiet). Saving from the Settings page rewrites this file in the correct shape.",
   "app": {
     "port": 8080,
     "baseUrl": "",

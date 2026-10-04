@@ -92,19 +92,15 @@ async function main() {
   // looks like "the site has no results", so say out loud at boot whether the
   // solver is actually usable — a misconfigured FLARESOLVERR_URL is the usual
   // reason, and it is invisible until the first challenge otherwise.
+  //
+  // Which sentence is right (and in which order the cases must be checked) is
+  // decided by describeSolverBootState(), so it can be unit-tested: a broken
+  // value must be reported as such even when a solver also answers at the
+  // default address.
   browser.flaresolverrStatus({ probe: true, maxAgeMs: 300_000 })
     .then((status) => {
-      if (status.configured && status.ok) {
-        log.info('app', `FlareSolverr ready at ${status.url}`, { version: status.version });
-      } else if (status.configured) {
-        log.warn('app', `FlareSolverr is configured at ${status.url} but not answering — Cloudflare-protected sources will be skipped`, { error: status.error });
-      } else if (status.defaultReachable) {
-        log.warn('app', `a FlareSolverr instance is answering at ${status.url || 'the default address'} but FLARESOLVERR_URL is not set — set it and recreate the container`);
-      } else if (status.issue?.kind === 'unusable') {
-        log.warn('app', `FlareSolverr misconfigured: ${status.issue.message}`);
-      } else {
-        log.info('app', 'FlareSolverr is not configured — sources behind Cloudflare will be skipped (set FLARESOLVERR_URL to enable them)');
-      }
+      const line = browser.describeSolverBootState(status);
+      log[line.level]('app', line.message, line.fields);
     })
     .catch((err) => logError('app', 'FlareSolverr status check failed', err));
 

@@ -136,3 +136,82 @@ test('the operator message names which of the three situations this is', () => {
   assert.doesNotMatch(absent, /already answering/);
   assert.equal(DEFAULT_FLARESOLVERR_URL, 'http://flaresolverr:8192');
 });
+
+test('a value that is a copied comment is reported as such, not as "not set"', () => {
+  // The real file had `"flaresolverrUrl": "# e.g. http://flaresolverr:8191 (profile: cf)"`
+  // while the sidecar answered at the compose default. The operator must be told
+  // to fix the value — "FLARESOLVERR_URL is not set" sent them to .env instead.
+  const issue = flaresolverrConfigIssue('# e.g. http://flaresolverr:8191 (profile: cf)');
+  assert.equal(issue.kind, 'unusable');
+  assert.match(issue.message, /is a comment, not a URL/);
+  assert.match(issue.message, /"scraper": \{ "flaresolverrUrl": "http:\/\/flaresolverr:8192" \}/);
+  assert.match(issue.message, /flat "scraper\.flaresolverrUrl" key is ignored/);
+
+  const hint = describeSolverNotUsable(
+    {
+      configured: false,
+      defaultReachable: true,
+      defaultUrl: DEFAULT_FLARESOLVERR_URL,
+      issue: flaresolverrConfigIssue('# e.g. http://flaresolverr:8191 (profile: cf)'),
+    },
+    'cinevo.nl',
+  );
+  assert.match(hint, /is a comment, not a URL/);
+  assert.match(hint, /already answering at http:\/\/flaresolverr:8192/);
+});
+
+test('the boot line reports the broken value even when a solver answers at the default', () => {
+  // Branch order regression: `defaultReachable` used to be checked before
+  // `issue.kind === 'unusable'`, which hid the actionable message.
+  const broken = browser.describeSolverBootState({
+    configured: false,
+    defaultReachable: true,
+    defaultUrl: DEFAULT_FLARESOLVERR_URL,
+    issue: flaresolverrConfigIssue('# e.g. http://flaresolverr:8191 (profile: cf)'),
+  });
+  assert.equal(broken.level, 'warn');
+  assert.match(broken.message, /misconfigured/);
+  assert.match(broken.message, /is a comment, not a URL/);
+  assert.equal(broken.fields.answeringAt, DEFAULT_FLARESOLVERR_URL);
+
+  // The other three states keep their own wording.
+  const ready = browser.describeSolverBootState({ configured: true, ok: true, url: 'http://flaresolverr:8192', version: '3.3.21' });
+  assert.equal(ready.level, 'info');
+  assert.match(ready.message, /ready at http:\/\/flaresolverr:8192/);
+
+  const down = browser.describeSolverBootState({ configured: true, ok: false, url: 'http://solver:9000', error: 'ECONNREFUSED' });
+  assert.equal(down.level, 'warn');
+  assert.match(down.message, /configured at http:\/\/solver:9000 but not answering/);
+
+  const reachableButUnset = browser.describeSolverBootState({ configured: false, defaultReachable: true, defaultUrl: DEFAULT_FLARESOLVERR_URL, issue: flaresolverrConfigIssue('') });
+  assert.equal(reachableButUnset.level, 'warn');
+  assert.match(reachableButUnset.message, /is not set/);
+
+  const absent = browser.describeSolverBootState({ configured: false, defaultReachable: false, issue: flaresolverrConfigIssue('') });
+  assert.equal(absent.level, 'info');
+  assert.match(absent.message, /not configured/);
+});
+
+test('flaresolverrStatus() reports the default address it found', async () => {
+  // No FLARESOLVERR_URL is configured in the test process, so nothing is
+  // configured — but a solver that answers at the compose default must be
+  // reported *with its address*, which is what makes the boot line actionable.
+  const originalFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url) => {
+    seen.push(String(url));
+    return new Response(JSON.stringify({ status: 'ok', version: '3.3.21' }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const status = await browser.flaresolverrStatus({ probe: true, maxAgeMs: 0 });
+    assert.equal(status.configured, false);
+    assert.equal(status.defaultReachable, true);
+    assert.equal(status.defaultUrl, DEFAULT_FLARESOLVERR_URL);
+    assert.equal(status.version, '3.3.21');
+    assert.deepEqual(seen, [`${DEFAULT_FLARESOLVERR_URL}/health`]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

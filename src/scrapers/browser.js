@@ -797,6 +797,15 @@ export function flaresolverrConfigIssue(value = getConfig().scraper.flaresolverr
     };
   }
   if (flaresolverrEndpoint(raw)) return null;
+  // A value that *is* a comment means someone copied a line from the example —
+  // the fix is in the config file, so say that instead of blaming .env.
+  if (/^(#|\/\/)/.test(raw)) {
+    return {
+      kind: 'unusable',
+      raw,
+      message: `the configured FlareSolverr URL is a comment, not a URL (${truncate(raw, 60)}) — set the nested "scraper": { "flaresolverrUrl": "http://flaresolverr:8192" } in /config/vumovie.json (a flat "scraper.flaresolverrUrl" key is ignored) or set FLARESOLVERR_URL, then recreate the container`,
+    };
+  }
   return {
     kind: 'unusable',
     raw,
@@ -950,6 +959,9 @@ export async function flaresolverrStatus({ probe = true, maxAgeMs = SOLVER_STATU
     version: probed.version || null,
     error: probed.ok === false ? (probed.error || null) : null,
     defaultReachable: probed.defaultReachable === true,
+    // The address the probe found when the operator has nothing configured —
+    // the boot log and the UI hint name it so the fix is copy-pasteable.
+    defaultUrl: probed.defaultUrl || null,
     hint: probed.configured
       ? (probed.ok ? null : probed.error)
       : describeSolverNotUsable(probed, null),
@@ -965,16 +977,67 @@ export async function flaresolverrStatus({ probe = true, maxAgeMs = SOLVER_STATU
  *   - the variable is wrong/unparseable (fix the value),
  *   - the container is up but the variable is empty (set it),
  *   - nothing is running at all (start the service).
+ *
+ * Order matters: when the value is broken *and* a solver answers at the default
+ * address, the actionable fact is the broken value (the operator clearly tried
+ * to configure it). Checking `defaultReachable` first made that message
+ * unreachable and sent everyone looking in .env instead of at their config file,
+ * so the "set but unusable" case is handled first and the reachable instance is
+ * mentioned as an extra sentence rather than replacing the diagnosis.
  */
 export function describeSolverNotUsable(probe = null, host = null) {
   const challenge = host ? `${host} is showing a Cloudflare / bot challenge, but ` : '';
+  const answering = probe?.defaultReachable
+    ? ` A FlareSolverr instance is already answering at ${probe.defaultUrl || DEFAULT_FLARESOLVERR_URL} — point the value above at it.`
+    : '';
+  if (probe?.issue?.kind === 'unusable') {
+    return `${challenge}${probe.issue.message}${answering}`;
+  }
   if (probe?.defaultReachable) {
     return `${challenge}FLARESOLVERR_URL is empty while a FlareSolverr instance is already answering at ${probe.defaultUrl} — set FLARESOLVERR_URL=${probe.defaultUrl} in .env (or Settings → Scraper) and recreate the vu-movie container`;
   }
-  if (probe?.issue?.kind === 'unusable') {
-    return `${challenge}${probe.issue.message}`;
-  }
   return `${challenge}FLARESOLVERR_URL is not configured — start the flaresolverr service (docker compose up -d flaresolverr) and set FLARESOLVERR_URL=${DEFAULT_FLARESOLVERR_URL}; without it, sources behind Cloudflare are skipped (or visit the site once in a browser to get a clearance cookie)`;
+}
+
+/**
+ * One line for the boot log, and the level it deserves.
+ *
+ * Extracted from src/index.js so the branch order can be unit-tested: the
+ * `defaultReachable` branch used to be checked before `issue.kind === 'unusable'`,
+ * which hid the accurate "the value is a comment / not a URL" message exactly
+ * when an operator had *tried* to configure the solver (and, in the reported
+ * case, when the sidecar was running fine next to it).
+ */
+export function describeSolverBootState(status = {}) {
+  if (status.configured && status.ok) {
+    return { level: 'info', message: `FlareSolverr ready at ${status.url}`, fields: { version: status.version } };
+  }
+  if (status.configured) {
+    return {
+      level: 'warn',
+      message: `FlareSolverr is configured at ${status.url} but not answering — Cloudflare-protected sources will be skipped`,
+      fields: { error: status.error || null },
+    };
+  }
+  if (status.issue?.kind === 'unusable') {
+    return {
+      level: 'warn',
+      message: `FlareSolverr misconfigured: ${status.issue.message}`,
+      fields: status.defaultReachable ? { answeringAt: status.defaultUrl || DEFAULT_FLARESOLVERR_URL } : undefined,
+    };
+  }
+  if (status.defaultReachable) {
+    return {
+      level: 'warn',
+      message: `a FlareSolverr instance is answering at ${status.defaultUrl || 'the default address'} but FLARESOLVERR_URL is not set — set it and recreate the container`,
+      fields: undefined,
+    };
+  }
+  return {
+    level: 'info',
+    message: 'FlareSolverr is not configured — sources behind Cloudflare will be skipped (set FLARESOLVERR_URL to enable them)',
+    fields: undefined,
+  };
 }
 
 function flareSolverrCookies(cookies, pageUrl) {
@@ -1653,6 +1716,6 @@ export function hasSession(siteId) {
 
 export default {
   getBrowser, sniff, searchSite, browserInfo, closeBrowser, closeContexts,
-  flaresolverrStatus,
+  flaresolverrStatus, describeSolverBootState,
   sessionFile, hasSession,
 };
