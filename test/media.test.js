@@ -14,7 +14,7 @@ import path from 'node:path';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
   targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
-  parseFfmpegTemplateTokens, validateFfmpegTemplate,
+  parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -258,6 +258,57 @@ test('soft muxing picks the right subtitle codec per container', () => {
   assert.equal(mkv[mkv.indexOf('-c:s') + 1], 'srt');
 });
 
+test('live playback is paced at 1x so a real-time client is never flooded', () => {
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts' }, PROBE_1080P_H264);
+  const proxied = { url: 'http://127.0.0.1:8080/up/secret/f', kind: 'file' };
+
+  const live = buildFfmpegArgs({
+    source: proxied, profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(live.includes('-re'), 'live sessions read their input at the native rate');
+  assert.ok(live.indexOf('-re') < live.indexOf('-i'), '-re is an input option and must precede -i');
+
+  const download = buildFfmpegArgs({
+    source: { url: 'https://cdn.example.com/movie.mp4', kind: 'file' },
+    profile, hw: HW, mode: 'file', output: { container: 'matroska', target: '/downloads/movie.mkv' },
+  });
+  assert.ok(!download.includes('-re'), 'downloads and template tests stay as fast as the source allows');
+
+  const unpaced = buildFfmpegArgs({
+    source: proxied, profile: { ...profile, realtime: false }, hw: HW, mode: 'live',
+    output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(!unpaced.includes('-re'), 'a per-stream override can restore full-speed streaming');
+});
+
+test('live templates are paced too (the Enigma2 receiver path is a template)', () => {
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -f matroska -live 1 pipe:1';
+  const args = buildFfmpegArgs({
+    source: { url: 'http://127.0.0.1:8080/up/secret/f', kind: 'file' },
+    profile: normaliseProfile({ container: 'matroska', ffmpegTemplate: template }, PROBE_1080P_H264),
+    hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(args.includes('-re'), 'the relay injects -re into a template that has no pacing of its own');
+  assert.ok(args.indexOf('-re') < args.indexOf('-i'));
+  assert.ok(args.includes('-progress'));
+
+  // A template that spells out its own pacing must not get a second flag.
+  const explicit = buildFfmpegArgs({
+    source: { url: 'http://127.0.0.1:8080/up/secret/f', kind: 'file' },
+    profile: normaliseProfile({ container: 'matroska', ffmpegTemplate: 'ffmpeg -readrate 1 -i <url> -c:v copy -f matroska pipe:1' }, PROBE_1080P_H264),
+    hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!explicit.includes('-re'), '-readrate wins over the automatic pacing');
+
+  // …and a file download through a template stays unpaced.
+  const download = buildFfmpegArgs({
+    source: { url: 'https://cdn.example.com/movie.mp4', kind: 'file' },
+    profile: normaliseProfile({ container: 'matroska', ffmpegTemplate: template }, PROBE_1080P_H264),
+    hw: HW, mode: 'file', output: { container: 'matroska', target: '/downloads/movie.mkv' },
+  });
+  assert.ok(!download.includes('-re'));
+});
+
 test('normaliseProfile decides copy vs transcode and explains why', () => {
   const clean = normaliseProfile({ resolution: 1080 }, PROBE_1080P_H264);
   assert.equal(clean.transcode, false);
@@ -343,6 +394,13 @@ test('FFmpeg templates validate placeholders and refuse shell commands', () => {
   assert.deepEqual(parseFfmpegTemplateTokens(`ffmpeg -metadata "title=Director's cut; echo"`), [
     'ffmpeg', '-metadata', "title=Director's cut; echo",
   ]);
+});
+
+test('outputFormatOf reports the muxer the argv really writes', () => {
+  assert.equal(outputFormatOf(['-i', 'https://x/y.mp4', '-f', 'matroska', '-live', '1', 'pipe:1']), 'matroska');
+  assert.equal(outputFormatOf(['-f', 'hls', '-hls_time', '2', '-f', 'mpegts', 'pipe:1']), 'mpegts', 'the last -f wins');
+  assert.equal(outputFormatOf(['-i', 'https://x/y.mp4', 'pipe:1']), null, 'no -f → ffmpeg picks by target');
+  assert.equal(outputFormatOf([]), null);
 });
 
 test('custom live templates preserve the signed URL and merge source auth headers', () => {

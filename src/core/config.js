@@ -167,6 +167,19 @@ export const DEFAULTS = {
     /** Buffered TS parts kept per client before we drop the client (bytes). */
     maxClientBacklog: Number(process.env.MAX_CLIENT_BACKLOG || 12 * 1024 * 1024),
     /**
+     * Pace live playback at the source's native rate (ffmpeg `-re`).
+     *
+     * The relay's clients are real-time players (VLC, a browser, the VU+), not
+     * downloaders: they consume ~1-3 MB/s. Without `-re`, ffmpeg reads the
+     * loopback upstream proxy as fast as it is served, so the relay pushes tens
+     * of MB/s at a client that cannot possibly drain it — the socket backlog
+     * passes `maxClientBacklog` within seconds and the client is dropped with
+     * "cannot keep up" (then the receiver goes black). Pacing the input keeps
+     * the encoder at 1x, which also stops the wasted CDN traffic while a
+     * session is up. Set REALTIME_PLAYBACK=false to get the old behaviour.
+     */
+    realtime: String(process.env.REALTIME_PLAYBACK || 'true').toLowerCase() !== 'false',
+    /**
      * How many times the relay may restart ffmpeg while clients are watching
      * (transient upstream failures / early-ended chunked transfers).
      */

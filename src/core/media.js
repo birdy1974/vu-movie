@@ -870,6 +870,22 @@ function mergeTemplateHeaders(existing, sourceHeaders) {
 }
 
 /**
+ * Should this live session read its input at 1x (`-re`)?
+ *
+ * A relayed stream is watched by real-time players, so ffmpeg must not read a
+ * local source (the chunked upstream proxy, a downloaded file) as fast as the
+ * disk allows: that floods the client socket, trips the relay's backlog guard
+ * and stops the picture a few seconds in. `transcode.realtime` is the global
+ * switch, `profile.realtime` an optional per-stream override. A template that
+ * spells out `-re`/`-readrate`/`-nore` always wins — never inject a second one.
+ */
+export function realtimePacing(profile = {}) {
+  const value = profile?.realtime ?? getConfig().transcode.realtime;
+  if (value === false || value === 0) return false;
+  return !['false', '0', 'no', 'off'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+/**
  * Render a template to an argv list. Source URLs and private request headers are
  * inserted as individual argv values, never interpolated into shell text.
  */
@@ -918,6 +934,11 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       addInputOption('-analyzeduration', '1000000');
       addInputOption('-probesize', '1000000');
       addInputOption('-live_start_index', '-3', streamKind(source.url) === 'hls');
+      // Live playback is paced to the source's native rate. Without it the
+      // relay pushes the movie at many times real time into a player that can
+      // only drain 1x, and the backlog guard drops the client seconds in.
+      const paced = hasOption('-re') || hasOption('-readrate') || hasOption('-nore');
+      addInputOption('-re', null, realtimePacing(profile) && !paced);
     }
 
     const headers = headerObject(source.headers);
@@ -1125,6 +1146,9 @@ export function normaliseProfile(input = {}, probeInfo = null) {
     subtitleLanguage: input.subtitleLanguage || 'nld',
     deinterlace: Boolean(input.deinterlace),
     hardware: input.hardware ?? true,
+    // Per-stream override of the global 1x live pacing (transcode.realtime).
+    // `undefined` → follow the global setting; `false` → stream at full speed.
+    realtime: input.realtime ?? cfg.realtime,
     scaleMethod: input.scaleMethod || 'auto',
     ffmpegTemplate: typeof input.ffmpegTemplate === 'string' ? input.ffmpegTemplate : '',
     ffmpegTemplateId: typeof input.ffmpegTemplateId === 'string' ? input.ffmpegTemplateId : '',
@@ -1237,6 +1261,12 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
     args.push('-user_agent', sourceHeaders['User-Agent'] || getConfig().scraper.userAgent);
     args.push(...headerArgs(sourceHeaders));
   }
+  // Live playback is paced to the source's native rate (`-re`): the relay's
+  // clients are real-time players, so reading the loopback proxy as fast as it
+  // can be served simply floods the client socket and gets it dropped by the
+  // backlog guard a few seconds into the movie. `mode: 'file'` (downloads,
+  // template tests) deliberately stays unpaced.
+  if (mode === 'live' && realtimePacing(p)) args.push('-re');
   // Live playback: a 1 MB probe window starts the picture sooner and stops
   // ffmpeg scanning deep into a long VOD manifest (flag from the field-tested
   // command the DUO2 test ran with).
@@ -1397,6 +1427,22 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 /** ffmpeg filter paths need escaping of : \ ' and , */
 export function escapeFilterPath(p) {
   return String(p).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/,/g, '\\,');
+}
+
+/**
+ * The muxer an argv list really writes: the value of the last `-f`.
+ *
+ * Templates may name a container in their metadata that the command itself does
+ * not produce (an operator switching the `-f` by hand, a stale library entry),
+ * and the HTTP layer advertises the container the URL asked for. Comparing the
+ * *actual* `-f` against the request is how the relay can say "the .ts URL hands
+ * the receiver a matroska stream" instead of letting the player mis-detect it.
+ */
+export function outputFormatOf(args = []) {
+  const index = args.lastIndexOf('-f');
+  if (index < 0 || index + 1 >= args.length) return null;
+  const value = String(args[index + 1]).trim().toLowerCase();
+  return value || null;
 }
 
 /**
