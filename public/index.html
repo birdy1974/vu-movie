@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0f16">
 <title>vu-movie</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2338bdf8'/><text x='5' y='23' font-size='18' font-family='sans-serif' font-weight='bold' fill='%2304121c'>vu</text></svg>">
@@ -15,12 +16,13 @@
       <div><b>vu-movie</b><small>movie → stream proxy</small></div>
     </div>
     <nav class="nav" id="nav">
+      <button data-p="mobile">▢ Mobile</button>
       <button data-p="dash" class="on">▤ Dashboard</button>
-      <button data-p="find">⌕ Search &amp; scrape</button>
-      <button data-p="stream">▶ Stream</button>
+      <button data-p="find">⌕ Search</button>
       <button data-p="subs">▭ Subtitles</button>
-      <button data-p="e2">☰ Enigma2</button>
-      <button data-p="tpl">⚒ Transcode templates</button>
+      <button data-p="tpl">⚒ Transcode</button>
+      <button data-p="list">☰ Playlist</button>
+      <button data-p="stream">▶ Stream</button>
       <button data-p="tpl-test">▷ Test</button>
       <button data-p="logs">≡ Logs</button>
       <button data-p="set">⚙ Settings</button>
@@ -37,6 +39,67 @@
   </aside>
 
   <main class="main">
+    <!-- ============ MOBILE ============ -->
+    <section id="p-mobile" class="hide">
+      <h1>Mobile</h1>
+      <p class="sub">Phone-sized view of the one workflow: find a title, pick a format, put it on the playlist, push it to the box.</p>
+
+      <div class="card">
+        <h2>1 · Search</h2>
+        <div class="field"><label for="mob-q">Title</label>
+          <input id="mob-q" placeholder="e.g. dune part two" autocomplete="off" enterkeyhint="search"></div>
+        <div class="mob-grid">
+          <div class="field"><label for="mob-type">Type</label>
+            <select id="mob-type"><option value="">both</option><option value="movie">movie</option><option value="series">series</option></select></div>
+          <div class="field"><label for="mob-sources">Sources</label>
+            <select id="mob-sources"><option value="enabled">enabled sources</option><option value="all">all sources</option></select></div>
+        </div>
+        <div class="row">
+          <button class="btn pri grow" id="btn-mob-search">⌕ Search</button>
+          <span class="mut" id="mob-search-hint"></span>
+        </div>
+        <div id="mob-results" class="mob-results"><div class="meta">Search a title, then tap it to see the available formats.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>2 · Format</h2>
+        <div id="mob-formats" class="mob-formats"><div class="meta">Pick a title above — its metadata and every playable format appear here.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>3 · Playlist</h2>
+        <div class="row" style="margin-bottom:8px">
+          <span class="mut" id="mob-list-summary"></span>
+          <button class="btn sm ghost" id="btn-mob-refresh">⟳ refresh</button>
+        </div>
+        <div id="mob-list" class="mob-list"><div class="meta">loading…</div></div>
+      </div>
+
+      <div class="card">
+        <h2>4 · Subtitles</h2>
+        <div class="field"><label for="mob-sub-item">For which playlist item?</label>
+          <select id="mob-sub-item"></select></div>
+        <div class="row">
+          <button class="btn pri grow" id="btn-mob-sub-search">⌕ search subtitle</button>
+          <select id="mob-sub-lang" style="width:auto"><option value="nl">NL</option><option value="en">EN</option><option value="all">all</option></select>
+        </div>
+        <div id="mob-subs" class="mob-subs"><div class="meta">Searches with the title of the selected playlist item — no typing needed.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>5 · Generate / push</h2>
+        <div class="row">
+          <button class="btn pri grow" id="btn-mob-generate">⤓ generate playlist (.m3u)</button>
+          <button class="btn grow" id="btn-mob-push">☁ push to Enigma2</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn sm ghost" id="btn-mob-copy-url">copy playlist URL</button>
+          <span class="mut" id="mob-output-hint"></span>
+        </div>
+        <div class="log hide" id="mob-push-log" style="margin-top:10px"></div>
+      </div>
+    </section>
+
     <!-- ============ DASHBOARD ============ -->
     <section id="p-dash">
       <h1>Dashboard</h1>
@@ -62,10 +125,10 @@
       </div>
     </section>
 
-    <!-- ============ SEARCH & SCRAPE ============ -->
+    <!-- ============ SEARCH ============ -->
     <section id="p-find" class="hide">
-      <h1>Search &amp; scrape</h1>
-      <p class="sub">Search the enabled sites, or paste the URL of the movie/series page you already have open.</p>
+      <h1>Search</h1>
+      <p class="sub">Search the enabled sites, or paste the URL of the movie/series page you already have open. Titles found on several providers are grouped into one card; pick a format to add it to the playlist.</p>
       <div class="card">
         <div class="tabs" id="find-tabs">
           <button class="on" data-t="title">Search by title</button>
@@ -79,7 +142,15 @@
             <div class="field"><label>Type</label>
               <select id="q-type"><option value="">both</option><option value="movie">movie</option><option value="series">series</option></select></div>
           </div>
-          <div class="field"><label>Sources (click to toggle)</label><div id="source-chips" class="row"><span class="meta">loading…</span></div></div>
+          <div class="field">
+            <label>Sources (click to toggle)</label>
+            <div id="source-chips" class="row"><span class="meta">loading…</span></div>
+            <div class="row" style="margin-top:7px">
+              <button class="btn sm ghost" id="btn-sources-all">✓ enable all</button>
+              <button class="btn sm ghost" id="btn-sources-none">✕ disable all</button>
+              <span class="mut" id="sources-count"></span>
+            </div>
+          </div>
           <div class="row">
             <button class="btn pri" id="btn-search">⌕ Search</button>
             <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="q-moviebox" checked> include MovieBox</label>
@@ -129,6 +200,14 @@
                 <label class="results-filter" for="results-provider-filter"><span>Provider</span>
                   <select id="results-provider-filter" aria-label="Filter results by provider"><option value="">All providers</option></select>
                 </label>
+                <label class="results-filter" for="results-sort"><span>Sort</span>
+                  <select id="results-sort" aria-label="Sort results">
+                    <option value="year-desc">Year (newest first)</option>
+                    <option value="year-asc">Year (oldest first)</option>
+                    <option value="title">Title A–Z</option>
+                    <option value="providers">Most providers</option>
+                  </select>
+                </label>
               </div>
               <div class="results-view-switch" id="results-view" role="group" aria-label="Search results display">
                 <button type="button" data-view="list" aria-pressed="false" title="Show results as a list">List</button>
@@ -147,6 +226,7 @@
               <div id="sel-name" style="font-weight:600">nothing selected</div>
               <div class="meta" id="sel-meta">search or paste a URL, then pick a candidate below</div>
               <div id="sel-details" class="selected-details hide"></div>
+              <div id="sel-meta-table" class="meta-table hide"></div>
               <div id="sel-episode-controls" class="selected-episodes hide">
                 <div class="field"><label for="sel-season">Season</label><select id="sel-season"></select></div>
                 <div class="field"><label for="sel-episode">Episode</label><select id="sel-episode"></select></div>
@@ -154,7 +234,9 @@
               </div>
             </div>
           </div>
-          <div style="margin-top:12px" id="candidates"><div class="meta">No candidates yet.</div></div>
+          <h3 style="margin-top:14px">Formats</h3>
+          <p class="sub" style="margin:4px 0 8px">Every resolved format of this title, with all metadata. Nothing is put on the playlist until you pick one.</p>
+          <div id="candidates"><div class="meta">No formats yet.</div></div>
           <div class="row" style="margin-top:12px" id="sel-actions"></div>
           <div id="sel-subtitle-panel" class="card pad0 hide" style="margin-top:12px">
             <div class="cardhead">
@@ -171,137 +253,10 @@
       </div>
     </section>
 
-    <!-- ============ STREAM ============ -->
-    <section id="p-stream" class="hide">
-      <h1>Stream &amp; transcode</h1>
-      <p class="sub">One stable URL per title. VLC, the browser and the VU+ Duo2 can all use the same URL at once.</p>
-      <div class="card" id="stream-empty"><div class="meta">No stream selected — create one from Search &amp; scrape, or pick one on the dashboard.</div></div>
-
-      <div id="stream-body" class="hide">
-        <div class="card" style="margin-bottom:14px">
-          <div class="spread">
-            <div><h2 id="st-title" style="margin:0">—</h2><div class="meta" id="st-meta"></div></div>
-            <div class="row" id="st-tags"></div>
-          </div>
-          <div class="row" style="margin-top:12px" id="st-client-urls"></div>
-          <div class="row" style="margin-top:12px">
-            <button class="btn pri" id="btn-vlc">▶ open in VLC</button>
-            <button class="btn" id="btn-session-start">⧗ start session</button>
-            <button class="btn" id="btn-session-stop">■ stop session</button>
-            <button class="btn" id="btn-download">⤓ download to NAS</button>
-            <button class="btn" id="btn-playlist">⤓ .m3u playlist</button>
-            <button class="btn ghost" id="btn-direct">⇱ direct link (302)</button>
-            <button class="btn ghost" id="btn-test-template">▷ test template</button>
-            <button class="btn ghost" id="btn-refresh-stream">⟳ refresh</button>
-          </div>
-        </div>
-
-        <div class="gl">
-          <div class="card">
-            <div class="spread"><h2 style="margin:0">Transcode profile</h2>
-              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="pf-always"> always transcode</label></div>
-            <p class="sub" style="margin:8px 0 12px">Left untouched when the source already fits the target — it is then remuxed at ~0 % CPU.</p>
-            <div class="f2">
-              <div class="field"><label>Encoder / mode</label>
-                <select id="pf-mode">
-                  <option value="auto">auto (copy when possible)</option>
-                  <option value="vaapi">VAAPI hardware → H.264</option>
-                  <option value="x264">software x264</option>
-                  <option value="h265">software H.265 (slow)</option>
-                  <option value="copy">copy only (never encode)</option>
-                </select></div>
-              <div class="field"><label>Resolution</label>
-                <select id="pf-res"><option value="480">480p</option><option value="720">720p</option><option value="1080">1080p</option></select></div>
-              <div class="field"><label>Aspect ratio</label>
-                <select id="pf-aspect"><option value="source">keep source</option><option value="169">16:9</option><option value="43">4:3</option></select></div>
-              <div class="field"><label>Container</label>
-                <select id="pf-container">
-                  <option value="mpegts">MPEG-TS (best for VLC + Enigma2)</option>
-                  <option value="matroska">MATROSKA / MKV (best for downloads)</option>
-                  <option value="hls">HLS (segments, browser/seekable)</option>
-                </select></div>
-              <div class="field"><label>Video bitrate <span class="mut" id="pf-vbr-l">8000 kbps</span></label>
-                <input type="range" id="pf-vbr" min="400" max="12000" step="100" value="8000"></div>
-              <div class="field"><label>Audio bitrate <span class="mut" id="pf-abr-l">192 kbps</span></label>
-                <input type="range" id="pf-abr" min="64" max="320" step="32" value="192"></div>
-              <div class="field"><label>Audio channels</label>
-                <select id="pf-ac"><option value="2">2 (stereo, safe everywhere)</option><option value="6" selected>6 (keep surround)</option></select></div>
-              <div class="field"><label>Frame rate</label>
-                <select id="pf-fps"><option value="source">keep source</option><option value="25" selected>force 25</option><option value="30">force 30</option></select></div>
-              <div class="field"><label>Subtitles</label>
-                <select id="pf-subs">
-                  <option value="none">none</option>
-                  <option value="soft" selected>mux as a track (MPEG-TS → DVB subs)</option>
-                  <option value="burn">burn in (re-encode)</option>
-                </select></div>
-              <div class="field"><label>Deinterlace (old DVD/TS sources)</label>
-                <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="pf-deint"> enable yadif</label></div>
-            </div>
-            <div class="field ffmpeg-template-box">
-              <label for="pf-template-select">Outgoing FFmpeg template</label>
-              <div class="row">
-                <select id="pf-template-select" aria-label="Outgoing FFmpeg template" style="flex:1;min-width:240px">
-                  <option value="">Guided profile builder</option>
-                  <option value="__custom__">Custom command…</option>
-                </select>
-                <button type="button" class="btn sm ghost" id="btn-template-default" disabled>set as default for new streams</button>
-              </div>
-              <div class="meta" style="margin-top:5px">Choose a saved template or paste any FFmpeg command. A custom template is authoritative for the live outgoing stream; the guided controls above remain available when the profile builder is selected.</div>
-              <div id="pf-template-editor" class="hide" style="margin-top:9px">
-                <textarea id="pf-template-command" class="mono" rows="7" spellcheck="false" aria-label="Full FFmpeg command template" placeholder="ffmpeg -hide_banner -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -f mpegts pipe:1"></textarea>
-                <div class="meta" style="margin-top:5px">Use exactly one <code>&lt;url&gt;</code> (or <code>{{url}}</code>) immediately after <code>-i</code>. Output to <code>pipe:1</code>, or use final <code>&lt;output&gt;</code> for HLS. The app inserts source headers and safe network defaults when absent. Commands are parsed to argv and never run through a shell.</div>
-                <div class="field" style="margin-top:9px">
-                  <label for="pf-template-name">Template name</label>
-                  <input id="pf-template-name" maxlength="100" placeholder="e.g. HEVC passthrough to MPEG-TS">
-                </div>
-                <div class="row">
-                  <button type="button" class="btn sm" id="btn-template-save-new">save as new template</button>
-                  <button type="button" class="btn sm ghost" id="btn-template-save">save template changes</button>
-                  <button type="button" class="btn sm ghost" id="btn-template-delete">delete template</button>
-                </div>
-              </div>
-            </div>
-            <div class="field output-templates-box">
-              <label>FFmpeg template per output</label>
-              <p class="sub" style="margin:4px 0 6px">Override the template for a single output without changing the others. The Enigma2 / Duo2 slot is independent of the VLC .ts slot — useful when the receiver wants H.264 720p but your desktop player can take the original 1080p HEVC.</p>
-              <div id="pf-output-templates" class="output-templates-grid"></div>
-            </div>
-            <div class="note" id="pf-note"></div>
-            <div class="row">
-              <button class="btn pri" id="btn-profile-apply">save profile</button>
-              <button class="btn ghost" id="btn-profile-reset">reset</button>
-            </div>
-            <h3 style="margin-top:14px">Generated ffmpeg command (live)</h3>
-            <div class="row" style="margin-bottom:8px">
-              <label for="pf-cmd-output" class="mut" style="margin:0">Preview for</label>
-              <select id="pf-cmd-output" style="width:auto"></select>
-              <span class="mut" id="pf-cmd-template"></span>
-            </div>
-            <pre id="cmd-preview">…</pre>
-          </div>
-
-          <div>
-            <div class="card" style="margin-bottom:14px">
-              <h2>Live monitor</h2>
-              <div id="st-monitor"><div class="meta">no session running</div></div>
-            </div>
-            <div class="card pad0" style="margin-bottom:14px">
-              <div class="cardhead"><h2 style="margin:0">Probe of the source</h2></div>
-              <div id="st-probe" style="padding:12px"><div class="meta">no probe data</div></div>
-            </div>
-            <div class="card">
-              <h2>Hardware</h2>
-              <div id="st-hw"><div class="meta">unknown</div></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- ============ SUBTITLES ============ -->
     <section id="p-subs" class="hide">
       <h1>Subtitles</h1>
-      <p class="sub">Dutch first, English second. Keyless providers work out of the box; add API keys or your own sources where you need more.</p>
+      <p class="sub">Dutch first, English second. Pick the playlist items to search for — the titles come from the playlist, so nothing has to be typed.</p>
       <div class="gl">
         <div>
           <div class="card pad0" style="margin-bottom:14px">
@@ -331,245 +286,167 @@
         <div>
           <div class="card" style="margin-bottom:14px">
             <h2>Search</h2>
-            <div class="f2">
-              <div class="field"><label>Title</label><input id="sub-title"></div>
-              <div class="field"><label>Year</label><input id="sub-year" type="number"></div>
-              <div class="field"><label>Languages (comma separated)</label><input id="sub-langs" value="nl,en"></div>
-              <div class="field"><label>IMDb id (optional)</label><input id="sub-imdb" placeholder="tt1160419"></div>
+            <div class="field">
+              <label>Playlist items to search for</label>
+              <div id="sub-targets" class="check-list"><div class="meta">loading the playlist…</div></div>
+              <div class="row" style="margin-top:6px">
+                <button class="btn sm ghost" id="btn-sub-targets-all">✓ all items</button>
+                <button class="btn sm ghost" id="btn-sub-targets-none">✕ none</button>
+                <span class="mut" id="sub-targets-note"></span>
+              </div>
             </div>
+            <details id="sub-manual">
+              <summary class="sub" style="cursor:pointer;margin-bottom:8px">Search a title manually (not in the playlist)</summary>
+              <div class="f2">
+                <div class="field"><label>Title</label><input id="sub-title"></div>
+                <div class="field"><label>Year</label><input id="sub-year" type="number"></div>
+                <div class="field"><label>Languages (comma separated)</label><input id="sub-langs" value="nl,en"></div>
+                <div class="field"><label>IMDb id (optional)</label><input id="sub-imdb" placeholder="tt1160419"></div>
+              </div>
+            </details>
             <div class="row">
               <button class="btn pri" id="btn-sub-search">⌕ search subtitles</button>
-              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="sub-autostream" checked> attach to the selected stream</label>
+              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><span class="mut">Show</span>
+                <select id="sub-lang-filter" style="width:auto">
+                  <option value="all">all languages</option>
+                  <option value="nl">NL only</option>
+                  <option value="en">EN only</option>
+                </select></label>
+              <span class="mut" id="sub-progress"></span>
             </div>
           </div>
           <div class="card pad0">
             <div class="cardhead"><h2 style="margin:0">Results</h2><span class="mut" id="sub-count"></span></div>
             <div id="sub-results"><div class="meta" style="padding:14px">no search yet</div></div>
           </div>
-          <div class="card" style="margin-top:14px">
-            <h2>Attach / push</h2>
-            <div class="kv"><span>subtitle stored for stream</span><span id="sub-attached">—</span></div>
-            <div class="field"><label>Timing offset (ms)</label><input id="sub-offset" type="number" value="0" step="100"></div>
-            <div class="row">
-              <button class="btn" id="btn-sub-push">☁ push .srt to receiver</button>
-              <span class="mut">requires FTP or a mounted share (Settings → Enigma2)</span>
-            </div>
-          </div>
         </div>
       </div>
     </section>
 
-    <!-- ============ ENIGMA2 ============ -->
-    <section id="p-e2" class="hide">
-      <h1>Enigma2 bouquet</h1>
-      <p class="sub">Build a userbouquet for the VU+ Duo2, upload it over FTP, then reload through OpenWebif. Service type 4097 (GStreamer) is the safe default.</p>
-      <div class="gl">
+    <!-- ============ TRANSCODE ============ -->
+    <section id="p-tpl" class="hide">
+      <h1>Transcode</h1>
+      <p class="sub">One FFmpeg template per streaming profile. Pick a template on the left, tune every parameter on the right — the command, the advice and the parameters always stay in step.</p>
+      <div class="ffmpeg-page">
         <div class="card pad0">
-          <div class="cardhead"><h2 style="margin:0">Preview</h2>
-            <div class="row"><button class="btn sm" id="btn-e2-preview">⟳ regenerate</button></div></div>
-          <div style="padding:12px">
-            <div class="row" style="margin-bottom:8px">
-              <span class="tag info" id="e2-file">userbouquet.vu-movie.tv</span>
-              <span class="tag" id="e2-count">0 entries</span>
-              <span class="tag alt" id="e2-status">unknown</span>
-            </div>
-            <pre id="e2-preview">—</pre>
-            <div class="row" style="margin-top:10px">
-              <button class="btn" id="btn-e2-copy">copy</button>
-              <button class="btn" id="btn-e2-download">download .tv</button>
-              <button class="btn ghost" id="btn-e2-dry">dry run (no change)</button>
-            </div>
+          <div class="cardhead">
+            <h2 style="margin:0">FFmpeg templates</h2>
+            <button class="btn sm pri" id="btn-tpl-new">+ new</button>
           </div>
+          <div class="cardbody pad12">
+            <div class="row">
+              <button class="btn sm grow" id="btn-tpl-set-default" disabled title="Make the selected template the default for new streams">★ set default</button>
+              <button class="btn sm grow" id="btn-tpl-delete-top" disabled title="Delete the selected template">✕ delete</button>
+            </div>
+            <div class="meta" id="tpl-list-note" style="margin-top:6px">Select a template to edit it.</div>
+          </div>
+          <div id="tpl-list" class="tpl-list"></div>
+        </div>
+        <div id="tpl-editor-host" class="ffmpeg-editor-host"></div>
+      </div>
+    </section>
+
+    <!-- ============ PLAYLIST ============ -->
+    <section id="p-list" class="hide">
+      <h1>Playlist</h1>
+      <p class="sub">The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue.</p>
+      <div class="card">
+        <div class="spread">
+          <div class="row">
+            <span class="tag info" id="list-summary">—</span>
+            <span class="mut" id="list-hint"></span>
+          </div>
+          <div class="row">
+            <button class="btn sm ghost" id="btn-list-enable-all">✓ enable all</button>
+            <button class="btn sm ghost" id="btn-list-disable-all">✕ disable all</button>
+            <button class="btn sm ghost" id="btn-list-refresh">⟳ refresh</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div class="field" style="flex:1;min-width:220px;margin:0">
+            <label for="list-add">Add a stream that is not in the playlist yet</label>
+            <select id="list-add"><option value="">(no other streams)</option></select>
+          </div>
+          <button class="btn sm" id="btn-list-add">+ add</button>
+          <button class="btn sm ghost" id="btn-list-open-stream">▶ open outputs</button>
+        </div>
+      </div>
+      <div id="playlist-items" class="playlist-items"><div class="meta" style="padding:14px">loading…</div></div>
+    </section>
+
+    <!-- ============ STREAM (outputs of the playlist) ============ -->
+    <section id="p-stream" class="hide">
+      <h1>Stream</h1>
+      <p class="sub">Every output URL of the complete playlist: VLC, playlists, Enigma2 bouquet and Xtream Codes. All of them read the Playlist tab — enable or reorder an item there and these URLs follow.</p>
+      <div class="card">
+        <div class="spread">
+          <div>
+            <h2 style="margin:0" id="st-title">Playlist outputs</h2>
+            <div class="meta" id="st-meta">loading…</div>
+          </div>
+          <div class="row">
+            <button class="btn sm pri" id="btn-st-push">☁ push bouquet to Enigma2</button>
+            <button class="btn sm" id="btn-st-dry">dry run</button>
+            <button class="btn sm ghost" id="btn-st-test-box">test receiver</button>
+            <button class="btn sm ghost" id="btn-st-refresh">⟳ refresh</button>
+          </div>
+        </div>
+        <div class="log hide" id="st-push-log" style="margin-top:12px;max-height:220px"></div>
+      </div>
+
+      <div class="grid g2" style="margin-top:14px" id="st-outputs"></div>
+
+      <div class="card pad0" style="margin-top:14px">
+        <div class="cardhead"><h2 style="margin:0">Per-item URLs</h2>
+          <span class="mut" id="st-item-count"></span></div>
+        <div id="st-items"><div class="meta" style="padding:14px">loading…</div></div>
+      </div>
+
+      <div class="gl" style="margin-top:14px">
+        <div class="card pad0">
+          <div class="cardhead"><h2 style="margin:0">Enigma2 bouquet preview</h2>
+            <div class="row"><span class="tag info" id="e2-file">userbouquet.vu-movie.tv</span>
+              <span class="tag" id="e2-count">0 entries</span>
+              <button class="btn sm ghost" id="btn-e2-copy">copy</button>
+              <button class="btn sm ghost" id="btn-e2-download">download .tv</button></div></div>
+          <pre id="e2-preview" style="margin:0;border:0;border-radius:0;min-height:80px;max-height:320px">—</pre>
         </div>
         <div>
           <div class="card" style="margin-bottom:14px">
-            <h2>Receiver</h2>
-            <div class="f2">
-              <div class="field"><label>Host</label><input id="e2-host" class="mono" placeholder="192.168.1.50"></div>
-              <div class="field"><label>WebIF port</label><input id="e2-port" class="mono" value="80"></div>
-              <div class="field"><label>user</label><input id="e2-user" value="root"></div>
-              <div class="field"><label>password</label><input id="e2-pass" type="password" placeholder="(empty if none)"></div>
-              <div class="field"><label>bouquet name</label><input id="e2-name" value="vu-movie"></div>
-              <div class="field"><label>service type</label>
-                <select id="e2-service">
-                  <option value="4097">4097 — GStreamer / exteplayer3</option>
-                  <option value="5001">5001 — GStreamer (OpenPLi)</option>
-                  <option value="5002">5002 — exteplayer3</option>
-                  <option value="1">1 — DVB/TS</option>
-                </select></div>
-            </div>
-            <div class="row">
-              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="e2-ftp"> use FTP for bouquet/subtitle files (OpenWebif only reloads)</label>
-            </div>
-            <div class="row" style="margin-top:10px">
-              <button class="btn" id="btn-e2-save">save settings</button>
-              <button class="btn" id="btn-e2-test">test connection</button>
-              <button class="btn pri" id="btn-e2-push">☁ push bouquet now</button>
-            </div>
-            <div class="log" id="e2-log" style="margin-top:12px;max-height:220px">—</div>
+            <h2>Live monitor</h2>
+            <div id="st-monitor"><div class="meta">no session running</div></div>
           </div>
           <div class="card">
-            <h2>Which streams go in?</h2>
-            <div class="row"><label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="all" checked> all streams</label>
-              <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="radio" name="e2scope" value="selected"> only the selected stream</label></div>
-            <div class="note">Stream URLs point at this NAS, so the box keeps working after the upstream token expired — vu-movie re-resolves the source on demand.</div>
+            <h2>Receiver</h2>
+            <div id="st-box" class="meta">unknown — press “test receiver”.</div>
+            <div class="meta" style="margin-top:8px">Host, credentials, bouquet name and service type live in <b>Settings → Enigma2</b>.</div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ============ TRANSCODE TEMPLATES ============ -->
-    <section id="p-tpl" class="hide">
-      <h1>Transcode templates</h1>
-      <p class="sub">Save a different FFmpeg command for each output the box hands out. The Enigma2 bouquet gets its own slot, so the VU+ Duo2 never inherits a 4K HEVC template that VLC needs but the receiver cannot decode.</p>
-      <div class="gl">
-        <div class="card pad0">
-          <div class="cardhead">
-            <span><i class="bi bi-gear-wide-connected"></i> Templates</span>
-            <button class="btn sm pri" id="btn-tpl-new">+ New template</button>
-          </div>
-          <div class="cardbody pad12">
-            <label class="muted-label" for="tpl-default">Default template (used when an output has no specific assignment)</label>
-            <div class="row">
-              <select class="form-select form-select-sm" id="tpl-default" style="flex:1"></select>
-              <button class="btn sm ghost" id="btn-tpl-set-default" disabled>set default</button>
-            </div>
-            <p class="sub" style="margin:8px 0 0">Saved templates and their commands are also editable inline on the Stream tab.</p>
-          </div>
-          <div class="cardbody" id="tpl-list" style="max-height:calc(100vh - 320px);overflow:auto"></div>
-        </div>
-
-        <div class="card pad0">
-          <div class="cardhead">
-            <span id="tpl-editor-title">Template editor</span>
-            <button class="btn sm pri" id="btn-tpl-save-top">save</button>
-          </div>
-          <div class="cardbody pad12">
-            <div class="f2">
-              <div class="field"><label>Name</label>
-                <input id="tpl-editor-name" maxlength="100" placeholder="e.g. HEVC passthrough to MPEG-TS"></div>
-              <div class="field"><label>Output format / container</label>
-                <select id="tpl-editor-container">
-                  <option value="mpegts">MPEG-TS (VLC + Enigma2)</option>
-                  <option value="matroska">MATROSKA / MKV</option>
-                  <option value="hls">HLS</option>
-                </select></div>
-            </div>
-            <div class="f2" style="margin-top:2px">
-              <div class="field"><label>Description (optional)</label>
-                <input id="tpl-editor-description" maxlength="280" placeholder="when to use this template"></div>
-              <div class="field"><label>Available for playback</label>
-                <label class="row" style="gap:6px;margin:2px 0 0;color:var(--fg)">
-                  <input type="checkbox" id="tpl-editor-enabled" checked>
-                  <span class="meta" style="margin:0">disabled templates stay saved but are never picked for an output</span>
-                </label>
-              </div>
-            </div>
-
-            <div class="param-head">
-              <h3 style="margin:0">FFmpeg parameters</h3>
-              <div class="row" style="gap:6px;margin:0">
-                <button type="button" class="btn sm ghost" id="btn-tpl-fields-reset">reset to defaults</button>
-                <span class="mut" id="tpl-editor-sync-status"></span>
-              </div>
-            </div>
-            <p class="sub" style="margin:4px 0 10px">Every control below rewrites the final command live — the parameters are the same set the stalker-proxy-manager exposes. Changing the command by hand fills the controls back in, so an existing template stays editable.</p>
-            <div id="tpl-editor-fields" class="param-grid"><div class="meta">loading parameters…</div></div>
-
-            <details class="param-advanced" id="tpl-editor-advanced">
-              <summary>Advanced parameters <span class="mut" id="tpl-editor-adv-count"></span></summary>
-              <p class="sub" style="margin:8px 0">Anything else ffmpeg accepts. When a flag is not set, vu-movie adds its own safe default at spawn time (network timeouts, reconnect, probe size) — set it here to take over that value.</p>
-              <div class="row param-adv-add">
-                <select id="tpl-adv-flag" style="flex:1;min-width:220px"></select>
-                <input id="tpl-adv-value" class="mono" style="flex:1;min-width:140px" placeholder="value" list="tpl-adv-values">
-                <datalist id="tpl-adv-values"></datalist>
-                <button type="button" class="btn sm" id="btn-tpl-adv-add">+ add</button>
-              </div>
-              <div class="row param-adv-add hide" id="tpl-adv-custom-row">
-                <input id="tpl-adv-custom-flag" class="mono" style="flex:1;min-width:140px" placeholder="-my_flag" autocomplete="off">
-                <select id="tpl-adv-custom-side" style="flex:0 0 auto">
-                  <option value="input">input (before -i)</option>
-                  <option value="output" selected>output (encoder / muxer)</option>
-                </select>
-              </div>
-              <div id="tpl-editor-adv-rows" class="adv-rows"></div>
-            </details>
-
-            <div class="field" style="margin-top:14px">
-              <label>Full FFmpeg command</label>
-              <textarea id="tpl-editor-command" class="mono" rows="8" spellcheck="false"></textarea>
-              <p class="sub" style="margin:6px 0 0">Use exactly one <code>&lt;url&gt;</code> (or <code>{{url}}</code>) immediately after <code>-i</code>. Output to <code>pipe:1</code>, or use <code>&lt;output&gt;</code> for HLS so segments land in the relay directory. The app inserts source headers and safe network defaults when absent.</p>
-              <div class="row" style="margin-top:8px">
-                <button type="button" class="btn sm" id="btn-tpl-fields-to-cmd">↻ rebuild command from fields</button>
-                <button type="button" class="btn sm ghost" id="btn-tpl-cmd-to-fields">↻ read fields from command</button>
-                <span class="mut" id="tpl-editor-cmd-meta"></span>
-              </div>
-            </div>
-            <div id="tpl-editor-messages" class="param-messages"></div>
-            <h3 style="margin-top:14px">Used by</h3>
-            <p class="sub" style="margin:4px 0 8px">Tick the output types this template should drive. At playback time the relay picks the right template per request — Enigma2 gets its own, .ts and .mkv are separate, and so are the playlists and the direct 302.</p>
-            <div id="tpl-editor-outputs" class="output-grid"></div>
-            <div class="row" style="margin-top:14px">
-              <button class="btn pri" id="btn-tpl-save">save template</button>
-              <button class="btn ghost" id="btn-tpl-delete">delete</button>
-              <button class="btn" id="btn-tpl-test">▷ test</button>
-              <span class="mut" id="tpl-editor-status"></span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ TEMPLATE TEST PANEL ============ -->
+    <!-- ============ TEST ============ -->
     <section id="p-tpl-test" class="hide">
-      <h1>Test FFmpeg template</h1>
-      <p class="sub">Run a saved or inline FFmpeg command against a real stream for a few seconds and inspect the live output, stderr tail and exit code before you bind the template to an output.</p>
-      <div class="card">
-        <div class="f2">
-          <div class="field">
-            <label for="tpl-test-template">Template</label>
-            <select id="tpl-test-template"></select>
-            <div class="meta">Pick a saved template or <code>(inline command…)</code> to test one you have not saved yet.</div>
-          </div>
-          <div class="field">
-            <label for="tpl-test-stream">Test against stream</label>
-            <select id="tpl-test-stream"></select>
-            <div class="meta">The template runs against this stream's upstream URL + headers for the window you choose.</div>
-          </div>
-        </div>
-        <div class="f2" style="margin-top:8px">
-          <div class="field">
-            <label for="tpl-test-duration">Run for (seconds)</label>
-            <input id="tpl-test-duration" type="number" min="1" max="30" step="1" value="5">
-            <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div>
-          </div>
-          <div class="field">
-            <label for="tpl-test-output">Verdict</label>
-            <div id="tpl-test-verdict" class="tpl-test-verdict">(not run yet)</div>
-            <div class="meta" id="tpl-test-summary">Press <b>Run test</b> to spawn ffmpeg against the chosen stream.</div>
-          </div>
-        </div>
-        <div class="field">
-          <label for="tpl-test-command">Inline command (only for the "inline command…" option)</label>
-          <textarea id="tpl-test-command" class="mono" rows="6" spellcheck="false" placeholder="ffmpeg -hide_banner -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -f mpegts pipe:1"></textarea>
-        </div>
-        <div class="row">
-          <button class="btn pri" id="btn-tpl-test-run">▷ run test</button>
-          <button class="btn ghost" id="btn-tpl-test-reset">reset</button>
-          <span class="mut" id="tpl-test-status"></span>
-        </div>
-      </div>
-      <div class="gl" style="margin-top:14px">
+      <h1>Test</h1>
+      <p class="sub">Same editor as the Transcode tab, plus an input source. Every individual parameter of the selected template can be changed here, and the raw ffmpeg output appears as it is produced.</p>
+      <div class="ffmpeg-page">
         <div class="card pad0">
-          <div class="cardhead"><h2 style="margin:0">Command preview</h2>
-            <span class="mut" id="tpl-test-cmd-meta"></span></div>
-          <pre id="tpl-test-cmd" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px">…</pre>
+          <div class="cardhead"><h2 style="margin:0">What to test</h2></div>
+          <div class="cardbody pad12">
+            <div class="field"><label for="test-template">FFmpeg template</label>
+              <select id="test-template"></select>
+              <div class="meta">Loads the template's parameters and command into the editor on the right; nothing is saved unless you press “save template”.</div></div>
+            <div class="field"><label for="test-source">Input source</label>
+              <select id="test-source"></select>
+              <div class="meta">Playlist items and saved streams run with their real upstream URL and headers (signed cookies included).</div></div>
+            <div class="field hide" id="test-url-field"><label for="test-url">Custom source URL</label>
+              <input id="test-url" class="mono" placeholder="https://…/movie.mp4"></div>
+            <div class="field"><label for="test-duration">Run for (seconds)</label>
+              <input id="test-duration" type="number" min="1" max="30" step="1" value="5">
+              <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div></div>
+          </div>
         </div>
-        <div class="card pad0">
-          <div class="cardhead"><h2 style="margin:0">ffmpeg stderr (live)</h2>
-            <span class="mut" id="tpl-test-progress-meta"></span></div>
-          <pre id="tpl-test-stderr" style="margin:0;border-radius:0;border:0;background:#080c13;padding:12px;min-height:80px;max-height:340px;overflow:auto">—</pre>
-        </div>
+        <div id="test-editor-host" class="ffmpeg-editor-host"></div>
       </div>
     </section>
 
@@ -619,7 +496,23 @@
     </section>
   </main>
 </div>
+
+<!-- generic modal host: metadata popup, preview web player, subtitle picker -->
+<div id="modal-root" class="modal-root hide" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" data-modal-close></div>
+  <div class="modal" role="document">
+    <div class="modal-head">
+      <h2 id="modal-title" style="margin:0">—</h2>
+      <button class="btn sm ghost" data-modal-close aria-label="close">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
 <div id="toasts"></div>
+<script src="/core.js"></script>
+<script src="/playlist.js"></script>
+<script src="/ffmpeg-editor.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
