@@ -2803,6 +2803,10 @@ const SETTINGS_SECTIONS = [
       ['container', 'select', ['mpegts', 'matroska', 'hls']],
       ['alwaysTranscode', 'bool'], ['hardware', 'bool'], ['maxConcurrent', 'number'],
       ['device', 'text'], ['idleStopSeconds', 'number'], ['encoderFallback', 'text'],
+      // Pace live output at the source's native rate: without it the relay
+      // floods a real-time player within seconds and drops it as "cannot keep
+      // up". Downloads and template test runs are never paced.
+      ['realtime', 'bool'],
     ],
   },
   {

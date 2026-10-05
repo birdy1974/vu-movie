@@ -100,6 +100,15 @@ permissions, Container Manager project import, firewall, where the data lives).
   which 302s to the upstream URL if you prefer to let VLC fetch it itself.
 * **Remux by default**: if the source is already 1080p H.264 it is copied, not
   re-encoded — a J3455 happily relays several of those.
+* **Paced at 1×** (ffmpeg `-re`, on by default for live outputs): the relay
+  hands the stream to the player at the source's native rate instead of reading
+  the upstream as fast as it can be served. Clients are real-time players that
+  drain ~1–3 MB/s, so bursting a 2-hour movie at 50× only fills their socket
+  buffer and gets them dropped by the backlog guard seconds in (the classic
+  `dropping a client that cannot keep up` line). Downloads (`/dl/…`) and
+  template test runs stay unpaced. Switch: `REALTIME_PLAYBACK=false` or
+  `transcode.realtime` in `/config/vumovie.json`; a single stream can opt out
+  with `"realtime": false` in its profile.
 
 ### Hardware transcoding that respects the J3455
 * VAAPI via `/dev/dri/renderD128` with the exact command family from the

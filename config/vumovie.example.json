@@ -28,6 +28,7 @@
     "container": "mpegts",
     "idleStopSeconds": 45,
     "maxRestarts": 3,
+    "realtime": true,
     "upstreamProxy": true,
     "upstreamChunkBytes": 1048576,
     "upstreamSegmentChunkBytes": 97280,

@@ -11,11 +11,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import express from 'express';
+import { EventEmitter } from 'node:events';
 import {
   createUpstreamProxy, closeUpstreamProxy, rewriteDashManifest, parseClientRange,
-  shouldProxyUpstream, upstreamProxyMiddleware, proxyStats,
+  shouldProxyUpstream, upstreamProxyMiddleware, proxyStats, listUpstreamProxies,
 } from '../src/streams/upstream.js';
-import { decideRestart, argsWithResume } from '../src/streams/relay.js';
+import { decideRestart, argsWithResume, releaseUpstreamProxy } from '../src/streams/relay.js';
 import { getConfig } from '../src/core/config.js';
 
 /* ------------------------------------------------------------------ *
@@ -53,6 +54,45 @@ test('argsWithResume splices an input-side -ss in front of the first -i', () => 
   assert.deepEqual(argsWithResume(args, 63), ['-hide_banner', '-reconnect', '1', '-ss', '63', '-i', 'http://x/in', '-f', 'mpegts', 'pipe:1']);
   assert.deepEqual(argsWithResume(args, 2), args, 'tiny resumes are skipped');
   assert.deepEqual(argsWithResume(args, NaN), args);
+});
+
+test('a deliberate stop closes the upstream proxy only after ffmpeg has exited', async (t) => {
+  // The regression this guards: stopSession() used to close the proxy in the
+  // same tick as the SIGTERM, aborting the in-flight ranged transfer under
+  // ffmpeg. ffmpeg then reconnected to a 404, exited with an I/O error and the
+  // log showed a crash for what was a clean idle stop.
+  const proxy = await createUpstreamProxy({
+    streamId: 'stop-test', url: 'https://cdn.example.com/movie.mp4', headers: {}, kind: 'file',
+  });
+  t.after(() => closeUpstreamProxy(proxy, 'test done'));
+
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  const session = { streamId: 'stop-test', child, upProxy: proxy };
+
+  releaseUpstreamProxy(session, 'idle for 45s');
+  assert.equal(proxy.closed, false, 'the proxy stays up while ffmpeg may still be reading it');
+
+  child.exitCode = 0;
+  child.signalCode = 'SIGTERM';
+  child.emit('close', 0, 'SIGTERM');
+  assert.equal(proxy.closed, true, 'the proxy is closed once the child is gone');
+  assert.ok(!listUpstreamProxies().some((p) => p.id === proxy.id));
+});
+
+test('a child that never exits cannot keep the upstream proxy alive forever', async (t) => {
+  const proxy = await createUpstreamProxy({
+    streamId: 'stuck-test', url: 'https://cdn.example.com/movie.mp4', headers: {}, kind: 'file',
+  });
+  t.after(() => closeUpstreamProxy(proxy, 'test done'));
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+
+  releaseUpstreamProxy({ streamId: 'stuck-test', child, upProxy: proxy }, 'stuck', { graceMs: 20 });
+  await new Promise((resolve) => { setTimeout(resolve, 80); });
+  assert.equal(proxy.closed, true, 'the grace timer is the safety net');
 });
 
 test('shouldProxyUpstream picks files and DASH, leaves HLS direct, honours the switch', () => {

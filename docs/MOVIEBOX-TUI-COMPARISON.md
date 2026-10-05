@@ -230,14 +230,28 @@ on *early clean EOFs* while clients watch (up to `STREAM_MAX_RESTARTS`, default 
 the last play head via an input-side `-ss`; only a play head at ≥ 99 % of the known duration
 counts as the genuine end of the movie.
 
+Two relay details the proxy made necessary:
+
+* **Live output is paced at 1×** (ffmpeg `-re`, injected both into the guided command and into
+  an operator template that does not set its own `-re`/`-readrate`). Because the proxy *can*
+  serve far faster than the CDN, an unpaced ffmpeg would read the whole movie in about a minute
+  and push it at the player: the client's socket backlog passes `MAX_CLIENT_BACKLOG` within
+  seconds and the relay drops it as "cannot keep up" — the picture dies a few seconds in, while
+  the CDN traffic is wasted too. `transcode.realtime` / `REALTIME_PLAYBACK=false` turns pacing
+  off; downloads (`/dl/…`, `mode: 'file'`) are never paced.
+* **The proxy is closed only after ffmpeg is gone** (`releaseUpstreamProxy`, 3 s grace).
+  Closing it in the same tick as the idle-stop SIGTERM aborted the in-flight ranged transfer
+  under ffmpeg, which then reconnected into a 404 and exited with an I/O error — a clean idle
+  stop looked like a crash in the log.
+
 Switches: `UPSTREAM_PROXY=false` restores the old direct-fetch behaviour; chunk sizes, cache
 budget and per-request timeout are `UPSTREAM_CHUNK_BYTES`, `UPSTREAM_SEGMENT_CHUNK_BYTES`,
 `UPSTREAM_CACHE_MB`, `UPSTREAM_REQUEST_TIMEOUT_MS`.
 
-Deliberately not ported from the TUI sidecar: segment *prefetch* (ffmpeg paces its own reads),
-the `max_height` filter (the relay's profile/transcode decides the resolution), subtitle
-serving (vu-movie pushes subtitles to the box instead), and a separate process (nothing here
-needs a second binary).
+Deliberately not ported from the TUI sidecar: segment *prefetch* (the relay paces ffmpeg with
+`-re` instead of reading ahead — see above), the `max_height` filter (the relay's
+profile/transcode decides the resolution), subtitle serving (vu-movie pushes subtitles to the
+box instead), and a separate process (nothing here needs a second binary).
 
 ---
 

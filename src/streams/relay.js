@@ -30,7 +30,7 @@ import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
-  validateFfmpegTemplate, buildFfmpegTemplateArgs,
+  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf,
 } from '../core/media.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
@@ -257,6 +257,36 @@ function resolveOutputTemplateForSession(profile = {}, outputType = '') {
   };
 }
 
+/**
+ * Close the upstream proxy only once ffmpeg has really stopped reading it.
+ *
+ * Tearing the proxy down in the same tick as the SIGTERM used to abort the
+ * in-flight ranged transfer under ffmpeg's feet: its HTTP reader saw a
+ * truncated stream, reconnected (as it is told to do), got 404 from the
+ * already-closed proxy session, and exited with an I/O error. A deliberate
+ * idle stop therefore looked like a crash in the log and threw away the last
+ * chunk of the movie. Waiting for the child to exit makes the stop clean; the
+ * grace timer is the safety net for a child that ignores SIGTERM/SIGKILL.
+ */
+export function releaseUpstreamProxy(session, reason = 'stopped', { graceMs = 3000 } = {}) {
+  if (!session?.upProxy || session.upProxyReleased) return;
+  session.upProxyReleased = true;
+  const close = () => {
+    clearTimeout(timer);
+    closeUpstreamProxy(session.upProxy, reason);
+  };
+  const timer = setTimeout(close, Math.max(0, Number(graceMs) || 0));
+  timer.unref?.();
+  const child = session.child;
+  const running = child && typeof child.once === 'function' && child.exitCode == null && child.signalCode == null;
+  if (!running) close();
+  else {
+    // 'close' (not 'exit') — it fires after ffmpeg's stdio is fully drained, so
+    // no read can still be in flight when the proxy disappears.
+    child.once('close', close);
+  }
+}
+
 export function stopSession(streamId, reason = 'requested') {
   const session = sessions.get(streamId);
   if (!session) return false;
@@ -265,10 +295,11 @@ export function stopSession(streamId, reason = 'requested') {
     bytesOut: session.bytesOut,
   });
   clearIdleTimer(session);
+  endClients(session, `session stopped (${reason})`);
   try { session.child?.kill('SIGTERM'); } catch (err) { logError('relay', 'could not kill ffmpeg', err); }
   setTimeout(() => { try { session.child?.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
   sessions.delete(streamId);
-  closeUpstreamProxy(session.upProxy, reason);
+  releaseUpstreamProxy(session, reason);
   cleanupHlsDir(session);
   return true;
 }
@@ -314,6 +345,10 @@ function scheduleIdleStop(session) {
   clearIdleTimer(session);
   const seconds = Math.max(5, getConfig().transcode.idleStopSeconds);
   session.idleTimer = setTimeout(() => {
+    // Only the session that is still registered may stop itself: a timer armed
+    // by a detaching client of a *replaced* session must never kill its
+    // successor (the stream can be restarted within the idle window).
+    if (sessions.get(session.streamId) !== session) return;
     if (session.clients.size === 0) stopSession(session.streamId, `idle for ${seconds}s`);
   }, seconds * 1000);
   session.idleTimer.unref?.();
@@ -405,6 +440,18 @@ export async function ensureSession(stream, opts = {}) {
       ? { container: 'hls', target: path.join(hlsDir, 'index.m3u8'), hlsDir, hlsTime, hlsListSize: 10 }
       : { container: profile.container, target: 'pipe:1' },
   });
+
+  // A template can write a container the URL did not promise (e.g. a Matroska
+  // template bound to the `enigma2` slot: the bouquet serves `.ts.enigma2`, the
+  // HTTP layer says `video/mp2t`, and the Duo2 gets an MKV). Worth one line in
+  // the log — the receiver's mis-detection is otherwise blamed on the relay.
+  const actualFormat = outputFormatOf(args);
+  const expectedFormat = wantsHls ? 'hls' : (container === 'matroska' ? 'matroska' : 'mpegts');
+  if (actualFormat && actualFormat !== expectedFormat) {
+    log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || container} URL asked for ${expectedFormat} — players can mis-detect the stream`, {
+      stream: stream.id, templateId: template?.templateId || '', template: template?.name || '',
+    });
+  }
 
   const command = argsToCommand(args);
   const session = {
@@ -608,7 +655,7 @@ function spawnFfmpeg(session) {
 
     endClients(session, code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`);
     sessions.delete(session.streamId);
-    closeUpstreamProxy(session.upProxy, decision.reason);
+    releaseUpstreamProxy(session, decision.reason, { graceMs: 0 });
 
     if (session.hlsDir) {
       // The source was finite (a progressive file, or a VOD playlist): the muxer
@@ -695,6 +742,8 @@ function writeToClient(session, client, chunk) {
       if (client.pending > cfg.transcode.maxClientBacklog) {
         log.warn('relay', 'dropping a client that cannot keep up (protecting the encoder)', {
           session: session.id, ip: client.ip, pendingBytes: client.pending,
+          clientSec: Math.round((Date.now() - client.startedAt) / 1000),
+          hint: 'the player is draining slower than the source delivers — the relay paces live sessions with -re (transcode.realtime / REALTIME_PLAYBACK)',
         });
         session.clients.delete(client);
         try { client.res.end(); } catch { /* ignore */ }
@@ -746,4 +795,7 @@ export function stopAll(reason = 'shutdown') {
   for (const streamId of [...sessions.keys()]) stopSession(streamId, reason);
 }
 
-export default { ensureSession, attachClient, stopSession, listSessions, getSession, stopAll, publicSession, runTemplateTest };
+export default {
+  ensureSession, attachClient, stopSession, releaseUpstreamProxy, listSessions, getSession,
+  stopAll, publicSession, runTemplateTest,
+};
