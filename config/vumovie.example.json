@@ -26,7 +26,14 @@
     "audioChannels": 2,
     "fps": "source",
     "container": "mpegts",
-    "idleStopSeconds": 45
+    "idleStopSeconds": 45,
+    "maxRestarts": 3,
+    "upstreamProxy": true,
+    "upstreamChunkBytes": 1048576,
+    "upstreamSegmentChunkBytes": 97280,
+    "upstreamParallel": 4,
+    "upstreamCacheMb": 64,
+    "upstreamRequestTimeoutMs": 30000
   },
   "subtitles": {
     "languages": [
