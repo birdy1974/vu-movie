@@ -28,6 +28,9 @@ import * as relay from '../streams/relay.js';
 import * as exporter from '../streams/export.js';
 import { upstreamProxyMiddleware } from '../streams/upstream.js';
 import apiRouter from './api.js';
+import playlistApiRouter from '../playlist/api.js';
+import playlistOutputsRouter from '../playlist/outputs.js';
+import ffmpegRunRouter from '../playlist/ffmpeg-run.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = process.env.PUBLIC_DIR || path.resolve(__dirname, '../../public');
@@ -68,7 +71,11 @@ export function createApp() {
   app.use((req, res, next) => {
     const { username, password } = cfg.app;
     if (!username) return next();
-    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/') || req.path === '/api/health') return next();
+    // The stream endpoints and the playlist outputs are token-protected
+    // (/s/<token>/…, /pl/<token>/…, /xtream/<token>/…): VLC, the VU+ and IPTV
+    // apps cannot send a password, so they carry an unguessable path instead.
+    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/')
+      || req.path.startsWith('/pl/') || req.path.startsWith('/xtream/') || req.path === '/api/health') return next();
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -83,6 +90,15 @@ export function createApp() {
   // ---- chunked upstream proxy (/up/<secret>/…) — the loopback input for ----
   // ---- ffmpeg when a session fetches its source in ranged chunks      ----
   app.use(upstreamProxyMiddleware);
+
+  // ---- playlist outputs (token-protected, no password) ----
+  // /pl/<token>/… (m3u, m3u8, json, userbouquet.tv) and
+  // /xtream/<token>/… (player_api.php, get.php, xmltv.php).
+  app.use(playlistOutputsRouter);
+
+  // ---- playlist + live FFmpeg test API (before the main router) ----
+  app.use('/api/playlist', playlistApiRouter);
+  app.use('/api/ffmpeg', ffmpegRunRouter);
 
   app.use('/api', apiRouter);
 

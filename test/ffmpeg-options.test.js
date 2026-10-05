@@ -276,3 +276,116 @@ test('an advanced flag is documented for the editor', () => {
     assert.ok(entry.label && entry.help, entry.flag);
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * the values offered in the dropdowns
+ *
+ * The prefilled lists have to be real ffmpeg values: a name that does not
+ * exist in the build only fails once a stream is running, and a missing level
+ * or sample rate silently pushes the operator into the "custom value…" path.
+ * These assertions pin the vocabulary to the ffmpeg documentation (encoders,
+ * -profile:v / -level, -r, -ar, -b:a) and to stalker-proxy-manager's schema.
+ * ------------------------------------------------------------------ */
+
+test('the offered video encoders are real ffmpeg encoder names', () => {
+  const { videoCodecs } = templateOptionsSchema();
+  // encoders a Synology/Intel box realistically runs, plus copy
+  for (const name of ['copy', 'libx264', 'libx265', 'mpeg2video', 'h264_vaapi', 'hevc_vaapi', 'vp9_vaapi', 'h264_qsv', 'hevc_qsv']) {
+    assert.ok(videoCodecs.includes(name), `${name} is offered`);
+  }
+  // AV1 and NVENC are real names too — they just may not exist on the host
+  for (const name of ['libsvtav1', 'av1_vaapi', 'h264_nvenc', 'hevc_nvenc', 'libvpx-vp9']) {
+    assert.ok(videoCodecs.includes(name), `${name} is offered`);
+  }
+  assert.equal(new Set(videoCodecs).size, videoCodecs.length, 'no duplicates');
+});
+
+test('the offered audio encoders cover what TS, MKV and the box need', () => {
+  const { audioCodecs } = templateOptionsSchema();
+  for (const name of ['aac', 'ac3', 'eac3', 'mp2', 'mp3', 'libopus', 'flac', 'pcm_s16le', 'copy', 'none']) {
+    assert.ok(audioCodecs.includes(name), `${name} is offered`);
+  }
+  // dca needs -strict experimental, so it must not be a one-click choice
+  assert.ok(!audioCodecs.includes('dca'));
+});
+
+test('H.264 profiles and levels match the ffmpeg/x264 vocabulary', () => {
+  const field = (key) => TEMPLATE_FIELDS.find((f) => f.key === key);
+  const profiles = field('profile').choices;
+  for (const name of ['baseline', 'main', 'high', 'high10', 'high422', 'high444']) assert.ok(profiles.includes(name), `profile ${name}`);
+  const levels = field('level').choices;
+  // Annex A: 1 … 6.2 and the 1b level, exactly as -level:v accepts them
+  for (const name of ['1', '1b', '1.1', '2.2', '3.1', '4.1', '5.1', '6.2']) assert.ok(levels.includes(name), `level ${name}`);
+  assert.ok(!levels.includes('7.0'), 'level 7 does not exist');
+});
+
+test('frame rates, sample rates and bitrates are ffmpeg-acceptable values', () => {
+  const field = (key) => TEMPLATE_FIELDS.find((f) => f.key === key);
+  const fps = field('fps').choices.filter(Boolean);
+  assert.deepEqual(fps.filter((v) => !/^\d+(\.\d+)?$/.test(v)), [], 'every FPS is a number');
+  for (const rate of ['23.976', '29.97', '59.94', '25', '50', '60', '120']) assert.ok(fps.includes(rate), `fps ${rate}`);
+
+  const rates = field('audio_rate').choices.filter(Boolean).map(Number);
+  for (const rate of [8000, 11025, 22050, 32000, 44100, 48000, 96000, 192000]) assert.ok(rates.includes(rate), `sample rate ${rate}`);
+  assert.ok(Math.max(...rates) <= 384000, 'the encoders accept up to 384 kHz');
+
+  const bitrates = field('audio_bitrate').choices.filter(Boolean);
+  assert.ok(bitrates.every((v) => /^\d+k$/.test(v)), 'audio bitrates are kbit/s');
+  for (const rate of ['128k', '192k', '384k', '640k']) assert.ok(bitrates.includes(rate), `audio bitrate ${rate}`);
+
+  const videoRates = field('video_bitrate').choices.filter(Boolean);
+  assert.ok(videoRates.every((v) => /^\d+k$/.test(v)), 'video bitrates are kbit/s');
+});
+
+test('every advanced suggestion is a positive value for its own flag', () => {
+  const flag = (name) => ADVANCED_OPTIONS.find((entry) => entry.flag === name);
+  assert.ok(flag('-preset').choices.includes('veryfast'));
+  assert.ok(flag('-tune').choices.includes('zerolatency'));
+  assert.deepEqual(flag('-reconnect').choices, ['0', '1']);
+  assert.ok(flag('-probesize').choices.every((v) => Number(v) >= 32));
+  assert.ok(flag('-mpegts_flags').choices.some((v) => v.includes('resend_headers')));
+  // the timeout ladder reaches the 60 s that stalker-proxy-manager ships
+  assert.ok(flag('-rw_timeout').choices.includes('60000000'), flag('-rw_timeout').choices.join(' '));
+  assert.equal(flag('-rw_timeout').max, 2147483647);
+  // and the two player identities its editor offers for stubborn portals
+  assert.deepEqual(flag('-user_agent').choices, ['Lavf/61.7.100', 'VLC/3.0.21 LibVLC/3.0.21']);
+  assert.ok(flag('-hls_flags').choices.some((v) => v.includes('delete_segments')));
+  // nothing may be offered for a flag the renderer owns
+  const owned = new Set(templateOptionsSchema().formOwnedFlags);
+  for (const entry of ADVANCED_OPTIONS) assert.ok(!owned.has(entry.flag), `${entry.flag} is not form-owned`);
+});
+
+test('Matroska-only audio is flagged when the container is MPEG-TS or HLS', () => {
+  const base = { ...TEMPLATE_OPTION_DEFAULTS, video_codec: 'copy', audio_codec: 'flac' };
+  const ts = templateOptionWarnings(normaliseTemplateOptions(base, { container: 'mpegts' }), { container: 'mpegts' });
+  assert.ok(ts.some((w) => w.includes('needs the Matroska container')), ts.join(' | '));
+  const mkv = templateOptionWarnings(normaliseTemplateOptions(base, { container: 'matroska' }), { container: 'matroska' });
+  assert.ok(!mkv.some((w) => w.includes('needs the Matroska container')), mkv.join(' | '));
+  // …and the broad list still builds a valid command
+  const rendered = renderTemplate(normaliseTemplateOptions({ ...TEMPLATE_OPTION_DEFAULTS, video_codec: 'copy', audio_codec: 'flac' }, { container: 'matroska' }), { container: 'matroska' });
+  assert.match(rendered.command, /-c:a flac/);
+});
+
+test('the newly offered encoders render and validate', () => {
+  const cases = [
+    { video_codec: 'av1_vaapi', hw_accel: 'vaapi', rc_mode: 'CQP', global_quality: '26', output_format: 'matroska' },
+    { video_codec: 'libsvtav1', hw_accel: 'none', video_bitrate: '2500k', output_format: 'matroska' },
+    { video_codec: 'h264_nvenc', hw_accel: 'none', profile: 'high', level: '4.1', video_bitrate: '8000k', output_format: 'matroska' },
+    { video_codec: 'h264_vaapi', profile: 'high10', level: '5.1', output_format: 'mpegts' },
+  ];
+  for (const raw of cases) {
+    const options = normaliseTemplateOptions({ ...TEMPLATE_OPTION_DEFAULTS, ...raw }, { container: raw.output_format });
+    assert.deepEqual(validateTemplateOptions(options, { container: raw.output_format }), [], `${raw.video_codec} validates`);
+    const { command } = renderTemplate(options, { container: raw.output_format });
+    assert.ok(command.includes(`-c:v ${raw.video_codec}`), command);
+  }
+});
+
+test('the editor gets the encoder families from the schema (no second copy)', () => {
+  const schema = templateOptionsSchema();
+  assert.deepEqual(schema.vaapiEncoders, ['h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi', 'av1_vaapi']);
+  assert.ok(schema.h264Encoders.includes('h264_nvenc'));
+  // an encoder added to the family list is recognised as VAAPI by activeParameters
+  const options = normaliseTemplateOptions({ ...TEMPLATE_OPTION_DEFAULTS, video_codec: 'av1_vaapi', rc_mode: 'CQP' }, { container: 'matroska' });
+  assert.equal(activeParameters(options, { container: 'matroska' }).vaapiTuning, true);
+});

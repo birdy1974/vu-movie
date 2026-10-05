@@ -247,6 +247,30 @@ export const DEFAULTS = {
     /** Re-push the bouquet automatically after every scrape. */
     autoPush: String(process.env.ENIGMA2_AUTO_PUSH || 'false').toLowerCase() === 'true',
   },
+  /**
+   * The Playlist tab's ordered list of streams.
+   *
+   * `items` is the single source of truth for *what* the outputs of this box
+   * contain — the VLC/M3U playlist, the Enigma2 bouquet, the Xtream catalogue
+   * and the web player all read it in this order. Every entry is
+   * `{ streamId, enabled, templateId, subtitleLanguage, addedAt }`; a stream
+   * that exists but is not in the list is appended automatically the first time
+   * the playlist is read (see src/playlist/index.js), so upgrading from a
+   * version without a playlist keeps every stream visible.
+   *
+   * `token` is the unguessable handle in the public output URLs
+   * (/pl/<token>/…) — those endpoints are deliberately outside the /api
+   * password, exactly like the per-stream /s/<token>/ URLs, because VLC, the
+   * VU+ and an IPTV app cannot authenticate comfortably.
+   */
+  playlist: {
+    name: process.env.PLAYLIST_NAME || 'vu-movie',
+    items: [],
+    token: '',
+    /** Username/password an Xtream Codes client sends (empty = token only). */
+    xtreamUsername: process.env.XTREAM_USERNAME || 'vumovie',
+    xtreamPassword: process.env.XTREAM_PASSWORD || '',
+  },
   /** Site recipes — extra/overriding files land here. */
   sources: {
     dir: process.env.SOURCES_DIR || path.join(path.dirname(CONFIG_FILE), 'sources'),

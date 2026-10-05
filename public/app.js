@@ -1,187 +1,172 @@
-/* vu-movie — UI logic (no framework, no build step, one file). */
+/* vu-movie — the app shell: tab controllers, routing and bootstrap.
+ *
+ * This file is the last script on the page, so core.js, playlist.js and
+ * ffmpeg-editor.js are already loaded. It owns every tab except the three that
+ * have their own module:
+ *
+ *   core.js          helpers, shared `state`, `api()`, `toast()`, modal, copy
+ *   playlist.js      the Playlist tab (and the client copy of the playlist)
+ *   ffmpeg-editor.js the Transcode + Test tabs (one parameter editor)
+ *   app.js           Mobile, Dashboard, Search, Subtitles, Stream, Logs,
+ *                    Settings, navigation, health polling and bootstrap
+ *
+ * The backend is untouched (see the task: "keep the core code as it is"): every
+ * request below goes to an endpoint that already exists in src/http/api.js,
+ * src/playlist/api.js or src/playlist/ffmpeg-run.js.
+ */
 'use strict';
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => [...document.querySelectorAll(sel)];
-
+const PAGE_KEY = 'vu-movie.active-page';
+const SEARCH_STATE_KEY = 'vu-movie.search-state.v2';
 const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
-const SEARCH_STATE_KEY = 'vu-movie.search-state.v1';
-const ACTIVE_PAGE_KEY = 'vu-movie.active-page';
+const RESULT_SORT_KEY = 'vu-movie.search-results-sort';
 const SELECTED_STREAM_KEY = 'vu-movie.selected-stream';
-const APP_PAGES = ['dash', 'find', 'stream', 'subs', 'e2', 'tpl', 'tpl-test', 'logs', 'set'];
-const OUTPUT_LABELS = {
-  vlcTs: 'VLC / any player (.ts)',
-  vlcMkv: 'VLC / any player (.mkv)',
-  m3u8: 'Playlist (.m3u8)',
-  m3u: 'Playlist (.m3u)',
-  enigma2: 'Enigma2 / Duo2',
-  direct: 'Direct upstream link (302)',
-  download: 'Download to NAS',
-};
-const OUTPUT_TYPES = ['vlcTs', 'vlcMkv', 'm3u8', 'm3u', 'enigma2', 'direct', 'download'];
+// Set by Stream → “test template” so the Test tab opens on the same stream.
+const TEST_SOURCE_KEY = 'vu-movie.test-source';
 const FIND_TABS = ['title', 'url', 'browse'];
 const RESULT_VIEWS = ['list', 'poster', 'thumbnails'];
 
-function readStoredJson(key) {
-  try {
-    const value = localStorage.getItem(key);
-    return value ? JSON.parse(value) : null;
-  } catch { return null; }
-}
-
-function readStoredText(key) {
-  try { return localStorage.getItem(key) || ''; } catch { return ''; }
-}
-
-function getInitialResultsView() {
-  try {
-    const saved = localStorage.getItem(RESULT_VIEW_KEY);
-    return RESULT_VIEWS.includes(saved) ? saved : 'poster';
-  } catch {
-    return 'poster';
-  }
-}
-
-const state = {
-  health: null,
-  sources: [],
-  selectedSources: [],
-  results: [],
-  providerErrors: [],
-  resultsView: getInitialResultsView(),
-  selected: null,
-  selectedSeason: 0,
-  selectedEpisode: 0,
-  selectedSeasons: [],
-  candidates: [],
-  stream: null,
-  streams: [],
+const ui = {
+  search: { q: '', type: '', tabs: 'title', moviebox: true, url: '', urlTitle: '', urlYear: '', urlKind: 'movie', urlSeason: '', urlEpisode: '' },
+  resultsView: 'poster',
+  resultsSort: 'year-desc',
+  titleFilter: '',
+  providerFilter: '',
   providers: [],
-  subResults: [],
-  findSubtitleResults: [],
-  selectedSubtitle: null,
-  config: null,
-  logs: [],
-  jobs: [],
-  sessions: [],
-  ffmpegTemplates: [],
-  ffmpegTemplateSchema: null,
-  ffmpegTemplatesLoaded: false,
-  defaultFfmpegTemplateId: '',
-  pendingRestoreSelection: false,
-  pendingRestoreUrlResolve: false,
-  lastResolveMode: '',
+  selection: null,
+  groups: [],
+  candidates: [],
+  resolving: false,
+  seasons: null,
+  mobile: { group: null, candidates: [], results: [], subs: [] },
 };
 
-let searchRequestId = 0;
-let selectionRequestId = 0;
-let detailRequestId = 0;
-let resolveRequestId = 0;
-let streamRequestId = 0;
-let findSubtitleRequestId = 0;
-let searchAbortController = null;
-let detailAbortController = null;
-let resolveAbortController = null;
+let searchSeq = 0;
+let resolveSeq = 0;
+let searchAbort = null;
+let resolveAbort = null;
+const initialized = new Set();
+let currentPage = 'dash';
+let healthTimer = null;
+let logStream = null;
 
-function isAbortError(error) {
-  return error?.name === 'AbortError' || error?.name === 'CanceledError';
+/* ====================================================================== *
+ * routing
+ * ====================================================================== */
+
+function pageFromHash() {
+  const raw = String(window.location.hash || '').replace(/^#\/?/, '').split('?')[0];
+  return APP_PAGES.includes(raw) ? raw : '';
 }
 
-function invalidateSelectionRequests() {
-  selectionRequestId += 1;
-  detailRequestId += 1;
-  resolveRequestId += 1;
-  detailAbortController?.abort();
-  resolveAbortController?.abort();
-  detailAbortController = null;
-  resolveAbortController = null;
-  return selectionRequestId;
-}
-
-/* ---------------- tiny helpers ---------------- */
-
-async function api(path, opts = {}) {
-  const { silent = false, ...fetchOptions } = opts;
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) },
-    ...fetchOptions,
-    body: fetchOptions.body ? (typeof fetchOptions.body === 'string' ? fetchOptions.body : JSON.stringify(fetchOptions.body)) : undefined,
-  });
-  let data = null;
-  try { data = await res.json(); } catch { data = { ok: false, error: `invalid JSON (HTTP ${res.status})` }; }
-  if (!res.ok || data?.ok === false) {
-    const message = data?.error || `HTTP ${res.status}`;
-    if (!silent) toast(`${path}: ${message}`, 'err');
-    throw new Error(message);
+async function go(page, { hash = true, force = false } = {}) {
+  if (!APP_PAGES.includes(page)) page = 'dash';
+  currentPage = page;
+  $$('.nav button').forEach((button) => button.classList.toggle('on', button.dataset.p === page));
+  APP_PAGES.forEach((name) => $(`#p-${name}`)?.classList.toggle('hide', name !== page));
+  document.body.dataset.page = page;
+  writeStoredText(PAGE_KEY, page);
+  if (hash && pageFromHash() !== page) {
+    // `hash = page` keeps the back button working without a scroll jump.
+    window.location.hash = `#${page}`;
   }
-  return data;
-}
-
-function toast(message, kind = 'info', ms = 6000) {
-  const node = document.createElement('div');
-  node.className = `toast ${kind}`;
-  node.textContent = message;
-  $('#toasts').appendChild(node);
-  setTimeout(() => node.remove(), ms);
-}
-
-const escapeHtml = (text) => String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmtBytes = (n) => (n > 1073741824 ? `${(n / 1073741824).toFixed(1)} GB` : n > 1048576 ? `${(n / 1048576).toFixed(0)} MB` : `${Math.round((n || 0) / 1024)} KB`);
-const fmtTime = (iso) => (iso ? new Date(iso).toLocaleTimeString() : '—');
-const tag = (text, kind = '') => `<span class="tag ${kind}">${escapeHtml(text)}</span>`;
-
-/* ---------------- navigation ---------------- */
-
-function go(page) {
-  if (!APP_PAGES.includes(page)) return;
-  $$('#nav button').forEach((b) => b.classList.toggle('on', b.dataset.p === page));
-  $$('main > section').forEach((s) => s.classList.toggle('hide', s.id !== `p-${page}`));
-  try { localStorage.setItem(ACTIVE_PAGE_KEY, page); } catch { /* storage may be disabled */ }
-  if (page === 'dash') { loadHealth(); loadJobs(); loadStreams(); }
-  // If this is the first visit after upgrading (or browser storage was cleared),
-  // the most recently saved stream is a useful fallback for an empty Stream tab.
-  if (page === 'stream' && !state.stream && !readStoredText(SELECTED_STREAM_KEY) && state.streams[0]?.id) {
-    openStream(state.streams[0].id, { navigate: false });
+  try {
+    await openPage(page, { force });
+  } catch (error) {
+    toast(error.message, 'err');
   }
-  // openStream() normally navigates after fetching; the fallback above opts out
-  // of navigation so it cannot re-enter go('stream') recursively.
-  if (page === 'find' && state.pendingRestoreUrlResolve) {
-    state.pendingRestoreUrlResolve = false;
-    doResolveFromUrl();
-  } else if (page === 'find' && state.pendingRestoreSelection) {
-    state.pendingRestoreSelection = false;
-    const selectedIndex = state.results.indexOf(state.selected);
-    if (selectedIndex >= 0) selectResult(selectedIndex);
+}
+
+async function openPage(page, { force = false } = {}) {
+  const once = async (name, fn) => {
+    if (!initialized.has(name) || force) {
+      initialized.add(name);
+      try {
+        await fn();
+      } catch (error) {
+        // A failed first load must not lock the tab: forget it so opening the
+        // page again retries instead of showing an empty pane for ever.
+        initialized.delete(name);
+        throw error;
+      }
+    }
+  };
+  switch (page) {
+    case 'mobile':
+      await once('mobile', initMobile);
+      refreshMobile();
+      break;
+    case 'dash':
+      loadHealth();
+      loadJobs();
+      loadStreams();
+      await once('dash-sources', loadSources);
+      break;
+    case 'find':
+      await once('find', initFind);
+      break;
+    case 'subs':
+      await once('subs', initSubtitles);
+      refreshSubTargets();
+      break;
+    case 'tpl':
+      await once('tpl', async () => {
+        await VMPlaylist.load().catch(() => {});
+        await VMFfmpegEditor.initLibrary();
+        VMFfmpegEditor.wireLibraryTab();
+      });
+      VMFfmpegEditor.renderLibrary();
+      // the editor's own test pane offers the playlist + saved streams as input
+      VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
+      break;
+    case 'list':
+      await VMPlaylist.refresh();
+      break;
+    case 'stream':
+      await once('stream', initStream);
+      await refreshStream();
+      break;
+    case 'tpl-test':
+      await once('tpl-test', async () => {
+        await VMPlaylist.load().catch(() => {});
+        await VMFfmpegEditor.initTestTab();
+        wireTestSourcePicker();
+        wireTestControls();
+      });
+      renderTestSourcePicker();
+      VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
+      break;
+    case 'logs':
+      await once('logs', initLogs);
+      loadLogs();
+      break;
+    case 'set':
+      await once('set', initSettings);
+      break;
+    default:
+      break;
   }
-  if (page === 'logs') loadLogs();
-  if (page === 'set') loadSettings();
-  if (page === 'e2') loadEnigmaForm();
-  if (page === 'subs') loadProviders();
-  if (page === 'tpl') { loadFfmpegTemplates().then(renderTemplatesPage); }
-  if (page === 'tpl-test') { Promise.all([loadFfmpegTemplates(), loadStreams()]).then(loadTplTestStreams); }
 }
-$$('#nav button').forEach((b) => b.addEventListener('click', () => go(b.dataset.p)));
 
-/* ================= DASHBOARD ================= */
+/* ====================================================================== *
+ * dashboard (kept as it was — same cards, same data, new markup)
+ * ====================================================================== */
 
-function dot(state_) {
-  return state_ === true ? 'ok' : state_ === false ? 'err' : 'warn';
-}
+const dot = (value) => (value === true ? 'ok' : value === false ? 'err' : 'warn');
 
 async function loadHealth() {
   try {
-    const { health } = { health: await api('/api/health') };
-    state.health = health;
-    const h = health;
+    const h = await api('/api/health', { silent: true });
+    state.health = h;
+    const hwPending = Boolean(h.hwaccelPending || h.hwaccel?.pending);
     $('#h-ffmpeg').className = `dot ${dot(h.ffmpeg?.ok)}`;
-    $('#h-hw').className = `dot ${dot(h.hwaccel?.available)}`;
+    $('#h-hw').className = `dot ${dot(hwPending ? null : h.hwaccel?.available)}`;
     $('#h-db').className = `dot ${h.postgres ? 'ok' : 'warn'}`;
     $('#h-box').className = `dot ${h.enigma2?.configured ? dot(h.enigma2.ok) : 'warn'}`;
-    $('#side-info').innerHTML = `v${h.version} · up ${h.uptimeSec}s<br>${escapeHtml(h.hwaccel?.available ? `${h.hwaccel.driver || 'vaapi'} (H.264 enc)` : (h.hwaccel?.reason || 'no hardware accel'))}<br>${h.postgres ? 'postgres connected' : 'in-memory store'}`;
+    $('#side-info').innerHTML = `v${escapeHtml(h.version)} · up ${escapeHtml(String(h.uptimeSec))}s<br>`
+      + `${escapeHtml(hwPending ? 'hardware self-test running…' : h.hwaccel?.available ? `${h.hwaccel.driver || 'vaapi'} (H.264 enc)` : (h.hwaccel?.reason || 'no hardware accel'))}<br>`
+      + `${h.postgres ? 'postgres connected' : 'in-memory store'}`;
 
-    // While the first hardware self-test is still running, say so instead of
-    // showing an alarming "unavailable" — a slow GPU is not a broken GPU.
-    const hwPending = Boolean(h.hwaccelPending || h.hwaccel?.pending);
     const ffmpegRow = h.ffmpeg?.ok
       ? `${h.ffmpeg.version}${h.ffmpeg.elapsedMs >= 1000 ? ` (${h.ffmpeg.elapsedMs} ms)` : ''}`
       : h.ffmpeg?.pending ? 'checking…'
@@ -205,7 +190,7 @@ async function loadHealth() {
         rows: [
           ['ffmpeg', ffmpegRow, h.ffmpeg?.pending ? null : h.ffmpeg?.ok],
           ['ffprobe', h.ffprobe?.ok ? 'ok' : (h.ffprobe?.pending ? 'checking…' : 'missing'), h.ffprobe?.pending ? null : h.ffprobe?.ok],
-          ['chromium', h.browser?.available ? `running (${h.browser.activePages} page)` : (h.browser?.executable ? 'idle, ready' : 'not installed'), h.browser?.executable ? true : false],
+          ['chromium', h.browser?.available ? `running (${h.browser.activePages} page)` : (h.browser?.executable ? 'idle, ready' : 'not installed'), Boolean(h.browser?.executable)],
           ['external extractor', h.externalExtractor ? 'configured' : 'not used', null],
           ['node', h.node, null],
         ],
@@ -215,2582 +200,1513 @@ async function loadHealth() {
         rows: [
           ['postgres', h.postgres ? 'connected (tables migrated)' : 'memory fallback', h.postgres],
           ['database url', h.db?.lastError ? `error: ${h.db.lastError}` : 'ok', h.db?.lastError ? false : null],
-          ['streams', String(h.streamSessions?.length ?? 0), null],
+          ['live sessions', String(h.streamSessions?.length ?? 0), null],
         ],
       },
       {
         title: 'VU+ Duo2 (Enigma2)',
         rows: [
           ['configured', h.enigma2?.configured ? 'yes' : 'no (set host in Settings)', h.enigma2?.configured],
-          // The health endpoint never polls the box, so say when the answer is
-          // from and that it is a last-known value, not a fresh probe.
           ['reachable', h.enigma2?.message || '—', h.enigma2?.ok === null ? null : h.enigma2?.ok],
           ['model', h.enigma2?.model || '—', null],
           ['last checked', h.enigma2?.checked ? `${h.enigma2.ageMs != null ? Math.round(h.enigma2.ageMs / 1000) : '?'}s ago (on demand only)` : 'never', null],
         ],
       },
     ];
-    $('#dash-cards').innerHTML = cards.map((c) => `
+    $('#dash-cards').innerHTML = cards.map((card) => `
       <div class="card">
-        <h3>${escapeHtml(c.title)}</h3>
-        ${c.rows.map(([k, v, ok]) => `<div class="kv"><span>${escapeHtml(k)}</span>
-          <span>${ok === null ? '' : `<i class="dot ${dot(ok)}" style="margin-right:6px"></i>`}${escapeHtml(String(v))}</span></div>`).join('')}
+        <h3>${escapeHtml(card.title)}</h3>
+        ${card.rows.map(([key, value, ok]) => `<div class="kv"><span>${escapeHtml(key)}</span>
+          <span>${ok === null ? '' : `<i class="dot ${dot(ok)}" style="margin-right:6px"></i>`}${escapeHtml(String(value))}</span></div>`).join('')}
       </div>`).join('');
 
     renderSessions(h.streamSessions || []);
-    const healthById = Object.fromEntries((h.sources || []).map((s) => [s.id, s.health]));
-    state.sources.forEach((s) => { s.health = healthById[s.id] || s.health; });
-    renderSourceHealth();
-  } catch (err) {
-    $('#dash-cards').innerHTML = `<div class="card"><h3>Backend unreachable</h3><div class="meta">${escapeHtml(err.message)}</div></div>`;
+    const healthById = Object.fromEntries((h.sources || []).map((source) => [source.id, source.health]));
+    state.sources.forEach((source) => { source.health = healthById[source.id] || source.health; });
+    if (!$('#dash-sources')?.dataset.loaded) renderSourceHealth();
+  } catch (error) {
+    const cards = $('#dash-cards');
+    if (cards) cards.innerHTML = `<div class="card"><h3>Backend unreachable</h3><div class="meta">${escapeHtml(error.message)}</div></div>`;
   }
 }
 
 function renderSessions(sessions) {
   state.sessions = sessions;
-  $('#dash-sessions').innerHTML = sessions.length
-    ? sessions.map((s) => `<div class="kv"><span>${escapeHtml(s.streamId)} <span class="mut">${s.mode}/${s.encoder}</span></span>
-        <span>${s.clients} client(s) · ${s.bytesOut ? fmtBytes(s.bytesOut) : '0'} ${s.stats?.speed ? `· ${s.stats.speed}` : ''}</span></div>`).join('')
-    : '<div class="meta">none</div>';
-  if (state.stream?.id) {
-    const mine = sessions.find((s) => s.streamId === state.stream.id);
-    renderMonitor(mine);
+  const host = $('#dash-sessions');
+  if (host) {
+    host.innerHTML = sessions.length
+      ? sessions.map((s) => `<div class="kv"><span>${escapeHtml(s.streamId)} <span class="mut">${escapeHtml(s.mode || '')}/${escapeHtml(s.encoder || '')}</span></span>
+          <span>${s.clients} client(s) · ${s.bytesOut ? fmtBytes(s.bytesOut) : '0'} ${s.stats?.speed ? `· ${escapeHtml(s.stats.speed)}` : ''}</span></div>`).join('')
+      : '<div class="meta">none</div>';
   }
+  if ($('#st-monitor') && !$('#p-stream')?.classList.contains('hide')) renderStreamMonitor();
 }
 
 function renderSourceHealth() {
-  $('#dash-sources').innerHTML = state.sources.map((s) => `
-    <div class="srcrow">
-      <div><b>${escapeHtml(s.name)}</b> <span class="mut" style="font-size:11px">${escapeHtml(s.kind)}</span></div>
-      <div>${s.health?.ok === true ? tag(s.health.message || 'ok', 'ok') : s.health?.checks ? tag(s.health.message || 'failing', 'err') : tag('unused')}
-        <a href="${escapeHtml(s.home)}" target="_blank" rel="noreferrer">open ↗</a></div>
-    </div>`).join('') || '<div class="meta">no sources</div>';
+  const host = $('#dash-sources');
+  if (host) {
+    host.innerHTML = state.sources.map((source) => `
+      <div class="srcrow">
+        <div><b>${escapeHtml(source.name)}</b> <span class="mut" style="font-size:11px">${escapeHtml(source.kind || '')}</span></div>
+        <div>${source.health?.ok === true ? tag(source.health.message || 'ok', 'ok') : source.health?.checks ? tag(source.health.message || 'failing', 'err') : tag('unused')}
+          ${source.home ? `<a href="${escapeHtml(source.home)}" target="_blank" rel="noreferrer">open ↗</a>` : ''}</div>
+      </div>`).join('') || '<div class="meta">no sources</div>';
+  }
+  if (host) host.dataset.loaded = '1';
+  const chips = $('#source-chips');
+  if (chips && state.sources.length) renderSourceChips();
 }
 
 async function loadJobs() {
   try {
-    const { jobs } = await api('/api/jobs?limit=25');
+    const { jobs } = await api('/api/jobs?limit=25', { silent: true });
     state.jobs = jobs;
-    $('#dash-jobs').innerHTML = jobs.length ? `<table>
+    const host = $('#dash-jobs');
+    if (!host) return;
+    host.innerHTML = jobs.length ? `<table>
       <thead><tr><th>Job</th><th>Type</th><th>Progress</th><th>State</th><th></th></tr></thead><tbody>
-      ${jobs.map((j) => `<tr>
-        <td>${escapeHtml(j.title)}<div class="meta">${escapeHtml(j.message || '')}</div></td>
-        <td>${tag(j.type, j.type === 'download' ? 'info' : 'alt')}</td>
-        <td><div class="bars" style="height:10px">${Array.from({ length: 12 }, (_, i) => `<i style="height:${i < Math.round(j.progress / 8.4) ? 10 : 3}px"></i>`).join('')}</div>
-          <div class="meta">${j.progress}%</div></td>
-        <td>${tag(j.status, j.status === 'failed' ? 'err' : j.status === 'done' ? 'ok' : j.status === 'running' ? 'info' : '')}</td>
-        <td>${j.status === 'running' || j.status === 'queued' ? `<button class="btn sm ghost" onclick="App.cancelJob('${j.id}')">cancel</button>` : ''}</td>
+      ${jobs.map((job) => `<tr>
+        <td>${escapeHtml(job.title)}<div class="meta">${escapeHtml(job.message || '')}</div></td>
+        <td>${tag(job.type, job.type === 'download' ? 'info' : 'alt')}</td>
+        <td><div class="bars" style="height:10px">${Array.from({ length: 12 }, (_, i) => `<i style="height:${i < Math.round(job.progress / 8.4) ? 10 : 3}px"></i>`).join('')}</div>
+          <div class="meta">${job.progress}%</div></td>
+        <td>${tag(job.status, job.status === 'failed' ? 'err' : job.status === 'done' ? 'ok' : job.status === 'running' ? 'info' : '')}</td>
+        <td>${job.status === 'running' || job.status === 'queued' ? `<button class="btn sm ghost" data-cancel="${escapeHtml(job.id)}">cancel</button>` : ''}</td>
       </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">no jobs</div>';
-  } catch { /* toast already shown */ }
+  } catch { /* the toast from api() is enough */ }
 }
 
 async function loadStreams() {
-  const { streams } = await api('/api/streams');
+  const { streams } = await api('/api/streams', { silent: true });
   state.streams = streams;
-  if (!state.stream && !readStoredText(SELECTED_STREAM_KEY) && streams[0]?.id
-      && !$('#p-stream').classList.contains('hide')) {
-    openStream(streams[0].id, { navigate: false, silent: true });
+  const count = $('#dash-stream-count');
+  if (count) count.textContent = `${streams.length} saved`;
+  const host = $('#dash-streams');
+  if (host) {
+    host.innerHTML = streams.length ? `<table>
+      <thead><tr><th>Title</th><th>Source</th><th>Quality</th><th>Mode</th><th>Created</th><th></th></tr></thead><tbody>
+      ${streams.map((stream) => `<tr>
+        <td>${escapeHtml(stream.title)}${stream.year ? ` <span class="mut">(${stream.year})</span>` : ''}</td>
+        <td>${tag(stream.sourceId || '—')}</td><td>${tag(stream.quality || '—', 'ok')}</td>
+        <td>${tag(stream.transcode ? 'transcode' : 'copy', stream.transcode ? 'alt' : 'ok')}</td>
+        <td class="mut">${fmtTime(stream.createdAt)}</td>
+        <td><button class="btn sm" data-open-stream="${escapeHtml(stream.id)}">open</button></td>
+      </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">no streams yet</div>';
   }
-  $('#dash-stream-count').textContent = `${streams.length} saved`;
-  $('#dash-streams').innerHTML = streams.length ? `<table>
-    <thead><tr><th>Title</th><th>Source</th><th>Quality</th><th>Mode</th><th>Created</th><th></th></tr></thead><tbody>
-    ${streams.map((s) => `<tr>
-      <td>${escapeHtml(s.title)}${s.year ? ` <span class="mut">(${s.year})</span>` : ''}</td>
-      <td>${tag(s.sourceId || '—')}</td><td>${tag(s.quality || '—', 'ok')}</td>
-      <td>${tag(s.transcode ? 'transcode' : 'copy', s.transcode ? 'alt' : 'ok')}</td>
-      <td class="mut">${fmtTime(s.createdAt)}</td>
-      <td><button class="btn sm" onclick="App.openStream('${s.id}')">open</button></td>
-    </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">no streams yet</div>';
 }
 
-/* ================= FIND / SCRAPE ================= */
-
-function setFindTab(tab, persist = true) {
-  if (!FIND_TABS.includes(tab)) return;
-  $$('#find-tabs button').forEach((button) => button.classList.toggle('on', button.dataset.t === tab));
-  FIND_TABS.forEach((name) => $(`#tab-${name}`).classList.toggle('hide', name !== tab));
-  if (persist) saveSearchState();
-}
-
-$$('#find-tabs button').forEach((button) => button.addEventListener('click', () => setFindTab(button.dataset.t)));
+/* ====================================================================== *
+ * search — sources, grouped results, metadata + formats
+ * ====================================================================== */
 
 async function loadSources() {
   const { sources } = await api('/api/sources');
   state.sources = sources;
-  if (!state.selectedSources.length) state.selectedSources = sources.filter((s) => s.enabled).map((s) => s.id);
-  $('#source-chips').innerHTML = sources.map((s) => `
-    <span class="chip ${state.selectedSources.includes(s.id) ? 'on' : ''}" data-id="${s.id}">
-      ${escapeHtml(s.name)}${s.health?.ok === false ? ' ⚠' : ''}</span>`).join('');
-  $$('#source-chips .chip').forEach((chip) => chip.addEventListener('click', () => {
-    const id = chip.dataset.id;
-    state.selectedSources = state.selectedSources.includes(id)
-      ? state.selectedSources.filter((x) => x !== id)
-      : [...state.selectedSources, id];
-    chip.classList.toggle('on');
-    saveSearchState();
-  }));
-  $('#browse-links').innerHTML = sources.map((s) => `<a class="btn sm" href="${escapeHtml(s.home)}" target="_blank" rel="noreferrer">${escapeHtml(s.name)} ↗</a>`).join('');
-  if (state.results.length) {
-    updateResultProviderFilter();
-    renderResults();
-  }
+  if (!state.selectedSources.length) state.selectedSources = sources.filter((source) => source.enabled).map((source) => source.id);
+  renderSourceChips();
   renderSourceHealth();
 }
 
-function renderProviderErrors(errors = []) {
-  state.providerErrors = Array.isArray(errors) ? errors : [];
-  const node = $('#find-errors');
-  if (!state.providerErrors.length) {
-    node.classList.add('hide');
-    node.innerHTML = '';
-    return;
+function renderSourceChips() {
+  const host = $('#source-chips');
+  if (!host) return;
+  host.innerHTML = state.sources.map((source) => `
+    <span class="chip ${state.selectedSources.includes(source.id) ? 'on' : ''}" data-id="${escapeHtml(source.id)}" role="button" tabindex="0"
+      title="${escapeHtml(source.name)}${source.health?.ok === false ? ' — failing' : ''}">
+      ${escapeHtml(source.name)}${source.health?.ok === false ? ' ⚠' : ''}</span>`).join('')
+    || '<span class="meta">no sources configured</span>';
+  const count = $('#sources-count');
+  if (count) count.textContent = `${state.selectedSources.length}/${state.sources.length} enabled`;
+}
+
+function initFind() {
+  setFindTab(readStoredJson(SEARCH_STATE_KEY)?.tabs || 'title', false);
+  const stored = readStoredJson(SEARCH_STATE_KEY) || {};
+  ui.search = { ...ui.search, ...stored };
+  if (Array.isArray(stored.sources) && stored.sources.length) state.selectedSources = stored.sources;
+  ui.resultsView = RESULT_VIEWS.includes(readStoredText(RESULT_VIEW_KEY)) ? readStoredText(RESULT_VIEW_KEY) : 'poster';
+  ui.resultsSort = readStoredText(RESULT_SORT_KEY) || 'year-desc';
+  if ($('#q')) $('#q').value = ui.search.q || '';
+  if ($('#q-type')) $('#q-type').value = ui.search.type || '';
+  if ($('#q-moviebox')) $('#q-moviebox').checked = ui.search.moviebox !== false;
+  for (const [id, key] of [['u-url', 'url'], ['u-title', 'urlTitle'], ['u-year', 'urlYear'], ['u-season', 'urlSeason'], ['u-episode', 'urlEpisode']]) {
+    if ($(`#${id}`)) $(`#${id}`).value = ui.search[key] || '';
   }
-  node.innerHTML = `<b>${state.providerErrors.length} search provider${state.providerErrors.length === 1 ? '' : 's'} unavailable:</b><ul>${state.providerErrors
-    .map((entry) => `<li><b>${escapeHtml(entry.sourceName || entry.sourceId || 'Provider')}:</b> ${escapeHtml(entry.error || 'request failed')}</li>`)
-    .join('')}</ul>`;
-  node.classList.remove('hide');
+  if ($('#u-kind')) $('#u-kind').value = ui.search.urlKind || 'movie';
+  $('#results-sort').value = ui.resultsSort;
+  updateResultsViewButtons();
+  renderBrowseLinks();
+  loadSources().catch((error) => toast(error.message, 'err'));
+  wireFind();
 }
 
-function currentSubtitleTarget() {
-  const selected = state.selected || {};
-  const findTab = $('#find-tabs button.on')?.dataset.t || 'title';
-  const urlForm = findTab === 'url';
-  const title = String(selected.title || (urlForm ? $('#u-title').value : '') || '').trim();
-  if (!title) return null;
-  const requestedKind = urlForm ? $('#u-kind').value : $('#q-type').value;
-  const kind = ['movie', 'series'].includes(selected.kind)
-    ? selected.kind
-    : ['movie', 'series'].includes(requestedKind) ? requestedKind : 'movie';
-  const year = Number(selected.year) || (urlForm ? Number($('#u-year').value) : 0) || null;
-  const season = kind === 'series'
-    ? Number(state.selectedSeason || selected.selectedSeason || (urlForm ? $('#u-season').value : 0)) || 1
-    : null;
-  const episode = kind === 'series'
-    ? Number(state.selectedEpisode || selected.selectedEpisode || (urlForm ? $('#u-episode').value : 0)) || 1
-    : null;
-  return {
-    title,
-    year,
-    kind,
-    season,
-    episode,
-    imdb: selected.imdb || selected.imdbId || selected.ids?.imdb || null,
-    tmdb: selected.tmdb || selected.tmdbId || selected.ids?.tmdb || null,
-    release: selected.release || selected.releaseName || null,
-  };
+function saveSearchState() {
+  ui.search.sources = state.selectedSources;
+  writeStoredText(SEARCH_STATE_KEY, JSON.stringify(ui.search));
 }
 
-function clearFindSubtitleSearch() {
-  findSubtitleRequestId += 1;
-  state.findSubtitleResults = [];
-  state.selectedSubtitle = null;
-  const panel = $('#sel-subtitle-panel');
-  if (panel) panel.classList.add('hide');
-  if ($('#sel-subtitle-count')) $('#sel-subtitle-count').textContent = '';
-  if ($('#sel-subtitle-target')) $('#sel-subtitle-target').textContent = '';
-  if ($('#sel-subtitle-results')) $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px">no subtitle search yet</div>';
-  if ($('#sel-subtitle-selection')) {
-    $('#sel-subtitle-selection').textContent = '';
-    $('#sel-subtitle-selection').classList.add('hide');
-  }
+function setFindTab(tab, persist = true) {
+  if (!FIND_TABS.includes(tab)) return;
+  ui.search.tabs = tab;
+  $$('#find-tabs button').forEach((button) => button.classList.toggle('on', button.dataset.t === tab));
+  FIND_TABS.forEach((name) => $(`#tab-${name}`)?.classList.toggle('hide', name !== tab));
+  if (persist) saveSearchState();
 }
 
-function setFindSubtitlesAction() {
-  if (!currentSubtitleTarget()) {
-    $('#sel-actions').innerHTML = '';
-    return;
-  }
-  $('#sel-actions').innerHTML = '<button class="btn" data-find-subtitles>▭ find subtitles</button>';
-  $('#sel-actions [data-find-subtitles]').addEventListener('click', searchSelectedSubtitles);
-}
-
-function resetSelectedTitle() {
-  clearFindSubtitleSearch();
-  state.selected = null;
-  if ($('#results-title-select')) $('#results-title-select').value = '';
-  state.selectedSeason = 0;
-  state.selectedEpisode = 0;
-  state.selectedSeasons = [];
-  state.candidates = [];
-  $('#sel-name').textContent = 'nothing selected';
-  $('#sel-meta').textContent = 'search or paste a URL, then pick a candidate below';
-  $('#sel-poster').innerHTML = '<b>—</b>';
-  $('#sel-details').innerHTML = '';
-  $('#sel-details').classList.add('hide');
-  $('#sel-episode-controls').classList.add('hide');
-  $('#sel-actions').innerHTML = '';
-  $('#sel-note').textContent = 'Select a title to load details and resolve its streams.';
-  $('#candidates').innerHTML = '<div class="meta">No candidates yet.</div>';
-}
-
-async function searchSelectedSubtitles() {
-  const target = currentSubtitleTarget();
-  if (!target) return toast('Enter a title or title metadata before searching subtitles', 'warn');
-  const requestId = ++findSubtitleRequestId;
-  state.findSubtitleResults = [];
-  state.selectedSubtitle = null;
-  $('#sel-subtitle-panel').classList.remove('hide');
-  $('#sel-subtitle-count').textContent = 'searching…';
-  $('#sel-subtitle-target').textContent = `Searching ${target.title}${target.year ? ` (${target.year})` : ''}${target.kind === 'series' ? ` · S${target.season || '?'}E${target.episode || '?'}` : ''}`;
-  $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px"><span class="spin"></span> searching subtitle providers…</div>';
-  $('#sel-subtitle-selection').textContent = '';
-  $('#sel-subtitle-selection').classList.add('hide');
-  try {
-    const res = await api('/api/subtitles/search', { method: 'POST', body: target });
-    if (requestId !== findSubtitleRequestId) return;
-    state.findSubtitleResults = res.results || [];
-    $('#sel-subtitle-count').textContent = `${state.findSubtitleResults.length} candidate${state.findSubtitleResults.length === 1 ? '' : 's'}`;
-    renderFindSubtitleResults();
-  } catch (error) {
-    if (requestId !== findSubtitleRequestId) return;
-    $('#sel-subtitle-count').textContent = 'search failed';
-    $('#sel-subtitle-results').innerHTML = `<div class="note err" style="margin:12px">${escapeHtml(error?.message || 'Subtitle search failed')}</div>`;
-  }
-}
-
-function renderFindSubtitleResults() {
-  const results = state.findSubtitleResults || [];
-  if (!results.length) {
-    $('#sel-subtitle-results').innerHTML = '<div class="meta" style="padding:14px">No applicable subtitles found. Check the configured providers and languages.</div>';
-    return;
-  }
-  $('#sel-subtitle-results').innerHTML = `<table>
-    <thead><tr><th>Language</th><th>Provider</th><th>Release / match</th><th>Score</th><th>Downloads</th><th></th></tr></thead><tbody>
-    ${results.slice(0, 40).map((result, index) => {
-      const selected = state.selectedSubtitle === result;
-      const matches = [
-        result.hashMatch ? tag('hash match', 'ok') : '',
-        result.episodeMatch ? tag('episode match', 'ok') : '',
-        result.year ? tag(String(result.year)) : '',
-      ].filter(Boolean).join(' ');
-      const release = result.release || result.title || 'Untitled release';
-      return `<tr${selected ? ' class="subtitle-choice-selected"' : ''}>
-        <td>${tag((result.language || '?').toUpperCase(), (result.language || '').startsWith('nl') ? 'ok' : 'info')}</td>
-        <td>${escapeHtml(result.providerId || '—')}</td>
-        <td class="mono" style="font-size:11.5px">${escapeHtml(String(release).slice(0, 90))}${matches ? `<div style="margin-top:4px">${matches}</div>` : ''}</td>
-        <td>${Number.isFinite(Number(result.score)) ? Number(result.score) : '—'}${result.rating ? `<div class="meta">rating ${escapeHtml(result.rating)}</div>` : ''}</td>
-        <td class="mono">${Number(result.downloads) || 0}</td>
-        <td><button class="btn sm ${selected ? 'pri' : ''}" data-select-subtitle="${index}">${selected ? 'selected' : 'select'}</button></td>
-      </tr>`;
-    }).join('')}</tbody></table>`;
-  $$('#sel-subtitle-results button[data-select-subtitle]').forEach((button) => {
-    button.addEventListener('click', () => chooseFindSubtitle(Number(button.dataset.selectSubtitle)));
-  });
-}
-
-function matchingExistingStream(target) {
-  const normalize = (value) => String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\b(?:19|20)\d{2}\b/g, '').replace(/[^a-z0-9]+/g, '');
-  const candidates = [state.stream, ...(state.streams || [])].filter(Boolean);
-  const seen = new Set();
-  return candidates.find((stream) => {
-    if (stream.id && seen.has(String(stream.id))) return false;
-    if (stream.id) seen.add(String(stream.id));
-    if (normalize(stream.title) !== normalize(target.title)) return false;
-    if (target.year && stream.year && Number(target.year) !== Number(stream.year)) return false;
-    if (target.kind && stream.kind && target.kind !== stream.kind) return false;
-    if (target.kind === 'series') {
-      const season = stream.upstream?.season ?? stream.season;
-      const episode = stream.upstream?.episode ?? stream.episode;
-      if (target.season && Number(season) !== Number(target.season)) return false;
-      if (target.episode && Number(episode) !== Number(target.episode)) return false;
-    }
-    return true;
-  }) || null;
-}
-
-async function chooseFindSubtitle(index) {
-  const result = state.findSubtitleResults[index];
-  if (!result) return;
-  state.selectedSubtitle = result;
-  renderFindSubtitleResults();
-  const target = currentSubtitleTarget();
-  const existingStream = target && matchingExistingStream(target);
-  if (!existingStream) {
-    $('#sel-subtitle-selection').textContent = `Selected: ${result.release || result.title || result.providerId} · ${String(result.language || '?').toUpperCase()}. It will be attached when you create a stream for this title.`;
-    $('#sel-subtitle-selection').classList.remove('hide');
-    toast('Subtitle selected. It will be attached when you create this stream.', 'ok', 8000);
-    return;
-  }
-  $('#sel-subtitle-selection').textContent = 'Selected subtitle is being downloaded and attached to the matching stream…';
-  $('#sel-subtitle-selection').classList.remove('hide');
-  const attached = await downloadSubtitle(result, existingStream.id);
-  if (attached) {
-    try { await loadStreams(); } catch { /* api() already shows the error */ }
-  }
-  $('#sel-subtitle-selection').textContent = attached
-    ? `Attached: ${result.release || result.title || result.providerId} · ${String(result.language || '?').toUpperCase()}`
-    : `Could not attach ${result.release || result.title || result.providerId}. See the error notification for details.`;
+function renderBrowseLinks() {
+  const host = $('#browse-links');
+  if (!host) return;
+  host.innerHTML = state.sources.map((source) => `<a class="btn sm ghost" href="${escapeHtml(source.home)}" target="_blank" rel="noreferrer">${escapeHtml(source.name)} ↗</a>`).join('');
 }
 
 async function doSearch() {
-  const query = $('#q').value.trim();
-  if (!query) return toast('Enter a title first', 'warn');
-  state.lastResolveMode = 'search';
-  state.pendingRestoreUrlResolve = false;
-
-  searchAbortController?.abort();
-  const controller = new AbortController();
-  searchAbortController = controller;
-  const requestId = ++searchRequestId;
-  invalidateSelectionRequests();
-  resetSelectedTitle();
-  state.results = [];
-  resetResultFilters();
-  renderProviderErrors([]);
-  $('#results-count').textContent = '';
-  $('#results').innerHTML = '<div class="meta"><span class="spin"></span> searching…</div>';
-  $('#find-hint').innerHTML = '<span class="spin"></span> searching…';
-
+  const q = ($('#q')?.value || '').trim();
+  if (!q) {
+    toast('Type a title first', 'warn');
+    return;
+  }
+  ui.search.q = q;
+  ui.search.type = $('#q-type')?.value || '';
+  ui.search.moviebox = $('#q-moviebox')?.checked !== false;
+  saveSearchState();
+  searchAbort?.abort();
+  searchAbort = new AbortController();
+  const seq = ++searchSeq;
+  const hint = $('#find-hint');
+  if (hint) hint.textContent = 'searching…';
+  renderFindErrors([]);
+  $('#btn-search').disabled = true;
   try {
-    const params = new URLSearchParams({
-      q: query,
-      type: $('#q-type').value,
-      sources: state.selectedSources.join(','),
-      moviebox: String($('#q-moviebox').checked),
-    });
-    const res = await api(`/api/find/search?${params}`, { signal: controller.signal, silent: true });
-    if (requestId !== searchRequestId || controller.signal.aborted) return;
-    state.results = Array.isArray(res.results) ? res.results : [];
-    resetResultFilters();
-    renderProviderErrors(res.providerErrors || []);
+    const params = new URLSearchParams({ q });
+    if (ui.search.type) params.set('type', ui.search.type);
+    if (state.selectedSources.length && state.selectedSources.length !== state.sources.length) params.set('sources', state.selectedSources.join(','));
+    params.set('moviebox', ui.search.moviebox ? 'true' : 'false');
+    const data = await api(`/api/find/search?${params}`, { silent: true, signal: searchAbort.signal });
+    if (seq !== searchSeq) return;
+    state.results = data.results || [];
+    state.providerErrors = data.providerErrors || [];
+    ui.titleFilter = '';
+    if ($('#results-title-filter')) $('#results-title-filter').value = '';
+    renderFindErrors(state.providerErrors);
     renderResults();
-    const titleCount = groupSearchResults(state.results).length;
-    const failures = state.providerErrors.length;
-    $('#find-hint').textContent = `${titleCount} title${titleCount === 1 ? '' : 's'} · ${state.results.length} provider result${state.results.length === 1 ? '' : 's'}${failures ? ` · ${failures} provider failure${failures === 1 ? '' : 's'}` : ''}`;
-  } catch (err) {
-    if (requestId !== searchRequestId || controller.signal.aborted || isAbortError(err)) return;
-    renderProviderErrors([{ sourceName: 'Search service', error: err.message }]);
-    $('#results-count').textContent = 'Search failed';
-    $('#results').innerHTML = `<div class="note err">Search failed: ${escapeHtml(err.message)}. Check the search service and provider connectivity, then retry.</div>`;
-    $('#find-hint').textContent = 'Search failed';
+    if (!state.results.length) {
+      $('#results').innerHTML = '<div class="meta">No results. Open a site in the Browse tab, or paste the player URL in the Paste URL tab.</div>';
+    }
+    if (hint) hint.textContent = `${state.results.length} result(s) on ${new Set(state.results.map((r) => r.sourceId)).size} provider(s)`;
+    renderBrowseLinks();
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      renderFindErrors([{ sourceId: '', error: error.message }]);
+      if (hint) hint.textContent = '';
+    }
   } finally {
-    if (requestId === searchRequestId) {
-      if (searchAbortController === controller) searchAbortController = null;
-      if ($('#find-hint').textContent.includes('searching…')) $('#find-hint').textContent = 'Search cancelled';
-      saveSearchState();
+    $('#btn-search').disabled = false;
+  }
+}
+
+function renderFindErrors(providerErrors) {
+  const host = $('#find-errors');
+  if (!host) return;
+  const rows = (providerErrors || []).filter((entry) => entry?.error);
+  host.classList.toggle('hide', !rows.length);
+  host.innerHTML = rows.map((entry) => `<div class="errline">${tag(entry.sourceId || 'source', 'err')} ${escapeHtml(entry.error)}</div>`).join('');
+}
+
+/* ---------------- grouping ---------------- */
+
+const titleKey = (value) => String(value || '')
+  .toLowerCase()
+  .normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/\(\s*(19|20)\d{2}\s*\)/g, '')
+  .replace(/[^a-z0-9]+/g, ' ')
+  .trim();
+
+/** The same movie found on several providers becomes one group (title + year + kind). */
+function buildGroups(results) {
+  const groups = new Map();
+  for (const result of results) {
+    if (!result || !result.url) continue;
+    const key = `${titleKey(result.title)}|${result.year || ''}|${result.kind || 'movie'}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        title: result.title,
+        year: result.year || null,
+        kind: result.kind || 'movie',
+        poster: result.poster || '',
+        entries: [],
+      });
     }
+    const group = groups.get(key);
+    group.poster = group.poster || result.poster || '';
+    group.entries.push(result);
   }
+  return [...groups.values()];
 }
 
-function safePosterUrl(value, resultUrl = '') {
-  if (!value) return '';
-  try {
-    const text = String(value);
-    const isRelative = /^(?:\/|\.\/|\.\.\/)/.test(text);
-    const base = !isRelative && /^https?:/i.test(String(resultUrl)) ? resultUrl : window.location.href;
-    const url = new URL(text, base);
-    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
-  } catch { return ''; }
-}
-
-function attachPosterImageFallbacks(root = document) {
-  root.querySelectorAll('.result-poster img, #sel-poster img').forEach((img) => {
-    img.addEventListener('error', () => img.remove(), { once: true });
+function visibleGroups() {
+  const filter = titleKey(ui.titleFilter);
+  const provider = ui.providerFilter;
+  let groups = state.groups || [];
+  if (filter) groups = groups.filter((group) => titleKey(group.title).includes(filter));
+  if (provider) groups = groups.map((group) => ({ ...group, entries: group.entries.filter((entry) => entry.sourceId === provider) })).filter((group) => group.entries.length);
+  const sort = ui.resultsSort;
+  const year = (group) => Number(group.year) || 0;
+  return [...groups].sort((a, b) => {
+    if (sort === 'year-asc') return year(a) - year(b) || a.title.localeCompare(b.title);
+    if (sort === 'title') return a.title.localeCompare(b.title);
+    if (sort === 'providers') return b.entries.length - a.entries.length || year(b) - year(a);
+    return year(b) - year(a) || a.title.localeCompare(b.title);
   });
 }
 
-function resultPosterMarkup(result, compact = false) {
-  const words = String(result.title || '').trim().split(/\s+/).filter(Boolean);
-  const initials = words.slice(0, 2).map((word) => word[0]).join('').toUpperCase() || '▶';
-  const posterUrl = safePosterUrl(result.poster, result.url);
-  return `<div class="poster result-poster${compact ? ' compact' : ''}">
-    <span class="poster-fallback" aria-hidden="true">${escapeHtml(initials)}</span>
-    ${posterUrl ? `<img src="${escapeHtml(posterUrl)}" alt="" loading="lazy" decoding="async">` : ''}
-    <span class="tag ok badge">${escapeHtml(result.kind || 'title')}</span>
-  </div>`;
+function isSelectedGroup(group) {
+  return Boolean(state.selection?.key && state.selection.key === group.key);
 }
 
-function formatRuntime(minutes) {
-  const total = Number(minutes);
-  if (!Number.isInteger(total) || total <= 0) return '';
-  if (total < 60) return `${total} min`;
-  const hours = Math.floor(total / 60);
-  const remainder = total % 60;
-  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
-}
-
-function resultMetaMarkup(result, includeKind = true, includeLanguage = false) {
-  const parts = [];
-  if (result.year) parts.push(String(result.year));
-  if (includeKind && result.kind) parts.push(result.kind);
-  if (result.sourceName) parts.push(result.sourceName);
-  if (result.rating != null && Number.isFinite(Number(result.rating))) {
-    const rating = Number(result.rating);
-    parts.push(`★ ${Number.isInteger(rating) ? rating : rating.toFixed(1)}`);
+function renderResults() {
+  const host = $('#results');
+  if (!host) return;
+  state.groups = buildGroups(state.results || []);
+  const groups = visibleGroups();
+  host.className = `results results-${ui.resultsView}`;
+  const count = $('#results-count');
+  if (count) {
+    const providers = new Set((state.results || []).map((result) => result.sourceId));
+    count.textContent = state.results?.length ? `${state.groups.length} title(s) · ${state.results.length} hit(s) · ${providers.size} provider(s)` : '';
   }
-  const genres = Array.isArray(result.genres) ? result.genres : result.genres ? [result.genres] : [];
-  if (genres.length) parts.push(`Genres: ${genres.slice(0, 4).join(', ')}`);
-  const runtime = formatRuntime(result.runtime);
-  if (runtime) parts.push(`Runtime: ${runtime}`);
-  if (includeLanguage && result.language) parts.push(`Language: ${String(result.language).toUpperCase()}`);
-  return parts.map((part) => `<span class="result-meta-item">${escapeHtml(part)}</span>`).join('');
-}
-
-function normalizeResultText(value) {
-  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
-}
-
-function resultYearKey(result) {
-  const explicitYear = Number(result?.year);
-  if (Number.isFinite(explicitYear) && explicitYear > 0) return String(Math.floor(explicitYear));
-  const title = String(result?.title || '');
-  // Accept both "Title (2022)" and "Title 2022" (after normalizeResultText the
-  // parens are already stripped to spaces, but we run the regex against the
-  // raw title too so we don't miss the parenthetical form).
-  const parentheticalYear = /\s*\(((?:19|20)\d{2})\)\s*$/.exec(title);
-  if (parentheticalYear) return parentheticalYear[1];
-  const bareYear = /\s+((?:19|20)\d{2})\s*$/.exec(normalizeResultText(title));
-  return bareYear?.[1] || '';
-}
-
-function resultGroupingTitle(result, index) {
-  let title = normalizeResultText(result?.title);
-  const year = resultYearKey(result);
-  if (year) title = title.replace(new RegExp(`\\s+${year}$`), '').trim();
-  // Also strip common quality tags sites append to titles.
-  title = title.replace(/\s+(?:hd|4k|uhd|1080p|720p|480p|free|online|watch|movie|series)$/, '').trim();
-  return title || `untitled ${index}`;
-}
-
-function resultProviderKey(result) {
-  return String(result?.sourceId || result?.sourceName || 'unknown').trim();
-}
-
-function groupSearchResults(results = state.results) {
-  const buckets = new Map();
-  results.forEach((result, index) => {
-    if (!result || typeof result !== 'object') return;
-    const titleKey = resultGroupingTitle(result, index);
-    const kind = String(result.kind || 'title').toLowerCase();
-    const key = `${kind}|${titleKey}`;
-    if (!buckets.has(key)) buckets.set(key, { key, titleKey, kind, entries: [] });
-    buckets.get(key).entries.push({ result, index });
-  });
-
-  const groups = [];
-  const addGroup = (bucket, entries, year) => {
-    if (!entries.length) return;
-    groups.push({
-      key: `${bucket.key}|${year || 'unknown'}`,
-      titleKey: bucket.titleKey,
-      kind: bucket.kind,
-      year: year ? Number(year) : null,
-      allResults: entries,
-      matches: entries,
+  const providerSelect = $('#results-provider-filter');
+  if (providerSelect) {
+    const ids = [...new Set((state.results || []).map((result) => result.sourceId))];
+    const previous = providerSelect.value;
+    providerSelect.innerHTML = `<option value="">All providers</option>${ids.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(sourceName(id))}</option>`).join('')}`;
+    providerSelect.value = ids.includes(previous) ? previous : '';
+    ui.providerFilter = providerSelect.value;
+  }
+  const titleSelect = $('#results-title-select');
+  if (titleSelect) {
+    const previous = titleSelect.value;
+    titleSelect.innerHTML = `<option value="">Select a found title…</option>${groups.map((group) => `<option value="${escapeHtml(group.key)}">${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''} — ${group.entries.length} format(s)</option>`).join('')}`;
+    if (groups.some((group) => group.key === previous)) titleSelect.value = previous;
+  }
+  if (!groups.length) {
+    host.innerHTML = `<div class="meta">${(state.results || []).length ? 'Nothing matches these filters.' : 'No search yet.'}</div>`;
+    return;
+  }
+  host.innerHTML = groups.map((group) => resultGroupMarkup(group)).join('');
+  $$('[data-group]', host).forEach((card) => {
+    const group = groups.find((candidate) => candidate.key === card.dataset.group);
+    const open = () => selectGroup(group);
+    card.addEventListener('click', (event) => {
+      if (event.target.closest('a,button')) return;
+      open();
     });
-  };
-
-  for (const bucket of buckets.values()) {
-    const years = [...new Set(bucket.entries.map(({ result }) => resultYearKey(result)).filter(Boolean))];
-    const yearless = bucket.entries.filter(({ result }) => !resultYearKey(result));
-    if (years.length <= 1) {
-      // A missing year can join the only known edition, but never bridges two
-      // different remakes with the same title.
-      addGroup(bucket, bucket.entries, years[0] || '');
-      continue;
-    }
-    // Multiple distinct years → each year gets its own card (remakes / show vs
-    // movie with same title). Merge entries without a year into the year that
-    // has the most provider results — that's almost always the same title
-    // (sites that omit the year are usually scrapers missing metadata on a
-    // single source, not an undiscovered edition).
-    const counts = new Map();
-    for (const year of years) {
-      counts.set(year, bucket.entries.filter(({ result }) => resultYearKey(result) === year).length);
-    }
-    const majorityYear = [...counts.entries()].sort((a, b) => b[1] - a[1] || Number(b[0]) - Number(a[0]))[0]?.[0];
-    years.sort((a, b) => Number(b) - Number(a));
-    for (const year of years) {
-      const entries = bucket.entries.filter(({ result }) => resultYearKey(result) === year);
-      // Merge the yearless entries into the most-numerous year group rather
-      // than leaving them as an "unknown year" orphan.
-      if (year === majorityYear && yearless.length) entries.push(...yearless);
-      addGroup(bucket, entries, year);
-    }
-  }
-  return groups;
-}
-
-function preferredResultEntry(entries) {
-  const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
-  return [...entries].sort((a, b) => {
-    const posterOrder = Number(Boolean(b.result.poster)) - Number(Boolean(a.result.poster));
-    if (posterOrder) return posterOrder;
-    const rankA = sourceOrder.get(resultProviderKey(a.result)) ?? state.sources.length + 1;
-    const rankB = sourceOrder.get(resultProviderKey(b.result)) ?? state.sources.length + 1;
-    return rankA - rankB || a.index - b.index;
-  })[0];
-}
-
-function updateResultProviderFilter() {
-  const select = $('#results-provider-filter');
-  if (!select) return;
-  const selected = select.value;
-  const providers = new Map();
-  for (const result of state.results) {
-    const id = resultProviderKey(result);
-    if (!providers.has(id)) providers.set(id, { id, name: result.sourceName || id, count: 0 });
-    providers.get(id).count += 1;
-  }
-  const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
-  const ordered = [...providers.values()].sort((a, b) =>
-    (sourceOrder.get(a.id) ?? state.sources.length + 1) - (sourceOrder.get(b.id) ?? state.sources.length + 1)
-      || a.name.localeCompare(b.name));
-  select.innerHTML = `<option value="">All providers</option>${ordered.map((provider) =>
-    `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)} (${provider.count})</option>`).join('')}`;
-  select.value = providers.has(selected) ? selected : '';
-}
-
-function resetResultFilters() {
-  const title = $('#results-title-filter');
-  const provider = $('#results-provider-filter');
-  if (title) title.value = '';
-  if (provider) provider.value = '';
-  updateResultProviderFilter();
-  updateResultTitleSelect();
-}
-
-function visibleResultGroups() {
-  const titleFilter = normalizeResultText($('#results-title-filter')?.value);
-  const providerFilter = $('#results-provider-filter')?.value || '';
-  return groupSearchResults().map((group) => {
-    const matches = group.allResults.filter((entry) =>
-      !providerFilter || resultProviderKey(entry.result) === providerFilter);
-    if (!matches.length) return null;
-    if (titleFilter && !group.allResults.some((entry) =>
-      normalizeResultText(entry.result.title).includes(titleFilter))) return null;
-    return { ...group, matches };
-  }).filter(Boolean);
-}
-
-function updateResultTitleSelect(groups = visibleResultGroups()) {
-  const select = $('#results-title-select');
-  if (!select) return;
-  const previous = select.value;
-  const options = groups.map((group) => {
-    const primary = preferredResultEntry(group.matches);
-    const result = primary?.result || {};
-    const title = String(result.title || 'Untitled');
-    const year = group.year && resultYearKey(result) !== String(group.year) ? ` (${group.year})` : '';
-    const kind = ['movie', 'series'].includes(group.kind) ? ` · ${group.kind}` : '';
-    const providerCount = new Set(group.matches.map((entry) => resultProviderKey(entry.result))).size;
-    const providers = providerCount ? ` · ${providerCount} source${providerCount === 1 ? '' : 's'}` : '';
-    return `<option value="${escapeHtml(group.key)}">${escapeHtml(`${title}${year}${kind}${providers}`)}</option>`;
-  }).join('');
-  select.innerHTML = `<option value="">Select a found title…</option>${options}`;
-  const selectedGroup = groups.find((group) => group.allResults.some((entry) => entry.result === state.selected));
-  const value = selectedGroup?.key || (groups.some((group) => group.key === previous) ? previous : '');
-  select.value = value;
-}
-
-function providerChoicesMarkup(group) {
-  const providers = new Map();
-  for (const entry of group.matches) {
-    const id = resultProviderKey(entry.result);
-    if (!providers.has(id)) providers.set(id, { id, name: entry.result.sourceName || id, entries: [] });
-    providers.get(id).entries.push(entry);
-  }
-  const choices = [...providers.values()].sort((a, b) => {
-    const sourceOrder = new Map(state.sources.map((source, index) => [String(source.id), index]));
-    return (sourceOrder.get(a.id) ?? state.sources.length + 1) - (sourceOrder.get(b.id) ?? state.sources.length + 1)
-      || a.name.localeCompare(b.name);
+    card.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+    });
   });
-  return `<div class="moviecard-providers"><span class="moviecard-providers-label">Providers</span>${choices.map((provider) => {
-    const entry = preferredResultEntry(provider.entries);
-    const selected = provider.entries.some((candidate) => candidate.result === state.selected);
-    return `<button type="button" class="provider-choice${selected ? ' on' : ''}"
-      data-result-index="${entry.index}" aria-pressed="${selected}"
-      title="Select ${escapeHtml(provider.name)} for this title">${escapeHtml(provider.name)}</button>`;
-  }).join('')}</div>`;
 }
 
-function resultCardMarkup(group, view) {
-  const primary = preferredResultEntry(group.matches);
-  const rawResult = primary.result;
-  const result = group.year && !resultYearKey(rawResult) ? { ...rawResult, year: group.year } : rawResult;
-  const selected = group.allResults.some((entry) => entry.result === state.selected);
-  const title = escapeHtml(result.title || 'Untitled');
-  const metadataResult = { ...result, sourceName: '' };
-  const metadata = resultMetaMarkup(metadataResult, view === 'thumbnails');
-  const description = result.description
-    ? `<div class="result-description">${escapeHtml(result.description)}</div>`
-    : '';
-  const copy = `<div class="moviecard-copy">
-    <div class="moviecard-title" title="${title}">${title}</div>
-    ${metadata ? `<div class="meta result-meta">${metadata}</div>` : ''}
-    ${description}
-  </div>`;
-  const content = view === 'list'
-    ? `${resultPosterMarkup(result, true)}${copy}<span class="result-kind">${tag(result.kind || 'title')}</span>`
-    : view === 'thumbnails'
-      ? `${resultPosterMarkup(result, true)}${copy}`
-      : `${resultPosterMarkup(result)}${copy}`;
-  const titleLabel = `${result.title || 'Untitled'}${group.year ? ` (${group.year})` : ''}`;
-  const providerName = rawResult.sourceName || rawResult.sourceId || 'provider';
-  const indices = group.allResults.map((entry) => entry.index).join(',');
-  return `<article class="moviecard moviecard-${view}${selected ? ' sel' : ''}" data-result-indices="${indices}">
-    <div class="moviecard-main moviecard-main-${view}" role="button" tabindex="0"
-      data-result-index="${primary.index}" aria-pressed="${state.selected === rawResult}"
-      aria-label="Select ${escapeHtml(titleLabel)} from ${escapeHtml(providerName)}">${content}</div>
-    ${providerChoicesMarkup(group)}
+function sourceName(id) {
+  if (id === 'moviebox') return 'MovieBox';
+  return state.sources.find((source) => source.id === id)?.name || id || '—';
+}
+
+function resultGroupMarkup(group) {
+  const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
+  const meta = group.entries.map((entry) => entry.releaseDate || '').filter(Boolean)[0];
+  const rating = group.entries.map((entry) => Number(entry.rating)).filter((value) => value > 0).sort((a, b) => b - a)[0];
+  const genres = group.entries.flatMap((entry) => (Array.isArray(entry.genres) ? entry.genres : [])).slice(0, 3);
+  const description = group.entries.map((entry) => entry.description).find(Boolean);
+  const poster = group.poster || group.entries.map((entry) => entry.poster).find(Boolean) || '';
+  return `<article class="result-card${isSelectedGroup(group) ? ' selected' : ''}" data-group="${escapeHtml(group.key)}" tabindex="0" role="button">
+    <div class="poster small">${poster ? `<img src="${escapeHtml(poster)}" alt="" loading="lazy" onerror="this.remove()">` : '<b>—</b>'}</div>
+    <div class="result-body">
+      <div class="result-title">${escapeHtml(group.title)}${group.year ? ` <span class="mut">(${group.year})</span>` : ''}</div>
+      <div class="result-meta">
+        ${tag(group.kind || 'movie', group.kind === 'series' ? 'alt' : '')}
+        ${rating ? tag(`★ ${rating.toFixed(1)}`, 'ok') : ''}
+        ${meta ? tag(String(meta).slice(0, 10)) : ''}
+        ${genres.map((genre) => tag(genre)).join('')}
+      </div>
+      ${description ? `<p class="result-desc">${escapeHtml(String(description).slice(0, 260))}${String(description).length > 260 ? '…' : ''}</p>` : ''}
+      <div class="result-providers">${providers.map((id) => `<span class="chip on sm" title="${escapeHtml(sourceName(id))}">${escapeHtml(sourceName(id))}</span>`).join('')}</div>
+    </div>
+    <div class="result-actions">
+      <span class="tag info">${group.entries.length} format(s)</span>
+      <button class="btn sm pri" data-open-formats>formats &amp; metadata</button>
+    </div>
   </article>`;
 }
 
 function updateResultsViewButtons() {
-  $$('#results-view [data-view]').forEach((button) => {
-    const active = button.dataset.view === state.resultsView;
-    button.classList.toggle('on', active);
-    button.setAttribute('aria-pressed', String(active));
+  $$('#results-view button').forEach((button) => {
+    const on = button.dataset.view === ui.resultsView;
+    button.classList.toggle('on', on);
+    button.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
+  const host = $('#results');
+  if (host) host.className = `results results-${ui.resultsView}`;
 }
 
-function setResultsView(view) {
-  if (!RESULT_VIEWS.includes(view)) return;
-  state.resultsView = view;
-  try { localStorage.setItem(RESULT_VIEW_KEY, view); } catch { /* storage may be disabled */ }
-  updateResultsViewButtons();
-  renderResults();
-}
+/* ---------------- selection: metadata + formats ---------------- */
 
-function renderResults() {
-  const results = $('#results');
-  results.className = `results results-${state.resultsView}`;
-  if (!state.results.length) {
-    updateResultTitleSelect([]);
-    $('#results-count').textContent = '0 titles';
-    results.innerHTML = state.providerErrors.length
-      ? '<div class="note err">Search returned no titles because one or more providers failed. See the provider errors above; this is not a confirmed no-results response.</div>'
-      : '<div class="meta">No results. Try fewer sources, or use “Paste URL” with the movie page you have open.</div>';
-    return;
-  }
-  const groups = visibleResultGroups();
-  updateResultTitleSelect(groups);
-  const matchCount = groups.reduce((sum, group) => sum + group.matches.length, 0);
-  $('#results-count').textContent = `${groups.length} title${groups.length === 1 ? '' : 's'} · ${matchCount} provider result${matchCount === 1 ? '' : 's'}`;
-  if (!groups.length) {
-    results.innerHTML = '<div class="meta">No titles match these filters. Clear the title and provider filters to see all results.</div>';
-    return;
-  }
-  results.innerHTML = `<div class="results-cards">${groups.map((group) => resultCardMarkup(group, state.resultsView)).join('')}</div>`;
-  $$('#results .moviecard-main').forEach((main) => {
-    const index = Number(main.dataset.resultIndex);
-    main.addEventListener('click', () => selectResult(index));
-    main.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        selectResult(index);
-      }
-    });
-  });
-  $$('#results .provider-choice').forEach((button) => {
-    button.addEventListener('click', () => selectResult(Number(button.dataset.resultIndex)));
-  });
-  attachPosterImageFallbacks($('#results'));
-}
-
-function movieBoxTargetForResult(result) {
-  const url = String(result?.url || '');
-  const match = /^moviebox:\/\/subject\/([^/?#]+)/i.exec(url);
-  const params = new URLSearchParams(url.split('?')[1]?.split('#')[0] || '');
-  let subjectId = result?.movieboxSubjectId || match?.[1] || '';
-  try { subjectId = decodeURIComponent(String(subjectId)); } catch { /* use the supplied id */ }
-  return subjectId ? {
-    subjectId: String(subjectId),
-    season: Number(params.get('se')) || 0,
-    episode: Number(params.get('ep')) || 0,
-  } : null;
-}
-
-function renderSelectedInfo(result) {
-  $('#sel-name').textContent = `${result.title}${result.year ? ` (${result.year})` : ''}`;
-  const meta = resultMetaMarkup(result, true, true);
-  $('#sel-meta').innerHTML = `${meta ? `<div class="result-meta">${meta}</div>` : ''}${result.url ? `<div class="selected-url mono" title="${escapeHtml(result.url)}">${escapeHtml(result.url)}</div>` : ''}`;
-  const detailParts = [];
-  if (result.releaseDate && String(result.releaseDate) !== String(result.year || '')) {
-    detailParts.push(`<div class="selected-release">Release date: ${escapeHtml(result.releaseDate)}</div>`);
-  }
-  if (result.description) detailParts.push(`<p>${escapeHtml(result.description)}</p>`);
-  $('#sel-details').innerHTML = detailParts.join('');
-  $('#sel-details').classList.toggle('hide', detailParts.length === 0);
-  const posterUrl = safePosterUrl(result.poster, result.url);
-  $('#sel-poster').innerHTML = posterUrl
-    ? `<img src="${escapeHtml(posterUrl)}" alt="" style="width:100%;border-radius:8px">`
-    : `<b>${escapeHtml(result.title)}</b>`;
-  attachPosterImageFallbacks($('#sel-poster'));
-}
-
-function saveSearchState() {
-  const selectedIndex = state.selected ? state.results.indexOf(state.selected) : -1;
-  const urlForm = {
-    url: $('#u-url')?.value || '',
-    title: $('#u-title')?.value || '',
-    year: $('#u-year')?.value || '',
-    kind: $('#u-kind')?.value || 'movie',
-    season: $('#u-season')?.value || '',
-    episode: $('#u-episode')?.value || '',
-    browser: $('#u-browser')?.checked ?? true,
-    probe: $('#u-probe')?.checked ?? true,
-  };
-  try {
-    localStorage.setItem(SEARCH_STATE_KEY, JSON.stringify({
-      query: $('#q')?.value || '',
-      type: $('#q-type')?.value || '',
-      selectedSources: state.selectedSources,
-      moviebox: $('#q-moviebox')?.checked ?? true,
-      results: state.results,
-      providerErrors: state.providerErrors,
-      selectedResultIndex: selectedIndex >= 0 ? selectedIndex : null,
-      resolveMode: state.lastResolveMode,
-      selectedSeason: state.selectedSeason,
-      selectedEpisode: state.selectedEpisode,
-      titleFilter: $('#results-title-filter')?.value || '',
-      providerFilter: $('#results-provider-filter')?.value || '',
-      findTab: $('#find-tabs button.on')?.dataset.t || 'title',
-      urlForm,
-    }));
-  } catch { /* storage may be disabled or full */ }
-}
-
-function restoreSearchState(saved = readStoredJson(SEARCH_STATE_KEY)) {
-  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
-  state.pendingRestoreSelection = false;
-  state.pendingRestoreUrlResolve = false;
-  state.lastResolveMode = saved.resolveMode === 'url' ? 'url' : '';
-
-  $('#q').value = typeof saved.query === 'string' ? saved.query : '';
-  if (['', 'movie', 'series'].includes(saved.type)) $('#q-type').value = saved.type;
-  $('#q-moviebox').checked = saved.moviebox !== false;
-  state.selectedSources = Array.isArray(saved.selectedSources)
-    ? saved.selectedSources.filter((id) => typeof id === 'string')
-    : [];
-  state.results = Array.isArray(saved.results)
-    ? saved.results.filter((result) => result && typeof result === 'object' && !Array.isArray(result))
-    : [];
-  state.providerErrors = Array.isArray(saved.providerErrors) ? saved.providerErrors : [];
-
-  const selectedIndex = Number.isInteger(saved.selectedResultIndex)
-    && saved.selectedResultIndex >= 0 && saved.selectedResultIndex < state.results.length
-    ? saved.selectedResultIndex
-    : -1;
-  state.selected = selectedIndex >= 0 ? state.results[selectedIndex] : null;
-  state.selectedSeason = Number(saved.selectedSeason) || 0;
-  state.selectedEpisode = Number(saved.selectedEpisode) || 0;
-
-  const urlForm = saved.urlForm && typeof saved.urlForm === 'object' ? saved.urlForm : {};
-  $('#u-url').value = String(urlForm.url || '');
-  $('#u-title').value = String(urlForm.title || '');
-  $('#u-year').value = String(urlForm.year || '');
-  $('#u-kind').value = urlForm.kind === 'series' ? 'series' : 'movie';
-  $('#u-season').value = String(urlForm.season || '');
-  $('#u-episode').value = String(urlForm.episode || '');
-  $('#u-browser').checked = urlForm.browser !== false;
-  $('#u-probe').checked = urlForm.probe !== false;
-  setFindTab(FIND_TABS.includes(saved.findTab) ? saved.findTab : 'title', false);
-
-  renderProviderErrors(state.providerErrors);
-  updateResultProviderFilter();
-  $('#results-title-filter').value = String(saved.titleFilter || '');
-  $('#results-provider-filter').value = String(saved.providerFilter || '');
-  renderResults();
-
-  if (state.results.length || state.providerErrors.length) {
-    const titleCount = groupSearchResults(state.results).length;
-    $('#find-hint').textContent = `Restored ${titleCount} saved title${titleCount === 1 ? '' : 's'} and ${state.results.length} provider result${state.results.length === 1 ? '' : 's'}`;
-  } else if (saved.query) {
-    $('#find-hint').textContent = 'No saved results. Run the search again to reload them.';
-  }
-
-  if (state.selected) {
-    renderSelectedInfo(state.selected);
-    $('#sel-note').textContent = 'Saved title restored. Select it to refresh its stream candidates.';
-    $('#sel-episode-controls').classList.add('hide');
-    $('#sel-actions').innerHTML = '';
-    $('#candidates').innerHTML = '<div class="meta">Select the saved title to resolve fresh stream candidates.</div>';
-    state.pendingRestoreSelection = true;
-  } else if (state.lastResolveMode === 'url' && saved.findTab === 'url' && $('#u-url').value.trim()) {
-    state.pendingRestoreUrlResolve = true;
-  }
-}
-
-function restoreAppState() {
-  restoreSearchState();
-  const storedPage = readStoredText(ACTIVE_PAGE_KEY);
-  const activePage = APP_PAGES.includes(storedPage) ? storedPage : 'dash';
-  if (activePage !== 'dash') go(activePage);
-
-  const streamId = readStoredText(SELECTED_STREAM_KEY);
-  if (streamId) openStream(streamId, { navigate: false, silent: true });
-}
-
-function positiveNumber(value, fallback = null) {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 && number <= 500 ? number : fallback;
-}
-
-function findMovieBoxArray(value, keys, depth = 0, seen = new Set()) {
-  if (Array.isArray(value)) return value;
-  if (!value || typeof value !== 'object' || depth > 5 || seen.has(value)) return null;
-  seen.add(value);
-  for (const key of keys) if (Array.isArray(value[key])) return value[key];
-  for (const key of keys) {
-    if (value[key] && typeof value[key] === 'object') {
-      const found = findMovieBoxArray(value[key], keys, depth + 1, seen);
-      if (found) return found;
-    }
-  }
-  for (const key of ['data', 'subject', 'subjectInfo', 'seasonInfo', 'result']) {
-    if (value[key] && typeof value[key] === 'object') {
-      const found = findMovieBoxArray(value[key], keys, depth + 1, seen);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function normalizeMovieBoxSeasons(payload, details = {}, result = {}) {
-  const seasonKeys = ['seasons', 'seasonList', 'season_list', 'seasonInfos', 'seasonInfoList', 'items', 'list', 'results'];
-  const episodeKeys = ['episodes', 'episodeList', 'episode_list', 'episodeInfoList', 'epList', 'episodesList', 'list', 'items'];
-  const rows = findMovieBoxArray(payload, seasonKeys) || findMovieBoxArray(details, seasonKeys) || [];
-  const normalized = rows.map((season, index) => {
-    const entry = season && typeof season === 'object' ? season : { se: season };
-    const number = positiveNumber(entry.se ?? entry.seasonNumber ?? entry.seasonNo ?? entry.season ?? entry.number, index + 1);
-    const episodeRows = findMovieBoxArray(entry, episodeKeys) || [];
-    const episodes = episodeRows.map((episode, episodeIndex) => {
-      const item = episode && typeof episode === 'object' ? episode : { ep: episode };
-      const episodeNumber = positiveNumber(item.ep ?? item.episodeNumber ?? item.episodeNo ?? item.episode ?? item.number, episodeIndex + 1);
-      return { number: episodeNumber, title: item.title || item.name || item.episodeTitle || `Episode ${episodeNumber}` };
-    });
-    const count = positiveNumber(entry.episodeCount ?? entry.totalEpisodes ?? entry.totalEpisode
-      ?? entry.episodeNum ?? entry.epCount ?? entry.epNum ?? entry.episodesCount ?? entry.episodeTotal ?? entry.count, null);
-    const finalEpisodes = episodes.length ? episodes : Array.from({ length: count || 30 }, (_, i) => ({ number: i + 1, title: `Episode ${i + 1}` }));
-    return {
-      number,
-      title: entry.name || entry.title || entry.seasonName || `Season ${number}`,
-      episodes: finalEpisodes,
-      episodesFromApi: episodes.length > 0 || count != null,
-    };
-  }).filter((season) => season.number);
-  if (normalized.length) return normalized.sort((a, b) => a.number - b.number);
-
-  const rawCount = details.seasonCount ?? details.season_count ?? details.totalSeasons
-    ?? details.season ?? result.seasonCount;
-  const count = positiveNumber(rawCount, 1);
-  return Array.from({ length: Math.min(count, 100) }, (_, index) => ({
-    number: index + 1,
-    title: `Season ${index + 1}`,
-    episodes: Array.from({ length: 30 }, (_episode, episodeIndex) => ({
-      number: episodeIndex + 1,
-      title: `Episode ${episodeIndex + 1}`,
-    })),
-    episodesFromApi: false,
-  }));
-}
-
-function unwrapMovieBoxDetails(value) {
-  let current = value;
-  const visited = new Set();
-  for (let i = 0; i < 5 && current && typeof current === 'object' && !Array.isArray(current) && !visited.has(current); i += 1) {
-    visited.add(current);
-    const nested = current.subject || current.subjectInfo || current.detail || current.details || current.data;
-    if (!nested || typeof nested !== 'object') break;
-    current = nested;
-  }
-  return current || {};
-}
-
-function movieBoxGenreNames(value) {
-  const values = Array.isArray(value) ? value : value == null ? [] : [value];
-  return values.map((genre) => genre && typeof genre === 'object'
-    ? genre.name || genre.title || genre.label
-    : genre).filter((genre) => genre != null && String(genre).trim());
-}
-
-function updateSelectedFromMovieBox(result, payload) {
-  const details = unwrapMovieBoxDetails(payload);
-  const cover = details.cover?.url || details.coverUrl || details.poster || details.pic || null;
-  result.title = details.title || details.name || result.title;
-  result.year = result.year || Number(details.year || details.releaseDate?.slice?.(0, 4) || 0) || null;
-  result.description = details.description || details.overview || details.plot || details.introduction || result.description;
-  result.releaseDate = details.releaseDate || details.release_date || details.firstAirDate || details.first_air_date || result.releaseDate;
-  result.rating = details.imdbRatingValue || details.rating || result.rating;
-  const genres = details.genres || details.genreList || details.genreNames;
-  if (genres) result.genres = movieBoxGenreNames(genres);
-  result.runtime = details.duration || details.runtime || result.runtime;
-  if (!result.poster && cover && /^https?:\/\//i.test(String(cover))) result.poster = cover;
-  renderSelectedInfo(result);
-  saveSearchState();
-  return details;
-}
-
-function renderEpisodeOptions(season) {
-  const select = $('#sel-episode');
-  const episodes = season?.episodes?.length ? season.episodes : [{ number: 1, title: 'Episode 1' }];
-  select.innerHTML = episodes.map((episode) => `<option value="${episode.number}">${escapeHtml(episode.title || `Episode ${episode.number}`)}</option>`).join('');
-  if (episodes.some((episode) => episode.number === state.selectedEpisode)) select.value = String(state.selectedEpisode);
-  else {
-    state.selectedEpisode = episodes[0].number;
-    select.value = String(state.selectedEpisode);
-  }
-}
-
-function renderSeriesControls(seasons, selectionId, statusMessage = '') {
-  const controls = $('#sel-episode-controls');
-  state.selectedSeasons = seasons;
-  controls.classList.remove('hide');
-  const seasonSelect = $('#sel-season');
-  seasonSelect.innerHTML = seasons.map((season) => `<option value="${season.number}">${escapeHtml(season.title)}</option>`).join('');
-  const available = seasons.some((season) => season.number === state.selectedSeason);
-  if (!available) state.selectedSeason = seasons[0]?.number || 1;
-  seasonSelect.value = String(state.selectedSeason);
-  renderEpisodeOptions(seasons.find((season) => season.number === state.selectedSeason));
-  $('#sel-episode-status').textContent = statusMessage;
-
-  seasonSelect.onchange = () => {
-    if (selectionId !== selectionRequestId) return;
-    clearFindSubtitleSearch();
-    state.selectedSeason = Number(seasonSelect.value) || 1;
-    state.selectedEpisode = 0;
-    renderEpisodeOptions(seasons.find((season) => season.number === state.selectedSeason));
-    resolveSelectedMovieBox(selectionId);
-  };
-  $('#sel-episode').onchange = () => {
-    if (selectionId !== selectionRequestId) return;
-    clearFindSubtitleSearch();
-    state.selectedEpisode = Number($('#sel-episode').value) || 1;
-    resolveSelectedMovieBox(selectionId);
-  };
-}
-
-function isCurrentSelection(selectionId) {
-  return selectionId === selectionRequestId;
-}
-
-async function resolveSelectedMovieBox(selectionId) {
-  if (!isCurrentSelection(selectionId) || !state.selected) return;
-  const result = state.selected;
-  result.selectedSeason = state.selectedSeason;
-  result.selectedEpisode = state.selectedEpisode;
-  saveSearchState();
-  await resolve({
-    url: result.url,
-    title: result.title,
-    year: result.year,
-    kind: result.kind,
-    sourceId: result.sourceId,
-    season: state.selectedSeason,
-    episode: state.selectedEpisode,
-  }, selectionId);
-}
-
-async function loadMovieBoxDetails(result, selectionId) {
-  const target = movieBoxTargetForResult(result);
-  if (!target) {
-    $('#sel-note').textContent = 'MovieBox subject ID is missing; cannot load title details.';
-    return;
-  }
-  const controller = new AbortController();
-  detailAbortController?.abort();
-  detailAbortController = controller;
-  const requestId = ++detailRequestId;
-  $('#sel-note').textContent = 'Loading MovieBox title details and episode information…';
-  try {
-    const params = new URLSearchParams({ subjectId: target.subjectId, kind: result.kind || 'movie' });
-    const response = await api(`/api/find/details?${params}`, { signal: controller.signal, silent: true });
-    if (!isCurrentSelection(selectionId) || requestId !== detailRequestId || controller.signal.aborted) return;
-    const details = updateSelectedFromMovieBox(result, response.details);
-    if (result.kind === 'series') {
-      const seasons = normalizeMovieBoxSeasons(response.seasons, details, result);
-      state.selectedSeason = target.season || seasons[0]?.number || 1;
-      state.selectedEpisode = target.episode || 0;
-      const hasEpisodeData = seasons.some((season) => season.episodesFromApi);
-      const status = response.seasonError
-        ? `Episode list unavailable (${response.seasonError}); showing selectable fallback episode numbers.`
-        : hasEpisodeData
-          ? 'Choose a season and episode; streams reload for the selected episode.'
-          : 'MovieBox returned no episode list; showing fallback episode numbers. Streams still resolve for the selection.';
-      renderSeriesControls(seasons, selectionId, status);
-    }
-    $('#sel-note').textContent = result.kind === 'series'
-      ? 'Resolving the selected season and episode…'
-      : 'Details loaded. Resolving MovieBox streams…';
-    await resolveSelectedMovieBox(selectionId);
-  } catch (err) {
-    if (!isCurrentSelection(selectionId) || requestId !== detailRequestId || controller.signal.aborted || isAbortError(err)) return;
-    $('#sel-note').textContent = `MovieBox details failed (${err.message}); trying the selected title with default episode values.`;
-    if (result.kind === 'series') {
-      const seasons = normalizeMovieBoxSeasons(null, {}, result);
-      state.selectedSeason = target.season || 1;
-      state.selectedEpisode = target.episode || 1;
-      renderSeriesControls(seasons, selectionId, 'Episode details are unavailable; choose a fallback season and episode number.');
-    }
-    await resolveSelectedMovieBox(selectionId);
-  } finally {
-    if (requestId === detailRequestId && detailAbortController === controller) detailAbortController = null;
-  }
-}
-
-async function selectResult(index) {
-  const r = state.results[index];
-  if (!r) return;
-  const selectionId = invalidateSelectionRequests();
-  state.lastResolveMode = 'result';
-  state.pendingRestoreUrlResolve = false;
-  state.selected = r;
-  state.selectedSeason = 0;
-  state.selectedEpisode = 0;
-  state.selectedSeasons = [];
+function clearSelection() {
+  state.selection = null;
   state.candidates = [];
-  updateResultTitleSelect(visibleResultGroups());
-  saveSearchState();
-  $$('#results .moviecard').forEach((card) => {
-    const active = (card.dataset.resultIndices || '').split(',').includes(String(index));
-    card.classList.toggle('sel', active);
-  });
-  $$('#results .moviecard-main').forEach((main) => {
-    main.setAttribute('aria-pressed', String(Number(main.dataset.resultIndex) === index));
-  });
-  $$('#results .provider-choice').forEach((button) => {
-    const active = Number(button.dataset.resultIndex) === index;
-    button.classList.toggle('on', active);
-    button.setAttribute('aria-pressed', String(active));
-  });
-  clearFindSubtitleSearch();
-  renderSelectedInfo(r);
-  $('#sel-episode-controls').classList.add('hide');
-  $('#sel-note').textContent = 'Resolving candidates — every URL is probed with ffprobe before it is offered.';
+  state.seasons = null;
+  resolveAbort?.abort();
+  $('#sel-name').textContent = 'nothing selected';
+  $('#sel-meta').textContent = 'search or paste a URL, then pick a title to see its metadata and formats';
+  $('#sel-poster').innerHTML = '<b>—</b>';
+  $('#sel-details')?.classList.add('hide');
+  $('#sel-meta-table')?.classList.add('hide');
+  $('#sel-episode-controls')?.classList.add('hide');
+  $('#candidates').innerHTML = '<div class="meta">No formats yet.</div>';
   $('#sel-actions').innerHTML = '';
-  $('#candidates').innerHTML = '<div class="meta"><span class="spin"></span> resolving…</div>';
-  if (r.sourceId === 'moviebox' || String(r.url || '').startsWith('moviebox://')) {
-    await loadMovieBoxDetails(r, selectionId);
-  } else {
-    await resolve({ url: r.url, title: r.title, year: r.year, kind: r.kind, sourceId: r.sourceId }, selectionId);
+}
+
+function metadataRows(group) {
+  const first = group.entries[0] || {};
+  const rows = [
+    ['Title', group.title],
+    ['Year', group.year || '—'],
+    ['Kind', group.kind],
+    ['Rating', group.entries.map((entry) => Number(entry.rating)).filter((value) => value > 0).sort((a, b) => b - a)[0]?.toFixed(1) || '—'],
+    ['Genres', group.entries.flatMap((entry) => (Array.isArray(entry.genres) ? entry.genres : [])).join(', ') || '—'],
+    ['Runtime', group.entries.map((entry) => entry.runtime).find(Boolean) || first.duration || '—'],
+    ['Language', group.entries.map((entry) => entry.language).find(Boolean) || '—'],
+    ['Released', group.entries.map((entry) => entry.releaseDate).find(Boolean)?.slice(0, 10) || '—'],
+    ['Providers', group.entries.map((entry) => sourceName(entry.sourceId)).join(', ')],
+    ['Sources', String(group.entries.length)],
+  ];
+  const description = group.entries.map((entry) => entry.description).find(Boolean);
+  return { rows, description };
+}
+
+/** One card per provider/file inside a title — the "formats" list. */
+function candidateMarkup(candidate, index, meta = {}) {
+  const probe = candidate.probe || null;
+  const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.width ? ` ${probe.video.width}×${probe.video.height}` : ''}` : '';
+  const audio = probe?.audio ? `${probe.audio.codec || '?'}${probe.audio.channels ? ` ${probe.audio.channels}ch` : ''}` : '';
+  const ok = candidate.ok !== false;
+  const error = candidate.error || null;
+  return `<div class="cand ${ok ? '' : 'bad'}" data-candidate="${index}">
+    <div class="cand-main">
+      <div class="cand-title">${escapeHtml(candidate.quality || candidate.label || 'format')}
+        ${tag(meta.sourceName || sourceName(candidate.sourceId), 'alt')}
+        ${ok ? tag('probe ok', 'ok') : tag('unplayable', 'err')}</div>
+      <div class="cand-meta">${video ? tag(video) : ''}${audio ? tag(audio) : ''}${probe?.durationSec ? tag(fmtDuration(probe.durationSec)) : ''}${probe?.bitrate ? tag(`${Math.round(probe.bitrate / 1000)} kbps`) : ''}
+        ${(probe?.subtitles || []).length ? tag(`${probe.subtitles.length} subtitle track(s)`) : ''}</div>
+      ${meta.seasonEpisode ? `<div class="meta">${escapeHtml(meta.seasonEpisode)}</div>` : ''}
+      <div class="mono cand-url">${escapeHtml(String(candidate.url || '').slice(0, 160))}</div>
+      ${error ? `<div class="err-text">${escapeHtml(error)}</div>` : ''}
+    </div>
+    <div class="cand-side">
+      <button class="btn sm pri" data-add-candidate="${index}" ${ok ? '' : 'disabled'}>+ add to playlist</button>
+      <button class="btn sm ghost" data-probe-url="${escapeHtml(candidate.url || '')}">probe</button>
+    </div>
+  </div>`;
+}
+
+function renderCandidates(candidates, meta = {}) {
+  const host = $('#candidates');
+  if (!host) return;
+  if (!candidates.length) {
+    host.innerHTML = `<div class="meta">${state.resolving ? 'resolving formats…' : 'No playable formats found for this title.'}</div>`;
+    return;
+  }
+  host.innerHTML = candidates.map((candidate, index) => candidateMarkup(candidate, index, meta)).join('');
+}
+
+async function selectGroup(group) {
+  if (!group) return;
+  clearSelection();
+  state.selection = {
+    key: group.key,
+    title: group.title,
+    year: group.year,
+    kind: group.kind,
+    poster: group.poster,
+    sourceId: group.entries[0]?.sourceId || '',
+    movieboxSubjectId: group.entries.find((entry) => entry.movieboxSubjectId)?.movieboxSubjectId || null,
+    entries: group.entries,
+  };
+  const { rows, description } = metadataRows(group);
+  $('#sel-name').innerHTML = `${escapeHtml(group.title)}${group.year ? ` <span class="mut">(${group.year})</span>` : ''}`;
+  $('#sel-meta').textContent = `${group.kind} · ${group.entries.length} format(s) from ${new Set(group.entries.map((entry) => entry.sourceId)).size} provider(s)`;
+  if (group.poster) $('#sel-poster').innerHTML = `<img src="${escapeHtml(group.poster)}" alt="" onerror="this.remove()">`;
+  const details = $('#sel-details');
+  if (details) {
+    details.classList.toggle('hide', !description);
+    details.textContent = description || '';
+  }
+  const table = $('#sel-meta-table');
+  if (table) {
+    table.classList.remove('hide');
+    table.innerHTML = rows.map(([key, value]) => `<div class="meta-row"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('');
+  }
+  $('#sel-note').textContent = 'Formats come from every provider on this card. Nothing is put on the playlist until you press “add to playlist” on one format.';
+  renderSelectionActions();
+  await loadFormats();
+  if (group.kind === 'series' && state.selection.movieboxSubjectId) loadSeasons();
+}
+
+function renderSelectionActions() {
+  const host = $('#sel-actions');
+  if (!host) return;
+  host.innerHTML = `
+    <button class="btn sm" id="btn-sel-formats">↻ resolve formats</button>
+    <button class="btn sm ghost" id="btn-sel-subs">▭ matching subtitles</button>
+    <button class="btn sm ghost" id="btn-sel-playlist">☰ open playlist</button>
+    <span class="mut" id="sel-format-note"></span>`;
+  $('#btn-sel-formats').addEventListener('click', () => loadFormats({ announce: true }));
+  $('#btn-sel-subs').addEventListener('click', () => openSelectionSubtitles());
+  $('#btn-sel-playlist').addEventListener('click', () => go('list'));
+}
+
+/** Resolve every provider entry of the selection into playable formats. */
+async function loadFormats({ announce = false } = {}) {
+  const selection = state.selection;
+  if (!selection) return;
+  const seq = ++resolveSeq;
+  resolveAbort?.abort();
+  resolveAbort = new AbortController();
+  state.resolving = true;
+  const note = $('#sel-format-note');
+  if (note) note.textContent = 'resolving and probing…';
+  renderCandidates([], {});
+  const collected = [];
+  const errors = [];
+  for (const entry of selection.entries) {
+    if (seq !== resolveSeq) return;
+    try {
+      const body = {
+        url: entry.url,
+        sourceId: entry.sourceId,
+        title: entry.title || selection.title,
+        year: entry.year || selection.year || null,
+        kind: entry.kind || selection.kind || 'movie',
+        season: selection.season || 0,
+        episode: selection.episode || 0,
+        probe: true,
+        useBrowser: entry.sourceId !== 'moviebox',
+      };
+      const data = await api('/api/find/resolve', { method: 'POST', body, silent: true, signal: resolveAbort.signal });
+      if (seq !== resolveSeq) return;
+      for (const candidate of data.candidates || []) {
+        collected.push({ ...candidate, sourceId: candidate.sourceId || entry.sourceId, _entry: entry });
+      }
+      if (data.error) errors.push({ sourceId: entry.sourceId, error: data.error });
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      errors.push({ sourceId: entry.sourceId, error: error.message });
+    }
+  }
+  if (seq !== resolveSeq) return;
+  state.resolving = false;
+  state.candidates = collected;
+  renderCandidates(collected, {});
+  if (note) note.textContent = `${collected.filter((candidate) => candidate.ok !== false).length}/${collected.length} playable · ${errors.length ? `${errors.length} provider(s) failed` : 'all providers answered'}`;
+  if (errors.length) renderFindErrors(errors.map((entry) => ({ sourceId: entry.sourceId, error: entry.error })));
+  if (announce) toast(collected.length ? `${collected.length} format(s) resolved` : 'No formats resolved', collected.length ? 'ok' : 'warn');
+}
+
+async function addCandidateToPlaylist(index) {
+  const candidate = state.candidates[index];
+  const selection = state.selection;
+  if (!candidate || !selection) return;
+  const entry = candidate._entry || {};
+  const button = $(`[data-add-candidate="${index}"]`);
+  if (button) button.disabled = true;
+  try {
+    const body = {
+      title: selection.title,
+      year: entry.year || selection.year || null,
+      kind: entry.kind || selection.kind || 'movie',
+      poster: selection.poster || entry.poster || '',
+      description: entry.description || '',
+      sourceId: candidate.sourceId || entry.sourceId || '',
+      candidate: {
+        url: candidate.url,
+        quality: candidate.quality,
+        label: candidate.label,
+        sourceId: candidate.sourceId || entry.sourceId,
+        kind: candidate.kind,
+        headers: candidate.headers,
+        variants: candidate.variants,
+        probe: candidate.probe,
+      },
+      season: selection.season || null,
+      episode: selection.episode || null,
+    };
+    const data = await api('/api/streams', { method: 'POST', body });
+    await VMPlaylist.refresh();
+    toast(`Added “${data.stream.title}” to the playlist`, 'ok');
+    if (button) button.textContent = '✓ added';
+    const note = $('#sel-format-note');
+    if (note) note.innerHTML = `added · <a href="#list" data-go-list>open the playlist</a>`;
+  } catch (error) {
+    toast(error.message, 'err');
+    if (button) button.disabled = false;
   }
 }
+
+/* moviebox season/episode picker (series only) */
+async function loadSeasons() {
+  const selection = state.selection;
+  if (!selection?.movieboxSubjectId) return;
+  const controls = $('#sel-episode-controls');
+  try {
+    const data = await api(`/api/find/details?subjectId=${encodeURIComponent(selection.movieboxSubjectId)}&kind=series`, { silent: true });
+    state.seasons = data.seasons || null;
+    if (!state.seasons) { controls?.classList.add('hide'); return; }
+    const seasonNumbers = seasonsOf(state.seasons);
+    if (!seasonNumbers.length) { controls?.classList.add('hide'); return; }
+    controls.classList.remove('hide');
+    const seasonSelect = $('#sel-season');
+    seasonSelect.innerHTML = seasonNumbers.map((season) => `<option value="${season}">Season ${season}</option>`).join('');
+    seasonSelect.value = String(selection.season || seasonNumbers[0]);
+    updateEpisodeSelect();
+    $('#sel-episode-status').textContent = '';
+  } catch (error) {
+    controls?.classList.add('hide');
+    $('#sel-episode-status').textContent = `could not load seasons: ${error.message}`;
+  }
+}
+
+function seasonsOf(seasons) {
+  if (Array.isArray(seasons)) {
+    return [...new Set(seasons.map((entry) => Number(entry.season ?? entry.seasonNumber ?? entry)).filter(Number.isFinite))];
+  }
+  if (seasons && typeof seasons === 'object') {
+    return Object.keys(seasons).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  }
+  return [];
+}
+
+function episodesOf(seasons, season) {
+  const list = Array.isArray(seasons) ? seasons : [];
+  const entry = Array.isArray(seasons)
+    ? seasons.find((item) => Number(item.season ?? item.seasonNumber) === Number(season))
+    : seasons?.[season];
+  const raw = entry?.episodes || entry?.items || entry || seasons?.[season];
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => Number(item.episode ?? item.episodeNumber ?? item) || 0).filter(Boolean);
+}
+
+function updateEpisodeSelect() {
+  const select = $('#sel-episode');
+  if (!select) return;
+  const numbers = episodesOf(state.seasons, $('#sel-season').value);
+  select.innerHTML = (numbers.length ? numbers : [1]).map((episode) => `<option value="${episode}">Episode ${episode}</option>`).join('');
+}
+
+function selectionSeasonEpisode() {
+  const season = Number($('#sel-season')?.value) || 0;
+  const episode = Number($('#sel-episode')?.value) || 0;
+  return { season, episode };
+}
+
+async function applySeasonEpisode() {
+  const selection = state.selection;
+  if (!selection) return;
+  const { season, episode } = selectionSeasonEpisode();
+  selection.season = season;
+  selection.episode = episode;
+  $('#sel-episode-status').textContent = `resolving S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}…`;
+  await loadFormats();
+  $('#sel-episode-status').textContent = `showing S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+}
+
+/* ---------------- selection subtitles (same panel the old UI had) ---------------- */
+
+async function openSelectionSubtitles() {
+  const selection = state.selection;
+  if (!selection) return;
+  const panel = $('#sel-subtitle-panel');
+  panel.classList.remove('hide');
+  const items = VMPlaylist.items();
+  const suggested = items.find((item) => titleKey(item.title) === titleKey(selection.title)) || null;
+  $('#sel-subtitle-target').innerHTML = `${escapeHtml(selection.title)}${selection.year ? ` (${selection.year})` : ''}
+    <div class="row" style="margin-top:6px">attach to
+      <select id="sel-subtitle-item" style="width:auto">
+        <option value="">(pick a playlist item…)</option>
+        ${items.map((item) => `<option value="${escapeHtml(item.streamId)}"${suggested && suggested.streamId === item.streamId ? ' selected' : ''}>${escapeHtml(item.title)}${item.year ? ` (${item.year})` : ''}</option>`).join('')}
+      </select></div>`;
+  $('#sel-subtitle-count').textContent = 'searching…';
+  const host = $('#sel-subtitle-results');
+  host.innerHTML = '<div class="meta" style="padding:14px">searching the enabled providers…</div>';
+  try {
+    const data = await api('/api/subtitles/search', {
+      method: 'POST',
+      silent: true,
+      body: { title: selection.title, year: selection.year || null, kind: selection.kind || 'movie', season: selection.season || null, episode: selection.episode || null },
+    });
+    state.findSubtitleResults = data.results || [];
+    $('#sel-subtitle-count').textContent = `${state.findSubtitleResults.length} result(s)`;
+    host.innerHTML = state.findSubtitleResults.length
+      ? state.findSubtitleResults.slice(0, 40).map((result, index) => subtitleRowMarkup(result, index, 'find')).join('')
+      : '<div class="meta" style="padding:14px">no subtitles found</div>';
+  } catch (error) {
+    $('#sel-subtitle-count').textContent = '';
+    host.innerHTML = `<div class="meta" style="padding:14px">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function subtitleRowMarkup(result, index, scope) {
+  return `<div class="pick-row">
+    <div>
+      <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
+        ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
+        ${result.rating ? tag(`★ ${result.rating}`) : ''}</div>
+      <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
+    </div>
+    <button class="btn sm pri" data-attach-sub="${index}" data-scope="${scope}">attach</button>
+  </div>`;
+}
+
+async function attachSubtitle(result, { streamId = null, language = null } = {}) {
+  if (!streamId) {
+    toast('Pick the playlist item this subtitle belongs to first', 'warn');
+    return;
+  }
+  await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, {
+    method: 'POST',
+    body: { result, language: language || result.language || '' },
+  });
+  await VMPlaylist.refresh({ render: currentPage === 'list' });
+  toast(`Subtitle attached to the playlist item (${result.language || 'srt'})`, 'ok');
+}
+
+/* ---------------- URL resolve tab ---------------- */
 
 async function doResolveFromUrl() {
-  const url = $('#u-url').value.trim();
-  if (!url) return toast('Paste a URL first', 'warn');
-  state.lastResolveMode = 'url';
-  state.pendingRestoreSelection = false;
-  const selectionId = invalidateSelectionRequests();
-  resetSelectedTitle();
-  $('#sel-name').textContent = $('#u-title').value.trim() || url;
-  $('#sel-meta').textContent = 'Pasted URL resolve';
-  $('#sel-note').textContent = 'Scraping the supplied URL…';
+  const url = ($('#u-url')?.value || '').trim();
+  if (!url) {
+    toast('Paste the movie/series or player URL first', 'warn');
+    return;
+  }
+  ui.search.url = url;
+  ui.search.urlTitle = $('#u-title').value;
+  ui.search.urlYear = $('#u-year').value;
+  ui.search.urlKind = $('#u-kind').value;
+  ui.search.urlSeason = $('#u-season').value;
+  ui.search.urlEpisode = $('#u-episode').value;
   saveSearchState();
-  await resolve({
-    url,
-    title: $('#u-title').value.trim() || null,
+  const seq = ++resolveSeq;
+  resolveAbort?.abort();
+  resolveAbort = new AbortController();
+  clearSelection();
+  state.selection = {
+    key: `url:${url}`,
+    title: $('#u-title').value.trim() || url.replace(/^https?:\/\//, '').slice(0, 80),
     year: Number($('#u-year').value) || null,
-    kind: $('#u-kind').value,
+    kind: $('#u-kind').value || 'movie',
+    poster: '',
+    entries: [],
     season: Number($('#u-season').value) || 0,
     episode: Number($('#u-episode').value) || 0,
-    useBrowser: $('#u-browser').checked,
-    probe: $('#u-probe').checked,
-  }, selectionId);
-}
-
-async function resolve(payload, selectionId = null) {
-  resolveAbortController?.abort();
-  const controller = new AbortController();
-  resolveAbortController = controller;
-  const requestId = ++resolveRequestId;
-  state.candidates = [];
-  $('#sel-actions').innerHTML = '';
-  $('#candidates').innerHTML = '<div class="meta"><span class="spin"></span> resolving…</div>';
-  const isCurrent = () => requestId === resolveRequestId
-    && !controller.signal.aborted
-    && (selectionId == null || isCurrentSelection(selectionId));
+    fromUrl: true,
+  };
+  state.resolving = true;
+  $('#sel-name').textContent = state.selection.title;
+  $('#sel-meta').textContent = 'scraping the pasted URL…';
+  $('#candidates').innerHTML = '<div class="meta">resolving and probing…</div>';
+  $('#btn-resolve').disabled = true;
   try {
-    const res = await api('/api/find/resolve', {
-      method: 'POST',
-      body: { ...payload, probe: payload.probe !== false },
-      signal: controller.signal,
-      silent: true,
-    });
-    if (!isCurrent()) return;
-    state.candidates = res.candidates || [];
-    renderCandidates(res);
-  } catch (err) {
-    if (!isCurrent() || isAbortError(err)) return;
-    $('#candidates').innerHTML = `<div class="note err">Resolve failed: ${escapeHtml(err.message)}</div>`;
-    setFindSubtitlesAction();
-  } finally {
-    if (requestId === resolveRequestId && resolveAbortController === controller) resolveAbortController = null;
-  }
-}
-
-function renderCandidates(res) {
-  const list = res.candidates || [];
-  $('#sel-note').innerHTML = `Resolve timings: ${Object.entries(res.timeline || {}).map(([k, v]) => `${k} ${v}ms`).join(' · ') || '—'}`;
-  setFindSubtitlesAction();
-  if (!list.length) {
-    $('#candidates').innerHTML = `<div class="note err">No playable stream found.<br>${escapeHtml(res.error || '')}</div>`;
-    return;
-  }
-  $('#candidates').innerHTML = `<table>
-    <thead><tr><th>#</th><th>Quality</th><th>Source</th><th>Probe</th><th>State</th><th></th></tr></thead><tbody>
-    ${list.map((c) => `<tr>
-      <td>${c.index + 1}</td>
-      <td>${tag(c.quality || c.label || '—', c.ok ? 'ok' : 'warn')}</td>
-      <td>${tag(c.sourceId || '—')}<div class="meta">${escapeHtml((c.url || '').slice(0, 48))}…</div></td>
-      <td class="mono" style="font-size:11.5px">${c.probe?.video ? `${c.probe.video.codec} ${c.probe.video.width}x${c.probe.video.height} @${c.probe.video.fps || '?'}<br>${c.probe.audio?.map((a) => a.codec).join(',') || 'no audio'}${c.probe.subtitles?.length ? ` · ${c.probe.subtitles.length} sub track(s)` : ''}` : '—'}</td>
-      <td>${c.ok ? tag('playable', 'ok') : tag(c.error || 'unverified', 'err')}</td>
-      <td><button class="btn sm ${c.ok ? 'pri' : ''}" data-c="${c.index}">use</button></td>
-    </tr>`).join('')}</tbody></table>`;
-  $$('#candidates button[data-c]').forEach((b) => b.addEventListener('click', () => createStream(state.candidates[Number(b.dataset.c)])));
-}
-
-async function createStream(candidate) {
-  const sel = state.selected || {};
-  const streamKind = sel.kind || $('#u-kind').value;
-  const selectedSubtitleTarget = state.selectedSubtitle ? currentSubtitleTarget() : null;
-  const seasonForStream = state.selected
-    ? (state.selectedSeason || sel.selectedSeason || selectedSubtitleTarget?.season)
-    : (Number($('#u-season').value) || selectedSubtitleTarget?.season);
-  const episodeForStream = state.selected
-    ? (state.selectedEpisode || sel.selectedEpisode || selectedSubtitleTarget?.episode)
-    : (Number($('#u-episode').value) || selectedSubtitleTarget?.episode);
-  try {
-    const res = await api('/api/streams', {
+    const data = await api('/api/find/resolve', {
       method: 'POST',
       body: {
-        title: sel.title || $('#u-title').value || 'Untitled',
-        year: sel.year || Number($('#u-year').value) || null,
-        kind: streamKind,
-        poster: sel.poster || null,
-        description: sel.description || null,
-        sourceId: candidate.sourceId,
-        season: streamKind === 'series' ? (Number(seasonForStream) || null) : null,
-        episode: streamKind === 'series' ? (Number(episodeForStream) || null) : null,
-        candidate: {
-          url: candidate.url,
-          quality: candidate.quality,
-          label: candidate.label,
-          kind: candidate.kind,
-          headers: candidate.headers || {},
-          probe: candidate.probe,
-          variants: candidate.variants,
-          sourceId: candidate.sourceId,
-          via: candidate.via,
-        },
-        profile: {},
-        ...(state.selectedSubtitle ? { subtitleResult: state.selectedSubtitle } : {}),
+        url,
+        title: $('#u-title').value.trim() || undefined,
+        year: Number($('#u-year').value) || undefined,
+        kind: $('#u-kind').value,
+        season: Number($('#u-season').value) || 0,
+        episode: Number($('#u-episode').value) || 0,
+        probe: $('#u-probe').checked,
+        useBrowser: $('#u-browser').checked,
       },
+      silent: true,
+      signal: resolveAbort.signal,
     });
-    streamRequestId += 1;
-    state.stream = res.stream;
-    await loadFfmpegTemplates();
-    try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
-    toast(`Stream created: ${res.stream.title}`, 'ok');
-    if (state.selectedSubtitle) {
-      toast(res.subtitleError
-        ? `Subtitle selected, but could not attach: ${res.subtitleError}`
-        : `Selected subtitle attached: ${state.selectedSubtitle.release || state.selectedSubtitle.title || state.selectedSubtitle.providerId}`,
-      res.subtitleError ? 'warn' : 'ok', 9000);
-    }
-    renderStream(res);
-    go('stream');
-    loadStreams();
-  } catch { /* toast shown */ }
-}
-
-/* ================= STREAM ================= */
-
-const TEMPLATE_CUSTOM_VALUE = '__custom__';
-
-function newFfmpegTemplateId() {
-  return globalThis.crypto?.randomUUID?.()
-    || `template-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-function starterFfmpegTemplate(container = 'mpegts') {
-  const muxer = ['mpegts', 'matroska', 'hls'].includes(container) ? container : 'mpegts';
-  const base = `ffmpeg -hide_banner -nostdin -loglevel warning -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy`;
-  if (muxer === 'hls') return `${base} -f hls -hls_time 2 -hls_list_size 10 -hls_flags delete_segments+omit_endlist <output>`;
-  return `${base} -f ${muxer}${muxer === 'matroska' ? ' -live 1' : ''} pipe:1`;
-}
-
-async function loadFfmpegTemplates(force = false) {
-  if (state.ffmpegTemplatesLoaded && !force) return true;
-  try {
-    const result = await api('/api/ffmpeg/templates', { silent: true });
-    state.ffmpegTemplates = Array.isArray(result.templates) ? result.templates : [];
-    if (result.schema && Array.isArray(result.schema.fields)) state.ffmpegTemplateSchema = result.schema;
-    state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-    state.ffmpegDefaults = result.ffmpegDefaults && typeof result.ffmpegDefaults === 'object' ? result.ffmpegDefaults : {};
-    state.ffmpegTemplatesLoaded = true;
-    if (state.stream) {
-      renderFfmpegTemplateControls(state.stream.profile || {});
-      renderOutputTemplates(state.stream.profile?.outputTemplates || {});
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function updateFfmpegTemplateButtons() {
-  const select = $('#pf-template-select');
-  const value = select.value;
-  const saved = state.ffmpegTemplates.find((item) => item.id === value);
-  const active = value !== '';
-  $('#pf-template-editor').classList.toggle('hide', !active);
-  $('#btn-template-save-new').disabled = !active || !$('#pf-template-command').value.trim();
-  $('#btn-template-save').disabled = !saved;
-  $('#btn-template-delete').disabled = !saved;
-  $('#btn-template-default').disabled = !saved || state.defaultFfmpegTemplateId === saved.id;
-  $('#btn-template-default').textContent = saved && state.defaultFfmpegTemplateId === saved.id
-    ? 'default for new streams' : 'set as default for new streams';
-}
-
-function renderFfmpegTemplateControls(profile = {}) {
-  const select = $('#pf-template-select');
-  const options = [
-    new Option('Guided profile builder', ''),
-    new Option('Custom command…', TEMPLATE_CUSTOM_VALUE),
-    // A disabled template stays selectable for editing, but the label says so:
-    // at playback time the relay skips it and falls back to the guided builder.
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}${item.enabled === false ? ' (disabled)' : ''}`, item.id)),
-  ];
-  select.replaceChildren(...options);
-  const saved = state.ffmpegTemplates.find((item) => item.id === profile.ffmpegTemplateId);
-  select.value = saved ? saved.id : profile.ffmpegTemplate ? TEMPLATE_CUSTOM_VALUE : '';
-  $('#pf-template-command').value = profile.ffmpegTemplate || (saved?.command || '');
-  $('#pf-template-name').value = profile.ffmpegTemplateName || saved?.name || (profile.ffmpegTemplate ? 'Custom template' : '');
-  updateFfmpegTemplateButtons();
-}
-
-function selectFfmpegTemplate() {
-  const value = $('#pf-template-select').value;
-  const saved = state.ffmpegTemplates.find((item) => item.id === value);
-  if (saved) {
-    $('#pf-template-command').value = saved.command;
-    $('#pf-template-name').value = saved.name;
-    $('#pf-container').value = saved.container;
-  } else if (value === TEMPLATE_CUSTOM_VALUE) {
-    if (!$('#pf-template-command').value.trim()) {
-      $('#pf-template-command').value = starterFfmpegTemplate($('#pf-container').value);
-    }
-    if (!$('#pf-template-name').value.trim()) $('#pf-template-name').value = 'Custom template';
-  } else {
-    $('#pf-template-command').value = '';
-    $('#pf-template-name').value = '';
-  }
-  updateFfmpegTemplateButtons();
-  updateCommandPreview();
-}
-
-function currentTemplateProfileFields() {
-  const value = $('#pf-template-select').value;
-  const active = value !== '';
-  return {
-    ffmpegTemplate: active ? $('#pf-template-command').value.trim() : '',
-    ffmpegTemplateId: active && value !== TEMPLATE_CUSTOM_VALUE ? value : '',
-    ffmpegTemplateName: active ? $('#pf-template-name').value.trim() : '',
-  };
-}
-
-async function saveFfmpegTemplate({ update = false, makeDefault = false } = {}) {
-  const selectedId = $('#pf-template-select').value;
-  const existing = state.ffmpegTemplates.find((item) => item.id === selectedId);
-  if (update && !existing) return toast('Select a saved template before updating it', 'warn');
-  const name = $('#pf-template-name').value.trim();
-  const command = $('#pf-template-command').value.trim();
-  const container = $('#pf-container').value;
-  if (!name) return toast('Give the FFmpeg template a name first', 'warn');
-  if (!command) return toast('The FFmpeg template command is empty', 'warn');
-  const item = { id: existing?.id || newFfmpegTemplateId(), name, command, container };
-  const templates = existing
-    ? state.ffmpegTemplates.map((template) => template.id === existing.id ? item : template)
-    : [...state.ffmpegTemplates, item];
-  const defaultFfmpegTemplateId = makeDefault ? item.id : state.defaultFfmpegTemplateId;
-  const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT', body: { templates, defaultFfmpegTemplateId },
-  });
-  state.ffmpegTemplates = result.templates;
-  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-  state.ffmpegTemplatesLoaded = true;
-  renderFfmpegTemplateControls({
-    ffmpegTemplate: command, ffmpegTemplateId: item.id, ffmpegTemplateName: item.name,
-  });
-  $('#pf-container').value = container;
-  toast(makeDefault ? 'Template saved and set as the default for new streams' : 'FFmpeg template saved', 'ok');
-  updateCommandPreview();
-}
-
-async function deleteFfmpegTemplate() {
-  const id = $('#pf-template-select').value;
-  const existing = state.ffmpegTemplates.find((item) => item.id === id);
-  if (!existing) return;
-  if (!window.confirm(`Delete FFmpeg template “${existing.name}”?`)) return;
-  const templates = state.ffmpegTemplates.filter((item) => item.id !== id);
-  const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === id ? '' : state.defaultFfmpegTemplateId;
-  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
-  for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === id) ffmpegDefaults[output] = '';
-  const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults },
-  });
-  state.ffmpegTemplates = result.templates;
-  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-  state.ffmpegDefaults = result.ffmpegDefaults || {};
-  $('#pf-template-select').value = TEMPLATE_CUSTOM_VALUE;
-  $('#pf-template-name').value = 'Custom template';
-  updateFfmpegTemplateButtons();
-  toast('FFmpeg template deleted', 'ok');
-  updateCommandPreview();
-}
-
-/* ================= TRANSCODE TEMPLATES (dedicated page) ================= */
-
-/** All templates know which output types they want to drive. */
-state.tplEditor = null;
-state.ffmpegDefaults = state.ffmpegDefaults || {};
-/** Structured FFmpeg fields of the template being edited (see ffmpeg-options.js). */
-state.tplOptions = null;
-state.tplMessages = [];
-/** False while the fields still have to be read out of the command text. */
-state.tplOptionsSynced = true;
-/** Fields a parse starts from (null = nothing is assumed). */
-state.tplParseBase = null;
-state.tplRenderedCommand = '';
-/** Guards against an old build/parse response overwriting a newer editor state. */
-let tplRequestSeq = 0;
-let tplBuildTimer = null;
-let tplParseTimer = null;
-
-/**
- * Select a template for editing.
- *
- * The structured fields (state.tplOptions) are loaded from the template when it
- * has them; a template without fields (saved from the Stream tab, or by an
- * older version) has its command parsed into fields instead, so every existing
- * template becomes editable here.
- */
-function tplEditorSelect(template) {
-  state.tplEditor = template ? { ...template, output: { ...(template.output || {}) }, enabled: template.enabled !== false } : null;
-  state.tplMessages = [];
-  tplRequestSeq += 1;
-  if (!template) {
-    state.tplOptions = null;
-    renderTplEditor();
-    return;
-  }
-  const container = ['mpegts', 'matroska', 'hls'].includes(template.container) ? template.container : 'mpegts';
-  state.tplOptions = tplDefaultOptions(container);
-  state.tplRenderedCommand = String(template.command || '').trim();
-  state.tplOptionsSynced = false;
-  // Parsing starts from the *stored* fields when there are any (they can hold
-  // values a command cannot express, such as a dormant bitrate in CQP mode);
-  // for a hand-written command it starts from nothing, so no default is
-  // invented for a flag the operator never used.
-  state.tplParseBase = null;
-  if (template.options && typeof template.options === 'object') {
-    state.tplOptions = {
-      ...state.tplOptions,
-      ...template.options,
-      output_format: container,
-      advanced: Array.isArray(template.options.advanced) ? template.options.advanced.map((entry) => ({ ...entry })) : [],
-    };
-    state.tplOptionsSynced = true;
-    state.tplParseBase = state.tplOptions;
-    renderTplEditor();
-  } else {
-    renderTplEditor();
-    // No stored fields: read them out of the command and normalise the command
-    // from what was read, so the textarea and the controls always agree.
-    tplReadFieldsFromCommand({ rebuild: true, announce: true });
-  }
-}
-
-function tplOutputLabel(key) { return OUTPUT_LABELS[key] || key; }
-
-function tplShortCommand(command = '') {
-  const trimmed = String(command || '').replace(/\s+/g, ' ').trim();
-  return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
-}
-
-function tplSchema() { return state.ffmpegTemplateSchema || null; }
-
-/**
- * Default fields for a new template: a passthrough remux into the template's
- * container — exactly what the Stream tab has always suggested — now editable
- * as parameters instead of hand-written text.
- */
-function tplDefaultOptions(container = 'mpegts') {
-  const fallback = {
-    hw_accel: 'none', device: '/dev/dri/renderD128', resolution: 'source', aspect: '16:9',
-    video_codec: 'copy', video_bitrate: '', maxrate: '', bufsize: '', fps: '', gop: '',
-    profile: '', level: '', vf_preset: 'none', low_power: false, rc_mode: 'VBR', global_quality: '',
-    async_depth: '', audio_codec: 'copy', audio_bitrate: '', audio_channels: '', audio_rate: '',
-    subs: 'drop', extra_input: '', extra_output: '', advanced: [],
-  };
-  const defaults = { ...fallback, ...((tplSchema()?.defaults) || {}), output_format: container, advanced: [] };
-  if (!Array.isArray(defaults.advanced)) defaults.advanced = [];
-  return defaults;
-}
-
-function tplOptionValue(key) {
-  const options = state.tplOptions || {};
-  if (key === 'output_format') return options.output_format || state.tplEditor?.container || 'mpegts';
-  const value = options[key];
-  return value === undefined || value === null ? '' : value;
-}
-
-/** One parameter control, built from the server-side schema. */
-function tplFieldControl(def) {
-  const id = `tpl-opt-${def.key}`;
-  const value = tplOptionValue(def.key);
-  const choices = Array.isArray(def.choices) ? def.choices : [];
-  const label = `<label for="${id}">${escapeHtml(def.label)}</label>`;
-  const hint = def.help ? `<p class="param-hint">${escapeHtml(def.help)}</p>` : '';
-  const presetLabel = (choice) => (choice === '' ? '(default)' : (def.labels && def.labels[choice]) || choice);
-  if (def.kind === 'bool') {
-    const current = value === true || value === 'true' ? 'true' : 'false';
-    return `<div class="param-field${current === 'true' ? ' on' : ''}" data-param="${def.key}">${label}
-      <select id="${id}" data-param-input="${def.key}">
-        <option value="false"${current === 'false' ? ' selected' : ''}>disabled</option>
-        <option value="true"${current === 'true' ? ' selected' : ''}>enabled</option>
-      </select>${hint}</div>`;
-  }
-  if (def.kind === 'enum' && def.custom === false) {
-    const extra = value !== '' && !choices.includes(value) ? [value] : [];
-    const options = [...choices, ...extra]
-      .map((choice) => `<option value="${escapeHtml(choice)}"${String(value) === String(choice) ? ' selected' : ''}>${escapeHtml(presetLabel(choice))}</option>`)
-      .join('');
-    return `<div class="param-field" data-param="${def.key}">${label}
-      <select id="${id}" data-param-input="${def.key}">${options}</select>${hint}</div>`;
-  }
-  const listId = `${id}-list`;
-  const datalist = choices.length
-    ? `<datalist id="${listId}">${choices.map((choice) => `<option value="${escapeHtml(choice)}">${escapeHtml(presetLabel(choice))}</option>`).join('')}</datalist>`
-    : '';
-  const inputMode = ['integer', 'number', 'positive', 'rate'].includes(def.kind) ? ' inputmode="decimal"' : '';
-  const className = def.kind === 'flags' || def.kind === 'rate' ? ' class="mono"' : '';
-  const placeholder = def.kind === 'resolution' ? 'source or 1280x720'
-    : def.kind === 'rate' ? 'e.g. 8000k' : def.kind === 'flags' ? 'additional ffmpeg flags' : '';
-  return `<div class="param-field" data-param="${def.key}">${label}
-    <input id="${id}" data-param-input="${def.key}"${className}${inputMode} value="${escapeHtml(String(value))}" placeholder="${escapeHtml(placeholder)}" list="${listId}" autocomplete="off">
-    ${datalist}${hint}</div>`;
-}
-
-function tplRenderParameters() {
-  const host = $('#tpl-editor-fields');
-  if (!host) return;
-  const schema = tplSchema();
-  if (!schema) {
-    host.innerHTML = '<div class="meta">the parameter schema could not be loaded — reload the page</div>';
-    return;
-  }
-  if (!state.tplEditor) {
-    host.innerHTML = '<div class="meta">Pick a template from the list (or press “+ New template”) to edit its parameters here.</div>';
-    return;
-  }
-  if (!state.tplOptions) state.tplOptions = tplDefaultOptions();
-  host.innerHTML = (schema.groups || []).map((group) => {
-    const fields = (schema.fields || []).filter((def) => def.group === group.id);
-    if (!fields.length) return '';
-    return `<div class="param-group">${escapeHtml(group.label)}</div>${fields.map(tplFieldControl).join('')}`;
-  }).join('');
-}
-
-function tplAdvancedDefinition(flag) {
-  return (tplSchema()?.advanced || []).find((entry) => entry.flag === flag) || null;
-}
-
-function tplRenderAdvanced() {
-  const host = $('#tpl-editor-adv-rows');
-  if (!host) return;
-  const rows = Array.isArray(state.tplOptions?.advanced) ? state.tplOptions.advanced : [];
-  const count = $('#tpl-editor-adv-count');
-  if (count) count.textContent = rows.length ? `· ${rows.length} set` : '· none set';
-  host.innerHTML = rows.length ? rows.map((entry, index) => {
-    const def = tplAdvancedDefinition(entry.flag);
-    const choices = def?.choices || [];
-    const listId = `tpl-adv-values-${index}`;
-    const datalist = choices.length
-      ? `<datalist id="${listId}">${choices.map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('')}</datalist>`
-      : '';
-    const title = def ? `${def.label} — ${def.help}` : 'custom ffmpeg flag';
-    return `<div class="adv-row" data-adv-index="${index}">
-      <div class="adv-flag" title="${escapeHtml(title)}">${escapeHtml(entry.flag)} <span class="adv-side">${escapeHtml(entry.side || 'output')}</span></div>
-      <input class="mono" data-adv-value="${index}" value="${escapeHtml(String(entry.value ?? ''))}" placeholder="value" list="${listId}" autocomplete="off">
-      <button type="button" class="btn sm ghost" data-adv-remove="${index}" title="remove this parameter">✕</button>
-      ${datalist}
-    </div>`;
-  }).join('') : '<div class="meta">No advanced parameters set — vu-movie\'s own safe defaults apply.</div>';
-
-  const picker = $('#tpl-adv-flag');
-  if (picker) {
-    const advanced = tplSchema()?.advanced || [];
-    const groups = [['input', 'input — before -i'], ['output', 'output — encoder / muxer']];
-    picker.replaceChildren(...groups.flatMap(([side, label]) => {
-      const entries = advanced.filter((entry) => entry.side === side);
-      if (!entries.length) return [];
-      const optgroup = document.createElement('optgroup');
-      optgroup.label = label;
-      for (const entry of entries) optgroup.append(new Option(`${entry.flag} — ${entry.label}`, entry.flag));
-      return [optgroup];
-    }), new Option('custom flag…', '__custom__'));
-  }
-  const customRow = $('#tpl-adv-custom-row');
-  if (customRow) customRow.classList.toggle('hide', picker?.value !== '__custom__');
-  const valueList = $('#tpl-adv-values');
-  if (valueList) {
-    const def = tplAdvancedDefinition($('#tpl-adv-flag')?.value);
-    valueList.innerHTML = (def?.choices || []).map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('');
-  }
-}
-
-function tplRenderMessages() {
-  const host = $('#tpl-editor-messages');
-  if (!host) return;
-  const messages = state.tplMessages || [];
-  host.innerHTML = messages.length
-    ? messages.map((entry) => `<div class="param-msg ${entry.level}">${escapeHtml(entry.text)}</div>`).join('')
-    : '';
-}
-
-function tplSetMessages(messages) {
-  state.tplMessages = messages.filter(Boolean);
-  tplRenderMessages();
-}
-
-function tplSetStatus(text) {
-  const el = $('#tpl-editor-sync-status');
-  if (el) el.textContent = text || '';
-}
-
-function tplOptionsForRequest() {
-  const options = { ...(state.tplOptions || {}) };
-  options.output_format = state.tplEditor?.container || options.output_format || 'mpegts';
-  options.advanced = (options.advanced || []).map((entry) => ({ ...entry }));
-  return options;
-}
-
-/**
- * Fields → command: the server renders the command (one implementation, no
- * second copy in the browser), the textarea shows the result.
- */
-async function tplBuildCommandNow({ announce = true } = {}) {
-  if (!state.tplEditor || !state.tplOptions) return false;
-  const seq = ++tplRequestSeq;
-  const container = state.tplEditor.container || 'mpegts';
-  const meta = $('#tpl-editor-cmd-meta');
-  if (meta) meta.textContent = 'rendering…';
-  try {
-    const res = await api('/api/ffmpeg/templates/build', {
-      method: 'POST', silent: true,
-      body: { options: tplOptionsForRequest(), container },
-    });
-    if (seq !== tplRequestSeq) return false;
-    state.tplEditor.command = res.command;
-    state.tplRenderedCommand = res.command;
-    state.tplOptionsSynced = true;
-    state.tplParseBase = state.tplOptions;
-    const textarea = $('#tpl-editor-command');
-    if (textarea) textarea.value = res.command;
-    const messages = [
-      ...(res.errors || []).map((text) => ({ level: 'err', text })),
-      ...(res.warnings || []).map((text) => ({ level: 'warn', text })),
-    ];
-    tplSetMessages(messages);
-    if (meta) meta.textContent = `${res.command.split(/\s+/).length} tokens · ${container}`;
-    if (announce) {
-      tplSetStatus(res.errors?.length ? 'the parameters need attention' : 'command rendered from the parameters');
-    }
-    return true;
+    if (seq !== resolveSeq) return;
+    state.candidates = (data.candidates || []).map((candidate) => ({ ...candidate, _entry: { sourceId: candidate.sourceId } }));
+    state.resolving = false;
+    renderCandidates(state.candidates, {});
+    $('#sel-meta').textContent = `${state.candidates.length} format(s) found${data.error ? ` — ${data.error}` : ''}`;
+    renderSelectionActions();
   } catch (error) {
-    if (seq === tplRequestSeq && meta) meta.textContent = 'could not render the command';
-    if (seq === tplRequestSeq) tplSetMessages([{ level: 'err', text: `could not render the command: ${error.message || error}` }]);
-    return false;
-  }
-}
-
-/** command → fields (used when a template without stored fields is opened). */
-async function tplReadFieldsFromCommand({ rebuild = false, announce = true } = {}) {
-  if (!state.tplEditor) return false;
-  const command = ($('#tpl-editor-command')?.value ?? state.tplEditor.command ?? '').trim();
-  if (!command) return false;
-  const seq = ++tplRequestSeq;
-  tplSetStatus('reading parameters from the command…');
-  try {
-    const res = await api('/api/ffmpeg/templates/parse', {
-      method: 'POST', silent: true,
-      body: { command, container: state.tplEditor.container || 'mpegts', base: state.tplParseBase },
-    });
-    if (seq !== tplRequestSeq) return false;
-    state.tplOptions = {
-      ...tplDefaultOptions(state.tplEditor.container || 'mpegts'),
-      ...res.options,
-      output_format: state.tplEditor.container || 'mpegts',
-      advanced: Array.isArray(res.options?.advanced) ? res.options.advanced.map((entry) => ({ ...entry })) : [],
-    };
-    state.tplOptionsSynced = true;
-    state.tplParseBase = state.tplOptions;
-    renderTplEditor();
-    const messages = [
-      ...(res.warnings || []).map((text) => ({ level: 'warn', text })),
-      ...(res.errors || []).map((text) => ({ level: 'err', text })),
-    ];
-    tplSetMessages(messages);
-    if (announce) tplSetStatus('parameters read from the command');
-    if (!rebuild) return true;
-    const rebuilt = await tplBuildCommandNow({ announce: false });
-    // A command the fields cannot express byte for byte (an unusual -vf, no
-    // -c:a, …) comes back normalised. Say so instead of letting the textarea
-    // change under the operator's hands without explanation.
-    if (rebuilt && ($('#tpl-editor-command')?.value || '').trim() !== command) {
-      state.tplMessages = [
-        { level: 'info', text: 'The command was normalised so it matches the parameters (the parameters are what gets saved and run).' },
-        ...(state.tplMessages || []),
-      ];
-      tplRenderMessages();
-    }
-    return rebuilt;
-  } catch (error) {
-    if (seq === tplRequestSeq) tplSetMessages([{ level: 'err', text: `could not read the command: ${error.message || error}` }]);
-    return false;
-  }
-}
-
-function tplScheduleBuild() {
-  clearTimeout(tplBuildTimer);
-  tplBuildTimer = setTimeout(() => { tplBuildCommandNow(); }, 250);
-}
-
-function tplScheduleParse() {
-  clearTimeout(tplParseTimer);
-  tplParseTimer = setTimeout(() => { tplReadFieldsFromCommand({ rebuild: false }); }, 700);
-}
-
-/** One parameter changed: store it and let the server re-render the command. */
-function tplApplyOptionChange(key, value) {
-  if (!state.tplOptions) return;
-  const def = (tplSchema()?.fields || []).find((entry) => entry.key === key);
-  state.tplOptions[key] = def?.kind === 'bool' ? value === 'true' : value;
-  if (key === 'output_format') {
-    state.tplEditor.container = value;
-    const select = $('#tpl-editor-container');
-    if (select) select.value = value;
-  }
-  tplScheduleBuild();
-}
-
-function tplRenderEditorOutputs() {
-  const editor = state.tplEditor || null;
-  const outputsEl = $('#tpl-editor-outputs');
-  if (!outputsEl) return;
-  outputsEl.innerHTML = OUTPUT_TYPES.map((output) => {
-    const on = Boolean(editor?.output && editor.output[output]);
-    return `
-      <label class="row${on ? ' on' : ''}" data-output="${output}">
-        <input type="checkbox" data-output-check="${output}" ${on ? 'checked' : ''} ${editor ? '' : 'disabled'}>
-        <span>
-          <span class="output-name">${escapeHtml(tplOutputLabel(output))}</span>
-          <span class="output-meta">${escapeHtml(tplOutputHint(output))}</span>
-        </span>
-      </label>`;
-  }).join('');
-}
-
-function renderTemplatesPage() {
-  const list = $('#tpl-list');
-  if (!list) return;
-  if (!state.ffmpegTemplates.length) {
-    list.innerHTML = '<div class="meta" style="padding:14px">No templates saved yet — click “New template” or save one from the Stream tab.</div>';
-  } else {
-    list.innerHTML = state.ffmpegTemplates.map((item) => {
-      const outputs = OUTPUT_TYPES.filter((output) => item.output && item.output[output]).map((output) => tplOutputLabel(output));
-      const isDefault = state.defaultFfmpegTemplateId === item.id;
-      const isEditor = state.tplEditor && state.tplEditor.id === item.id;
-      const disabled = item.enabled === false;
-      const fields = item.options ? Object.keys(item.options).filter((key) => key !== 'advanced').length : 0;
-      return `
-        <div class="template-list-row${isEditor ? ' selected' : ''}${disabled ? ' disabled' : ''}" data-tpl-row="${escapeHtml(item.id)}">
-          <div style="min-width:0;flex:1">
-            <div class="tname">${escapeHtml(item.name || 'unnamed')}${isDefault ? ' <span class="tag alt">default</span>' : ''}${disabled ? ' <span class="tag warn">disabled</span>' : ''}</div>
-            <div class="tmeta">${escapeHtml(item.container || '—')} · ${outputs.length ? outputs.map((o) => `<span class="tag">${escapeHtml(o)}</span>`).join('') : '<span class="mut">no outputs assigned</span>'}${fields ? ` · <span class="tag info">${fields} fields</span>` : ''}</div>
-            <div class="tmeta mono" style="margin-top:3px">${escapeHtml(tplShortCommand(item.command))}</div>
-          </div>
-          <div class="tactions">
-            <button class="btn sm" data-tpl-edit="${escapeHtml(item.id)}">edit</button>
-            <button class="btn sm ghost" data-tpl-default="${escapeHtml(item.id)}">${isDefault ? 'default' : 'set default'}</button>
-            <button class="btn sm ghost" data-tpl-test-row="${escapeHtml(item.id)}">▷ test</button>
-            <button class="btn sm ghost" data-tpl-delete="${escapeHtml(item.id)}">delete</button>
-          </div>
-        </div>`;
-    }).join('');
-  }
-
-  // Default template selector in the page header.
-  const defSel = $('#tpl-default');
-  defSel.replaceChildren(
-    new Option('(no default — guided profile builder)', ''),
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
-  );
-  defSel.value = state.defaultFfmpegTemplateId || '';
-  $('#btn-tpl-set-default').disabled = !state.tplEditor?.id
-    || state.defaultFfmpegTemplateId === state.tplEditor.id;
-
-  renderTplEditor();
-}
-
-function renderTplEditor() {
-  const editor = state.tplEditor || null;
-  const titleEl = $('#tpl-editor-title');
-  const nameEl = $('#tpl-editor-name');
-  const descEl = $('#tpl-editor-description');
-  const cmdEl = $('#tpl-editor-command');
-  const containerEl = $('#tpl-editor-container');
-  const enabledEl = $('#tpl-editor-enabled');
-  if (!editor) {
-    titleEl.textContent = 'Template editor';
-    nameEl.value = '';
-    descEl.value = '';
-    cmdEl.value = '';
-    containerEl.value = 'mpegts';
-    if (enabledEl) enabledEl.checked = true;
-    state.tplOptions = null;
-    state.tplOptionsSynced = true;
-    state.tplRenderedCommand = '';
-    state.tplParseBase = null;
-    tplRenderParameters();
-    tplRenderAdvanced();
-    tplSetMessages([]);
-    tplSetStatus('');
-    const meta = $('#tpl-editor-cmd-meta');
-    if (meta) meta.textContent = '';
-    tplRenderEditorOutputs();
-    $('#btn-tpl-save').disabled = true;
-    $('#btn-tpl-save-top').disabled = true;
-    $('#btn-tpl-delete').disabled = true;
-    $('#tpl-editor-status').textContent = 'Click “+ New template” or pick one from the list.';
-    return;
-  }
-  titleEl.textContent = `Editing “${editor.name || 'untitled'}”`;
-  nameEl.value = editor.name || '';
-  descEl.value = editor.description || '';
-  cmdEl.value = editor.command || '';
-  containerEl.value = editor.container || 'mpegts';
-  if (enabledEl) enabledEl.checked = editor.enabled !== false;
-  tplRenderParameters();
-  tplRenderAdvanced();
-  tplRenderMessages();
-  const meta = $('#tpl-editor-cmd-meta');
-  if (meta && !meta.textContent) meta.textContent = `${String(editor.command || '').split(/\s+/).filter(Boolean).length} tokens · ${editor.container || 'mpegts'}`;
-  tplRenderEditorOutputs();
-  $('#btn-tpl-save').disabled = false;
-  $('#btn-tpl-save-top').disabled = false;
-  $('#btn-tpl-delete').disabled = !editor.id || state.defaultFfmpegTemplateId === editor.id;
-  $('#tpl-editor-status').textContent = editor.id
-    ? (state.defaultFfmpegTemplateId === editor.id ? 'This template is the global default.' : 'Save to apply changes.')
-    : 'New template — save to add it to the library.';
-}
-
-function tplOutputHint(output) {
-  switch (output) {
-    case 'vlcTs': return '.ts URL · desktop player';
-    case 'vlcMkv': return '.mkv URL · desktop player';
-    case 'm3u8': return 'HLS playlist URL';
-    case 'm3u': return 'M3U playlist file';
-    case 'enigma2': return 'Bouquet entry for VU+ / Duo2';
-    case 'direct': return 'Direct 302 redirect';
-    case 'download': return 'Saved-to-disk copy';
-    default: return '';
-  }
-}
-
-function tplCollectFromEditor() {
-  const editor = state.tplEditor || {};
-  const outputs = {};
-  for (const output of OUTPUT_TYPES) {
-    const checkbox = $(`#tpl-editor-outputs input[data-output-check="${output}"]`);
-    if (checkbox && checkbox.checked) outputs[output] = editor.id || '__self__';
-  }
-  const container = $('#tpl-editor-container').value;
-  const item = {
-    id: editor.id || newFfmpegTemplateId(),
-    name: $('#tpl-editor-name').value.trim(),
-    description: $('#tpl-editor-description').value.trim(),
-    container,
-    command: $('#tpl-editor-command').value.trim(),
-    enabled: $('#tpl-editor-enabled')?.checked !== false,
-    output: outputs,
-  };
-  // The fields are authoritative: the server renders the stored command from
-  // them, so what the editor shows is exactly what the relay will run.
-  if (state.tplOptions) {
-    item.options = { ...tplOptionsForRequest(), output_format: container };
-  }
-  return item;
-}
-
-async function tplSave({ makeDefault = false } = {}) {
-  if (!state.tplEditor) return;
-  clearTimeout(tplBuildTimer);
-  clearTimeout(tplParseTimer);
-  // The command text may have been edited (or pasted) less than a debounce ago.
-  // Re-read the fields from it first, so saving never throws away what is in
-  // the box in favour of the older parameter state.
-  const typed = $('#tpl-editor-command')?.value.trim() || '';
-  if (typed && (!state.tplOptionsSynced || typed !== state.tplRenderedCommand)) {
-    await tplReadFieldsFromCommand({ rebuild: true, announce: false });
-  }
-  const item = tplCollectFromEditor();
-  if (!item.name) return toast('Give the template a name first', 'warn');
-  if (!item.command) return toast('The template command is empty', 'warn');
-  if (!['mpegts', 'matroska', 'hls'].includes(item.container)) return toast('Pick a container', 'warn');
-  const existing = state.ffmpegTemplates.find((t) => t.id === item.id);
-  const next = existing
-    ? state.ffmpegTemplates.map((t) => (t.id === item.id ? item : t))
-    : [...state.ffmpegTemplates, item];
-  const defaultFfmpegTemplateId = makeDefault
-    ? item.id
-    : (state.defaultFfmpegTemplateId || '');
-  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
-  // If this template is no longer the editor's owner of an output, drop the assignment.
-  for (const [output, owner] of Object.entries(ffmpegDefaults)) {
-    if (owner !== item.id) continue;
-    if (!item.output[output]) ffmpegDefaults[output] = '';
-  }
-  // Promote any freshly ticked outputs to "this template is the default" so
-  // operators don't have to flip them in two places after editing.
-  for (const [output, owner] of Object.entries(item.output)) {
-    if (owner === '__self__') ffmpegDefaults[output] = item.id;
-    if (owner === item.id) ffmpegDefaults[output] = item.id;
-  }
-  const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT', body: { templates: next, defaultFfmpegTemplateId, ffmpegDefaults },
-  });
-  state.ffmpegTemplates = result.templates;
-  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-  state.ffmpegDefaults = result.ffmpegDefaults || {};
-  state.ffmpegTemplatesLoaded = true;
-  tplEditorSelect(result.templates.find((t) => t.id === item.id) || null);
-  renderTemplatesPage();
-  if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
-  renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
-  toast(makeDefault ? 'Template saved and set as default' : 'Template saved', 'ok');
-  updateCommandPreview();
-}
-
-async function tplDelete() {
-  const editor = state.tplEditor;
-  if (!editor?.id) { tplEditorSelect(null); return; }
-  if (!window.confirm(`Delete template “${editor.name || editor.id}”?`)) return;
-  const templates = state.ffmpegTemplates.filter((t) => t.id !== editor.id);
-  const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === editor.id ? '' : state.defaultFfmpegTemplateId;
-  const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
-  for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === editor.id) ffmpegDefaults[output] = '';
-  const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults },
-  });
-  state.ffmpegTemplates = result.templates;
-  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-  state.ffmpegDefaults = result.ffmpegDefaults || {};
-  tplEditorSelect(null);
-  renderTemplatesPage();
-  if (state.stream) renderFfmpegTemplateControls(state.stream.profile || {});
-  renderOutputTemplates(state.stream?.profile?.outputTemplates || {});
-  toast('Template deleted', 'ok');
-}
-
-async function tplSetDefaultFromList(id) {
-  const existing = state.ffmpegTemplates.find((t) => t.id === id);
-  if (!existing) return;
-  const result = await api('/api/ffmpeg/templates', {
-    method: 'PUT',
-    body: {
-      templates: state.ffmpegTemplates,
-      defaultFfmpegTemplateId: state.defaultFfmpegTemplateId === id ? '' : id,
-      ffmpegDefaults: state.ffmpegDefaults,
-    },
-  });
-  state.ffmpegTemplates = result.templates;
-  state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-  state.ffmpegDefaults = result.ffmpegDefaults || {};
-  renderTemplatesPage();
-  toast(state.defaultFfmpegTemplateId === id ? 'Set as default' : 'Default cleared', 'ok');
-}
-
-/* ---------------- TEMPLATE TEST PANEL ---------------- */
-
-const TPL_TEST_INLINE_VALUE = '__inline__';
-state.tplTest = { inFlight: false, lastResult: null };
-
-function tplTestVerdictClass(result) {
-  if (!result) return '';
-  if (result.ok) return 'ok';
-  if (result.error) return 'err';
-  return 'warn';
-}
-
-function tplTestSummary(result) {
-  if (!result) return 'Press “Run test” to spawn ffmpeg against the chosen stream.';
-  if (result.error) {
-    return `ffmpeg could not be spawned: ${escapeHtml(result.error)}`;
-  }
-  const parts = [
-    result.bytesOut ? `${fmtBytes(result.bytesOut)} produced` : 'no bytes produced',
-    `ran for ${(result.durationMs / 1000).toFixed(1)} s`,
-    result.exitCode != null ? `exit ${result.exitCode}` : '',
-    result.signal ? `signal ${result.signal}` : '',
-    result.timedOut ? 'timed out (test window reached)' : '',
-  ].filter(Boolean);
-  const verdict = result.ok ? 'Looks healthy.' : (parts[0] === 'no bytes produced' ? 'No data reached the output — the template is not transcoding this stream.' : 'ffmpeg exited with an error.');
-  return `${verdict} ${parts.join(' · ')}.`;
-}
-
-function fmtProgressValue(value) {
-  if (value === null || value === undefined) return '—';
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) return '—';
-    if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
-    return String(value);
-  }
-  return String(value);
-}
-
-function tplTestProgressMeta(result) {
-  if (!result || !result.progress || !Object.keys(result.progress).length) return '';
-  const p = result.progress;
-  const items = [
-    p.bitrate ? `bitrate: ${p.bitrate}` : null,
-    p.fps ? `fps: ${p.fps}` : null,
-    p.speed ? `speed: ${p.speed}` : null,
-    p.frame != null ? `frame: ${p.frame}` : null,
-    p.outTimeMs != null ? `time: ${(Number(p.outTimeMs) / 1000).toFixed(1)}s` : null,
-    p.dropFrames != null ? `dropped: ${p.dropFrames}` : null,
-  ].filter(Boolean);
-  return items.join(' · ');
-}
-
-function renderTplTestPanel() {
-  const tmplSel = $('#tpl-test-template');
-  const streamSel = $('#tpl-test-stream');
-  const verdict = $('#tpl-test-verdict');
-  const summary = $('#tpl-test-summary');
-  const cmdEl = $('#tpl-test-cmd');
-  const stderrEl = $('#tpl-test-stderr');
-  const cmdMeta = $('#tpl-test-cmd-meta');
-  const progMeta = $('#tpl-test-progress-meta');
-  const statusEl = $('#tpl-test-status');
-  const inlineCommandEl = $('#tpl-test-command');
-  const runBtn = $('#btn-tpl-test-run');
-  const resetBtn = $('#btn-tpl-test-reset');
-
-  if (!tmplSel) return;
-
-  // Template picker: every saved template + an "inline command…" option.
-  const selected = tmplSel.value || '';
-  tmplSel.replaceChildren(
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}${item.enabled === false ? ' (disabled)' : ''}`, item.id)),
-    new Option('(inline command…)', TPL_TEST_INLINE_VALUE),
-  );
-  if (![...tmplSel.options].some((opt) => opt.value === selected)) tmplSel.value = '';
-  else tmplSel.value = selected;
-  if (!tmplSel.value) tmplSel.value = state.tplTest.lastResult?.templateId || (state.ffmpegTemplates[0]?.id || TPL_TEST_INLINE_VALUE);
-
-  // Stream picker: every saved stream (the test runs against the stream's
-  // actual upstream URL + headers, including signed cookies).
-  const streamPicked = streamSel.value || '';
-  streamSel.replaceChildren(
-    new Option('(pick a stream)', ''),
-    ...state.streams.map((s) => new Option(`${s.title}${s.year ? ` (${s.year})` : ''} · ${s.upstream?.quality || s.quality || 'source'}`, s.id)),
-  );
-  if (streamPicked && [...streamSel.options].some((opt) => opt.value === streamPicked)) {
-    streamSel.value = streamPicked;
-  } else if (state.stream?.id) {
-    streamSel.value = state.stream.id;
-  }
-
-  // Inline command visibility follows the picker.
-  if (inlineCommandEl) {
-    const inline = tmplSel.value === TPL_TEST_INLINE_VALUE;
-    inlineCommandEl.disabled = !inline;
-    inlineCommandEl.parentElement?.classList.toggle('hide', !inline);
-    if (inline && !inlineCommandEl.value.trim() && state.tplEditor) {
-      inlineCommandEl.value = state.tplEditor.command || '';
-    }
-  }
-
-  const result = state.tplTest.lastResult;
-  if (result) {
-    verdict.className = `tpl-test-verdict ${tplTestVerdictClass(result)}`;
-    verdict.textContent = result.ok
-      ? `✓ ${result.templateName || 'Template'} ran cleanly`
-      : `✗ ${result.templateName || 'Template'} failed`;
-    summary.textContent = tplTestSummary(result);
-    cmdEl.textContent = result.command || '—';
-    cmdMeta.textContent = `${result.outputType ? `${OUTPUT_LABELS[result.outputType] || result.outputType} · ` : ''}${result.templateId ? `template ${result.templateId}` : 'inline'}`;
-    stderrEl.textContent = (result.stderr && result.stderr.trim()) || '(no stderr captured — ffmpeg probably had nothing to say, which is a good sign)';
-    progMeta.textContent = tplTestProgressMeta(result);
-  } else {
-    verdict.className = 'tpl-test-verdict';
-    verdict.textContent = '(not run yet)';
-    summary.textContent = 'Press “Run test” to spawn ffmpeg against the chosen stream.';
-    cmdEl.textContent = '—';
-    cmdMeta.textContent = '';
-    stderrEl.textContent = '—';
-    progMeta.textContent = '';
-  }
-
-  statusEl.textContent = state.tplTest.inFlight ? 'running ffmpeg…' : '';
-  runBtn.disabled = state.tplTest.inFlight;
-  runBtn.textContent = state.tplTest.inFlight ? '⧗ running…' : '▷ run test';
-  resetBtn.disabled = state.tplTest.inFlight;
-}
-
-async function loadTplTestStreams() {
-  try {
-    const result = await api('/api/streams', { silent: true });
-    state.streams = Array.isArray(result.streams) ? result.streams : state.streams;
-  } catch { /* toast handled */ }
-  renderTplTestPanel();
-}
-
-async function runTplTest() {
-  if (state.tplTest.inFlight) return;
-  const tmplSel = $('#tpl-test-template');
-  const streamSel = $('#tpl-test-stream');
-  const durationEl = $('#tpl-test-duration');
-  const inlineCommandEl = $('#tpl-test-command');
-  const templateId = tmplSel.value;
-  const streamId = streamSel.value;
-  if (!streamId) return toast('Pick a stream to test the template against', 'warn');
-  const durationMs = Math.max(500, Math.min(30000, Number(durationEl.value) * 1000 || 5000));
-  let body;
-  if (templateId === TPL_TEST_INLINE_VALUE) {
-    const command = (inlineCommandEl.value || '').trim();
-    if (!command) return toast('Inline command is empty', 'warn');
-    body = { streamId, durationMs, command, name: 'inline test' };
-  } else {
-    if (!templateId) return toast('Pick a template to render', 'warn');
-    body = { streamId, durationMs };
-  }
-
-  state.tplTest.inFlight = true;
-  renderTplTestPanel();
-  try {
-    const route = templateId === TPL_TEST_INLINE_VALUE
-      ? '/api/ffmpeg/test'
-      : `/api/ffmpeg/templates/${encodeURIComponent(templateId)}/test`;
-    const response = await api(route, { method: 'POST', body });
-    const result = response.result || {};
-    const templateMeta = response.template || {};
-    state.tplTest.lastResult = {
-      ...result,
-      templateId: templateMeta.id || templateId || '',
-      templateName: templateMeta.name || 'inline test',
-      outputType: '',
-    };
-    if (result.ok) toast('Template test succeeded', 'ok');
-    else if (result.error) toast(`Template test failed: ${result.error}`, 'err');
-    else toast('Template test produced no output', 'warn');
-  } catch (err) {
-    state.tplTest.lastResult = {
-      ok: false, error: err.message, command: '', stderr: '',
-      durationMs: 0, bytesOut: 0, exitCode: null, signal: null,
-      templateId, templateName: '', outputType: '',
-    };
+    if (error.name === 'AbortError') return;
+    state.resolving = false;
+    $('#candidates').innerHTML = `<div class="meta">${escapeHtml(error.message)}</div>`;
   } finally {
-    state.tplTest.inFlight = false;
-    renderTplTestPanel();
+    $('#btn-resolve').disabled = false;
   }
 }
 
-function resetTplTest() {
-  state.tplTest.lastResult = null;
-  renderTplTestPanel();
+/* ---------------- find wiring ---------------- */
+
+function wireFind() {
+  $$('#find-tabs button').forEach((button) => button.addEventListener('click', () => setFindTab(button.dataset.t)));
+  $('#btn-search')?.addEventListener('click', doSearch);
+  $('#q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') doSearch(); });
+  $('#btn-sources-all')?.addEventListener('click', () => { state.selectedSources = state.sources.map((source) => source.id); renderSourceChips(); saveSearchState(); });
+  $('#btn-sources-none')?.addEventListener('click', () => { state.selectedSources = []; renderSourceChips(); saveSearchState(); });
+  $('#source-chips')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('.chip');
+    if (!chip) return;
+    const id = chip.dataset.id;
+    state.selectedSources = state.selectedSources.includes(id)
+      ? state.selectedSources.filter((value) => value !== id)
+      : [...state.selectedSources, id];
+    renderSourceChips();
+    saveSearchState();
+  });
+  $('#source-chips')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.target.closest('.chip')?.click(); }
+  });
+  ['q', 'q-type', 'q-moviebox'].forEach((id) => $(`#${id}`)?.addEventListener('change', () => {
+    ui.search.q = $('#q').value;
+    ui.search.type = $('#q-type').value;
+    ui.search.moviebox = $('#q-moviebox').checked;
+    saveSearchState();
+  }));
+  ['u-url', 'u-title', 'u-year', 'u-season', 'u-episode'].forEach((id) => $(`#${id}`)?.addEventListener('input', () => {
+    ui.search.url = $('#u-url').value;
+    ui.search.urlTitle = $('#u-title').value;
+    ui.search.urlYear = $('#u-year').value;
+    ui.search.urlSeason = $('#u-season').value;
+    ui.search.urlEpisode = $('#u-episode').value;
+    saveSearchState();
+  }));
+  $('#u-kind')?.addEventListener('change', () => { ui.search.urlKind = $('#u-kind').value; saveSearchState(); });
+  $('#btn-resolve')?.addEventListener('click', doResolveFromUrl);
+  $('#results-title-filter')?.addEventListener('input', debounce(() => {
+    ui.titleFilter = $('#results-title-filter').value;
+    renderResults();
+  }, 200));
+  $('#results-title-select')?.addEventListener('change', () => {
+    const group = (state.groups || []).find((candidate) => candidate.key === $('#results-title-select').value);
+    if (group) selectGroup(group);
+  });
+  $('#results-provider-filter')?.addEventListener('change', () => {
+    ui.providerFilter = $('#results-provider-filter').value;
+    renderResults();
+  });
+  $('#results-sort')?.addEventListener('change', () => {
+    ui.resultsSort = $('#results-sort').value;
+    writeStoredText(RESULT_SORT_KEY, ui.resultsSort);
+    renderResults();
+  });
+  $('#results-view')?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-view]');
+    if (!button) return;
+    ui.resultsView = button.dataset.view;
+    writeStoredText(RESULT_VIEW_KEY, ui.resultsView);
+    updateResultsViewButtons();
+    renderResults();
+  });
+  $('#results')?.addEventListener('click', (event) => {
+    if (event.target.closest('[data-open-formats]')) {
+      const card = event.target.closest('[data-group]');
+      selectGroup((state.groups || []).find((group) => group.key === card?.dataset.group));
+      return;
+    }
+  });
+  $('#candidates')?.addEventListener('click', (event) => {
+    const add = event.target.closest('[data-add-candidate]');
+    if (add) { addCandidateToPlaylist(Number(add.dataset.addCandidate)); return; }
+    const probe = event.target.closest('[data-probe-url]');
+    if (probe) probeUrl(probe.dataset.probeUrl);
+  });
+  $('#btn-sel-subs-close')?.addEventListener('click', () => $('#sel-subtitle-panel')?.classList.add('hide'));
+  $('#sel-subtitle-results')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-attach-sub]');
+    if (!button) return;
+    const result = state.findSubtitleResults[Number(button.dataset.attachSub)];
+    const target = $('#sel-subtitle-item')?.value;
+    attachSubtitle(result, { streamId: target })
+      .then(() => { $('#sel-subtitle-selection')?.classList.remove('hide'); $('#sel-subtitle-selection').textContent = `attached to ${target}`; })
+      .catch((error) => toast(error.message, 'err'));
+  });
+  $('#sel-season')?.addEventListener('change', () => { updateEpisodeSelect(); applySeasonEpisode(); });
+  $('#sel-episode')?.addEventListener('change', applySeasonEpisode);
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('[data-go-list]')) go('list');
+    const open = event.target.closest('[data-open-stream]');
+    if (open) { VMPlaylist.openMetadata(open.dataset.openStream, { popup: true }); }
+  });
+  $('#dash-jobs')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-cancel]');
+    if (button) {
+      api(`/api/jobs/${button.dataset.cancel}/cancel`, { method: 'POST' })
+        .then(() => loadJobs())
+        .catch(() => {});
+    }
+  });
+  clearSelection();
 }
 
-/** Helper for the per-stream profile test button on the Stream tab. */
-async function testCurrentStreamTemplate() {
-  if (!state.stream) return;
-  await loadFfmpegTemplates(true);
-  await loadTplTestStreams();
-  // Pick the saved template the stream uses; otherwise fall back to inline.
-  const profile = state.stream.profile || {};
-  const tmplSel = $('#tpl-test-template');
-  const streamSel = $('#tpl-test-stream');
-  if (profile.ffmpegTemplateId && state.ffmpegTemplates.find((t) => t.id === profile.ffmpegTemplateId)) {
-    tmplSel.value = profile.ffmpegTemplateId;
-  } else if (profile.ffmpegTemplate && profile.ffmpegTemplate.trim()) {
-    tmplSel.value = TPL_TEST_INLINE_VALUE;
-    $('#tpl-test-command').value = profile.ffmpegTemplate;
-  }
-  streamSel.value = state.stream.id;
-  go('tpl-test');
-}
-
-/* ---- per-output template pickers on the Stream tab ---- */
-
-function renderOutputTemplates(current = {}) {
-  const grid = $('#pf-output-templates');
-  if (!grid) return;
-  const cur = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
-  const opts = [
-    new Option('(inherit)', ''),
-    ...state.ffmpegTemplates.map((item) => new Option(`${item.name} · ${item.container}`, item.id)),
-  ];
-  grid.innerHTML = OUTPUT_TYPES.map((output) => {
-    const sel = document.createElement('select');
-    sel.dataset.output = output;
-    sel.replaceChildren(...opts);
-    sel.value = cur[output] || '';
-    return `<div class="field">
-      <label>${escapeHtml(tplOutputLabel(output))}</label>
-      ${sel.outerHTML}
-      <div class="meta">${escapeHtml(tplOutputHint(output))}</div>
-    </div>`;
-  }).join('');
-}
-
-function readOutputTemplatesFromForm() {
-  const result = {};
-  for (const select of $$('#pf-output-templates select[data-output]')) {
-    const value = select.value;
-    if (value) result[select.dataset.output] = value;
-  }
-  return result;
-}
-
-function readProfileForm() {
-  return {
-    mode: $('#pf-mode').value,
-    resolution: Number($('#pf-res').value),
-    aspect: $('#pf-aspect').value,
-    container: $('#pf-container').value,
-    videoBitrate: Number($('#pf-vbr').value),
-    audioBitrate: Number($('#pf-abr').value),
-    audioChannels: Number($('#pf-ac').value),
-    fps: $('#pf-fps').value,
-    subtitles: $('#pf-subs').value,
-    alwaysTranscode: $('#pf-always').checked,
-    deinterlace: $('#pf-deint').checked,
-    ...currentTemplateProfileFields(),
-    outputTemplates: readOutputTemplatesFromForm(),
-  };
-}
-
-async function openStream(id, { navigate = true, silent = false } = {}) {
-  const requestId = ++streamRequestId;
+async function probeUrl(url) {
+  if (!url) return;
   try {
-    const res = await api(`/api/streams/${encodeURIComponent(String(id))}`, { silent });
-    if (requestId !== streamRequestId) return;
-    state.stream = res.stream;
-    await loadFfmpegTemplates();
-    try { localStorage.setItem(SELECTED_STREAM_KEY, String(res.stream.id)); } catch { /* storage may be disabled */ }
-    renderStream(res);
-    if (navigate) go('stream');
-  } catch (err) {
-    if (requestId !== streamRequestId) return;
-    if (err.message === 'stream not found') {
-      if (readStoredText(SELECTED_STREAM_KEY) === String(id)) {
-        try { localStorage.removeItem(SELECTED_STREAM_KEY); } catch { /* storage may be disabled */ }
-      }
-      if (!state.stream || String(state.stream.id) === String(id)) {
-        state.stream = null;
-        $('#stream-body').classList.add('hide');
-        $('#stream-empty').classList.remove('hide');
-      }
-    }
-    // api() already shows errors unless this is a quiet startup restore.
+    const data = await api(`/api/probe?url=${encodeURIComponent(url)}`, { silent: true });
+    const probe = data.probe || {};
+    const video = probe.video ? `${probe.video.codec} ${probe.video.width}×${probe.video.height}` : 'no video track';
+    toast(`probe ok: ${probe.container || '?'} · ${video} · ${probe.durationSec ? fmtDuration(probe.durationSec) : 'live/unknown'}`, 'ok', 9000);
+  } catch (error) {
+    toast(`probe failed: ${error.message}`, 'err');
   }
 }
 
-function renderStream(res) {
-  const s = res.stream || state.stream;
-  const urls = res.urls || {};
-  $('#stream-empty').classList.add('hide');
-  $('#stream-body').classList.remove('hide');
-  $('#st-title').textContent = `${s.title}${s.year ? ` (${s.year})` : ''}`;
-  $('#st-meta').innerHTML = `${tag(s.upstream?.quality || 'unknown', 'ok')} ${tag(s.upstream?.kind || 'file')} ${tag(s.source_id || s.sourceId || '—')}
-    ${s.expires_at ? `<span class="mut">token until ${new Date(s.expires_at).toLocaleString()}</span>` : '<span class="mut">token never expires</span>'}`;
-  $('#st-tags').innerHTML = `${tag(s.profile?.ffmpegTemplate ? 'custom FFmpeg template' : s.profile?.transcode ? 'transcode' : 'stream copy', s.profile?.ffmpegTemplate || s.profile?.transcode ? 'alt' : 'ok')}
-    ${tag(s.profile?.ffmpegTemplateName || s.profile?.encoder || 'copy')} ${tag(s.profile?.container || 'mpegts', 'info')}
-    ${(s.profile?.reasons || []).slice(0, 2).map((r) => tag(r)).join('')}`;
+/* ====================================================================== *
+ * subtitles
+ * ====================================================================== */
 
-  // Populate the per-output command preview dropdown with the labels from the
-  // backend. The user picks which output to render the ffmpeg command for.
-  const cmdOut = $('#pf-cmd-output');
-  if (cmdOut && !cmdOut.options.length) {
-    cmdOut.replaceChildren(...OUTPUT_TYPES.map((output) => new Option(OUTPUT_LABELS[output] || output, output)));
-  }
-
-  const rows = [
-    ['VLC / any player (.ts)', urls.ts],
-    ['VLC / any player (.mkv)', urls.mkv],
-    ['Playlist (.m3u8)', urls.hls],
-    ['Playlist (.m3u)', urls.playlist],
-    ['Enigma2 / Duo2', urls.forBox],
-    ...(urls.direct ? [['Direct upstream link (302)', urls.direct]] : []),
-    ['Watch in browser', urls.watch],
-  ];
-  $('#st-client-urls').innerHTML = rows.map(([label, url]) => `
-    <div class="field" style="flex:1;min-width:260px;margin-bottom:0">
-      <label>${escapeHtml(label)}</label>
-      <div class="row"><input type="text" class="mono" data-client-url readonly value="${escapeHtml(url || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1">
-      <button type="button" class="btn sm" data-copy-client-url>copy</button></div>
-    </div>`).join('')
-    + (urls.directNote
-      ? `<div class="note mut" style="flex-basis:100%;margin-top:4px">Direct upstream link ${escapeHtml(urls.directNote)}.</div>`
-      : '');
-  $$('#st-client-urls input[data-client-url]').forEach((input) => {
-    input.addEventListener('click', () => input.select());
-  });
-  $$('#st-client-urls button[data-copy-client-url]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const input = button.parentElement.querySelector('input[data-client-url]');
-      if (input) App.copy(input.value);
-    });
-  });
-
-  const p = s.profile || {};
-  renderFfmpegTemplateControls(p);
-  renderOutputTemplates(p.outputTemplates || {});
-  if (p.resolution) $('#pf-res').value = String(p.resolution);
-  if (p.aspect) $('#pf-aspect').value = p.aspect === 'source' ? 'source' : p.aspect;
-  if (p.container) { try { $('#pf-container').value = p.container; } catch { /* hls etc. */ } }
-  if (p.fps) $('#pf-fps').value = p.fps === 'source' ? 'source' : String(p.fps);
-  if (p.videoBitrate) { $('#pf-vbr').value = p.videoBitrate; $('#pf-vbr-l').textContent = `${p.videoBitrate} kbps`; }
-  if (p.audioBitrate) { $('#pf-abr').value = p.audioBitrate; $('#pf-abr-l').textContent = `${p.audioBitrate} kbps`; }
-  // Without this the selector silently fell back to "2 (stereo)" after a reload,
-  // and the next Apply saved stereo over the 5.1 the user had chosen.
-  if (p.audioChannels) { try { $('#pf-ac').value = String(p.audioChannels); } catch { /* keep default */ } }
-  $('#pf-always').checked = Boolean(p.alwaysTranscode);
-  $('#pf-mode').value = p.mode || 'auto';
-  $('#pf-subs').value = p.subtitles || 'soft';
-  $('#pf-note').innerHTML = p.ffmpegTemplate
-    ? `Using <b>${escapeHtml(p.ffmpegTemplateName || 'custom FFmpeg template')}</b>; its command controls the outgoing stream. Guided profile fields are ignored while a template is selected.`
-    : (p.reasons || []).length
-      ? `Decision: <b>${p.transcode ? 'encode' : 'stream copy'}</b> — ${escapeHtml((p.reasons || []).join('; '))}`
-      : 'Profile will be decided when the stream starts.';
-
-  renderProbe(s.upstream?.probe);
-  if (state.health?.hwaccel) {
-    $('#st-hw').innerHTML = `
-      <div class="kv"><span>device</span><span class="mono">${escapeHtml(state.health.hwaccel.device || '')}</span></div>
-      <div class="kv"><span>vaapi</span><span>${state.health.hwaccel.available ? 'available' : 'unavailable'}</span></div>
-      <div class="kv"><span>H.264 encode</span><span>${state.health.hwaccel.h264Encode ? 'yes' : 'no'}</span></div>
-      <div class="kv"><span>HEVC encode</span><span>${state.health.hwaccel.hevcEncode ? 'yes' : 'no (decode only)'}</span></div>
-      <div class="kv"><span>fps filter variant</span><span>${state.health.hwaccel.fpsVariant || '—'}</span></div>`;
-  }
-  updateCommandPreview();
-  const session = res.session;
-  renderMonitor(session);
+async function initSubtitles() {
+  wireSubtitles();
+  await Promise.all([
+    loadProviders().catch((error) => toast(error.message, 'err')),
+    VMPlaylist.load().catch(() => {}),
+  ]);
+  refreshSubTargets();
 }
-
-function renderProbe(probe) {
-  if (!probe) { $('#st-probe').innerHTML = '<div class="meta">no probe data (candidate was not probed)</div>'; return; }
-  const v = probe.video || {};
-  $('#st-probe').innerHTML = `
-    <div class="kv"><span>container</span><span class="mono">${escapeHtml(probe.container || '—')}</span></div>
-    <div class="kv"><span>video</span><span class="mono">${escapeHtml(v.codec || '—')} ${v.width || '?'}x${v.height || '?'} @${v.fps || '?'} </span></div>
-    <div class="kv"><span>bitrate</span><span class="mono">${probe.bitrate ? `${Math.round(probe.bitrate / 1000)} kbps` : '—'}</span></div>
-    <div class="kv"><span>duration</span><span class="mono">${probe.durationSec ? `${Math.floor(probe.durationSec / 60)} min` : '—'}</span></div>
-    <div class="kv"><span>audio</span><span class="mono">${(probe.audio || []).map((a) => `${a.codec}${a.channels ? ` ${a.channels}ch` : ''}`).join(', ') || '—'}</span></div>
-    <div class="kv"><span>subtitle tracks</span><span class="mono">${(probe.subtitles || []).length}</span></div>`;
-}
-
-function renderMonitor(session) {
-  if (!session) { $('#st-monitor').innerHTML = '<div class="meta">no session running</div>'; return; }
-  const st = session.stats || {};
-  $('#st-monitor').innerHTML = `
-    <div class="kv"><span>state</span><b>${session.alive ? 'streaming' : 'stopped'}</b></div>
-    <div class="kv"><span>mode</span><span>${escapeHtml(session.mode)} · ${escapeHtml(session.encoder)}</span></div>
-    <div class="kv"><span>clients</span><span>${session.clients}</span></div>
-    <div class="kv"><span>speed</span><span class="mono">${st.speed || '—'}</span></div>
-    <div class="kv"><span>encoded fps</span><span class="mono">${st.fps ?? '—'}</span></div>
-    <div class="kv"><span>bitrate</span><span class="mono">${st.bitrate || '—'}</span></div>
-    <div class="kv"><span>dropped frames</span><span class="mono">${st.dropFrames ?? 0}</span></div>
-    <div class="kv"><span>out</span><span class="mono">${fmtBytes(session.bytesOut)}</span></div>
-    <div class="kv"><span>uptime</span><span class="mono">${session.uptimeSec}s</span></div>
-    ${session.hls ? `<div class="row" style="margin-top:8px"><a class="btn sm" href="${session.progressUrl}" target="_blank">open HLS playlist ↗</a></div>` : ''}
-    <h3 style="margin-top:12px">ffmpeg command</h3>
-    <pre style="max-height:160px">${escapeHtml(session.command || '')}</pre>`;
-}
-
-let commandTimer = null;
-let commandPreviewRevision = 0;
-function updateCommandPreview() {
-  clearTimeout(commandTimer);
-  const revision = ++commandPreviewRevision;
-  commandTimer = setTimeout(async () => {
-    if (!state.stream) return;
-    try {
-      const outputType = $('#pf-cmd-output')?.value || '';
-      const res = await api(`/api/streams/${state.stream.id}/command`, {
-        method: 'POST', body: { profile: { ...readProfileForm(), outputType } }, silent: true,
-      });
-      if (revision !== commandPreviewRevision) return;
-      $('#cmd-preview').textContent = res.command;
-      if (res.profile.ffmpegTemplate) {
-        $('#pf-note').innerHTML = `Using <b>${escapeHtml(res.profile.ffmpegTemplateName || 'custom FFmpeg template')}</b>; the template controls this outgoing command. The guided fields above are ignored.`;
-      } else {
-        $('#pf-note').innerHTML = `${res.profile.transcode ? '<b>encode</b>' : '<b>stream copy</b>'} — ${escapeHtml((res.profile.reasons || []).join('; '))}
-          ${res.profile.transcode && res.profile.encoder === 'vaapi' && !res.hw.available ? '<br><span class="tag warn">vaapi unavailable here — this command will use software encoding</span>' : ''}`;
-      }
-      const tplLabel = res.template && res.template.templateId
-        ? `${escapeHtml(res.template.name || res.template.templateId)} (${escapeHtml(res.template.source || 'guided')})`
-        : (res.template && res.template.source === 'stream-custom' ? 'custom inline command' : 'guided profile builder');
-      $('#pf-cmd-template').textContent = tplLabel;
-    } catch (error) {
-      if (revision !== commandPreviewRevision) return;
-      if ($('#pf-template-select').value) {
-        $('#cmd-preview').textContent = `Template error: ${error.message}`;
-        $('#pf-note').innerHTML = `<b>Template not valid for this outgoing stream:</b> ${escapeHtml(error.message)}`;
-      }
-    }
-  }, 250);
-}
-
-async function applyProfile() {
-  if (!state.stream) return;
-  const profile = readProfileForm();
-  const res = await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile } });
-  toast(profile.ffmpegTemplate
-    ? `Profile saved (FFmpeg template: ${profile.ffmpegTemplateName || 'custom'})`
-    : `Profile saved (${res.profile.transcode ? 'transcode' : 'copy'})`, 'ok');
-  await openStream(state.stream.id, { navigate: false });
-}
-
-/* ================= SUBTITLES ================= */
 
 async function loadProviders() {
-  try {
-    const { providers } = await api('/api/subtitles/providers');
-    state.providers = providers;
-    $('#sub-providers').innerHTML = `<table>
-      <thead><tr><th>Provider</th><th>Kind</th><th>Needs</th><th>Languages</th><th>State</th><th></th></tr></thead><tbody>
-      ${providers.map((p) => `<tr>
-        <td>${escapeHtml(p.name)}<div class="meta">${escapeHtml(p.note || '')}</div></td>
-        <td>${tag(p.kind, p.kind === 'custom' ? 'alt' : '')}</td>
-        <td>${p.needs.length ? p.needs.map((n) => tag(n, 'warn')).join('') : tag('—', 'ok')}</td>
-        <td>${p.languages.map((l) => tag(l.toUpperCase())).join('')}</td>
-        <td>${p.enabled
-          ? (p.state?.ok === false ? tag(p.state.message, 'err') : p.state?.ok ? tag(p.state.message, 'ok') : tag('enabled'))
-          : tag('disabled — needs key/credentials', 'warn')}</td>
-        <td class="row">
-          ${p.enabled ? `<button class="btn sm ghost" data-test="${p.id}">test</button>` : ''}
-          ${p.kind === 'custom' ? `<button class="btn sm ghost" data-del="${p.id}">delete</button>` : ''}
-        </td>
-      </tr>`).join('')}</tbody></table>`;
-    $$('#sub-providers button[data-test]').forEach((b) => b.addEventListener('click', async () => {
-      b.textContent = 'testing…';
-      try {
-        const { result } = await api('/api/subtitles/providers/test', { method: 'POST', body: { id: b.dataset.test } });
-        toast(`${result.id}: ${result.message}`, result.ok ? 'ok' : 'warn', 9000);
-      } finally { loadProviders(); }
-    }));
-    $$('#sub-providers button[data-del]').forEach((b) => b.addEventListener('click', async () => {
-      await api(`/api/subtitles/providers/${b.dataset.del}`, { method: 'DELETE' });
-      loadProviders();
-    }));
-  } catch { /* toast */ }
+  const data = await api('/api/subtitles/providers', { silent: true });
+  state.providers = data.providers || [];
+  renderProviders();
+}
+
+function renderProviders() {
+  const host = $('#sub-providers');
+  if (!host) return;
+  host.innerHTML = state.providers.map((provider) => `
+    <div class="srcrow">
+      <div><b>${escapeHtml(provider.name || provider.id)}</b>
+        <span class="mut" style="font-size:11px">${escapeHtml(provider.kind || '')}${provider.needs?.length ? ` · needs ${escapeHtml(provider.needs.join(', '))}` : ''}</span>
+        ${provider.note ? `<div class="meta">${escapeHtml(provider.note)}</div>` : ''}</div>
+      <div class="row" style="gap:6px">
+        ${provider.state?.ok === true ? tag(provider.state.message || 'ok', 'ok') : provider.state?.ok === false ? tag(provider.state.message || 'failing', 'err') : tag(provider.enabled === false ? 'disabled' : 'not tested')}
+        <button class="btn sm ghost" data-test-provider="${escapeHtml(provider.id)}">test</button>
+      </div>
+    </div>`).join('') || '<div class="meta" style="padding:14px">no providers</div>';
+}
+
+function refreshSubTargets() {
+  const host = $('#sub-targets');
+  if (!host) return;
+  const items = VMPlaylist.items();
+  if (!items.length) {
+    host.innerHTML = '<div class="meta">The playlist is empty — add a title in the Search tab first.</div>';
+    return;
+  }
+  const chosen = new Set($$('#sub-targets input:checked').map((input) => input.value));
+  const preferred = ['nl', 'en'];
+  const defaultLang = (item) => item.subtitleLanguage || preferred.find((lang) => (state.config?.subtitles?.languages || []).includes(lang)) || 'nl';
+  host.innerHTML = items.map((item) => `<label class="check-row"${item.enabled ? '' : ' data-disabled="1"'}>
+    <input type="checkbox" value="${escapeHtml(item.streamId)}"${chosen.size === 0 || chosen.has(item.streamId) ? ' checked' : ''}>
+    <span>${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}
+      ${item.enabled ? '' : '<span class="tag warn">disabled</span>'}
+      ${item.subtitlePath ? tag(item.subtitleLanguage || 'subtitle', 'ok') : ''}
+      <span class="mut">· ${escapeHtml(defaultLang(item))}</span></span>
+  </label>`).join('');
+  const note = $('#sub-targets-note');
+  if (note) note.textContent = `${items.length} item(s)`;
+}
+
+function subTargetIds() {
+  return $$('#sub-targets input:checked').map((input) => input.value);
+}
+
+/**
+ * The custom subtitle provider form, moved from the Subtitles tab to
+ * Settings → Subtitles.
+ */
+function wireSubtitleSourceForm() {
+  $('#btn-cp-save')?.addEventListener('click', async () => {
+    const id = $('#cp-id').value.trim();
+    const searchUrl = $('#cp-search').value.trim();
+    const note = $('#cp-note');
+    if (!/^[a-z0-9._-]+$/i.test(id) || !searchUrl) {
+      toast('An id without spaces and a search URL are required', 'warn');
+      return;
+    }
+    const kind = $('#cp-kind').value;
+    const parse = { kind, map: { url: 'url', title: 'title', release: 'release', language: 'language' } };
+    if (kind === 'json') parse.items = $('#cp-parse').value.trim() || 'data';
+    else parse.regex = $('#cp-parse').value.trim() || '<a[^>]+href="([^"]+)"[^>]*>([^<]{2,120})<';
+    if (note) note.textContent = 'saving…';
+    try {
+      await api('/api/subtitles/providers', {
+        method: 'POST',
+        body: { id, name: $('#cp-name').value.trim() || id, searchUrl, downloadUrl: $('#cp-download').value.trim(), parse, enabled: true },
+      });
+      toast('Custom subtitle provider saved — it is on the Subtitles tab now', 'ok');
+      if (note) note.textContent = `saved “${id}”`;
+      for (const field of ['cp-id', 'cp-name', 'cp-search', 'cp-parse', 'cp-download']) {
+        const input = $(`#${field}`);
+        if (input) input.value = '';
+      }
+      await loadProviders().catch(() => {});
+    } catch (error) {
+      if (note) note.textContent = '';
+      toast(error.message, 'err');
+    }
+  });
 }
 
 async function searchSubtitles() {
-  const title = $('#sub-title').value.trim() || state.stream?.title;
-  if (!title) return toast('Enter a title (or select a stream)', 'warn');
-  $('#sub-results').innerHTML = '<div class="meta"><span class="spin"></span> searching providers…</div>';
-  const res = await api('/api/subtitles/search', {
-    method: 'POST',
-    body: {
-      title,
-      year: Number($('#sub-year').value) || state.stream?.year || null,
-      kind: state.stream?.kind || 'movie',
-      season: state.stream?.upstream?.season || null,
-      episode: state.stream?.upstream?.episode || null,
-      imdb: $('#sub-imdb').value.trim() || null,
-      languages: $('#sub-langs').value.split(',').map((s) => s.trim()).filter(Boolean),
-      streamId: $('#sub-autostream').checked && state.stream ? state.stream.id : null,
-    },
-  });
-  state.subResults = res.results;
-  $('#sub-count').textContent = `${res.results.length} candidates`;
-  $('#sub-results').innerHTML = res.results.length ? `<table>
-    <thead><tr><th>Lang</th><th>Provider</th><th>Release</th><th>Score</th><th>DLs</th><th></th></tr></thead><tbody>
-    ${res.results.slice(0, 40).map((r, i) => `<tr>
-      <td>${tag((r.language || '?').toUpperCase(), (r.language || '').startsWith('nl') ? 'ok' : 'info')}</td>
-      <td>${escapeHtml(r.providerId)}</td>
-      <td class="mono" style="font-size:11.5px">${escapeHtml((r.release || r.title || '').slice(0, 70))}${r.hashMatch ? ' ' + tag('hash match', 'ok') : ''}</td>
-      <td>${r.score}</td><td class="mono">${r.downloads || 0}</td>
-      <td><button class="btn sm pri" data-sub="${i}">download</button></td>
-    </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">No subtitles found. Check the provider states above — a "needs key" provider is skipped, not broken.</div>';
-  $$('#sub-results button[data-sub]').forEach((b) => b.addEventListener('click', () => downloadSubtitle(state.subResults[Number(b.dataset.sub)])));
-}
-
-async function downloadSubtitle(result, streamId = ($('#sub-autostream').checked ? state.stream?.id : null)) {
+  const ids = subTargetIds();
+  const manualTitle = $('#sub-title')?.value.trim();
+  const languages = String($('#sub-langs')?.value || 'nl,en').split(',').map((value) => value.trim()).filter(Boolean);
+  const host = $('#sub-results');
+  const progress = $('#sub-progress');
+  if (!ids.length && !manualTitle) {
+    toast('Select at least one playlist item, or type a title under “search manually”', 'warn');
+    return;
+  }
+  state.subResults = [];
+  if (progress) progress.textContent = 'searching…';
+  $('#btn-sub-search').disabled = true;
+  host.innerHTML = '<div class="meta" style="padding:14px">searching…</div>';
   try {
-    const res = await api('/api/subtitles/download', {
-      method: 'POST',
-      body: { result, offsetMs: Number($('#sub-offset').value) || 0, streamId: streamId || null, push: streamId ? null : false },
-    });
-    if (streamId) {
-      $('#sub-attached').textContent = `${res.language} · ${res.cues} cues · ${res.provider}`;
-      if (state.stream?.id === streamId) {
-        const fresh = await api(`/api/streams/${encodeURIComponent(String(streamId))}`);
-        state.stream = fresh.stream;
-        renderStream(fresh);
+    if (ids.length) {
+      let done = 0;
+      for (const streamId of ids) {
+        const item = VMPlaylist.itemFor(streamId);
+        if (progress) progress.textContent = `searching ${++done}/${ids.length}: ${item?.title || streamId}…`;
+        try {
+          const data = await api('/api/subtitles/search', {
+            method: 'POST',
+            silent: true,
+            body: {
+              streamId,
+              title: item?.title,
+              year: item?.year || null,
+              kind: item?.kind || 'movie',
+              season: item?.season || null,
+              episode: item?.episode || null,
+              languages: [item?.subtitleLanguage].filter(Boolean).length ? [item.subtitleLanguage] : languages,
+            },
+          });
+          state.subResults.push({ streamId, title: item?.title || streamId, results: data.results || [] });
+        } catch (error) {
+          state.subResults.push({ streamId, title: item?.title || streamId, results: [], error: error.message });
+        }
       }
-      toast('Subtitle attached to the stream profile (soft mux). Restart the session to apply.', 'info', 9000);
     } else {
-      toast(`Subtitle downloaded: ${res.language} ${res.cues} cues (${res.provider})`, 'ok');
+      const data = await api('/api/subtitles/search', {
+        method: 'POST',
+        silent: true,
+        body: { title: manualTitle, year: Number($('#sub-year')?.value) || null, imdb: $('#sub-imdb')?.value.trim() || null, languages },
+      });
+      state.subResults.push({ streamId: null, title: manualTitle, results: data.results || [] });
     }
-    return true;
-  } catch {
-    return false; // api() already shows the failure
-  }
-}
-
-/* ================= ENIGMA2 ================= */
-
-async function loadEnigmaForm() {
-  try {
-    const { config } = await api('/api/config');
-    const e = config.enigma2 || {};
-    $('#e2-host').value = e.host || '';
-    $('#e2-port').value = e.port || 80;
-    $('#e2-user').value = e.username || 'root';
-    $('#e2-name').value = e.bouquetName || 'vu-movie';
-    $('#e2-service').value = String(e.serviceType || 4097);
-    $('#e2-ftp').checked = Boolean(e.ftpEnabled);
-    $('#e2-pass').value = '';
-    $('#e2-pass').placeholder = e.password ? '(blank keeps saved password)' : '(empty if none)';
-  } catch { /* api() shows the error */ }
-}
-
-async function loadEnigmaStatus() {
-  const button = $('#btn-e2-test');
-  const originalText = button.textContent;
-  if (!$('#e2-host').value.trim()) await loadEnigmaForm();
-  const host = $('#e2-host').value.trim();
-  const port = Number($('#e2-port').value) || 80;
-  const username = $('#e2-user').value.trim();
-  const password = $('#e2-pass').value;
-
-  button.disabled = true;
-  button.textContent = 'testing…';
-  $('#e2-status').textContent = 'testing connection…';
-  $('#e2-status').className = 'tag info';
-  $('#e2-log').textContent = `Testing OpenWebif and FTP file access at ${host || '(no host configured)'}…`;
-  try {
-    const { status } = await api('/api/enigma2/test', {
-      method: 'POST', body: { host, port, username, ftpEnabled: $('#e2-ftp').checked, ...(password ? { password } : {}) },
-    });
-    const message = status.message || (status.ok ? 'WebIF reachable' : 'receiver unreachable');
-    $('#e2-status').textContent = message;
-    $('#e2-status').className = `tag ${status.ok ? 'ok' : status.configured ? 'err' : 'warn'}`;
-    $('#e2-log').textContent = message;
-    toast(status.ok ? `Connection successful: ${message}` : `Connection test failed: ${message}`, status.ok ? 'ok' : 'warn', 9000);
-  } catch (error) {
-    const message = error?.message || 'connection test failed';
-    $('#e2-status').textContent = 'test failed';
-    $('#e2-status').className = 'tag err';
-    $('#e2-log').textContent = message;
   } finally {
-    button.disabled = false;
-    button.textContent = originalText;
+    $('#btn-sub-search').disabled = false;
+    if (progress) progress.textContent = '';
   }
+  renderSubResults();
 }
 
-async function previewBouquet() {
-  const scope = document.querySelector('input[name=e2scope]:checked')?.value;
-  const streamIds = scope === 'selected' && state.stream ? [state.stream.id] : [];
-  const res = await api('/api/enigma2/preview', { method: 'POST', body: { streamIds, name: $('#e2-name').value || 'vu-movie' } });
-  $('#e2-file').textContent = res.fileName;
-  $('#e2-count').textContent = `${res.entries} entries`;
-  $('#e2-preview').textContent = res.text;
-  state.e2Preview = res;
+function renderSubResults() {
+  const host = $('#sub-results');
+  if (!host) return;
+  const language = $('#sub-lang-filter')?.value || 'all';
+  let total = 0;
+  const blocks = (state.subResults || []).map((block) => {
+    const results = (block.results || []).filter((result) => language === 'all' || (result.language || '').startsWith(language));
+    total += results.length;
+    return `<div class="sub-block">
+      <div class="cardhead"><h3 style="margin:0">${escapeHtml(block.title)}</h3>
+        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''}</span></div>
+      ${results.length
+        ? results.slice(0, 60).map((result, index) => `<div class="pick-row">
+            <div>
+              <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
+                ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
+                ${result.rating ? tag(`★ ${result.rating}`) : ''}</div>
+              <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
+            </div>
+            <button class="btn sm pri" data-attach="${index}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${escapeHtml(block.title)}">attach</button>
+          </div>`).join('')
+        : '<div class="meta" style="padding:10px 0">nothing in this language</div>'}
+    </div>`;
+  });
+  $('#sub-count').textContent = total ? `${total} result(s)` : '';
+  host.innerHTML = blocks.join('') || '<div class="meta" style="padding:14px">no search yet</div>';
 }
 
-async function saveEnigmaSettings() {
-  const enigma2 = {
-    host: $('#e2-host').value.trim(),
-    port: Number($('#e2-port').value) || 80,
-    username: $('#e2-user').value.trim(),
-    bouquetName: $('#e2-name').value.trim() || 'vu-movie',
-    serviceType: Number($('#e2-service').value) || 4097,
-    ftpEnabled: $('#e2-ftp').checked,
-  };
-  // Password is write-only in the API response. An empty input means "leave the
-  // saved credential alone"; users can still replace it by entering a new one.
-  if ($('#e2-pass').value) enigma2.password = $('#e2-pass').value;
-  await api('/api/config', { method: 'PUT', body: { enigma2 } });
-  toast('Enigma2 settings saved', 'ok');
-  loadEnigmaStatus();
+function wireSubtitles() {
+  $('#btn-providers-refresh')?.addEventListener('click', () => loadProviders().catch((error) => toast(error.message, 'err')));
+  $('#sub-providers')?.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-test-provider]');
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = 'testing…';
+    try {
+      const data = await api('/api/subtitles/providers/test', { method: 'POST', body: { id: button.dataset.testProvider }, silent: true });
+      toast(`${button.dataset.testProvider}: ${data.result?.message || (data.result?.ok ? 'ok' : 'failed')}`, data.result?.ok ? 'ok' : 'warn');
+      await loadProviders();
+    } catch (error) {
+      toast(error.message, 'err');
+      button.disabled = false;
+      button.textContent = 'test';
+    }
+  });
+  $('#btn-sub-targets-all')?.addEventListener('click', () => { $$('#sub-targets input').forEach((input) => { input.checked = true; }); });
+  $('#btn-sub-targets-none')?.addEventListener('click', () => { $$('#sub-targets input').forEach((input) => { input.checked = false; }); });
+  $('#btn-sub-search')?.addEventListener('click', searchSubtitles);
+  $('#sub-lang-filter')?.addEventListener('change', renderSubResults);
+  $('#sub-results')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-attach]');
+    if (!button) return;
+    const block = (state.subResults || []).find((entry) => entry.title === button.dataset.block);
+    const result = block?.results?.[Number(button.dataset.attach)];
+    if (!result) return;
+    const streamId = button.dataset.stream || null;
+    if (!streamId) {
+      toast('This was a manual search — attach it from the Playlist tab item instead', 'warn');
+      return;
+    }
+    button.disabled = true;
+    attachSubtitle(result, { streamId, language: result.language })
+      .then(() => { button.textContent = '✓ attached'; })
+      .catch((error) => { toast(error.message, 'err'); button.disabled = false; });
+  });
 }
 
-async function pushBouquet(dryRun = false) {
-  const scope = document.querySelector('input[name=e2scope]:checked')?.value;
-  const streamIds = scope === 'selected' && state.stream ? [state.stream.id] : [];
-  $('#e2-log').innerHTML = `<div><span class="info">INFO </span> pushing${dryRun ? ' (dry run)' : ''}…</div>`;
+/* ====================================================================== *
+ * stream — every output URL of the playlist
+ * ====================================================================== */
+
+const STREAM_URL_LABELS = [
+  ['ts', 'VLC / any player (.ts)'],
+  ['mkv', 'VLC / any player (.mkv)'],
+  ['hls', 'Playlist (.m3u8)'],
+  ['playlist', 'Playlist (.m3u)'],
+  ['forBox', 'Enigma2 / Duo2'],
+  ['direct', 'Direct upstream link (302)'],
+  ['download', 'Download to NAS'],
+  ['watch', 'Watch in browser'],
+];
+
+function selectedStreamId() {
+  const picked = $('#st-pick')?.value;
+  if (picked) return picked;
+  const stored = readStoredText(SELECTED_STREAM_KEY);
+  if (stored && VMPlaylist.itemFor(stored)) return stored;
+  return VMPlaylist.items()[0]?.streamId || '';
+}
+
+/** The per-stream URL list the old Stream tab showed (VLC, playlist, direct…). */
+function renderStreamUrls() {
+  const pick = $('#st-pick');
+  const host = $('#st-urls');
+  if (!pick || !host) return;
+  const items = VMPlaylist.items();
+  const previous = selectedStreamId();
+  pick.innerHTML = items.length
+    ? items.map((item) => `<option value="${escapeHtml(item.streamId)}"${item.streamId === previous ? ' selected' : ''}>${escapeHtml(item.title)}${item.year ? ` (${item.year})` : ''}</option>`).join('')
+    : '<option value="">(the playlist is empty)</option>';
+  const item = VMPlaylist.itemFor(pick.value || previous) || items[0] || null;
+  if (!item) {
+    host.innerHTML = '<div class="meta">No stream yet — add one from the Search tab and it appears here.</div>';
+    return;
+  }
+  const urls = item.urls || {};
+  host.innerHTML = `<div class="row" style="margin-bottom:8px">
+      ${tag(item.quality || 'unknown', 'ok')} ${tag(item.kind || 'movie')} ${tag(item.sourceId || '—')}
+      ${tag(VMPlaylist.templateLabel(item), item.hasTemplate ? 'alt' : '')}
+      ${item.enabled ? tag('in the outputs', 'ok') : tag('disabled — not in the outputs', 'warn')}
+      <span class="mut">${item.session ? `${item.session.clients || 0} player(s) connected` : 'no relay session running'}</span>
+    </div>
+    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => `
+      <div class="field" style="margin:0">
+        <label>${escapeHtml(label)}</label>
+        <div class="row">
+          <input type="text" class="mono" readonly value="${escapeHtml(urls[key] || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
+          <button type="button" class="btn sm" data-copy-url="${escapeHtml(urls[key] || '')}"${urls[key] ? '' : ' disabled'}>copy</button>
+        </div>
+      </div>`).join('')}</div>
+    ${urls.directNote ? `<div class="note mut" style="margin:8px 0 0">Direct upstream link ${escapeHtml(urls.directNote)}.</div>` : ''}`;
+  $$('#st-urls input[readonly]').forEach((input) => input.addEventListener('click', () => input.select()));
+  const note = $('#st-url-note');
+  if (note) note.textContent = `${item.title}${item.year ? ` (${item.year})` : ''}`;
+}
+
+async function streamUrlAction(action) {
+  const id = selectedStreamId();
+  if (!id) return toast('No stream selected', 'warn');
+  const log = $('#st-url-log');
+  const say = (text) => { if (log) { log.classList.remove('hide'); log.textContent = text; } };
   try {
-    const res = await api('/api/enigma2/push', { method: 'POST', body: { streamIds, name: $('#e2-name').value || 'vu-movie', dryRun } });
-    $('#e2-log').innerHTML = [
-      `<div><span class="info">INFO </span> bouquet "${escapeHtml(res.bouquet?.name || '')}" → ${res.bouquet?.entries || 0} entries</div>`,
-      res.transport ? `<div><span class="info">INFO </span> transport: ${escapeHtml(res.transport)}</div>` : '',
-      res.verified !== null && res.verified !== undefined ? `<div><span class="info">INFO </span> verified on the receiver: ${res.verified} entries</div>` : '',
-      `<div><span class="${res.ok ? 'info' : 'error'}">${res.ok ? 'INFO ' : 'ERROR'}</span> ${res.ok ? 'push complete' : escapeHtml(res.error || 'failed')}</div>`,
-      res.bouquet?.bouquetsLine ? `<div><span class="debug">DEBUG</span> ${escapeHtml(res.bouquet.bouquetsLine)}</div>` : '',
-    ].join('');
-    toast(res.ok ? 'Bouquet pushed to the receiver' : `Push failed: ${res.error}`, res.ok ? 'ok' : 'err', 10000);
-    if (!dryRun) previewBouquet();
-  } catch (err) {
-    $('#e2-log').innerHTML += `<div><span class="error">ERROR</span> ${escapeHtml(err.message)}</div>`;
+    if (action === 'vlc') {
+      const url = VMPlaylist.itemFor(id)?.urls?.ts;
+      if (!url) return toast('This stream has no .ts URL', 'warn');
+      window.location.href = String(url).replace(/^https?:/, 'vlc:');
+      return;
+    }
+    if (action === 'start' || action === 'stop') {
+      say(action === 'start' ? 'starting the relay session…' : 'stopping the session…');
+      const data = await api(`/api/streams/${encodeURIComponent(id)}/session`, { method: action === 'start' ? 'POST' : 'DELETE', silent: true });
+      say(action === 'start'
+        ? `session running · ${data.session?.mode || 'copy'}/${data.session?.encoder || 'copy'} · ${data.session?.clients || 0} client(s)`
+        : 'session stopped');
+      toast(action === 'start' ? 'Relay session started' : 'Relay session stopped', 'ok');
+      await VMPlaylist.refresh({ render: currentPage === 'list' });
+      renderStreamUrls();
+      return;
+    }
+    if (action === 'download') {
+      say('queueing the download…');
+      const data = await api(`/api/streams/${encodeURIComponent(id)}/download`, { method: 'POST', body: {}, silent: true });
+      say(`download queued · job ${data.job?.id || '—'}${data.job?.filename ? ` → ${data.job.filename}` : ''}`);
+      toast('Download queued — watch it on the Dashboard', 'ok');
+      return;
+    }
+    if (action === 'm3u') {
+      const res = await fetch(`/api/streams/${encodeURIComponent(id)}/playlist`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'audio/x-mpegurl' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `${(VMPlaylist.itemFor(id)?.title || 'vu-movie').replace(/[^A-Za-z0-9._-]+/g, '-')}.m3u`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      say(`playlist written: ${text.split('\n').filter((line) => line && !line.startsWith('#')).length} entrie(s)`);
+      return;
+    }
+  } catch (error) {
+    say(`✗ ${error.message}`);
+    toast(error.message, 'err');
   }
 }
 
-/* ================= LOGS ================= */
+function initStream() {
+  $('#btn-st-refresh')?.addEventListener('click', () => refreshStream(true));
+  $('#btn-st-dry')?.addEventListener('click', () => pushBouquet({ dryRun: true }));
+  $('#btn-st-push')?.addEventListener('click', () => pushBouquet({}));
+  $('#btn-st-test-box')?.addEventListener('click', testReceiver);
+  $('#btn-e2-copy')?.addEventListener('click', () => copyText($('#e2-preview')?.textContent || ''));
+  $('#btn-e2-download')?.addEventListener('click', () => {
+    const text = $('#e2-preview')?.textContent || '';
+    const blob = new Blob([text], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = state.playlist.urls?.bouquetName || 'userbouquet.vu-movie.tv';
+    link.click();
+    URL.revokeObjectURL(link.href);
+  });
+  $('#st-outputs')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-copy]');
+    if (button) copyText(button.dataset.copy);
+  });
+  $('#st-items')?.addEventListener('click', (event) => {
+    const copyButton = event.target.closest('[data-copy-item]');
+    if (copyButton) { copyText(copyButton.dataset.copyItem); return; }
+    const watch = event.target.closest('[data-watch]');
+    if (watch) window.open(watch.dataset.watch, '_blank');
+  });
+  // per-stream URL panel (the information the old Stream tab showed)
+  $('#st-pick')?.addEventListener('change', () => { writeStoredText(SELECTED_STREAM_KEY, $('#st-pick').value); renderStreamUrls(); });
+  $('#btn-st-copy-all')?.addEventListener('click', () => {
+    const lines = $$('#st-urls input[readonly]').filter((input) => input.value)
+      .map((input) => `${(input.getAttribute('aria-label') || 'url').replace(/ URL$/, '')}: ${input.value}`);
+    if (!lines.length) return toast('Nothing to copy', 'warn');
+    copyText(lines.join('\n'));
+  });
+  $('#st-urls')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-copy-url]');
+    if (button?.dataset.copyUrl) copyText(button.dataset.copyUrl);
+  });
+  $('#btn-st-vlc')?.addEventListener('click', () => streamUrlAction('vlc'));
+  $('#btn-st-session-start')?.addEventListener('click', () => streamUrlAction('start'));
+  $('#btn-st-session-stop')?.addEventListener('click', () => streamUrlAction('stop'));
+  $('#btn-st-download')?.addEventListener('click', () => streamUrlAction('download'));
+  $('#btn-st-m3u')?.addEventListener('click', () => streamUrlAction('m3u'));
+  $('#btn-st-test-template')?.addEventListener('click', () => {
+    // the Test tab runs the same command the relay would use for this stream
+    const item = VMPlaylist.itemFor(selectedStreamId());
+    writeStoredText(TEST_SOURCE_KEY, selectedStreamId());
+    App.go('tpl-test');
+    if (item) toast(`Test tab: pick “${item.title}” and press start test`, 'info', 6000);
+  });
+}
 
-function logLine(entry) {
-  return `<div><span class="t">${escapeHtml(entry.time?.slice(11) || '')}</span> <span class="${entry.level}">${entry.level.toUpperCase().padEnd(5)}</span> <span class="component">${escapeHtml(entry.component)}</span> ${escapeHtml(entry.message)}${entry.fields ? ` <span class="mut">${escapeHtml(JSON.stringify(entry.fields))}</span>` : ''}</div>`;
+async function refreshStream(announce = false) {
+  await VMPlaylist.load();
+  const urls = state.playlist.urls || {};
+  const summary = state.playlist.summary || { total: 0, enabled: 0 };
+  $('#st-title').textContent = 'Playlist outputs';
+  $('#st-meta').innerHTML = `${escapeHtml(state.playlist.name || 'vu-movie')} · ${summary.enabled}/${summary.total} item(s) enabled · ${escapeHtml(state.playlist.items.filter((item) => item.hasTemplate).length)} with an FFmpeg template`;
+  const xtream = urls.xtream || {};
+  const entries = [
+    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true },
+    { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player', url: urls.m3u },
+    { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata', url: urls.m3uPlus },
+    { name: 'VLC playlist', hint: 'the same list, VLC preset', url: urls.vlc },
+    { name: 'Kodi playlist', hint: 'Kodi preset (.m3u)', url: urls.kodi },
+    { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json },
+    { name: 'Xtream Codes', hint: `player_api.php · user ${xtream.username || '—'}`, url: xtream.playerApi, kind: 'xtream', xtream },
+    { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet },
+  ];
+  $('#st-outputs').innerHTML = entries.map((entry) => `
+    <div class="card">
+      <div class="spread">
+        <div><h3 style="margin:0">${escapeHtml(entry.name)}</h3><div class="meta">${escapeHtml(entry.hint || '')}</div></div>
+        <div class="row" style="gap:6px">
+          ${entry.kind === 'link' ? `<a class="btn sm" href="${escapeHtml(entry.url || '')}" target="_blank" rel="noreferrer">open ↗</a>` : ''}
+          <button class="btn sm ghost" data-copy="${escapeHtml(entry.url || '')}">copy</button>
+        </div>
+      </div>
+      <div class="mono url-line">${escapeHtml(entry.url || '—')}</div>
+      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Give these credentials to Tivimate, IPTV Smarters or any other Xtream-compatible app; the player API URL above is the server address.">i</span></div>` : ''}
+    </div>`).join('');
+
+  $('#st-item-count').textContent = `${state.playlist.items.length} item(s)`;
+  $('#st-items').innerHTML = state.playlist.items.length ? `<table>
+    <thead><tr><th>#</th><th>Title</th><th>Quality</th><th>Template</th><th>Subtitle</th><th>URLs</th></tr></thead><tbody>
+    ${state.playlist.items.map((item, index) => `<tr class="${item.enabled ? '' : 'row-off'}">
+      <td class="mut">${index + 1}</td>
+      <td>${escapeHtml(item.title)}${item.enabled ? '' : ' <span class="tag warn">off</span>'}</td>
+      <td>${tag(item.quality || '—', 'ok')}</td>
+      <td>${escapeHtml(VMPlaylist.templateLabel(item))}</td>
+      <td>${item.subtitlePath ? tag(item.subtitleLanguage || 'yes', 'ok') : '<span class="mut">—</span>'}</td>
+      <td class="row" style="gap:6px">
+        <button class="btn sm ghost" data-copy-item="${escapeHtml(item.urls.forBox || '')}">copy box URL</button>
+        <button class="btn sm ghost" data-watch="${escapeHtml(item.urls.watch || '')}">watch</button>
+      </td>
+    </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">the playlist is empty</div>';
+
+  renderStreamUrls();
+  renderStreamMonitor();
+  await refreshBouquetPreview();
+  if (announce) toast('Outputs refreshed', 'ok', 2500);
+}
+
+async function refreshBouquetPreview() {
+  try {
+    const data = await api('/api/playlist/enigma2', { method: 'POST', body: {}, silent: true });
+    const bouquet = data.bouquet || data;
+    $('#e2-preview').textContent = bouquet.text || '—';
+    $('#e2-file').textContent = bouquet.fileName || 'userbouquet.vu-movie.tv';
+    $('#e2-count').textContent = `${bouquet.entries ?? 0} entries`;
+  } catch (error) {
+    $('#e2-preview').textContent = `// could not build the bouquet: ${error.message}`;
+  }
+}
+
+function renderStreamMonitor() {
+  const host = $('#st-monitor');
+  if (!host) return;
+  const running = (state.playlist.items || []).filter((item) => item.session);
+  if (!running.length) {
+    host.innerHTML = '<div class="meta">no session running — the relay starts one when a player opens a URL.</div>';
+    return;
+  }
+  host.innerHTML = running.map((item) => {
+    const session = item.session;
+    return `<div class="kv"><span>${escapeHtml(item.title)} <span class="mut">${escapeHtml(session.mode || '')}/${escapeHtml(session.encoder || '')}</span></span>
+      <span>${session.clients} client(s) · ${fmtBytes(session.bytesOut || 0)} · up ${fmtDuration(session.uptimeSec)}${session.stats?.speed ? ` · ${escapeHtml(session.stats.speed)}` : ''}</span></div>`;
+  }).join('');
+}
+
+async function pushBouquet({ dryRun = false } = {}) {
+  const log = $('#st-push-log');
+  log?.classList.remove('hide');
+  if (log) log.textContent = dryRun ? 'building a dry run…' : 'pushing the bouquet to the receiver…';
+  try {
+    const data = await api('/api/playlist/enigma2', { method: 'POST', body: { action: 'push', dryRun }, silent: true });
+    const lines = [
+      dryRun ? '✓ dry run — nothing was written to the receiver' : (data.ok ? '✓ bouquet pushed to the receiver' : '✗ push failed'),
+      `entries: ${data.bouquet?.entries ?? '—'} · file: ${data.bouquet?.fileName || '—'}`,
+      data.transport ? `transport: ${data.transport.via || JSON.stringify(data.transport)}` : '',
+      data.error ? `error: ${data.error}` : '',
+      data.reload ? `reload: ${data.reload.ok ? 'ok' : data.reload.error || 'failed'}` : '',
+    ].filter(Boolean);
+    if (log) log.textContent = lines.join('\n') + (data.bouquet?.text ? `\n\n${data.bouquet.text.slice(0, 4000)}` : '');
+    toast(dryRun ? 'Dry run finished' : (data.ok ? 'Bouquet pushed' : `Push failed: ${data.error || 'unknown error'}`), data.ok ? 'ok' : 'err');
+    await refreshStream();
+  } catch (error) {
+    if (log) log.textContent = `✗ ${error.message}`;
+    toast(error.message, 'err');
+  }
+}
+
+async function testReceiver() {
+  const host = $('#st-box');
+  host.textContent = 'asking the receiver…';
+  try {
+    const data = await api('/api/enigma2/status', { silent: true });
+    const status = data.status || {};
+    host.innerHTML = `<div class="kv"><span>reachable</span><span><i class="dot ${dot(status.ok)}"></i> ${escapeHtml(status.message || '—')}</span></div>
+      <div class="kv"><span>model</span><span>${escapeHtml(status.model || '—')}</span></div>
+      <div class="kv"><span>webif</span><span>${escapeHtml(status.webif || status.via || '—')}</span></div>`;
+    toast(status.ok ? 'Receiver reachable' : `Receiver: ${status.message || 'unreachable'}`, status.ok ? 'ok' : 'warn');
+  } catch (error) {
+    host.textContent = error.message;
+  }
+}
+
+/* ====================================================================== *
+ * transcode + test (the editor lives in ffmpeg-editor.js)
+ * ====================================================================== */
+
+/** The Test tab's own source picker, using the same options as the editor. */
+function renderTestSourcePicker() {
+  const select = $('#test-source');
+  if (!select) return;
+  const previous = select.value;
+  const items = VMPlaylist.items();
+  const saved = state.streams || [];
+  const seen = new Set(items.map((item) => String(item.streamId)));
+  const options = ['<option value="">(pick a source…)</option>'];
+  if (items.length) {
+    options.push('<optgroup label="Playlist">');
+    for (const item of items) options.push(`<option value="stream:${escapeHtml(item.streamId)}">${escapeHtml(item.title)}${item.enabled ? '' : ' (disabled)'}</option>`);
+    options.push('</optgroup>');
+  }
+  const others = saved.filter((stream) => !seen.has(String(stream.id)));
+  if (others.length) {
+    options.push('<optgroup label="Saved streams">');
+    for (const stream of others) options.push(`<option value="stream:${escapeHtml(stream.id)}">${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}</option>`);
+    options.push('</optgroup>');
+  }
+  options.push('<optgroup label="Other"><option value="url:">custom URL…</option></optgroup>');
+  select.innerHTML = options.join('');
+  const wanted = previous || readStoredText(TEST_SOURCE_KEY) || '';
+  const candidate = wanted.startsWith('stream:') ? wanted : `stream:${wanted}`;
+  if (wanted && [...select.options].some((option) => option.value === candidate)) select.value = candidate;
+  else if (items.length) select.value = `stream:${items[0].streamId}`;
+  syncTestTarget();
+}
+
+function wireTestSourcePicker() {
+  $('#test-source')?.addEventListener('change', syncTestTarget);
+  $('#test-url')?.addEventListener('input', syncTestTarget);
+  $('#test-duration')?.addEventListener('change', syncTestTarget);
+}
+
+/** The Test tab's own start/stop/clear buttons drive the editor instance. */
+function wireTestControls() {
+  $('#btn-test-run')?.addEventListener('click', () => {
+    syncTestTarget();
+    VMFfmpegEditor.runTestTab();
+  });
+  $('#btn-test-stop')?.addEventListener('click', () => VMFfmpegEditor.stopTestTab());
+  $('#btn-test-clear')?.addEventListener('click', () => {
+    const editor = VMFfmpegEditor.testEditor;
+    if (editor) VMFfmpegEditor.clearTestOutput?.(editor);
+    const status = $('#test-status');
+    if (status) status.textContent = '';
+  });
+  VMFfmpegEditor.syncTabButtons?.(false);
+}
+
+/** Keep the editor instance's working source in sync with the tab controls. */
+function syncTestTarget() {
+  const editor = VMFfmpegEditor.testEditor;
+  const value = $('#test-source')?.value || '';
+  $('#test-url-field')?.classList.toggle('hide', value !== 'url:');
+  if (!editor) return;
+  if (value === 'url:') editor.test.source = { kind: 'url', streamId: '', url: $('#test-url')?.value.trim() || '' };
+  else if (value.startsWith('stream:')) editor.test.source = { kind: 'stream', streamId: value.slice(7), url: '' };
+  else editor.test.source = { kind: 'stream', streamId: '', url: '' };
+  editor.test.durationMs = (Number($('#test-duration')?.value) || 5) * 1000;
+}
+
+/* ====================================================================== *
+ * logs (unchanged behaviour: level, component, text filter, live tail)
+ * ====================================================================== */
+
+function initLogs() {
+  $('#btn-log-refresh')?.addEventListener('click', () => loadLogs());
+  $('#btn-log-clear')?.addEventListener('click', () => { state.logs = []; renderLogs(); });
+  $('#log-level')?.addEventListener('change', async () => {
+    try {
+      await api('/api/logs/level', { method: 'POST', body: { level: $('#log-level').value } });
+      toast(`Server log level → ${$('#log-level').value}`, 'ok', 2500);
+      loadLogs();
+    } catch (error) { toast(error.message, 'err'); }
+  });
+  ['log-component', 'log-search'].forEach((id) => $(`#${id}`)?.addEventListener('input', renderLogs));
+  subscribeToEvents();
 }
 
 async function loadLogs() {
-  const params = new URLSearchParams({
-    level: $('#log-level').value,
-    component: $('#log-component').value,
-    search: $('#log-search').value,
-    limit: '400',
-  });
-  const res = await api(`/api/logs?${params}`);
-  state.logs = res.entries;
-  const select = $('#log-component');
-  const current = select.value;
-  select.innerHTML = `<option value="">all components</option>${res.components.map((c) => `<option value="${escapeHtml(c)}" ${c === current ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}`;
-  $('#log-view').innerHTML = res.entries.map(logLine).join('') || '<div class="mut">no entries</div>';
-  $('#log-view').scrollTop = $('#log-view').scrollHeight;
+  try {
+    const data = await api('/api/logs?limit=400', { silent: true });
+    state.logs = data.entries || [];
+    const select = $('#log-component');
+    if (select) {
+      const previous = select.value;
+      select.innerHTML = `<option value="">all components</option>${(data.components || []).map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}`;
+      select.value = previous;
+    }
+    if ($('#log-level')) $('#log-level').value = data.level || 'info';
+    renderLogs();
+  } catch { /* the toast is enough */ }
 }
 
-function connectEvents() {
-  const source = new EventSource('/api/events');
-  source.addEventListener('log', (event) => {
-    const entry = JSON.parse(event.data);
-    state.logs.push(entry);
-    if (state.logs.length > 800) state.logs.shift();
-    const min = { debug: 0, info: 1, warn: 2, error: 3 }[$('#log-level').value] ?? 1;
-    const rank = { debug: 0, info: 1, warn: 2, error: 3 }[entry.level] ?? 1;
-    const component = $('#log-component').value;
-    const search = $('#log-search').value.toLowerCase();
-    if (rank < min) return;
-    if (component && entry.component !== component) return;
-    if (search && !JSON.stringify(entry).toLowerCase().includes(search)) return;
-    if (!$('#log-live').checked || $('#p-logs').classList.contains('hide')) return;
-    const view = $('#log-view');
-    view.insertAdjacentHTML('beforeend', logLine(entry));
-    while (view.childElementCount > 500) view.firstElementChild.remove();
-    view.scrollTop = view.scrollHeight;
-  });
-  source.addEventListener('job', () => { if (!$('#p-dash').classList.contains('hide')) loadJobs(); });
-  source.addEventListener('sessions', (event) => renderSessions(JSON.parse(event.data)));
-  source.onerror = () => { /* EventSource reconnects on its own */ };
+function logLineMarkup(entry) {
+  const level = String(entry.level || 'info');
+  const cls = level === 'error' ? 'err' : level === 'warn' ? 'warn' : level === 'debug' ? 'debug' : 'info';
+  return `<div class="logline ${cls}"><span class="lt">${escapeHtml(fmtTime(entry.time || entry.timestamp))}</span>
+    <span class="ll">${escapeHtml(level.slice(0, 4).toUpperCase())}</span>
+    <span class="lc">${escapeHtml(entry.component || '')}</span>
+    <span class="lm">${escapeHtml(entry.message || '')}${entry.meta && Object.keys(entry.meta).length ? ` <span class="mut">${escapeHtml(JSON.stringify(entry.meta))}</span>` : ''}</span></div>`;
 }
 
-/* ================= SETTINGS ================= */
+function renderLogs() {
+  const host = $('#log-view');
+  if (!host) return;
+  const level = $('#log-level')?.value || 'info';
+  const levels = ['debug', 'info', 'warn', 'error'];
+  const min = levels.indexOf(level);
+  const component = $('#log-component')?.value || '';
+  const search = ($('#log-search')?.value || '').toLowerCase();
+  const rows = (state.logs || []).filter((entry) => {
+    if (levels.indexOf(entry.level || 'info') < min) return false;
+    if (component && entry.component !== component) return false;
+    if (search && !`${entry.component} ${entry.message} ${JSON.stringify(entry.meta || {})}`.toLowerCase().includes(search)) return false;
+    return true;
+  });
+  host.innerHTML = rows.length ? rows.map(logLineMarkup).join('') : '<div class="meta">no log lines match</div>';
+  if ($('#log-live')?.checked) host.scrollTop = host.scrollHeight;
+}
+
+/** /api/events is the server's live log + job/session feed. */
+function subscribeToEvents() {
+  if (logStream?.readyState === EventSource.OPEN) return;
+  try {
+    logStream = new EventSource('/api/events');
+  } catch { return; }
+  logStream.addEventListener('log', (event) => {
+    try {
+      const entry = JSON.parse(event.data);
+      state.logs = [...(state.logs || []).slice(-800), entry];
+      if ($('#log-live')?.checked && !$('#p-logs')?.classList.contains('hide')) renderLogs();
+    } catch { /* ignore malformed lines */ }
+  });
+  logStream.addEventListener('job', () => {
+    // the server sends one job per event; re-reading the list keeps the bars
+    // and the state tags in sync without guessing the payload shape
+    if (!$('#p-dash')?.classList.contains('hide')) loadJobs();
+  });
+  logStream.addEventListener('sessions', (event) => {
+    try { renderSessions(JSON.parse(event.data)); } catch { /* ignore */ }
+  });
+  logStream.addEventListener('error', () => { /* EventSource reconnects on its own */ });
+}
+
+/* ====================================================================== *
+ * settings (same sections and behaviour as before)
+ * ====================================================================== */
 
 const SETTINGS_SECTIONS = [
   {
@@ -2803,9 +1719,6 @@ const SETTINGS_SECTIONS = [
       ['container', 'select', ['mpegts', 'matroska', 'hls']],
       ['alwaysTranscode', 'bool'], ['hardware', 'bool'], ['maxConcurrent', 'number'],
       ['device', 'text'], ['idleStopSeconds', 'number'], ['encoderFallback', 'text'],
-      // Pace live output at the source's native rate: without it the relay
-      // floods a real-time player within seconds and drops it as "cannot keep
-      // up". Downloads and template test runs are never paced.
       ['realtime', 'bool'],
     ],
   },
@@ -2842,30 +1755,120 @@ const SETTINGS_SECTIONS = [
   },
 ];
 
-let settingsDraft = null;
+/**
+ * Human labels and one-line explanations for every settings field. The old
+ * tab printed the raw config keys; these read like the section they belong to
+ * (and the explanation is the "i" tooltip).
+ */
+const SETTINGS_NOTES = {
+  transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
+  subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
+  enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
+  scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
+  storage: 'Folders inside the container, and how much disk the cache may use.',
+  app: 'The web server itself — port, login and token lifetime.',
+};
+
+const SETTINGS_LABELS = {
+  'transcode.mode': ['Mode', 'auto picks copy vs. transcode from the source; copy/vaapi/x264/h265 force one.'],
+  'transcode.resolution': ['Resolution cap', 'Longest edge the output may have. 0 or empty keeps the source.'],
+  'transcode.aspect': ['Aspect ratio', 'source keeps the source, 169/43 force a specific ratio.'],
+  'transcode.videoBitrate': ['Video bitrate', 'Target video bitrate in kbps for the software encoders.'],
+  'transcode.audioBitrate': ['Audio bitrate', 'Target audio bitrate in kbps.'],
+  'transcode.audioChannels': ['Audio channels', '1 mono, 2 stereo, 6 = 5.1. Empty keeps the source layout.'],
+  'transcode.fps': ['Frame rate', 'source keeps the source, 25/30 force a rate.'],
+  'transcode.container': ['Container', 'mpegts for live VLC/Enigma2, matroska for files, hls for segmented playback.'],
+  'transcode.alwaysTranscode': ['Always transcode', 'Never stream-copy, even when the source already matches.'],
+  'transcode.hardware': ['Use hardware (VAAPI)', 'Prefer the iGPU when the box exposes /dev/dri.'],
+  'transcode.maxConcurrent': ['Max concurrent jobs', 'How many relay sessions and downloads may run at the same time.'],
+  'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
+  'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session when no player has read from it for this long.'],
+  'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
+  'transcode.realtime': ['Pace live output', 'Throttle the relay to the source rate so real-time players do not starve.'],
+
+  'subtitles.languages': ['Languages', 'Search order, comma separated — e.g. nl, en.'],
+  'subtitles.autoSearch': ['Auto search', 'Search subtitles automatically after a title is resolved.'],
+  'subtitles.pushToReceiver': ['Push to receiver', 'Upload the chosen subtitle to the Enigma2 box as well.'],
+  'subtitles.receiverDir': ['Receiver directory', 'Folder on the box that receives the .srt files.'],
+  'subtitles.disabledProviders': ['Disabled providers', 'Provider ids to skip, comma separated (see the Subtitles tab).'],
+
+  'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
+  'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
+  'enigma2.username': ['Username', 'Only needed when the box asks for a login.'],
+  'enigma2.password': ['Password', 'Stored in /config/vumovie.json; shown masked after a reload.'],
+  'enigma2.bouquetName': ['Bouquet name', 'Name the playlist gets in the receiver bouquet list.'],
+  'enigma2.rootDir': ['Root directory', 'Folder on the box for the bouquet and the subtitle files.'],
+  'enigma2.serviceType': ['Service type', 'Enigma2 service type, 1 = non-TS (4097 = stream), 1 = DVB.'],
+  'enigma2.ftpEnabled': ['FTP upload', 'Upload the bouquet and subtitles over FTP instead of HTTP.'],
+  'enigma2.ftpPort': ['FTP port', '21 by default.'],
+  'enigma2.autoPush': ['Auto push', 'Push the bouquet after every playlist change.'],
+
+  'scraper.browserConcurrency': ['Browser concurrency', 'How many headless pages may resolve at the same time.'],
+  'scraper.browserIdleSeconds': ['Browser idle (s)', 'Close the headless browser after this many idle seconds.'],
+  'scraper.resolveTimeoutMs': ['Resolve timeout (ms)', 'Give up on one candidate after this long.'],
+  'scraper.probeCandidates': ['Probe candidates', 'Run ffprobe on every candidate so dead mirrors are filtered out.'],
+  'scraper.maxCandidates': ['Max candidates', 'How many mirrors are tried before a title is reported as failed.'],
+  'scraper.flaresolverrUrl': ['FlareSolverr URL', 'Optional Cloudflare-bypass proxy, e.g. http://flaresolverr:8191.'],
+  'scraper.externalExtractorUrl': ['External extractor URL', 'Optional helper service for sites the built-in resolvers cannot read.'],
+  'scraper.sessionDir': ['Browser session dir', 'Where cookies and the browser profile are kept.'],
+  'scraper.userAgent': ['User agent', 'User agent used for scraping and for the upstream requests.'],
+
+  'storage.downloads': ['Downloads folder', 'Where “download to NAS” writes finished files.'],
+  'storage.tmp': ['Temp folder', 'Scratch space for downloads and live tests.'],
+  'storage.cacheBudgetMb': ['Cache budget (MB)', 'How much disk the relay cache may use before old segments are dropped.'],
+
+  'app.port': ['HTTP port', 'Port the web interface listens on (restart required).'],
+  'app.baseUrl': ['Public base URL', 'Address used in every output URL — set it when the box sits behind a proxy.'],
+  'app.username': ['Username', 'Login for the web interface.'],
+  'app.password': ['Password', 'Shown masked; leave it untouched to keep the current one.'],
+  'app.logLevel': ['Log level', 'debug for troubleshooting, info for normal use.'],
+  'app.tokenTtlMinutes': ['Token lifetime (min)', 'How long a stream token stays valid. 0 = never expires.'],
+};
+
+async function initSettings() {
+  wireSettings();
+  await loadSettings();
+}
 
 async function loadSettings() {
-  const res = await api('/api/config');
-  state.config = res.config;
-  settingsDraft = JSON.parse(JSON.stringify(res.config));
-  $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
-    <div class="card">
-      <h2>${escapeHtml(section.title)}</h2>
-      ${section.fields.map(([key, type, options]) => {
-        const value = settingsDraft[section.key]?.[key];
-        const id = `set-${section.key}-${key}`;
-        if (type === 'bool') {
-          return `<div class="field"><label class="row" style="gap:6px;color:var(--fg);margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(key)}</label></div>`;
-        }
-        if (type === 'select') {
-          return `<div class="field"><label>${escapeHtml(key)}</label><select id="${id}">${options.map((o) => `<option value="${o}" ${String(value) === String(o) ? 'selected' : ''}>${o}</option>`).join('')}</select></div>`;
-        }
-        if (type === 'list') {
-          return `<div class="field"><label>${escapeHtml(key)} (comma separated)</label><input id="${id}" value="${escapeHtml((value || []).join(', '))}"></div>`;
-        }
-        return `<div class="field"><label>${escapeHtml(key)}</label><input id="${id}" type="${type}" value="${escapeHtml(value ?? '')}"></div>`;
-      }).join('')}
-    </div>`).join('');
+  try {
+    const res = await api('/api/config');
+    state.config = res.config;
+    const draft = structuredClone(res.config);
+    $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
+      <div class="card" data-set-section="${escapeHtml(section.key)}">
+        <div class="cardhead"><h2 style="margin:0">${titleWithTip(section.title, SETTINGS_NOTES[section.key])}</h2>
+          <span class="mut">${section.fields.length} field(s)</span></div>
+        <div class="set-fields">
+        ${section.fields.map(([key, type, options]) => {
+          const value = draft[section.key]?.[key];
+          const id = `set-${section.key}-${key}`;
+          const [label, hint] = SETTINGS_LABELS[`${section.key}.${key}`] || [key, ''];
+          if (type === 'bool') {
+            return `<div class="field" data-set-field="${id}"><label class="check-row" style="margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(label)} ${tip(hint)}</label></div>`;
+          }
+          if (type === 'select') {
+            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><select id="${id}">${(options || []).map((option) => `<option value="${escapeHtml(option)}" ${String(value) === String(option) ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}</select></div>`;
+          }
+          if (type === 'list') {
+            const list = Array.isArray(value) ? value : String(value ?? '').split(',').map((part) => part.trim()).filter(Boolean);
+            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" value="${escapeHtml(list.join(', '))}" placeholder="comma separated"></div>`;
+          }
+          const inputType = type === 'password' ? 'password' : type === 'number' ? 'number' : 'text';
+          return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}" value="${escapeHtml(value ?? '')}"></div>`;
+        }).join('')}
+        </div>
+      </div>`).join('');
+    const hint = $('#settings-hint');
+    if (hint) hint.textContent = `${SETTINGS_SECTIONS.length} section(s) loaded from /api/config`;
+  } catch (error) {
+    const grid = $('#settings-grid');
+    if (grid) grid.innerHTML = `<div class="card"><h2>Settings could not be loaded</h2>
+      <div class="param-msg err">${escapeHtml(error.message)}</div>
+      <div class="row"><button class="btn" id="btn-settings-retry">try again</button></div></div>`;
+    $('#btn-settings-retry')?.addEventListener('click', () => loadSettings().catch(() => {}));
+    throw error;
+  }
 }
 
 async function saveSettings() {
@@ -2878,9 +1881,9 @@ async function saveSettings() {
       let value;
       if (type === 'bool') value = el.checked;
       else if (type === 'number') value = Number(el.value);
-      else if (type === 'list') value = el.value.split(',').map((s) => s.trim()).filter(Boolean);
+      else if (type === 'list') value = el.value.split(',').map((part) => part.trim()).filter(Boolean);
       else value = el.value;
-      if (type === 'password' && /^•+$/.test(String(value))) continue; // unchanged masked secret
+      if (type === 'password' && /^•+$/.test(String(value))) continue;
       patch[section.key][key] = value;
     }
   }
@@ -2889,429 +1892,376 @@ async function saveSettings() {
   loadHealth();
 }
 
-/* ================= wiring ================= */
-
-async function copyText(text) {
-  const value = String(text ?? '');
-  if (!value) {
-    toast('Nothing to copy', 'warn');
-    return false;
-  }
-
-  // The Clipboard API is restricted to secure contexts. vu-movie is commonly
-  // opened over plain HTTP on a home LAN, so keep a synchronous fallback for
-  // those browsers (and for browsers that deny clipboard-write permissions).
-  if (window.isSecureContext && navigator.clipboard?.writeText) {
+function wireSettings() {
+  wireSubtitleSourceForm();
+  $('#btn-save-settings')?.addEventListener('click', () => saveSettings().catch((error) => toast(error.message, 'err')));
+  $('#btn-reload-settings')?.addEventListener('click', () => loadSettings().then(() => toast('Settings reloaded', 'ok', 2500)).catch((error) => toast(error.message, 'err')));
+  $('#btn-hw-test')?.addEventListener('click', async () => {
+    toast('Re-testing the hardware encoder — this can take ~30 s', 'info');
     try {
-      await navigator.clipboard.writeText(value);
-      toast('Copied to the clipboard', 'ok', 2500);
-      return true;
-    } catch { /* fall through to execCommand while the click is still active */ }
-  }
-
-  const textarea = document.createElement('textarea');
-  textarea.value = value;
-  textarea.setAttribute('readonly', '');
-  Object.assign(textarea.style, {
-    position: 'fixed', top: '0', left: '-9999px', opacity: '0', pointerEvents: 'none',
-  });
-  document.body.appendChild(textarea);
-  textarea.focus();
-  textarea.select();
-  textarea.setSelectionRange(0, value.length);
-  let copied = false;
-  try { copied = document.execCommand('copy'); } catch { /* unsupported browser */ }
-  textarea.remove();
-
-  if (copied) {
-    toast('Copied to the clipboard', 'ok', 2500);
-    return true;
-  }
-  toast('Copy failed — select the text manually', 'warn');
-  return false;
-}
-
-const App = {
-  go, openStream, cancelJob: async (id) => { await api(`/api/jobs/${id}/cancel`, { method: 'POST' }); loadJobs(); },
-  copy: copyText,
-  loadJobs, loadStreams, loadHealth,
-};
-window.App = App;
-
-function wire() {
-  $('#btn-search').addEventListener('click', doSearch);
-  $('#results-title-filter').addEventListener('input', () => { renderResults(); saveSearchState(); });
-  $('#results-title-select').addEventListener('change', () => {
-    const group = visibleResultGroups().find((candidate) => candidate.key === $('#results-title-select').value);
-    const preferred = group && preferredResultEntry(group.matches);
-    if (preferred) selectResult(preferred.index);
-  });
-  $('#results-provider-filter').addEventListener('change', () => { renderResults(); saveSearchState(); });
-  const saveUrlForm = () => {
-    clearFindSubtitleSearch();
-    state.lastResolveMode = '';
-    state.pendingRestoreUrlResolve = false;
-    saveSearchState();
-    setFindSubtitlesAction();
-  };
-  ['u-url', 'u-title', 'u-year', 'u-season', 'u-episode'].forEach((id) =>
-    $(`#${id}`).addEventListener('input', saveUrlForm));
-  ['u-kind', 'u-browser', 'u-probe'].forEach((id) =>
-    $(`#${id}`).addEventListener('change', saveUrlForm));
-  $('#results-view').addEventListener('click', (event) => {
-    const button = event.target.closest('button[data-view]');
-    if (button) setResultsView(button.dataset.view);
-  });
-  updateResultsViewButtons();
-  $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
-  $('#btn-resolve').addEventListener('click', doResolveFromUrl);
-  $('#btn-sel-subs-close').addEventListener('click', () => $('#sel-subtitle-panel').classList.add('hide'));
-
-  ['pf-vbr', 'pf-abr'].forEach((id) => $(`#${id}`).addEventListener('input', () => {
-    $(`#${id}-l`).textContent = `${$(`#${id}`).value} kbps`;
-    updateCommandPreview();
-  }));
-  ['pf-mode', 'pf-res', 'pf-aspect', 'pf-container', 'pf-fps', 'pf-subs', 'pf-always', 'pf-deint', 'pf-ac']
-    .forEach((id) => $(`#${id}`).addEventListener('change', updateCommandPreview));
-  $('#pf-template-select').addEventListener('change', selectFfmpegTemplate);
-  $('#pf-template-command').addEventListener('input', () => {
-    updateFfmpegTemplateButtons();
-    updateCommandPreview();
-  });
-  $('#btn-template-save-new').addEventListener('click', () => saveFfmpegTemplate());
-  $('#btn-template-save').addEventListener('click', () => saveFfmpegTemplate({ update: true }));
-  $('#btn-template-default').addEventListener('click', () => saveFfmpegTemplate({ update: true, makeDefault: true }));
-  $('#btn-template-delete').addEventListener('click', deleteFfmpegTemplate);
-  $('#pf-cmd-output')?.addEventListener('change', updateCommandPreview);
-  $('#pf-output-templates')?.addEventListener('change', updateCommandPreview);
-  $('#btn-test-template')?.addEventListener('click', testCurrentStreamTemplate);
-
-  // Dedicated Transcode templates page
-  $('#btn-tpl-new')?.addEventListener('click', () => {
-    tplEditorSelect({ id: '', name: '', description: '', container: 'mpegts', command: '', enabled: true, output: {} });
-    // A new template starts from the defaults (a passthrough remux), rendered
-    // by the server so the textarea never shows a stale hand-written starter.
-    tplBuildCommandNow({ announce: false });
-  });
-  $('#btn-tpl-save')?.addEventListener('click', () => tplSave());
-  $('#btn-tpl-save-top')?.addEventListener('click', () => tplSave());
-  $('#btn-tpl-delete')?.addEventListener('click', tplDelete);
-  $('#btn-tpl-test')?.addEventListener('click', () => {
-    if (!state.tplEditor) return;
-    const editor = state.tplEditor;
-    const tmplSel = $('#tpl-test-template');
-    if (editor.id && state.ffmpegTemplates.find((t) => t.id === editor.id)) {
-      tmplSel.value = editor.id;
-    } else {
-      tmplSel.value = TPL_TEST_INLINE_VALUE;
-      $('#tpl-test-command').value = editor.command || '';
-    }
-    go('tpl-test');
-  });
-  $('#btn-tpl-set-default')?.addEventListener('click', () => {
-    if (!state.tplEditor?.id) return;
-    tplSetDefaultFromList(state.tplEditor.id);
-  });
-
-  // Parameters: every control rewrites the command, the command fills the
-  // controls back in. Both directions go through the server, so the renderer
-  // exists exactly once (src/core/ffmpeg-options.js).
-  $('#tpl-editor-fields')?.addEventListener('input', (event) => {
-    const input = event.target.closest('[data-param-input]');
-    if (!input) return;
-    tplApplyOptionChange(input.dataset.paramInput, input.value);
-    const field = input.closest('.param-field');
-    if (field && input.tagName === 'SELECT') field.classList.toggle('on', input.value === 'true');
-  });
-  $('#tpl-editor-fields')?.addEventListener('change', (event) => {
-    const input = event.target.closest('[data-param-input]');
-    if (!input) return;
-    tplApplyOptionChange(input.dataset.paramInput, input.value);
-    const field = input.closest('.param-field');
-    if (field && input.tagName === 'SELECT') field.classList.toggle('on', input.value === 'true');
-  });
-  $('#btn-tpl-fields-to-cmd')?.addEventListener('click', () => tplBuildCommandNow());
-  $('#btn-tpl-cmd-to-fields')?.addEventListener('click', () => tplReadFieldsFromCommand({ rebuild: false }));
-  $('#btn-tpl-fields-reset')?.addEventListener('click', () => {
-    if (!state.tplEditor) return;
-    const container = state.tplEditor.container || 'mpegts';
-    state.tplOptions = tplDefaultOptions(container);
-    renderTplEditor();
-    tplBuildCommandNow({ announce: false });
-    tplSetStatus('parameters reset to the defaults');
-  });
-  $('#tpl-adv-flag')?.addEventListener('change', () => {
-    const custom = $('#tpl-adv-flag').value === '__custom__';
-    $('#tpl-adv-custom-row')?.classList.toggle('hide', !custom);
-    const def = tplAdvancedDefinition($('#tpl-adv-flag').value);
-    const list = $('#tpl-adv-values');
-    if (list) list.innerHTML = (def?.choices || []).map((choice) => `<option value="${escapeHtml(choice)}"></option>`).join('');
-    if (def) $('#tpl-adv-value').value = def.choices?.[0] || '';
-    if (custom) $('#tpl-adv-custom-flag')?.focus();
-  });
-  $('#btn-tpl-adv-add')?.addEventListener('click', () => {
-    if (!state.tplOptions) return;
-    const picked = $('#tpl-adv-flag').value;
-    const custom = picked === '__custom__';
-    const flag = custom ? $('#tpl-adv-custom-flag').value.trim() : picked;
-    if (!/^-[A-Za-z][\w:-]*$/.test(flag)) return toast('Enter a flag such as -rw_timeout', 'warn');
-    if (flag === '-i') return toast('-i is added by the form and cannot be used here', 'warn');
-    const def = tplAdvancedDefinition(flag);
-    const side = def ? def.side : ($('#tpl-adv-custom-side').value === 'input' ? 'input' : 'output');
-    state.tplOptions.advanced = [...(state.tplOptions.advanced || []), { flag, value: $('#tpl-adv-value').value.trim(), side }];
-    $('#tpl-adv-value').value = '';
-    if (custom) $('#tpl-adv-custom-flag').value = '';
-    tplRenderAdvanced();
-    tplScheduleBuild();
-  });
-  $('#tpl-editor-adv-rows')?.addEventListener('input', (event) => {
-    const input = event.target.closest('[data-adv-value]');
-    if (!input || !state.tplOptions?.advanced) return;
-    const entry = state.tplOptions.advanced[Number(input.dataset.advValue)];
-    if (!entry) return;
-    entry.value = input.value;
-    tplScheduleBuild();
-  });
-  $('#tpl-editor-adv-rows')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-adv-remove]');
-    if (!button || !state.tplOptions?.advanced) return;
-    state.tplOptions.advanced.splice(Number(button.dataset.advRemove), 1);
-    tplRenderAdvanced();
-    tplScheduleBuild();
-  });
-  $('#tpl-editor-enabled')?.addEventListener('change', () => {
-    if (!state.tplEditor) return;
-    state.tplEditor.enabled = $('#tpl-editor-enabled').checked;
-    $('#tpl-editor-status').textContent = 'Save to apply changes.';
-  });
-  $('#tpl-list')?.addEventListener('click', (event) => {
-    const editId = event.target.closest('[data-tpl-edit]')?.dataset.tplEdit;
-    const delId = event.target.closest('[data-tpl-delete]')?.dataset.tplDelete;
-    const defId = event.target.closest('[data-tpl-default]')?.dataset.tplDefault;
-    const testRowId = event.target.closest('[data-tpl-test-row]')?.dataset.tplTestRow;
-    if (editId) {
-      const item = state.ffmpegTemplates.find((t) => t.id === editId);
-      if (item) tplEditorSelect(item);
-    } else if (testRowId) {
-      $('#tpl-test-template').value = testRowId;
-      go('tpl-test');
-    } else if (delId) {
-      const item = state.ffmpegTemplates.find((t) => t.id === delId);
-      if (!item) return;
-      if (!window.confirm(`Delete template “${item.name}”?`)) return;
-      const templates = state.ffmpegTemplates.filter((t) => t.id !== delId);
-      const defaultFfmpegTemplateId = state.defaultFfmpegTemplateId === delId ? '' : state.defaultFfmpegTemplateId;
-      const ffmpegDefaults = { ...(state.ffmpegDefaults || {}) };
-      for (const [output, tplId] of Object.entries(ffmpegDefaults)) if (tplId === delId) ffmpegDefaults[output] = '';
-      api('/api/ffmpeg/templates', { method: 'PUT', body: { templates, defaultFfmpegTemplateId, ffmpegDefaults } }).then((res) => {
-        state.ffmpegTemplates = res.templates;
-        state.defaultFfmpegTemplateId = res.defaultFfmpegTemplateId || '';
-        state.ffmpegDefaults = res.ffmpegDefaults || {};
-        if (state.tplEditor?.id === delId) tplEditorSelect(null);
-        renderTemplatesPage();
-        toast('Template deleted', 'ok');
-      });
-    } else if (defId) {
-      tplSetDefaultFromList(defId);
-    }
-  });
-  $('#tpl-editor-outputs')?.addEventListener('change', (event) => {
-    const target = event.target;
-    if (!target.matches('input[data-output-check]')) return;
-    const output = target.dataset.outputCheck;
-    if (!state.tplEditor) return;
-    state.tplEditor.output = { ...(state.tplEditor.output || {}) };
-    if (target.checked) state.tplEditor.output[output] = state.tplEditor.id || '__self__';
-    else delete state.tplEditor.output[output];
-    tplRenderEditorOutputs();
-  });
-  $('#tpl-editor-command')?.addEventListener('input', () => {
-    if (!state.tplEditor) return;
-    state.tplEditor.command = $('#tpl-editor-command').value;
-    state.tplOptionsSynced = false;
-    $('#tpl-editor-status').textContent = 'Save to apply changes.';
-    tplScheduleParse();
-  });
-  $('#tpl-editor-name')?.addEventListener('input', () => {
-    if (!state.tplEditor) return;
-    state.tplEditor.name = $('#tpl-editor-name').value;
-  });
-  $('#tpl-editor-description')?.addEventListener('input', () => {
-    if (!state.tplEditor) return;
-    state.tplEditor.description = $('#tpl-editor-description').value;
-  });
-  $('#tpl-editor-container')?.addEventListener('change', () => {
-    if (!state.tplEditor) return;
-    const container = $('#tpl-editor-container').value;
-    state.tplEditor.container = container;
-    if (state.tplOptions) state.tplOptions.output_format = container;
-    tplRenderParameters();
-    tplScheduleBuild();
-  });
-  $('#tpl-default')?.addEventListener('change', async () => {
-    const value = $('#tpl-default').value;
-    const result = await api('/api/ffmpeg/templates', {
-      method: 'PUT',
-      body: { templates: state.ffmpegTemplates, defaultFfmpegTemplateId: value, ffmpegDefaults: state.ffmpegDefaults },
-    });
-    state.ffmpegTemplates = result.templates;
-    state.defaultFfmpegTemplateId = result.defaultFfmpegTemplateId || '';
-    state.ffmpegDefaults = result.ffmpegDefaults || {};
-    renderTemplatesPage();
-    toast(value ? 'Default template set' : 'Default template cleared', 'ok');
-  });
-
-  // Template test page
-  $('#tpl-test-template')?.addEventListener('change', () => {
-    state.tplTest.lastResult = null;
-    renderTplTestPanel();
-  });
-  $('#tpl-test-stream')?.addEventListener('change', () => {
-    state.tplTest.lastResult = null;
-    renderTplTestPanel();
-  });
-  $('#tpl-test-duration')?.addEventListener('input', () => {
-    if (state.tplTest.lastResult) state.tplTest.lastResult = null;
-    renderTplTestPanel();
-  });
-  $('#tpl-test-command')?.addEventListener('input', () => {
-    if (state.tplTest.lastResult) state.tplTest.lastResult = null;
-    renderTplTestPanel();
-  });
-  $('#btn-tpl-test-run')?.addEventListener('click', runTplTest);
-  $('#btn-tpl-test-reset')?.addEventListener('click', resetTplTest);
-  $('#btn-profile-apply').addEventListener('click', applyProfile);
-  $('#btn-profile-reset').addEventListener('click', async () => {
-    if (!state.stream) return;
-    await api(`/api/streams/${state.stream.id}/profile`, { method: 'POST', body: { profile: { mode: 'auto', container: 'mpegts', alwaysTranscode: false, resolution: 1080, videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', aspect: 'source', subtitles: 'soft', ffmpegTemplate: '', ffmpegTemplateId: '', ffmpegTemplateName: '' } } });
-    openStream(state.stream.id);
-  });
-  $('#btn-vlc').addEventListener('click', async () => {
-    const res = await api(`/api/streams/${state.stream.id}`);
-    window.location.href = res.urls.ts.replace(/^https?:/, 'vlc:');
-  });
-  $('#btn-session-start').addEventListener('click', async () => {
-    await api(`/api/streams/${state.stream.id}/session`, { method: 'POST', body: {} });
-    toast('Session started — ffmpeg is warming up', 'ok');
-    setTimeout(() => openStream(state.stream.id), 1200);
-  });
-  $('#btn-session-stop').addEventListener('click', async () => {
-    await api(`/api/streams/${state.stream.id}/session`, { method: 'DELETE' });
-    toast('Session stopped', 'info');
-    openStream(state.stream.id);
-  });
-  $('#btn-download').addEventListener('click', async () => {
-    const res = await api(`/api/streams/${state.stream.id}/download`, { method: 'POST', body: {} });
-    toast(`Download job ${res.job.id} queued — watch it on the dashboard`, 'ok', 9000);
-  });
-  $('#btn-playlist').addEventListener('click', () => {
-    window.location.href = `/s/${state.stream.token}/${state.stream.title ? state.stream.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase() : 'stream'}.m3u`;
-  });
-  $('#btn-direct').addEventListener('click', () => {
-    window.open(`/s/${state.stream.token}/direct`, '_blank');
-  });
-  $('#btn-refresh-stream').addEventListener('click', () => openStream(state.stream.id));
-
-  $('#btn-sub-search').addEventListener('click', searchSubtitles);
-  $('#btn-providers-refresh').addEventListener('click', loadProviders);
-  $('#btn-sub-push').addEventListener('click', async () => {
-    if (!state.stream) return toast('Select a stream first', 'warn');
-    const res = await api('/api/subtitles/push', { method: 'POST', body: { streamId: state.stream.id } });
-    toast(res.ok ? `Subtitle pushed (${res.path || res.via})` : `Push failed: ${res.error}`, res.ok ? 'ok' : 'err', 9000);
-  });
-  $('#btn-cp-save').addEventListener('click', async () => {
-    const id = $('#cp-id').value.trim();
-    const searchUrl = $('#cp-search').value.trim();
-    if (!id || !searchUrl) return toast('id and search URL are required', 'warn');
-    const kind = $('#cp-kind').value;
-    await api('/api/subtitles/providers', {
-      method: 'POST',
-      body: {
-        id, name: $('#cp-name').value.trim() || id, searchUrl, enabled: true,
-        downloadUrl: $('#cp-download').value.trim() || undefined,
-        parse: kind === 'json' ? { kind: 'json', items: $('#cp-parse').value.trim() } : { kind: 'html', regex: $('#cp-parse').value.trim() },
-      },
-    });
-    toast(`Provider ${id} saved`, 'ok');
-    loadProviders();
-  });
-
-  $('#btn-e2-preview').addEventListener('click', previewBouquet);
-  $('#btn-e2-save').addEventListener('click', saveEnigmaSettings);
-  $('#btn-e2-test').addEventListener('click', loadEnigmaStatus);
-  $('#btn-e2-push').addEventListener('click', () => pushBouquet(false));
-  $('#btn-e2-dry').addEventListener('click', () => pushBouquet(true));
-  $('#btn-e2-copy').addEventListener('click', () => App.copy(state.e2Preview?.text || ''));
-  $('#btn-e2-download').addEventListener('click', () => {
-    const blob = new Blob([state.e2Preview?.text || ''], { type: 'text/plain' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = state.e2Preview?.fileName || 'userbouquet.vu-movie.tv';
-    a.click();
-  });
-
-  $('#btn-log-refresh').addEventListener('click', loadLogs);
-  $('#btn-log-clear').addEventListener('click', () => { $('#log-view').innerHTML = ''; });
-  ['log-level', 'log-component', 'log-search'].forEach((id) => $(`#${id}`).addEventListener('change', loadLogs));
-  $('#log-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadLogs(); });
-
-  $('#btn-save-settings').addEventListener('click', saveSettings);
-  $('#btn-reload-settings').addEventListener('click', loadSettings);
-  $('#btn-hw-test').addEventListener('click', async () => {
-    toast('Re-testing the VAAPI pipelines (this runs a 2 s encode)…', 'info');
-    const res = await api('/api/config/hwaccel/test', { method: 'POST' });
-    const hw = res.hwaccel;
-    toast(hw.available
-      ? `VAAPI ok: ${hw.driver || 'driver'} via ${hw.libvaDriver || 'libva default'} (variant ${hw.fpsVariant})`
-      : `VAAPI unavailable: ${hw.reason}`, hw.available ? 'ok' : 'warn', 12000);
-    loadHealth();
-  });
-
-  // "ffmpeg is not working" button: timed probes, driver by driver, no guessing.
-  $('#btn-diag').addEventListener('click', async () => {
-    const out = $('#diag-out');
-    out.textContent = 'Running diagnostics: ffmpeg -version, /dev/dri, vainfo and a 2 s VAAPI encode per driver…';
-    try {
-      const res = await api('/api/diagnostics/ffmpeg');
-      const r = res.report;
-      const lines = [
-        `ffmpeg: ${r.ffmpeg.ok ? `${r.ffmpeg.version} — answered in ${r.ffmpeg.elapsedMs} ms (${r.ffmpeg.path})` : `${r.ffmpeg.kind}: ${r.ffmpeg.error}`}`,
-        `ffprobe: ${r.ffprobe.ok ? `ok (${r.ffprobe.version})` : `${r.ffprobe.kind}: ${r.ffprobe.error}`}`,
-        `/dev/dri: ${r.devicePresent ? `${r.config.device} present` : `${r.config.device} MISSING${r.driEntries.length ? ` (container sees: ${r.driEntries.join(', ')})` : ' (container sees no /dev/dri at all — pass it through in docker-compose.yml)'}`}`,
-        ...r.drivers.map((d) => `driver ${d.driver}: vainfo ${d.vainfo.ok ? `ok (${d.vainfo.version})` : `failed (${d.vainfo.error})`} · encode ${d.encode.ok ? 'WORKS' : `failed (${d.encode.error})`}`),
-      ];
-      out.innerHTML = `<b>${r.ok ? (r.hardwareOk ? 'Result: hardware transcoding is usable' : 'Result: ffmpeg works, software transcoding only') : 'Result: ffmpeg is not usable'}</b>`
-        + `<br>${lines.map((l) => escapeHtml(String(l))).join('<br>')}`
-        + `<br><span class="mut">finished in ${r.elapsedMs} ms · ${escapeHtml(r.hint || '')}</span>`;
-      toast(r.hardwareOk ? 'VAAPI works — details under the buttons' : 'No VAAPI — details under the buttons', r.hardwareOk ? 'ok' : 'warn', 10000);
+      const data = await api('/api/config/hwaccel/test', { method: 'POST', body: {} });
+      const hw = data.hwaccel || {};
+      toast(hw.available ? `VAAPI works (${hw.libvaDriver || hw.driver}, variant ${hw.fpsVariant})` : `No hardware acceleration: ${hw.reason || 'unknown reason'}`, hw.available ? 'ok' : 'warn', 10000);
       loadHealth();
-    } catch (err) {
-      out.textContent = `Diagnostics failed: ${err.message}`;
+    } catch (error) { toast(error.message, 'err'); }
+  });
+  $('#btn-diag')?.addEventListener('click', async () => {
+    const out = $('#diag-out');
+    out.textContent = 'running ffmpeg -version and a 2 s VAAPI encode per driver…';
+    try {
+      const data = await api('/api/diagnostics/ffmpeg', { silent: true });
+      const report = data.report || {};
+      out.textContent = JSON.stringify(report, null, 2);
+      toast(report.ok ? 'ffmpeg diagnostics: ok' : 'ffmpeg diagnostics found a problem — see the report', report.ok ? 'ok' : 'warn');
+    } catch (error) {
+      out.textContent = error.message;
     }
   });
-  $('#btn-cs-save').addEventListener('click', async () => {
+  $('#btn-cs-save')?.addEventListener('click', async () => {
     const id = $('#cs-id').value.trim();
     const home = $('#cs-home').value.trim();
-    if (!id || !home) return toast('id and home URL are required', 'warn');
-    await api('/api/sources', {
-      method: 'POST',
-      body: {
-        id, name: $('#cs-name').value.trim() || id, home, enabled: true,
-        match: [home.replace(/^https?:\/\//, '').replace(/\/.*$/, '')],
-        search: { kind: 'browser', url: $('#cs-search').value.trim() || `${home}/search/{query}`, linkPattern: '/(movie|tv|watch|serie)/' },
-        resolve: { kind: 'browser' },
-      },
-    });
-    toast(`Source ${id} saved`, 'ok');
-    loadSources();
+    if (!/^[a-z0-9._-]+$/i.test(id) || !home) {
+      toast('An id without spaces and a home URL are required', 'warn');
+      return;
+    }
+    try {
+      await api('/api/sources', {
+        method: 'POST',
+        body: {
+          id,
+          name: $('#cs-name').value.trim() || id,
+          home,
+          kind: 'browser',
+          search: { url: $('#cs-search').value.trim() || `${home.replace(/\/$/, '')}/search/{query}` },
+          resolve: { kind: 'browser' },
+          enabled: true,
+        },
+      });
+      toast('Custom source saved — it appears in the Search tab', 'ok');
+      $('#cs-id').value = ''; $('#cs-name').value = ''; $('#cs-home').value = ''; $('#cs-search').value = '';
+      await loadSources();
+    } catch (error) { toast(error.message, 'err'); }
   });
 }
 
-wire();
-restoreAppState();
-loadHealth();
-loadSources();
-loadStreams();
-loadJobs();
-connectEvents();
-setInterval(() => { if (!$('#p-dash').classList.contains('hide')) loadHealth(); }, 15000);
+/* ====================================================================== *
+ * mobile — the same workflow, phone-sized
+ * ====================================================================== */
+
+async function initMobile() {
+  await VMPlaylist.load().catch(() => {});
+  $('#btn-mob-search')?.addEventListener('click', mobileSearch);
+  $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
+  $('#mob-results')?.addEventListener('click', (event) => {
+    const card = event.target.closest('[data-mgroup]');
+    if (!card) return;
+    const group = state.mobile.results.find((candidate) => candidate.key === card.dataset.mgroup);
+    mobileSelect(group);
+  });
+  $('#mob-formats')?.addEventListener('click', (event) => {
+    const add = event.target.closest('[data-madd]');
+    if (!add) return;
+    mobileAdd(Number(add.dataset.madd));
+  });
+  $('#btn-mob-refresh')?.addEventListener('click', () => VMPlaylist.refresh().then(refreshMobile));
+  $('#mob-list')?.addEventListener('change', (event) => {
+    const select = event.target.closest('[data-mtpl]');
+    if (!select) return;
+    VMPlaylist.assignTemplate(select.dataset.mtpl, select.value).then(() => refreshMobile());
+  });
+  $('#btn-mob-sub-search')?.addEventListener('click', mobileSubtitleSearch);
+  $('#mob-subs')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-mattach]');
+    if (!button) return;
+    const result = state.mobile.subs[Number(button.dataset.mattach)];
+    if (!result) return;
+    button.disabled = true;
+    attachSubtitle(result, { streamId: $('#mob-sub-item').value })
+      .then(() => { button.textContent = '✓'; refreshMobile(); })
+      .catch((error) => { toast(error.message, 'err'); button.disabled = false; });
+  });
+  $('#btn-mob-generate')?.addEventListener('click', () => {
+    const url = state.playlist.urls?.m3u;
+    if (!url) return toast('No playlist URL yet', 'warn');
+    window.location.href = url;
+    mobileHint('playlist .m3u handed to the browser');
+  });
+  $('#btn-mob-push')?.addEventListener('click', async () => {
+    const log = $('#mob-push-log');
+    log.classList.remove('hide');
+    log.textContent = 'pushing…';
+    try {
+      const data = await api('/api/playlist/enigma2', { method: 'POST', body: { action: 'push' }, silent: true });
+      log.textContent = data.ok ? `✓ pushed ${data.bouquet?.entries ?? 0} entries (${data.transport?.via || 'receiver'})` : `✗ ${data.error || 'push failed'}`;
+      toast(data.ok ? 'Bouquet pushed to the box' : 'Push failed', data.ok ? 'ok' : 'err');
+    } catch (error) {
+      log.textContent = `✗ ${error.message}`;
+    }
+  });
+  $('#btn-mob-copy-url')?.addEventListener('click', () => copyText(state.playlist.urls?.page || ''));
+}
+
+function mobileHint(text) {
+  const hint = $('#mob-search-hint');
+  if (hint) hint.textContent = text;
+}
+
+async function mobileSearch() {
+  const q = ($('#mob-q')?.value || '').trim();
+  if (!q) { mobileHint('type a title first'); return; }
+  mobileHint('searching…');
+  const params = new URLSearchParams({ q, moviebox: 'true' });
+  if ($('#mob-type')?.value) params.set('type', $('#mob-type').value);
+  if ($('#mob-sources')?.value === 'enabled') params.set('sources', state.sources.filter((source) => source.enabled).map((source) => source.id).join(','));
+  try {
+    const data = await api(`/api/find/search?${params}`, { silent: true });
+    state.mobile.results = buildGroups(data.results || []).slice(0, 12);
+    const host = $('#mob-results');
+    host.innerHTML = state.mobile.results.length ? state.mobile.results.map((group) => `
+      <button class="mob-result" data-mgroup="${escapeHtml(group.key)}">
+        <span class="mob-title">${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''}</span>
+        <span class="meta">${group.kind} · ${group.entries.length} provider(s)</span>
+      </button>`).join('') : '<div class="meta">nothing found</div>';
+    mobileHint(`${state.mobile.results.length} title(s)`);
+  } catch (error) {
+    mobileHint(error.message);
+  }
+}
+
+async function mobileSelect(group) {
+  if (!group) return;
+  state.mobile.group = group;
+  const host = $('#mob-formats');
+  host.innerHTML = `<div class="meta">resolving ${group.entries.length} provider(s)…</div>`;
+  const collected = [];
+  for (const entry of group.entries) {
+    try {
+      const data = await api('/api/find/resolve', {
+        method: 'POST', silent: true,
+        body: { url: entry.url, sourceId: entry.sourceId, title: entry.title, year: entry.year || null, kind: entry.kind || group.kind, probe: true, useBrowser: entry.sourceId !== 'moviebox' },
+      });
+      for (const candidate of data.candidates || []) collected.push({ ...candidate, _entry: entry });
+    } catch { /* show what the other providers gave */ }
+  }
+  state.mobile.candidates = collected;
+  host.innerHTML = `
+    <div class="mob-head"><b>${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''}</b>
+      <span class="meta">${escapeHtml(group.kind)} · pick a format to add it to the playlist</span></div>
+    ${collected.filter((candidate) => candidate.ok !== false).map((candidate) => {
+      const index = collected.indexOf(candidate);
+      return `<button class="mob-format" data-madd="${index}">
+        <span>${escapeHtml(candidate.quality || candidate.label || 'format')}</span>
+        <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video ? ` · ${escapeHtml(` ${candidate.probe.video.width}×${candidate.probe.video.height}`)}` : ''}</span>
+      </button>`;
+    }).join('') || '<div class="meta">no playable formats</div>'}`;
+}
+
+async function mobileAdd(index) {
+  const candidate = state.mobile.candidates[index];
+  const group = state.mobile.group;
+  if (!candidate || !group) return;
+  const entry = candidate._entry || {};
+  try {
+    await api('/api/streams', {
+      method: 'POST',
+      body: {
+        title: group.title,
+        year: entry.year || group.year || null,
+        kind: entry.kind || group.kind || 'movie',
+        poster: group.poster || entry.poster || '',
+        description: entry.description || '',
+        sourceId: candidate.sourceId || entry.sourceId || '',
+        candidate: { url: candidate.url, quality: candidate.quality, label: candidate.label, sourceId: candidate.sourceId || entry.sourceId, kind: candidate.kind, headers: candidate.headers, variants: candidate.variants, probe: candidate.probe },
+      },
+    });
+    await VMPlaylist.refresh({ render: false });
+    refreshMobile();
+    toast(`“${group.title}” added to the playlist`, 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+function refreshMobile() {
+  const host = $('#mob-list');
+  const summary = $('#mob-list-summary');
+  const items = VMPlaylist.items();
+  if (summary) summary.textContent = `${items.filter((item) => item.enabled).length}/${items.length} enabled`;
+  if (!host) return;
+  if (!items.length) {
+    host.innerHTML = '<div class="meta">the playlist is empty — search above and pick a format</div>';
+  } else {
+    host.innerHTML = items.map((item) => `
+      <div class="mob-item">
+        <div class="mob-item-main">
+          <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
+          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''}</div>
+        </div>
+        <select class="mob-tpl" data-mtpl="${escapeHtml(item.streamId)}" aria-label="FFmpeg template for ${escapeHtml(item.title)}" title="FFmpeg template">
+          <option value="">guided builder</option>
+          ${VMPlaylist.templates().map((tpl) => `<option value="${escapeHtml(tpl.id)}"${(item.templateId || item.profileTemplateId) === tpl.id ? ' selected' : ''}>${escapeHtml(tpl.name)}</option>`).join('')}
+        </select>
+      </div>`).join('');
+  }
+  const select = $('#mob-sub-item');
+  if (select) {
+    const previous = select.value;
+    select.innerHTML = items.map((item) => `<option value="${escapeHtml(item.streamId)}">${escapeHtml(item.title)}</option>`).join('') || '<option value="">(playlist empty)</option>';
+    if (items.some((item) => item.streamId === previous)) select.value = previous;
+  }
+  const hint = $('#mob-output-hint');
+  if (hint) hint.textContent = state.playlist.urls?.m3u ? `${items.filter((item) => item.enabled).length} item(s) in the outputs` : '';
+  $('#btn-mob-copy-url')?.classList.toggle('hide', !state.playlist.urls?.page);
+}
+
+async function mobileSubtitleSearch() {
+  const streamId = $('#mob-sub-item')?.value;
+  if (!streamId) { toast('The playlist is empty', 'warn'); return; }
+  const item = VMPlaylist.itemFor(streamId);
+  const host = $('#mob-subs');
+  host.innerHTML = '<div class="meta">searching…</div>';
+  try {
+    const data = await api('/api/subtitles/search', {
+      method: 'POST', silent: true,
+      body: { streamId, title: item?.title, year: item?.year || null, kind: item?.kind || 'movie', season: item?.season || null, episode: item?.episode || null },
+    });
+    const filter = $('#mob-sub-lang')?.value || 'nl';
+    const results = (data.results || []).filter((result) => filter === 'all' || (result.language || '').startsWith(filter));
+    state.mobile.subs = results;
+    host.innerHTML = results.length ? results.slice(0, 25).map((result, index) => `
+      <div class="mob-sub">
+        <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span>
+          <div class="meta">${escapeHtml(result.release || result.title || '')}</div></div>
+        <button class="btn sm pri" data-mattach="${index}">attach</button>
+      </div>`).join('') : '<div class="meta">nothing found for this language</div>';
+  } catch (error) {
+    host.innerHTML = `<div class="meta">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/* ====================================================================== *
+ * bootstrap
+ * ====================================================================== */
+
+/* ---------------- sidebar: mini (icons) / pinned (icons + labels) ---------------- */
+
+const NAV_PIN_KEY = 'vu-movie.nav-pinned';
+
+function initSidebar() {
+  const app = $('.app');
+  const button = $('#btn-nav-pin');
+  const apply = (pinned) => {
+    app.classList.toggle('nav-mini', !pinned);
+    app.classList.toggle('nav-pinned', pinned);
+    if (button) {
+      button.textContent = pinned ? '⇤' : '⇥';
+      button.title = pinned ? 'unpin — collapse to icons (hover expands)' : 'pin the large menu';
+      button.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+      button.classList.toggle('on', pinned);
+    }
+    writeStoredText(NAV_PIN_KEY, pinned ? '1' : '0');
+  };
+  apply(readStoredText(NAV_PIN_KEY) === '1');
+  button?.addEventListener('click', () => apply(!app.classList.contains('nav-pinned')));
+}
+
+/* ---------------- collapsible panes (the mobile sub-panes) ---------------- */
+
+const FOLD_KEY = 'vu-movie.folded';
+
+function foldedState() {
+  const stored = readStoredJson(FOLD_KEY);
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
+function wireFolds() {
+  const stored = foldedState();
+  const setFold = (button, folded, persist = true) => {
+    const key = button.dataset.fold;
+    const body = $(`[data-fold-body="${key}"]`);
+    if (!body) return;
+    body.classList.toggle('hide', folded);
+    button.textContent = folded ? '▸' : '▾';
+    button.setAttribute('aria-expanded', folded ? 'false' : 'true');
+    button.title = folded ? 'show this pane' : 'hide this pane';
+    if (persist) writeStoredText(FOLD_KEY, JSON.stringify({ ...foldedState(), [key]: folded }));
+  };
+  $$('.foldbtn[data-fold]').forEach((button) => {
+    setFold(button, Boolean(stored[button.dataset.fold]), false);
+    button.addEventListener('click', () => {
+      const body = $(`[data-fold-body="${button.dataset.fold}"]`);
+      setFold(button, !body?.classList.contains('hide'));
+    });
+  });
+}
+
+function wireShell() {
+  $('#nav')?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-p]');
+    if (button) go(button.dataset.p);
+  });
+  window.addEventListener('hashchange', () => {
+    const page = pageFromHash();
+    if (page && page !== currentPage) go(page, { hash: false });
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && event.target?.matches?.('input,select,textarea')) event.target.blur();
+  });
+  document.addEventListener('click', (event) => {
+    const hashLink = event.target.closest('a[href^="#"]');
+    if (hashLink && APP_PAGES.includes(hashLink.getAttribute('href').slice(1))) {
+      event.preventDefault();
+      go(hashLink.getAttribute('href').slice(1));
+    }
+  });
+}
+
+Object.assign(App, {
+  go,
+  copy: copyText,
+  openModal,
+  closeModal,
+  loadHealth,
+  loadJobs,
+  loadStreams,
+  loadSources,
+  loadFfmpegTemplates: async () => {
+    const data = await api('/api/ffmpeg/templates', { silent: true });
+    state.ffmpegTemplates = data.templates || [];
+    state.defaultFfmpegTemplateId = data.defaultFfmpegTemplateId || '';
+    state.ffmpegDefaults = data.ffmpegDefaults || {};
+    state.ffmpegTemplatesLoaded = true;
+    return state.ffmpegTemplates;
+  },
+  onTemplatesChanged: () => {
+    VMPlaylist.refresh({ render: currentPage === 'list' }).catch(() => {});
+    VMFfmpegEditor.renderLibrary();
+    VMFfmpegEditor.renderTestTemplatePicker();
+    VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
+  },
+  openStream: (id) => VMPlaylist.openMetadata(id, { popup: true }),
+  cancelJob: async (id) => { await api(`/api/jobs/${id}/cancel`, { method: 'POST' }); loadJobs(); },
+});
+window.App = App;
+
+async function bootstrap() {
+  initTips();
+  initSidebar();
+  wireFolds();
+  wireShell();
+  VMPlaylist.wire();
+  loadHealth();
+  healthTimer = setInterval(() => {
+    if (document.hidden) return;
+    loadHealth();
+    if (currentPage === 'dash') loadJobs();
+  }, 15000);
+  window.addEventListener('beforeunload', () => clearInterval(healthTimer));
+
+  const stored = readStoredText(PAGE_KEY);
+  const wanted = pageFromHash() || (isPhone() ? 'mobile' : (APP_PAGES.includes(stored) ? stored : 'dash'));
+  await go(wanted, { hash: false });
+}
+
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);
+else bootstrap();
