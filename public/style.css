@@ -511,8 +511,11 @@ h3 .tip{margin-left:2px}
 @media(max-width:520px){.mob-item{flex-wrap:wrap}.mob-item .mob-tpl{max-width:none;width:100%;margin-left:0}}
 
 /* ---- drag & drop: the whole row is a drag source, not just the handle ---- */
-.pl-row{touch-action:pan-y;cursor:grab}
+.pl-row{cursor:grab}
 .pl-row:active{cursor:grabbing}
+/* only the handle opts out of scrolling, so a finger drag reorders on touch
+   while the rest of the row still scrolls the page */
+.pl-handle{touch-action:none}
 .pl-row .pl-thumb img{-webkit-user-drag:none;user-drag:none;pointer-events:none}
 .pl-row.dragging{cursor:grabbing;box-shadow:0 10px 26px rgba(0,0,0,.45);border-color:var(--acc)}
 .pl-row.drop-before::before,.pl-row.drop-after::after{content:'';display:block;position:absolute;left:8px;right:8px;height:2px;
