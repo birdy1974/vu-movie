@@ -26,6 +26,7 @@ import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
 import * as exporter from '../streams/export.js';
+import { upstreamProxyMiddleware } from '../streams/upstream.js';
 import apiRouter from './api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,7 +68,7 @@ export function createApp() {
   app.use((req, res, next) => {
     const { username, password } = cfg.app;
     if (!username) return next();
-    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path === '/api/health') return next();
+    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/') || req.path === '/api/health') return next();
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -78,6 +79,10 @@ export function createApp() {
     res.set('WWW-Authenticate', 'Basic realm="vu-movie"');
     return res.status(401).send('vu-movie: authentication required');
   });
+
+  // ---- chunked upstream proxy (/up/<secret>/…) — the loopback input for ----
+  // ---- ffmpeg when a session fetches its source in ranged chunks      ----
+  app.use(upstreamProxyMiddleware);
 
   app.use('/api', apiRouter);
 

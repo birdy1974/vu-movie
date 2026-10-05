@@ -32,6 +32,9 @@ import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
   validateFfmpegTemplate, buildFfmpegTemplateArgs,
 } from '../core/media.js';
+import {
+  maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
+} from './upstream.js';
 
 /**
  * Run an FFmpeg template (or built profile) for a short window against the
@@ -265,8 +268,42 @@ export function stopSession(streamId, reason = 'requested') {
   try { session.child?.kill('SIGTERM'); } catch (err) { logError('relay', 'could not kill ffmpeg', err); }
   setTimeout(() => { try { session.child?.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
   sessions.delete(streamId);
+  closeUpstreamProxy(session.upProxy, reason);
   cleanupHlsDir(session);
   return true;
+}
+
+/**
+ * Pure: should ffmpeg be restarted after it exited?
+ *
+ *  - nobody is watching → no (the idle stop owns that case);
+ *  - SIGTERM → no (a deliberate stop);
+ *  - a non-zero exit while clients watch → yes (transient upstream failure);
+ *  - a CLEAN exit (code 0) while clients watch → yes, unless the play head was
+ *    already at the known duration — because for these CDNs a "clean" EOF two
+ *    hours before the end of the movie is the chunked transfer being ended by
+ *    the server, not the movie finishing. This is the restart half of the
+ *    anti-cut safety net (the fetch half lives in streams/upstream.js).
+ */
+export function decideRestart({ clients = 0, restarts = 0, code = null, signal = null, outTimeMs = null, durationSec = null, maxRestarts = 3 }) {
+  if (clients <= 0) return { restart: false, reason: 'no clients' };
+  if (signal === 'SIGTERM' || signal === 'SIGKILL') return { restart: false, reason: 'stopped deliberately' };
+  if (restarts >= maxRestarts) return { restart: false, reason: `restart budget exhausted (${maxRestarts})` };
+  if (code !== 0) return { restart: true, reason: `ffmpeg exited with code ${code}` };
+  const playedSec = Number.isFinite(outTimeMs) ? outTimeMs / 1000 : null;
+  if (Number.isFinite(durationSec) && durationSec > 0 && playedSec !== null && playedSec >= durationSec * 0.99) {
+    return { restart: false, reason: 'the movie reached its known duration — genuine end of stream' };
+  }
+  return { restart: true, reason: 'clean EOF while clients are watching — upstream likely ended the transfer early (chunked CDN), resuming' };
+}
+
+/** Splice an input-side `-ss` in front of the first `-i` so a restart resumes. */
+export function argsWithResume(args, seconds) {
+  const at = Number(seconds);
+  if (!Number.isFinite(at) || at < 3) return args;
+  const index = args.indexOf('-i');
+  if (index < 0) return args;
+  return [...args.slice(0, index), '-ss', String(Math.floor(at)), ...args.slice(index)];
 }
 
 function clearIdleTimer(session) {
@@ -346,10 +383,18 @@ export async function ensureSession(stream, opts = {}) {
   if (hlsDir) enforceHlsBudget(hlsDir);
   const effectiveProfile = { ...profile, container: wantsHls ? 'hls' : profile.container };
 
+  // Chunked-fetch upstream proxy (the MovieBox-TUI mechanism): many of these
+  // CDNs end a chunked transfer after a few minutes of footage, which is what
+  // used to cut playback short. Instead of handing the CDN URL to ffmpeg, we
+  // pull the media ourselves in small ranged requests (per-request headers,
+  // per-request retries) and serve ffmpeg from a loopback endpoint. HLS stays
+  // direct — ffmpeg's HLS demuxer already fetches small segments.
+  const upProxy = await maybeCreateUpstreamProxy({ streamId: stream.id, upstream: stream.upstream });
+
   const args = buildFfmpegArgs({
     source: {
-      url: stream.upstream?.url,
-      headers: stream.upstream?.headers || {},
+      url: upProxy ? upProxy.inputUrl : stream.upstream?.url,
+      headers: upProxy ? {} : (stream.upstream?.headers || {}),
       kind: stream.upstream?.kind || undefined,
       container: stream.upstream?.probe?.container || null,
     },
@@ -385,8 +430,10 @@ export async function ensureSession(stream, opts = {}) {
     lastActivity: Date.now(),
     alive: true,
     restarts: 0,
+    resumeSeconds: 0,
     child: null,
     hw,
+    upProxy,
   };
 
   sessions.set(stream.id, session);
@@ -396,6 +443,7 @@ export async function ensureSession(stream, opts = {}) {
     outputType: session.outputType || '',
     templateId: session.templateId || '',
     templateSource: session.templateSource || '',
+    upstreamProxy: upProxy ? `yes (${upProxy.kind})` : 'no',
     reasons: profile.reasons?.join('; '), hw: hw.available ? 'vaapi' : 'software',
   });
   log.debug('relay', 'ffmpeg command', { command: truncate(command, 900) });
@@ -477,7 +525,11 @@ function spawnFfmpeg(session) {
   // ffmpegEnv() pins LIBVA_DRIVER_NAME to the driver the self-test proved to
   // work (iHD on some NAS, i965 on the DS918+) — without it ffmpeg would retry
   // the driver that failed on every session.
-  const child = spawn(ffmpegPath(), session.args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(session.hw) });
+  const args = session.resumeSeconds > 0 ? argsWithResume(session.args, session.resumeSeconds) : session.args;
+  if (session.resumeSeconds > 0) {
+    log.info('relay', `session ${session.id} resumes at ${session.resumeSeconds}s after the restart`, {});
+  }
+  const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(session.hw) });
   session.child = child;
   session.alive = true;
 
@@ -525,12 +577,28 @@ function spawnFfmpeg(session) {
 
     if (sessions.get(session.streamId) !== session) return; // replaced deliberately
 
-    // Restart once if clients are still attached — many upstream URLs drop after a
-    // while and a single retry rescues the playback instead of showing a black screen.
-    if (session.clients.size > 0 && session.restarts < 1 && code !== 0 && signal !== 'SIGTERM') {
+    // Restart while clients are still attached — upstream URLs drop, and the
+    // chunked CDNs end transfers early; decideRestart() tells the two cases
+    // apart from a genuine end-of-movie. On a mid-movie restart we resume at
+    // the last play head instead of starting over.
+    const decision = decideRestart({
+      clients: session.clients.size,
+      restarts: session.restarts,
+      code, signal,
+      outTimeMs: session.stats?.outTimeMs ?? null,
+      durationSec: session.stream?.upstream?.probe?.durationSec ?? null,
+      maxRestarts: Math.max(1, Number(getConfig().transcode.maxRestarts) || 3),
+    });
+    if (decision.restart) {
       session.restarts += 1;
+      const playedSec = Number.isFinite(session.stats?.outTimeMs) ? session.stats.outTimeMs / 1000 : 0;
+      // Resume a couple of seconds before the last play head so the player
+      // does not lose the GOP boundary it was decoding.
+      session.resumeSeconds = playedSec > 10 ? Math.max(0, Math.floor(playedSec) - 2) : 0;
+      if (session.resumeSeconds > 0) session.command = argsToCommand(argsWithResume(session.args, session.resumeSeconds));
       log.warn('relay', `restarting ffmpeg for session ${session.id} (attempt ${session.restarts})`, {
-        reason: session.stderrTail.slice(-2).join(' | '),
+        reason: decision.reason, resumeAtSec: session.resumeSeconds,
+        stderr: truncate(session.stderrTail.slice(-2).join(' | '), 240),
       });
       setTimeout(() => {
         if (sessions.get(session.streamId) === session && session.clients.size > 0) spawnFfmpeg(session);
@@ -538,8 +606,9 @@ function spawnFfmpeg(session) {
       return;
     }
 
-    endClients(session, code === 0 ? 'stream finished' : `ffmpeg exited with code ${code}`);
+    endClients(session, code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`);
     sessions.delete(session.streamId);
+    closeUpstreamProxy(session.upProxy, decision.reason);
 
     if (session.hlsDir) {
       // The source was finite (a progressive file, or a VOD playlist): the muxer
@@ -669,6 +738,7 @@ export function publicSession(session) {
     command: session.command,
     hls: Boolean(session.hlsDir),
     progressUrl: session.hlsDir ? `/hls/${session.stream.token}/index.m3u8` : null,
+    upstreamProxy: proxyStats(session.upProxy),
   };
 }
 

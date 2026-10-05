@@ -7,6 +7,10 @@
 1. **Scrapes** a stream from a supported site — either by searching the site for a
    title, or by pasting the page/player URL — and merges the chunks into **one
    continuous stream** that VLC, a browser, or the Duo2 can play directly.
+   CDNs that end a chunked transfer after a few minutes can't cut the movie
+   short: the relay pulls the source itself in small ranged requests (the
+   MovieBox-TUI mechanism — headers replayed on every request, every request
+   retried, DASH segments cached) and feeds ffmpeg locally (`UPSTREAM_PROXY`).
 2. **Transcodes** that stream on the NAS with Intel VAAPI hardware when the source
    is too big for the target (4K HEVC → 1080p H.264, 1 concurrent stream), with a
    full profile editor: resolution, aspect ratio, video/audio bitrate, fps, container.

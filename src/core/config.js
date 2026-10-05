@@ -166,6 +166,28 @@ export const DEFAULTS = {
     idleStopSeconds: Number(process.env.STREAM_IDLE_SECONDS || 45),
     /** Buffered TS parts kept per client before we drop the client (bytes). */
     maxClientBacklog: Number(process.env.MAX_CLIENT_BACKLOG || 12 * 1024 * 1024),
+    /**
+     * How many times the relay may restart ffmpeg while clients are watching
+     * (transient upstream failures / early-ended chunked transfers).
+     */
+    maxRestarts: Number(process.env.STREAM_MAX_RESTARTS || 3),
+    /**
+     * Chunked upstream proxy (the MovieBox-TUI fetching mechanism): pull the
+     * source in small ranged requests instead of handing the CDN one long
+     * connection. Stops CDNs from cutting a movie short after a few minutes.
+     * Set UPSTREAM_PROXY=false to go back to direct ffmpeg fetching.
+     */
+    upstreamProxy: String(process.env.UPSTREAM_PROXY || 'true').toLowerCase() !== 'false',
+    /** Range size for progressive files (1 MB keeps requests small and cheap). */
+    upstreamChunkBytes: Number(process.env.UPSTREAM_CHUNK_BYTES || 1024 * 1024),
+    /** Range size inside one DASH segment — 95 KB, exactly like the TUI. */
+    upstreamSegmentChunkBytes: Number(process.env.UPSTREAM_SEGMENT_CHUNK_BYTES || 95 * 1024),
+    /** Parallel ranged sub-requests while assembling a DASH segment. */
+    upstreamParallel: Number(process.env.UPSTREAM_PARALLEL || 4),
+    /** Per-session byte budget for the chunk/segment cache. */
+    upstreamCacheMb: Number(process.env.UPSTREAM_CACHE_MB || 64),
+    /** Per-request timeout for a single ranged CDN request. */
+    upstreamRequestTimeoutMs: Number(process.env.UPSTREAM_REQUEST_TIMEOUT_MS || 30000),
   },
   subtitles: {
     /** Order matters: the first language with a good hit wins. */
