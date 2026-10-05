@@ -428,3 +428,108 @@ body[data-page="mobile"] h1{font-size:17px}
 body[data-page="mobile"] .sub{font-size:12px}
 body[data-page="mobile"] .card{padding:11px}
 body[data-page="mobile"] .btn{padding:7px 11px}
+
+/* ====================================================================== *
+ * Round 2 — icon rail, foldable panes, hover tips, 3-column parameters
+ * ====================================================================== */
+
+/* ---- left menu: icons by default, expands on hover, pinnable ---- */
+.navpin{all:unset;cursor:pointer;margin-left:auto;padding:2px 7px;border:1px solid var(--line);border-radius:8px;
+  color:var(--mut);font-size:12px;line-height:1.5;flex-shrink:0}
+.navpin:hover{color:var(--fg);border-color:#3a4d70;background:var(--card2)}
+.navpin.on{color:#fff;border-color:transparent;background:linear-gradient(135deg,rgba(14,165,233,.75),rgba(99,102,241,.75))}
+.nav button .ico{width:22px;flex:0 0 22px;text-align:center;font-size:15px;line-height:1}
+.nav button .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brandtext{min-width:0}
+
+/* mini = overlay rail: the content does not reflow when the rail expands */
+.app.nav-mini .side{position:fixed;top:0;left:0;bottom:0;height:100vh;width:62px;flex:0 0 62px;
+  padding:14px 9px;overflow:hidden;z-index:40;transition:width .15s ease,box-shadow .15s ease}
+.app.nav-mini .side:hover,.app.nav-mini .side:focus-within{width:236px;overflow:auto;
+  box-shadow:18px 0 44px rgba(0,0,0,.55)}
+.app.nav-mini .main{margin-left:62px}
+.app.nav-mini .side .lbl{display:none}
+.app.nav-mini .side .brandtext{display:none}
+.app.nav-mini .side .sepsmall{display:none}
+.app.nav-mini .side .navpin{margin:0 auto}
+.app.nav-mini .brand{flex-direction:column;justify-content:center;padding:4px 0 12px;gap:6px}
+.app.nav-mini .nav button{justify-content:center;padding:10px 0}
+.app.nav-mini .sidefoot{display:none}
+.app.nav-mini .side:hover .lbl,.app.nav-mini .side:focus-within .lbl{display:inline}
+.app.nav-mini .side:hover .brandtext,.app.nav-mini .side:focus-within .brandtext{display:block}
+.app.nav-mini .side:hover .sidefoot,.app.nav-mini .side:focus-within .sidefoot{display:block}
+.app.nav-mini .side:hover .brand,.app.nav-mini .side:focus-within .brand{flex-direction:row;justify-content:flex-start;padding:4px 6px 14px;gap:10px}
+.app.nav-mini .side:hover .nav button,.app.nav-mini .side:focus-within .nav button{justify-content:flex-start;padding:9px 11px}
+
+/* ---- collapsible panes (the fold button in a card header) ---- */
+.foldbtn{all:unset;cursor:pointer;flex-shrink:0;width:26px;height:22px;display:inline-grid;place-items:center;
+  border:1px solid var(--line);border-radius:7px;color:var(--mut);font-size:11px;line-height:1}
+.foldbtn:hover{color:var(--fg);border-color:#3a4d70;background:var(--card2)}
+.foldbtn:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.cardhead+.cardbody{padding:12px 14px 14px}
+.cardhead+.cardbody>.field:last-child{margin-bottom:0}
+
+/* ---- "i" hover tips: the inline help text lives in the tooltip ---- */
+.tip{display:inline-grid;place-items:center;width:14px;height:14px;margin-left:4px;border-radius:50%;
+  border:1px solid var(--line);background:var(--bg2);color:var(--mut);font-size:9.5px;font-weight:700;
+  cursor:help;position:relative;vertical-align:1px}
+.tip:hover,.tip:focus-visible{color:#04121c;background:var(--acc);border-color:var(--acc);outline:none}
+.tip::after{content:attr(data-tip);position:absolute;z-index:70;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%);
+  width:max-content;max-width:290px;padding:8px 10px;border-radius:9px;border:1px solid var(--line);
+  background:#0d1524;color:var(--fg);font-size:11.5px;font-weight:400;line-height:1.45;text-align:left;
+  box-shadow:0 12px 30px rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .12s ease;white-space:normal}
+.tip::before{content:'';position:absolute;z-index:71;left:50%;bottom:calc(100% + 2px);transform:translateX(-50%);
+  border:5px solid transparent;border-top-color:#0d1524;opacity:0;transition:opacity .12s ease}
+.tip:hover::after,.tip:focus-visible::after,.tip:hover::before,.tip:focus-visible::before{opacity:1}
+label .tip{float:right;margin-top:1px}
+summary .tip{margin-left:6px}
+h3 .tip{margin-left:2px}
+.param-field.off label,.param-field.off .tip{opacity:.65}
+/* the disabled-reason tooltip needs the "tip" class on the field wrapper */
+.param-field[title]{cursor:help}
+
+/* ---- 3-column parameter grid (Transcode / Test editor) ---- */
+.param-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px;align-items:start}
+.param-field{min-width:0;margin:0}
+.param-field label{display:block;overflow-wrap:anywhere}
+.param-field select,.param-field input{width:100%}
+@media(max-width:1280px){.param-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:900px){.param-grid{grid-template-columns:1fr}}
+
+/* ---- stream tab: the per-stream URL list ---- */
+.st-url-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:10px 14px}
+.st-url-grid input[readonly]{cursor:text}
+@media(max-width:760px){.st-url-grid{grid-template-columns:1fr}}
+
+/* ---- settings: field grid inside a section card ---- */
+.set-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px 14px}
+.set-fields .field{margin:0}
+
+/* ---- mobile playlist rows: the template select sits beside the title ---- */
+.mob-item .mob-title{font-weight:600;line-height:1.3}
+.mob-item .mob-tpl{width:auto;max-width:46%;flex-shrink:0;font-size:12px;padding:6px 8px;margin-left:auto;align-self:center}
+@media(max-width:520px){.mob-item{flex-wrap:wrap}.mob-item .mob-tpl{max-width:none;width:100%;margin-left:0}}
+
+/* ---- drag & drop: the whole row is a drag source, not just the handle ---- */
+.pl-row{touch-action:pan-y;cursor:grab}
+.pl-row:active{cursor:grabbing}
+.pl-row .pl-thumb img{-webkit-user-drag:none;user-drag:none;pointer-events:none}
+.pl-row.dragging{cursor:grabbing;box-shadow:0 10px 26px rgba(0,0,0,.45);border-color:var(--acc)}
+.pl-row.drop-before::before,.pl-row.drop-after::after{content:'';display:block;position:absolute;left:8px;right:8px;height:2px;
+  background:var(--acc);border-radius:2px}
+.pl-row{position:relative}
+.pl-row.drop-before::before{top:-5px}
+.pl-row.drop-after::after{bottom:-5px}
+
+/* the phone/tablet top bar keeps every label: an icon-only bar is unusable there */
+@media(max-width:1000px){
+  .app.nav-mini .side{position:sticky;top:0;left:auto;bottom:auto;width:auto;flex:0 0 auto;height:auto;
+    margin:0;padding:8px 10px;overflow:visible;box-shadow:none}
+  .app.nav-mini .main{margin-left:0}
+  .app.nav-mini .side .lbl,.app.nav-mini .side .brandtext{display:inline}
+  .app.nav-mini .brand{justify-content:flex-start;padding:2px 4px 8px;gap:10px}
+  .app.nav-mini .nav button{justify-content:flex-start;padding:7px 10px}
+  .app.nav-mini .sidefoot,.app.nav-mini .side .sidefoot{display:none}
+  .navpin{display:none}
+  .nav button .ico{width:auto;flex:0 0 auto}
+}

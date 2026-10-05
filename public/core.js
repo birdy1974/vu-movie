@@ -10,6 +10,22 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+/* ---------------- compatibility ---------------- */
+
+/**
+ * Deep clone for plain JSON data (config, FFmpeg templates).
+ *
+ * `structuredClone` only exists in newer browsers (Chrome 98+, Safari 15.4+,
+ * Firefox 94+). Without it, `structuredClone(config)` threw and left the whole
+ * Settings grid empty, and the Test tab never loaded its template — so this is
+ * shimmed here and the call sites keep using the standard name.
+ */
+function cloneJson(value) {
+  if (value === undefined) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+if (typeof globalThis.structuredClone !== 'function') globalThis.structuredClone = (value) => cloneJson(value);
+
 /* ---------------- storage ---------------- */
 
 function readStoredJson(key) {

@@ -219,6 +219,11 @@ const VMFfmpegEditor = (() => {
    * controls
    * ------------------------------------------------------------------ */
 
+  /** Inline help is hidden behind this "i": hover or focus shows the text. */
+  const tip = (text, label = 'more information') => (text
+    ? `<span class="tip" tabindex="0" role="note" aria-label="${escapeHtml(label)}" data-tip="${escapeHtml(text)}">i</span>`
+    : '');
+
   const choiceLabel = (key, value) => {
     if (value === '') return ['rate', 'integer', 'number', 'positive'].includes(fieldDef(key)?.kind) || ['fps', 'gop', 'global_quality', 'async_depth', 'audio_channels', 'audio_rate', 'video_bitrate', 'maxrate', 'bufsize', 'audio_bitrate'].includes(key)
       ? '— (leave to ffmpeg)'
@@ -231,12 +236,12 @@ const VMFfmpegEditor = (() => {
     const value = values[key];
     const value2 = value === undefined || value === null ? '' : String(value);
     const id = `ff-${def.key}`;
-    const hint = def.help ? `<p class="param-hint">${escapeHtml(def.help)}</p>` : '';
+    const hint = tip(def.help, def.label ? `${def.label} — more information` : 'more information');
 
     if (def.kind === 'bool') {
       const current = yesNo(value);
       return `<div class="param-field" data-field="${key}">
-        <label for="${id}">${escapeHtml(def.label)}</label>
+        <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
         <select id="${id}" data-param="${key}">
           <option value="false"${current === 'false' ? ' selected' : ''}>disabled</option>
           <option value="true"${current === 'true' ? ' selected' : ''}>enabled</option>
@@ -245,8 +250,8 @@ const VMFfmpegEditor = (() => {
 
     if (def.kind === 'flags') {
       return `<div class="param-field" data-field="${key}">
-        <label for="${id}">${escapeHtml(def.label)}</label>
-        <input id="${id}" class="mono" data-param="${key}" value="${escapeHtml(value2)}" placeholder="additional ffmpeg flags" spellcheck="false" autocomplete="off">${hint}</div>`;
+        <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
+        <input id="${id}" class="mono" data-param="${key}" value="${escapeHtml(value2)}" placeholder="additional ffmpeg flags" spellcheck="false" autocomplete="off"></div>`;
     }
 
     const choices = Array.isArray(def.choices) ? def.choices : [];
@@ -259,13 +264,13 @@ const VMFfmpegEditor = (() => {
     const placeholder = def.kind === 'resolution' ? 'e.g. 1280x720 or 900p'
       : def.kind === 'aspect' ? 'e.g. 16:9' : def.kind === 'rate' ? 'e.g. 8000k' : 'value';
     return `<div class="param-field" data-field="${key}">
-      <label for="${id}">${escapeHtml(def.label)}</label>
+      <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
       <div class="param-select-row">
         <select id="${id}" data-param="${key}">${optionList}
           <option value="${CUSTOM}"${customSelected ? ' selected' : ''}>✎ custom value…</option>
         </select>
         ${customInput}
-      </div>${hint}</div>`;
+      </div></div>`;
   }
 
   function advancedRowMarkup(entry, index) {
@@ -328,13 +333,11 @@ const VMFfmpegEditor = (() => {
           <span class="mut" id="${id}-active-count"></span>
         </div>
 
-        <h3>Individual FFmpeg parameters</h3>
-        <p class="sub" style="margin:2px 0 10px">Greyed-out parameters do not apply to the current combination — the reason is beside the value.</p>
+        <h3>Individual FFmpeg parameters ${tip('Greyed-out parameters do not apply to the current combination — hover the field (or its i) to read why.')}</h3>
         <div class="param-grid" id="${id}-params"></div>
 
         <details class="param-advanced">
-          <summary>Advanced parameters <span class="mut" id="${id}-adv-count"></span></summary>
-          <p class="sub" style="margin:8px 0">Anything else ffmpeg accepts. Flags the form owns (-i, -map, codecs, filters, -f …) must be set in their own parameter.</p>
+          <summary>Advanced parameters <span class="mut" id="${id}-adv-count"></span> ${tip('Anything else ffmpeg accepts. Flags the form owns (-i, -map, codecs, filters, -f …) must be set in their own parameter.')}</summary>
           <div class="row param-adv-add">
             <select id="${id}-adv-flag" style="flex:1;min-width:200px"></select>
             <input id="${id}-adv-value" class="mono" style="flex:1;min-width:120px" placeholder="value" list="${id}-adv-values">
@@ -352,39 +355,35 @@ const VMFfmpegEditor = (() => {
         </details>
 
         ${mode === 'library' ? `<details class="param-advanced" id="${id}-outputs-box">
-          <summary>Used for these outputs</summary>
-          <p class="sub" style="margin:8px 0">Where this template is used when a stream has no template of its own. The default template covers everything else.</p>
+          <summary>Used for these outputs ${tip('Where this template is used when a stream has no template of its own. The default template covers everything else.')}</summary>
           <div id="${id}-outputs" class="output-grid"></div>
         </details>` : ''}
 
-        <h3 style="margin-top:16px">Advice</h3>
+        <h3 style="margin-top:16px">Advice ${tip('The editor checks the parameter combination and flags what does not match, with the reason and a suggestion.')}</h3>
         <div class="param-messages" id="${id}-advice"></div>
 
-        <h3 style="margin-top:16px">Final FFmpeg command</h3>
+        <h3 style="margin-top:16px">Final FFmpeg command ${tip('Use exactly one <url> right after -i. Output to pipe:1, or <output> for HLS. The relay adds source headers and its safe network defaults when a flag is absent.')}</h3>
         <textarea id="${id}-command" class="mono" rows="7" spellcheck="false" placeholder="ffmpeg -hide_banner -i <url> …"></textarea>
         <div class="row" style="margin-top:8px">
           <button class="btn sm" id="${id}-rebuild">↻ rebuild from parameters</button>
           <button class="btn sm ghost" id="${id}-read">↻ read parameters from command</button>
           <span class="mut" id="${id}-cmd-meta"></span>
         </div>
-        <p class="sub" style="margin:6px 0 0">Use exactly one <code>&lt;url&gt;</code> right after <code>-i</code>. Output to <code>pipe:1</code>, or <code>&lt;output&gt;</code> for HLS. The relay adds source headers and its safe network defaults when a flag is absent.</p>
-
-        <h3 style="margin-top:16px">Test the final command</h3>
+        <h3 style="margin-top:16px">Test the final command ${tip('Runs the command above against a real source for a few seconds and shows the raw ffmpeg output. Nothing is saved.')}</h3>
         <div class="test-pane">
           ${externalTestControls ? '' : `<div class="f2">
-            <div class="field"><label for="${id}-test-source">Input source</label>
-              <select id="${id}-test-source"></select>
-              <div class="meta">Playlist items and saved streams keep their upstream URL and request headers.</div></div>
-            <div class="field"><label for="${id}-test-duration">Run for (seconds)</label>
+            <div class="field"><label for="${id}-test-source">Input source ${tip('Playlist items and saved streams keep their upstream URL and request headers.')}</label>
+              <select id="${id}-test-source"></select></div>
+            <div class="field"><label for="${id}-test-duration">Run for (seconds) ${tip('Max 30 s — long enough to read one keyframe, short enough that the relay never stalls.')}</label>
               <input id="${id}-test-duration" type="number" min="1" max="30" step="1" value="5"></div>
           </div>`}
           <div class="field hide" id="${id}-test-url-field"><label for="${id}-test-url">Custom source URL</label>
             <input id="${id}-test-url" class="mono" placeholder="https://…/movie.mp4"></div>
           <div class="row">
-            <button class="btn pri" id="${id}-test-run">▷ run test</button>
-            <button class="btn ghost" id="${id}-test-stop" disabled>■ stop</button>
+            ${externalTestControls ? '' : `<button class="btn pri" id="${id}-test-run">▷ run test</button>
+            <button class="btn ghost" id="${id}-test-stop" disabled>■ stop</button>`}
             <button class="btn sm ghost" id="${id}-test-clear">clear output</button>
-            <span class="mut" id="${id}-test-status"></span>
+            ${externalTestControls ? '' : `<span class="mut" id="${id}-test-status"></span>`}
           </div>
           <div class="tpl-test-verdict" id="${id}-test-verdict" style="margin-top:10px">(not run yet)</div>
           <div class="tpl-test-progress" id="${id}-test-progress"></div>
@@ -483,19 +482,20 @@ const VMFfmpegEditor = (() => {
       inputs.forEach((input) => { input.disabled = disabled; });
       wrapper.classList.toggle('off', disabled);
       wrapper.classList.toggle('on', !disabled);
-      let reason = $('.param-reason', wrapper);
+      // The "why" of a greyed-out parameter goes into its own "i" tooltip, so
+      // the form stays quiet and the reason is one hover away.
+      const marker = $('.tip', wrapper);
       if (disabled && rule.why) {
-        if (!reason) {
-          reason = document.createElement('p');
-          reason.className = 'param-hint param-reason';
-          wrapper.appendChild(reason);
+        if (marker) {
+          marker.dataset.baseTip = marker.dataset.baseTip || marker.dataset.tip || '';
+          marker.dataset.tip = `not applicable: ${rule.why}${marker.dataset.baseTip ? `. ${marker.dataset.baseTip}` : ''}`;
         }
-        reason.textContent = `not applicable: ${rule.why}`;
-      } else if (reason) {
-        reason.remove();
-      } else if (!disabled) {
-        on += 1;
+        wrapper.title = `not applicable: ${rule.why}`;
+      } else {
+        if (marker && marker.dataset.baseTip) marker.dataset.tip = marker.dataset.baseTip;
+        wrapper.removeAttribute('title');
       }
+      if (!disabled) on += 1;
     }
     const count = $(`#${instance.id}-active-count`);
     if (count) count.textContent = `${on} parameter(s) in effect`;
@@ -839,6 +839,11 @@ const VMFfmpegEditor = (() => {
     return { kind: 'stream', streamId: '', url: '' };
   }
 
+  /** The status text lives in the editor, or in the Test tab when it owns the buttons. */
+  const testStatus = (instance) => $(`#${instance.id}-test-status`) || (instance.externalTestControls ? $('#test-status') : null);
+  const testRunButton = (instance) => $(`#${instance.id}-test-run`) || (instance.externalTestControls ? $('#btn-test-run') : null);
+  const testStopButton = (instance) => $(`#${instance.id}-test-stop`) || (instance.externalTestControls ? $('#btn-test-stop') : null);
+
   function clearTestOutput(instance) {
     const output = $(`#${instance.id}-test-output`);
     if (output) output.textContent = '— raw ffmpeg output appears here —';
@@ -875,9 +880,9 @@ const VMFfmpegEditor = (() => {
     if (target.kind === 'url' && !target.url) return toast('Enter the custom source URL', 'warn');
 
     const verdict = $(`#${instance.id}-test-verdict`);
-    const status = $(`#${instance.id}-test-status`);
-    const runButton = $(`#${instance.id}-test-run`);
-    const stopButton = $(`#${instance.id}-test-stop`);
+    const status = testStatus(instance);
+    const runButton = testRunButton(instance);
+    const stopButton = testStopButton(instance);
     clearTestOutput(instance);
     if (verdict) {
       verdict.className = 'tpl-test-verdict';
@@ -912,7 +917,8 @@ const VMFfmpegEditor = (() => {
       },
       done: (payload) => {
         instance.test.running = null;
-        if (runButton) runButton.textContent = '▷ run test';
+        if (runButton && !instance.externalTestControls) runButton.textContent = '▷ run test';
+        else if (runButton) runButton.disabled = false;
         if (stopButton) stopButton.disabled = true;
         if (status) status.textContent = `finished in ${(Number(payload.durationMs) / 1000).toFixed(1)} s`;
         if (verdict) {
@@ -924,7 +930,8 @@ const VMFfmpegEditor = (() => {
       },
       onError: (error) => {
         instance.test.running = null;
-        if (runButton) runButton.textContent = '▷ run test';
+        if (runButton && !instance.externalTestControls) runButton.textContent = '▷ run test';
+        else if (runButton) runButton.disabled = false;
         if (stopButton) stopButton.disabled = true;
         if (status) status.textContent = 'the live stream failed — trying the one-shot test…';
         appendTestLine(instance, `# live mode failed: ${error.message}`);
@@ -932,13 +939,14 @@ const VMFfmpegEditor = (() => {
       },
     });
     instance.test.running = handle;
-    if (runButton) runButton.textContent = '⧗ running…';
+    if (runButton && !instance.externalTestControls) runButton.textContent = '⧗ running…';
+    else if (runButton) runButton.disabled = true;
   }
 
   /** Fallback when SSE is blocked (some reverse proxies buffer it): the old one-shot test. */
   async function oneShotTest(instance, target, durationMs) {
     const verdict = $(`#${instance.id}-test-verdict`);
-    const status = $(`#${instance.id}-test-status`);
+    const status = testStatus(instance);
     try {
       const res = await api('/api/ffmpeg/test', {
         method: 'POST',
@@ -972,10 +980,11 @@ const VMFfmpegEditor = (() => {
   function stopTest(instance) {
     instance.test.running?.abort?.();
     instance.test.running = null;
-    const runButton = $(`#${instance.id}-test-run`);
-    const stopButton = $(`#${instance.id}-test-stop`);
-    const status = $(`#${instance.id}-test-status`);
-    if (runButton) runButton.textContent = '▷ run test';
+    const runButton = testRunButton(instance);
+    const stopButton = testStopButton(instance);
+    const status = testStatus(instance);
+    if (runButton && !instance.externalTestControls) runButton.textContent = '▷ run test';
+    else if (runButton) runButton.disabled = false;
     if (stopButton) stopButton.disabled = true;
     if (status) status.textContent = 'stopped';
   }
@@ -1200,7 +1209,10 @@ const VMFfmpegEditor = (() => {
     await App.loadStreams?.();
     testEditor = create({ host: $('#test-editor-host'), mode: 'test', externalTestControls: true });
     renderTestTemplatePicker();
-    renderTestSources();
+    // NB: the instance is required — calling this without one threw
+    // "Cannot read properties of undefined (reading 'id')", which aborted
+    // initTestTab() before the tab's start/stop buttons were wired.
+    renderTestSources(testEditor);
     const first = state.ffmpegTemplates[0];
     if (first) loadTestTemplate(first.id);
     else loadTemplate(testEditor, null);
@@ -1247,20 +1259,33 @@ const VMFfmpegEditor = (() => {
     return { kind: 'stream', streamId: '', url: '' };
   }
 
-  /** Called by the Test tab's own "run test" button. */
+  /** Called by the Test tab's own "start test" button. */
   function runTestTab() {
     const durationMs = Math.max(500, Math.min(30000, (Number($('#test-duration')?.value) || 5) * 1000));
-    return runTest(testEditor, { source: testTarget(), durationMs });
+    const target = testTarget();
+    syncTabButtons(true);
+    const status = $('#test-status');
+    if (status) status.textContent = `running ffmpeg for ${(durationMs / 1000).toFixed(1)} s…`;
+    return runTest(testEditor, { source: target, durationMs }).finally(() => syncTabButtons(false));
   }
 
   function stopTestTab() {
     stopTest(testEditor);
+    syncTabButtons(false);
+  }
+
+  /** Keep the tab's run/stop buttons in step with the editor instance. */
+  function syncTabButtons(running) {
+    const run = $('#btn-test-run');
+    const stop = $('#btn-test-stop');
+    if (run) { run.disabled = Boolean(running); run.textContent = running ? '⧗ running…' : '▷ start test'; }
+    if (stop) stop.disabled = !running;
   }
 
   return {
     ensureSchema, create, loadTemplate, saveTemplate, deleteTemplate, setDefaultTemplate,
     initLibrary, initTestTab, renderLibrary, selectTemplate, loadTestTemplate, wireLibraryTab,
-    runTestTab, stopTestTab, renderTestSources, renderTestTemplatePicker, adviceFor, computeActive,
+    runTestTab, stopTestTab, syncTabButtons, clearTestOutput, renderTestSources, renderTestTemplatePicker, adviceFor, computeActive,
     get testEditor() { return testEditor; },
     get libraryEditor() { return libraryEditor; },
   };

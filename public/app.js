@@ -21,6 +21,8 @@ const SEARCH_STATE_KEY = 'vu-movie.search-state.v2';
 const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
 const RESULT_SORT_KEY = 'vu-movie.search-results-sort';
 const SELECTED_STREAM_KEY = 'vu-movie.selected-stream';
+// Set by Stream → “test template” so the Test tab opens on the same stream.
+const TEST_SOURCE_KEY = 'vu-movie.test-source';
 const FIND_TABS = ['title', 'url', 'browse'];
 const RESULT_VIEWS = ['list', 'poster', 'thumbnails'];
 
@@ -79,7 +81,14 @@ async function openPage(page, { force = false } = {}) {
   const once = async (name, fn) => {
     if (!initialized.has(name) || force) {
       initialized.add(name);
-      await fn();
+      try {
+        await fn();
+      } catch (error) {
+        // A failed first load must not lock the tab: forget it so opening the
+        // page again retries instead of showing an empty pane for ever.
+        initialized.delete(name);
+        throw error;
+      }
     }
   };
   switch (page) {
@@ -122,6 +131,7 @@ async function openPage(page, { force = false } = {}) {
         await VMPlaylist.load().catch(() => {});
         await VMFfmpegEditor.initTestTab();
         wireTestSourcePicker();
+        wireTestControls();
       });
       renderTestSourcePicker();
       VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
@@ -1111,6 +1121,43 @@ function subTargetIds() {
   return $$('#sub-targets input:checked').map((input) => input.value);
 }
 
+/**
+ * The custom subtitle provider form, moved from the Subtitles tab to
+ * Settings → Subtitles.
+ */
+function wireSubtitleSourceForm() {
+  $('#btn-cp-save')?.addEventListener('click', async () => {
+    const id = $('#cp-id').value.trim();
+    const searchUrl = $('#cp-search').value.trim();
+    const note = $('#cp-note');
+    if (!/^[a-z0-9._-]+$/i.test(id) || !searchUrl) {
+      toast('An id without spaces and a search URL are required', 'warn');
+      return;
+    }
+    const kind = $('#cp-kind').value;
+    const parse = { kind, map: { url: 'url', title: 'title', release: 'release', language: 'language' } };
+    if (kind === 'json') parse.items = $('#cp-parse').value.trim() || 'data';
+    else parse.regex = $('#cp-parse').value.trim() || '<a[^>]+href="([^"]+)"[^>]*>([^<]{2,120})<';
+    if (note) note.textContent = 'saving…';
+    try {
+      await api('/api/subtitles/providers', {
+        method: 'POST',
+        body: { id, name: $('#cp-name').value.trim() || id, searchUrl, downloadUrl: $('#cp-download').value.trim(), parse, enabled: true },
+      });
+      toast('Custom subtitle provider saved — it is on the Subtitles tab now', 'ok');
+      if (note) note.textContent = `saved “${id}”`;
+      for (const field of ['cp-id', 'cp-name', 'cp-search', 'cp-parse', 'cp-download']) {
+        const input = $(`#${field}`);
+        if (input) input.value = '';
+      }
+      await loadProviders().catch(() => {});
+    } catch (error) {
+      if (note) note.textContent = '';
+      toast(error.message, 'err');
+    }
+  });
+}
+
 async function searchSubtitles() {
   const ids = subTargetIds();
   const manualTitle = $('#sub-title')?.value.trim();
@@ -1210,27 +1257,6 @@ function wireSubtitles() {
       button.textContent = 'test';
     }
   });
-  $('#btn-cp-save')?.addEventListener('click', async () => {
-    const id = $('#cp-id').value.trim();
-    const searchUrl = $('#cp-search').value.trim();
-    if (!/^[a-z0-9._-]+$/i.test(id) || !searchUrl) {
-      toast('An id without spaces and a search URL are required', 'warn');
-      return;
-    }
-    const kind = $('#cp-kind').value;
-    const parse = { kind, map: { url: 'url', title: 'title', release: 'release', language: 'language' } };
-    if (kind === 'json') parse.items = $('#cp-parse').value.trim() || 'data';
-    else parse.regex = $('#cp-parse').value.trim() || '<a[^>]+href="([^"]+)"[^>]*>([^<]{2,120})<';
-    try {
-      await api('/api/subtitles/providers', {
-        method: 'POST',
-        body: { id, name: $('#cp-name').value.trim() || id, searchUrl, downloadUrl: $('#cp-download').value.trim(), parse, enabled: true },
-      });
-      toast('Custom subtitle provider saved', 'ok');
-      $('#cp-id').value = ''; $('#cp-name').value = ''; $('#cp-search').value = ''; $('#cp-parse').value = ''; $('#cp-download').value = '';
-      await loadProviders();
-    } catch (error) { toast(error.message, 'err'); }
-  });
   $('#btn-sub-targets-all')?.addEventListener('click', () => { $$('#sub-targets input').forEach((input) => { input.checked = true; }); });
   $('#btn-sub-targets-none')?.addEventListener('click', () => { $$('#sub-targets input').forEach((input) => { input.checked = false; }); });
   $('#btn-sub-search')?.addEventListener('click', searchSubtitles);
@@ -1257,6 +1283,110 @@ function wireSubtitles() {
  * stream — every output URL of the playlist
  * ====================================================================== */
 
+const STREAM_URL_LABELS = [
+  ['ts', 'VLC / any player (.ts)'],
+  ['mkv', 'VLC / any player (.mkv)'],
+  ['hls', 'Playlist (.m3u8)'],
+  ['playlist', 'Playlist (.m3u)'],
+  ['forBox', 'Enigma2 / Duo2'],
+  ['direct', 'Direct upstream link (302)'],
+  ['download', 'Download to NAS'],
+  ['watch', 'Watch in browser'],
+];
+
+function selectedStreamId() {
+  const picked = $('#st-pick')?.value;
+  if (picked) return picked;
+  const stored = readStoredText(SELECTED_STREAM_KEY);
+  if (stored && VMPlaylist.itemFor(stored)) return stored;
+  return VMPlaylist.items()[0]?.streamId || '';
+}
+
+/** The per-stream URL list the old Stream tab showed (VLC, playlist, direct…). */
+function renderStreamUrls() {
+  const pick = $('#st-pick');
+  const host = $('#st-urls');
+  if (!pick || !host) return;
+  const items = VMPlaylist.items();
+  const previous = selectedStreamId();
+  pick.innerHTML = items.length
+    ? items.map((item) => `<option value="${escapeHtml(item.streamId)}"${item.streamId === previous ? ' selected' : ''}>${escapeHtml(item.title)}${item.year ? ` (${item.year})` : ''}</option>`).join('')
+    : '<option value="">(the playlist is empty)</option>';
+  const item = VMPlaylist.itemFor(pick.value || previous) || items[0] || null;
+  if (!item) {
+    host.innerHTML = '<div class="meta">No stream yet — add one from the Search tab and it appears here.</div>';
+    return;
+  }
+  const urls = item.urls || {};
+  host.innerHTML = `<div class="row" style="margin-bottom:8px">
+      ${tag(item.quality || 'unknown', 'ok')} ${tag(item.kind || 'movie')} ${tag(item.sourceId || '—')}
+      ${tag(VMPlaylist.templateLabel(item), item.hasTemplate ? 'alt' : '')}
+      ${item.enabled ? tag('in the outputs', 'ok') : tag('disabled — not in the outputs', 'warn')}
+      <span class="mut">${item.session ? `${item.session.clients || 0} player(s) connected` : 'no relay session running'}</span>
+    </div>
+    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => `
+      <div class="field" style="margin:0">
+        <label>${escapeHtml(label)}</label>
+        <div class="row">
+          <input type="text" class="mono" readonly value="${escapeHtml(urls[key] || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
+          <button type="button" class="btn sm" data-copy-url="${escapeHtml(urls[key] || '')}"${urls[key] ? '' : ' disabled'}>copy</button>
+        </div>
+      </div>`).join('')}</div>
+    ${urls.directNote ? `<div class="note mut" style="margin:8px 0 0">Direct upstream link ${escapeHtml(urls.directNote)}.</div>` : ''}`;
+  $$('#st-urls input[readonly]').forEach((input) => input.addEventListener('click', () => input.select()));
+  const note = $('#st-url-note');
+  if (note) note.textContent = `${item.title}${item.year ? ` (${item.year})` : ''}`;
+}
+
+async function streamUrlAction(action) {
+  const id = selectedStreamId();
+  if (!id) return toast('No stream selected', 'warn');
+  const log = $('#st-url-log');
+  const say = (text) => { if (log) { log.classList.remove('hide'); log.textContent = text; } };
+  try {
+    if (action === 'vlc') {
+      const url = VMPlaylist.itemFor(id)?.urls?.ts;
+      if (!url) return toast('This stream has no .ts URL', 'warn');
+      window.location.href = String(url).replace(/^https?:/, 'vlc:');
+      return;
+    }
+    if (action === 'start' || action === 'stop') {
+      say(action === 'start' ? 'starting the relay session…' : 'stopping the session…');
+      const data = await api(`/api/streams/${encodeURIComponent(id)}/session`, { method: action === 'start' ? 'POST' : 'DELETE', silent: true });
+      say(action === 'start'
+        ? `session running · ${data.session?.mode || 'copy'}/${data.session?.encoder || 'copy'} · ${data.session?.clients || 0} client(s)`
+        : 'session stopped');
+      toast(action === 'start' ? 'Relay session started' : 'Relay session stopped', 'ok');
+      await VMPlaylist.refresh({ render: currentPage === 'list' });
+      renderStreamUrls();
+      return;
+    }
+    if (action === 'download') {
+      say('queueing the download…');
+      const data = await api(`/api/streams/${encodeURIComponent(id)}/download`, { method: 'POST', body: {}, silent: true });
+      say(`download queued · job ${data.job?.id || '—'}${data.job?.filename ? ` → ${data.job.filename}` : ''}`);
+      toast('Download queued — watch it on the Dashboard', 'ok');
+      return;
+    }
+    if (action === 'm3u') {
+      const res = await fetch(`/api/streams/${encodeURIComponent(id)}/playlist`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'audio/x-mpegurl' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `${(VMPlaylist.itemFor(id)?.title || 'vu-movie').replace(/[^A-Za-z0-9._-]+/g, '-')}.m3u`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      say(`playlist written: ${text.split('\n').filter((line) => line && !line.startsWith('#')).length} entrie(s)`);
+      return;
+    }
+  } catch (error) {
+    say(`✗ ${error.message}`);
+    toast(error.message, 'err');
+  }
+}
+
 function initStream() {
   $('#btn-st-refresh')?.addEventListener('click', () => refreshStream(true));
   $('#btn-st-dry')?.addEventListener('click', () => pushBouquet({ dryRun: true }));
@@ -1281,6 +1411,30 @@ function initStream() {
     if (copyButton) { copyText(copyButton.dataset.copyItem); return; }
     const watch = event.target.closest('[data-watch]');
     if (watch) window.open(watch.dataset.watch, '_blank');
+  });
+  // per-stream URL panel (the information the old Stream tab showed)
+  $('#st-pick')?.addEventListener('change', () => { writeStoredText(SELECTED_STREAM_KEY, $('#st-pick').value); renderStreamUrls(); });
+  $('#btn-st-copy-all')?.addEventListener('click', () => {
+    const lines = $$('#st-urls input[readonly]').filter((input) => input.value)
+      .map((input) => `${(input.getAttribute('aria-label') || 'url').replace(/ URL$/, '')}: ${input.value}`);
+    if (!lines.length) return toast('Nothing to copy', 'warn');
+    copyText(lines.join('\n'));
+  });
+  $('#st-urls')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-copy-url]');
+    if (button?.dataset.copyUrl) copyText(button.dataset.copyUrl);
+  });
+  $('#btn-st-vlc')?.addEventListener('click', () => streamUrlAction('vlc'));
+  $('#btn-st-session-start')?.addEventListener('click', () => streamUrlAction('start'));
+  $('#btn-st-session-stop')?.addEventListener('click', () => streamUrlAction('stop'));
+  $('#btn-st-download')?.addEventListener('click', () => streamUrlAction('download'));
+  $('#btn-st-m3u')?.addEventListener('click', () => streamUrlAction('m3u'));
+  $('#btn-st-test-template')?.addEventListener('click', () => {
+    // the Test tab runs the same command the relay would use for this stream
+    const item = VMPlaylist.itemFor(selectedStreamId());
+    writeStoredText(TEST_SOURCE_KEY, selectedStreamId());
+    App.go('tpl-test');
+    if (item) toast(`Test tab: pick “${item.title}” and press start test`, 'info', 6000);
   });
 }
 
@@ -1329,6 +1483,7 @@ async function refreshStream(announce = false) {
       </td>
     </tr>`).join('')}</tbody></table>` : '<div class="meta" style="padding:14px">the playlist is empty</div>';
 
+  renderStreamUrls();
   renderStreamMonitor();
   await refreshBouquetPreview();
   if (announce) toast('Outputs refreshed', 'ok', 2500);
@@ -1424,7 +1579,9 @@ function renderTestSourcePicker() {
   }
   options.push('<optgroup label="Other"><option value="url:">custom URL…</option></optgroup>');
   select.innerHTML = options.join('');
-  if (previous && [...select.options].some((option) => option.value === previous)) select.value = previous;
+  const wanted = previous || readStoredText(TEST_SOURCE_KEY) || '';
+  const candidate = wanted.startsWith('stream:') ? wanted : `stream:${wanted}`;
+  if (wanted && [...select.options].some((option) => option.value === candidate)) select.value = candidate;
   else if (items.length) select.value = `stream:${items[0].streamId}`;
   syncTestTarget();
 }
@@ -1433,6 +1590,22 @@ function wireTestSourcePicker() {
   $('#test-source')?.addEventListener('change', syncTestTarget);
   $('#test-url')?.addEventListener('input', syncTestTarget);
   $('#test-duration')?.addEventListener('change', syncTestTarget);
+}
+
+/** The Test tab's own start/stop/clear buttons drive the editor instance. */
+function wireTestControls() {
+  $('#btn-test-run')?.addEventListener('click', () => {
+    syncTestTarget();
+    VMFfmpegEditor.runTestTab();
+  });
+  $('#btn-test-stop')?.addEventListener('click', () => VMFfmpegEditor.stopTestTab());
+  $('#btn-test-clear')?.addEventListener('click', () => {
+    const editor = VMFfmpegEditor.testEditor;
+    if (editor) VMFfmpegEditor.clearTestOutput?.(editor);
+    const status = $('#test-status');
+    if (status) status.textContent = '';
+  });
+  VMFfmpegEditor.syncTabButtons?.(false);
 }
 
 /** Keep the editor instance's working source in sync with the tab controls. */
@@ -1582,34 +1755,122 @@ const SETTINGS_SECTIONS = [
   },
 ];
 
+/**
+ * Human labels and one-line explanations for every settings field. The old
+ * tab printed the raw config keys; these read like the section they belong to
+ * (and the explanation is the "i" tooltip).
+ */
+const SETTINGS_NOTES = {
+  transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
+  subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
+  enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
+  scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
+  storage: 'Folders inside the container, and how much disk the cache may use.',
+  app: 'The web server itself — port, login and token lifetime.',
+};
+
+const SETTINGS_LABELS = {
+  'transcode.mode': ['Mode', 'auto picks copy vs. transcode from the source; copy/vaapi/x264/h265 force one.'],
+  'transcode.resolution': ['Resolution cap', 'Longest edge the output may have. 0 or empty keeps the source.'],
+  'transcode.aspect': ['Aspect ratio', 'source keeps the source, 169/43 force a specific ratio.'],
+  'transcode.videoBitrate': ['Video bitrate', 'Target video bitrate in kbps for the software encoders.'],
+  'transcode.audioBitrate': ['Audio bitrate', 'Target audio bitrate in kbps.'],
+  'transcode.audioChannels': ['Audio channels', '1 mono, 2 stereo, 6 = 5.1. Empty keeps the source layout.'],
+  'transcode.fps': ['Frame rate', 'source keeps the source, 25/30 force a rate.'],
+  'transcode.container': ['Container', 'mpegts for live VLC/Enigma2, matroska for files, hls for segmented playback.'],
+  'transcode.alwaysTranscode': ['Always transcode', 'Never stream-copy, even when the source already matches.'],
+  'transcode.hardware': ['Use hardware (VAAPI)', 'Prefer the iGPU when the box exposes /dev/dri.'],
+  'transcode.maxConcurrent': ['Max concurrent jobs', 'How many relay sessions and downloads may run at the same time.'],
+  'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
+  'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session when no player has read from it for this long.'],
+  'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
+  'transcode.realtime': ['Pace live output', 'Throttle the relay to the source rate so real-time players do not starve.'],
+
+  'subtitles.languages': ['Languages', 'Search order, comma separated — e.g. nl, en.'],
+  'subtitles.autoSearch': ['Auto search', 'Search subtitles automatically after a title is resolved.'],
+  'subtitles.pushToReceiver': ['Push to receiver', 'Upload the chosen subtitle to the Enigma2 box as well.'],
+  'subtitles.receiverDir': ['Receiver directory', 'Folder on the box that receives the .srt files.'],
+  'subtitles.disabledProviders': ['Disabled providers', 'Provider ids to skip, comma separated (see the Subtitles tab).'],
+
+  'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
+  'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
+  'enigma2.username': ['Username', 'Only needed when the box asks for a login.'],
+  'enigma2.password': ['Password', 'Stored in /config/vumovie.json; shown masked after a reload.'],
+  'enigma2.bouquetName': ['Bouquet name', 'Name the playlist gets in the receiver bouquet list.'],
+  'enigma2.rootDir': ['Root directory', 'Folder on the box for the bouquet and the subtitle files.'],
+  'enigma2.serviceType': ['Service type', 'Enigma2 service type, 1 = non-TS (4097 = stream), 1 = DVB.'],
+  'enigma2.ftpEnabled': ['FTP upload', 'Upload the bouquet and subtitles over FTP instead of HTTP.'],
+  'enigma2.ftpPort': ['FTP port', '21 by default.'],
+  'enigma2.autoPush': ['Auto push', 'Push the bouquet after every playlist change.'],
+
+  'scraper.browserConcurrency': ['Browser concurrency', 'How many headless pages may resolve at the same time.'],
+  'scraper.browserIdleSeconds': ['Browser idle (s)', 'Close the headless browser after this many idle seconds.'],
+  'scraper.resolveTimeoutMs': ['Resolve timeout (ms)', 'Give up on one candidate after this long.'],
+  'scraper.probeCandidates': ['Probe candidates', 'Run ffprobe on every candidate so dead mirrors are filtered out.'],
+  'scraper.maxCandidates': ['Max candidates', 'How many mirrors are tried before a title is reported as failed.'],
+  'scraper.flaresolverrUrl': ['FlareSolverr URL', 'Optional Cloudflare-bypass proxy, e.g. http://flaresolverr:8191.'],
+  'scraper.externalExtractorUrl': ['External extractor URL', 'Optional helper service for sites the built-in resolvers cannot read.'],
+  'scraper.sessionDir': ['Browser session dir', 'Where cookies and the browser profile are kept.'],
+  'scraper.userAgent': ['User agent', 'User agent used for scraping and for the upstream requests.'],
+
+  'storage.downloads': ['Downloads folder', 'Where “download to NAS” writes finished files.'],
+  'storage.tmp': ['Temp folder', 'Scratch space for downloads and live tests.'],
+  'storage.cacheBudgetMb': ['Cache budget (MB)', 'How much disk the relay cache may use before old segments are dropped.'],
+
+  'app.port': ['HTTP port', 'Port the web interface listens on (restart required).'],
+  'app.baseUrl': ['Public base URL', 'Address used in every output URL — set it when the box sits behind a proxy.'],
+  'app.username': ['Username', 'Login for the web interface.'],
+  'app.password': ['Password', 'Shown masked; leave it untouched to keep the current one.'],
+  'app.logLevel': ['Log level', 'debug for troubleshooting, info for normal use.'],
+  'app.tokenTtlMinutes': ['Token lifetime (min)', 'How long a stream token stays valid. 0 = never expires.'],
+};
+
 async function initSettings() {
   wireSettings();
   await loadSettings();
 }
 
 async function loadSettings() {
-  const res = await api('/api/config');
-  state.config = res.config;
-  const draft = structuredClone(res.config);
-  $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
-    <div class="card">
-      <h2>${escapeHtml(section.title)}</h2>
-      ${section.fields.map(([key, type, options]) => {
-        const value = draft[section.key]?.[key];
-        const id = `set-${section.key}-${key}`;
-        if (type === 'bool') {
-          return `<div class="field"><label class="check-row" style="margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(key)}</label></div>`;
-        }
-        if (type === 'select') {
-          return `<div class="field"><label>${escapeHtml(key)}</label><select id="${id}">${options.map((option) => `<option value="${option}" ${String(value) === String(option) ? 'selected' : ''}>${option}</option>`).join('')}</select></div>`;
-        }
-        if (type === 'list') {
-          return `<div class="field"><label>${escapeHtml(key)} (comma separated)</label><input id="${id}" value="${escapeHtml((value || []).join(', '))}"></div>`;
-        }
-        return `<div class="field"><label>${escapeHtml(key)}</label><input id="${id}" type="${type}" value="${escapeHtml(value ?? '')}"></div>`;
-      }).join('')}
-    </div>`).join('');
-  $('#settings-hint').textContent = `${Object.keys(res.config).length} section(s) loaded`;
+  try {
+    const res = await api('/api/config');
+    state.config = res.config;
+    const draft = structuredClone(res.config);
+    const tip = (text) => (text ? `<span class="tip" tabindex="0" role="note" aria-label="more information" data-tip="${escapeHtml(text)}">i</span>` : '');
+    $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
+      <div class="card" data-set-section="${escapeHtml(section.key)}">
+        <div class="cardhead"><h2 style="margin:0">${escapeHtml(section.title)}</h2>
+          <span class="mut" title="${escapeHtml(SETTINGS_NOTES[section.key] || '')}">${section.fields.length} field(s)</span></div>
+        ${SETTINGS_NOTES[section.key] ? `<p class="sub" style="margin:2px 0 10px">${escapeHtml(SETTINGS_NOTES[section.key])}</p>` : ''}
+        <div class="set-fields">
+        ${section.fields.map(([key, type, options]) => {
+          const value = draft[section.key]?.[key];
+          const id = `set-${section.key}-${key}`;
+          const [label, hint] = SETTINGS_LABELS[`${section.key}.${key}`] || [key, ''];
+          if (type === 'bool') {
+            return `<div class="field" data-set-field="${id}"><label class="check-row" style="margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(label)} ${tip(hint)}</label></div>`;
+          }
+          if (type === 'select') {
+            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><select id="${id}">${(options || []).map((option) => `<option value="${escapeHtml(option)}" ${String(value) === String(option) ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}</select></div>`;
+          }
+          if (type === 'list') {
+            const list = Array.isArray(value) ? value : String(value ?? '').split(',').map((part) => part.trim()).filter(Boolean);
+            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" value="${escapeHtml(list.join(', '))}" placeholder="comma separated"></div>`;
+          }
+          const inputType = type === 'password' ? 'password' : type === 'number' ? 'number' : 'text';
+          return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}" value="${escapeHtml(value ?? '')}"></div>`;
+        }).join('')}
+        </div>
+      </div>`).join('');
+    const hint = $('#settings-hint');
+    if (hint) hint.textContent = `${SETTINGS_SECTIONS.length} section(s) loaded from /api/config`;
+  } catch (error) {
+    const grid = $('#settings-grid');
+    if (grid) grid.innerHTML = `<div class="card"><h2>Settings could not be loaded</h2>
+      <div class="param-msg err">${escapeHtml(error.message)}</div>
+      <div class="row"><button class="btn" id="btn-settings-retry">try again</button></div></div>`;
+    $('#btn-settings-retry')?.addEventListener('click', () => loadSettings().catch(() => {}));
+    throw error;
+  }
 }
 
 async function saveSettings() {
@@ -1634,6 +1895,7 @@ async function saveSettings() {
 }
 
 function wireSettings() {
+  wireSubtitleSourceForm();
   $('#btn-save-settings')?.addEventListener('click', () => saveSettings().catch((error) => toast(error.message, 'err')));
   $('#btn-reload-settings')?.addEventListener('click', () => loadSettings().then(() => toast('Settings reloaded', 'ok', 2500)).catch((error) => toast(error.message, 'err')));
   $('#btn-hw-test')?.addEventListener('click', async () => {
@@ -1834,13 +2096,13 @@ function refreshMobile() {
     host.innerHTML = items.map((item) => `
       <div class="mob-item">
         <div class="mob-item-main">
-          <div>${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
-          <div class="meta">${escapeHtml(item.quality || '')} · ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''}</div>
-          <select data-mtpl="${escapeHtml(item.streamId)}" style="width:auto;margin-top:4px">
-            <option value="">guided builder</option>
-            ${VMPlaylist.templates().map((tpl) => `<option value="${escapeHtml(tpl.id)}"${(item.templateId || item.profileTemplateId) === tpl.id ? ' selected' : ''}>${escapeHtml(tpl.name)}</option>`).join('')}
-          </select>
+          <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
+          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''}</div>
         </div>
+        <select class="mob-tpl" data-mtpl="${escapeHtml(item.streamId)}" aria-label="FFmpeg template for ${escapeHtml(item.title)}" title="FFmpeg template">
+          <option value="">guided builder</option>
+          ${VMPlaylist.templates().map((tpl) => `<option value="${escapeHtml(tpl.id)}"${(item.templateId || item.profileTemplateId) === tpl.id ? ' selected' : ''}>${escapeHtml(tpl.name)}</option>`).join('')}
+        </select>
       </div>`).join('');
   }
   const select = $('#mob-sub-item');
@@ -1882,6 +2144,58 @@ async function mobileSubtitleSearch() {
 /* ====================================================================== *
  * bootstrap
  * ====================================================================== */
+
+/* ---------------- sidebar: mini (icons) / pinned (icons + labels) ---------------- */
+
+const NAV_PIN_KEY = 'vu-movie.nav-pinned';
+
+function initSidebar() {
+  const app = $('.app');
+  const button = $('#btn-nav-pin');
+  const apply = (pinned) => {
+    app.classList.toggle('nav-mini', !pinned);
+    app.classList.toggle('nav-pinned', pinned);
+    if (button) {
+      button.textContent = pinned ? '⇤' : '⇥';
+      button.title = pinned ? 'unpin — collapse to icons (hover expands)' : 'pin the large menu';
+      button.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+      button.classList.toggle('on', pinned);
+    }
+    writeStoredText(NAV_PIN_KEY, pinned ? '1' : '0');
+  };
+  apply(readStoredText(NAV_PIN_KEY) === '1');
+  button?.addEventListener('click', () => apply(!app.classList.contains('nav-pinned')));
+}
+
+/* ---------------- collapsible panes (the mobile sub-panes) ---------------- */
+
+const FOLD_KEY = 'vu-movie.folded';
+
+function foldedState() {
+  const stored = readStoredJson(FOLD_KEY);
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
+function wireFolds() {
+  const stored = foldedState();
+  const setFold = (button, folded, persist = true) => {
+    const key = button.dataset.fold;
+    const body = $(`[data-fold-body="${key}"]`);
+    if (!body) return;
+    body.classList.toggle('hide', folded);
+    button.textContent = folded ? '▸' : '▾';
+    button.setAttribute('aria-expanded', folded ? 'false' : 'true');
+    button.title = folded ? 'show this pane' : 'hide this pane';
+    if (persist) writeStoredText(FOLD_KEY, JSON.stringify({ ...foldedState(), [key]: folded }));
+  };
+  $$('.foldbtn[data-fold]').forEach((button) => {
+    setFold(button, Boolean(stored[button.dataset.fold]), false);
+    button.addEventListener('click', () => {
+      const body = $(`[data-fold-body="${button.dataset.fold}"]`);
+      setFold(button, !body?.classList.contains('hide'));
+    });
+  });
+}
 
 function wireShell() {
   $('#nav')?.addEventListener('click', (event) => {
@@ -1933,6 +2247,8 @@ Object.assign(App, {
 window.App = App;
 
 async function bootstrap() {
+  initSidebar();
+  wireFolds();
   wireShell();
   VMPlaylist.wire();
   loadHealth();

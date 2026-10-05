@@ -10,22 +10,23 @@
 </head>
 <body>
 <div class="app">
-  <aside class="side">
+  <aside class="side" id="side">
     <div class="brand">
       <div class="logo">vu</div>
-      <div><b>vu-movie</b><small>movie → stream proxy</small></div>
+      <div class="brandtext"><b>vu-movie</b><small>movie → stream proxy</small></div>
+      <button type="button" class="navpin" id="btn-nav-pin" title="pin the large menu" aria-pressed="false">⇥</button>
     </div>
     <nav class="nav" id="nav">
-      <button data-p="mobile">▢ Mobile</button>
-      <button data-p="dash" class="on">▤ Dashboard</button>
-      <button data-p="find">⌕ Search</button>
-      <button data-p="subs">▭ Subtitles</button>
-      <button data-p="tpl">⚒ Transcode</button>
-      <button data-p="list">☰ Playlist</button>
-      <button data-p="stream">▶ Stream</button>
-      <button data-p="tpl-test">▷ Test</button>
-      <button data-p="logs">≡ Logs</button>
-      <button data-p="set">⚙ Settings</button>
+      <button data-p="mobile" title="Mobile"><span class="ico">▢</span><span class="lbl">Mobile</span></button>
+      <button data-p="dash" class="on" title="Dashboard"><span class="ico">▤</span><span class="lbl">Dashboard</span></button>
+      <button data-p="find" title="Search"><span class="ico">⌕</span><span class="lbl">Search</span></button>
+      <button data-p="subs" title="Subtitles"><span class="ico">▭</span><span class="lbl">Subtitles</span></button>
+      <button data-p="tpl" title="Transcode"><span class="ico">⚒</span><span class="lbl">Transcode</span></button>
+      <button data-p="list" title="Playlist"><span class="ico">☰</span><span class="lbl">Playlist</span></button>
+      <button data-p="stream" title="Stream"><span class="ico">▶</span><span class="lbl">Stream</span></button>
+      <button data-p="tpl-test" title="Test"><span class="ico">▷</span><span class="lbl">Test</span></button>
+      <button data-p="logs" title="Logs"><span class="ico">≡</span><span class="lbl">Logs</span></button>
+      <button data-p="set" title="Settings"><span class="ico">⚙</span><span class="lbl">Settings</span></button>
     </nav>
     <div class="sidefoot" id="side-status">
       <div class="row" style="gap:4px">
@@ -45,7 +46,9 @@
       <p class="sub">Phone-sized view of the one workflow: find a title, pick a format, put it on the playlist, push it to the box.</p>
 
       <div class="card">
-        <h2>1 · Search</h2>
+        <div class="cardhead"><h2 style="margin:0">1 · Search</h2>
+          <button type="button" class="foldbtn" data-fold="mob-search" aria-expanded="true" title="hide / show this pane">▾</button></div>
+        <div class="cardbody" data-fold-body="mob-search">
         <div class="field"><label for="mob-q">Title</label>
           <input id="mob-q" placeholder="e.g. dune part two" autocomplete="off" enterkeyhint="search"></div>
         <div class="mob-grid">
@@ -59,24 +62,33 @@
           <span class="mut" id="mob-search-hint"></span>
         </div>
         <div id="mob-results" class="mob-results"><div class="meta">Search a title, then tap it to see the available formats.</div></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>2 · Format</h2>
+        <div class="cardhead"><h2 style="margin:0">2 · Format</h2>
+          <button type="button" class="foldbtn" data-fold="mob-format" aria-expanded="true" title="hide / show this pane">▾</button></div>
+        <div class="cardbody" data-fold-body="mob-format">
         <div id="mob-formats" class="mob-formats"><div class="meta">Pick a title above — its metadata and every playable format appear here.</div></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>3 · Playlist</h2>
+        <div class="cardhead"><h2 style="margin:0">3 · Playlist</h2>
+          <button type="button" class="foldbtn" data-fold="mob-playlist" aria-expanded="true" title="hide / show this pane">▾</button></div>
+        <div class="cardbody" data-fold-body="mob-playlist">
         <div class="row" style="margin-bottom:8px">
           <span class="mut" id="mob-list-summary"></span>
           <button class="btn sm ghost" id="btn-mob-refresh">⟳ refresh</button>
         </div>
         <div id="mob-list" class="mob-list"><div class="meta">loading…</div></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>4 · Subtitles</h2>
+        <div class="cardhead"><h2 style="margin:0">4 · Subtitles</h2>
+          <button type="button" class="foldbtn" data-fold="mob-subs" aria-expanded="true" title="hide / show this pane">▾</button></div>
+        <div class="cardbody" data-fold-body="mob-subs">
         <div class="field"><label for="mob-sub-item">For which playlist item?</label>
           <select id="mob-sub-item"></select></div>
         <div class="row">
@@ -84,10 +96,13 @@
           <select id="mob-sub-lang" style="width:auto"><option value="nl">NL</option><option value="en">EN</option><option value="all">all</option></select>
         </div>
         <div id="mob-subs" class="mob-subs"><div class="meta">Searches with the title of the selected playlist item — no typing needed.</div></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>5 · Generate / push</h2>
+        <div class="cardhead"><h2 style="margin:0">5 · Generate / push</h2>
+          <button type="button" class="foldbtn" data-fold="mob-out" aria-expanded="true" title="hide / show this pane">▾</button></div>
+        <div class="cardbody" data-fold-body="mob-out">
         <div class="row">
           <button class="btn pri grow" id="btn-mob-generate">⤓ generate playlist (.m3u)</button>
           <button class="btn grow" id="btn-mob-push">☁ push to Enigma2</button>
@@ -97,6 +112,7 @@
           <span class="mut" id="mob-output-hint"></span>
         </div>
         <div class="log hide" id="mob-push-log" style="margin-top:10px"></div>
+        </div>
       </div>
     </section>
 
@@ -261,25 +277,9 @@
         <div>
           <div class="card pad0" style="margin-bottom:14px">
             <div class="cardhead"><h2 style="margin:0">Providers</h2>
-              <button class="btn sm ghost" id="btn-providers-refresh">refresh</button></div>
+              <button class="btn sm ghost" id="btn-providers-refresh">refresh</button>
+              <span class="mut">add your own in Settings → Subtitles</span></div>
             <div id="sub-providers"><div class="meta" style="padding:14px">loading…</div></div>
-          </div>
-
-          <div class="card">
-            <h2>Add your own subtitle source</h2>
-            <p class="sub">Templates use <code>{query} {lang} {imdb} {tmdb} {sxx} {exx} {year}</code>. Works for any site that returns a list of links or JSON.</p>
-            <div class="f2">
-              <div class="field"><label>id (no spaces)</label><input id="cp-id" placeholder="mysource"></div>
-              <div class="field"><label>name</label><input id="cp-name" placeholder="My source"></div>
-            </div>
-            <div class="field"><label>search URL template</label><input id="cp-search" class="mono" placeholder="https://example.com/api?q={query}&lang={lang}"></div>
-            <div class="f2">
-              <div class="field"><label>response type</label><select id="cp-kind"><option value="html">HTML (regex)</option><option value="json">JSON</option></select></div>
-              <div class="field"><label>JSON items path / HTML regex</label><input id="cp-parse" class="mono" placeholder="data.items  or  &lt;a href=&quot;(?&lt;url&gt;[^&quot;]+)&quot;&gt;(?&lt;title&gt;[^&lt;]+)&lt;/a&gt;"></div>
-            </div>
-            <div class="field"><label>download URL template (optional, <code>{url}</code> = the found link)</label><input id="cp-download" class="mono"></div>
-            <div class="row"><button class="btn pri" id="btn-cp-save">save provider</button>
-              <span class="mut">then use the Test button in the table above</span></div>
           </div>
         </div>
 
@@ -394,6 +394,30 @@
         <div class="log hide" id="st-push-log" style="margin-top:12px;max-height:220px"></div>
       </div>
 
+      <div class="card pad0" style="margin-top:14px">
+        <div class="cardhead">
+          <h2 style="margin:0">Stream URLs</h2>
+          <div class="row">
+            <select id="st-pick" style="width:auto;min-width:220px" aria-label="Pick a stream"></select>
+            <button class="btn sm ghost" id="btn-st-copy-all">copy all</button>
+          </div>
+        </div>
+        <div id="st-urls" class="pad12"><div class="meta">Loading the playlist…</div></div>
+        <div class="cardbody pad12" style="border-top:1px solid var(--line)">
+          <div class="row">
+            <button class="btn pri" id="btn-st-vlc">▶ open in VLC</button>
+            <button class="btn" id="btn-st-session-start">⧗ start session</button>
+            <button class="btn" id="btn-st-session-stop">■ stop session</button>
+            <button class="btn" id="btn-st-download">⤓ download to NAS</button>
+            <button class="btn ghost" id="btn-st-m3u">⤓ .m3u playlist</button>
+            <button class="btn ghost" id="btn-st-test-template">▷ test template</button>
+            <span class="mut" id="st-url-note"></span>
+          </div>
+          <div class="note" style="margin-top:10px">Guided profile builder, per-stream FFmpeg parameters and saved templates live on the <b>Transcode</b> tab; the relay session and the download use whatever that stream is set to.</div>
+          <div class="log hide" id="st-url-log" style="margin-top:10px;max-height:200px"></div>
+        </div>
+      </div>
+
       <div class="grid g2" style="margin-top:14px" id="st-outputs"></div>
 
       <div class="card pad0" style="margin-top:14px">
@@ -445,6 +469,12 @@
               <input id="test-duration" type="number" min="1" max="30" step="1" value="5">
               <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div></div>
           </div>
+          <div class="row">
+            <button class="btn pri" id="btn-test-run">▷ start test</button>
+            <button class="btn ghost" id="btn-test-stop" disabled>■ stop</button>
+            <button class="btn sm ghost" id="btn-test-clear">clear output</button>
+            <span class="mut" id="test-status"></span>
+          </div>
         </div>
         <div id="test-editor-host" class="ffmpeg-editor-host"></div>
       </div>
@@ -491,6 +521,25 @@
           </div>
           <button class="btn pri" id="btn-cs-save">save source</button>
           <div class="note">Resolving uses the headless browser (network sniffing), so a custom source works even when the site obfuscates its player — the search URL is all you need.</div>
+        </div>
+      </div>
+
+      <div class="card pad0" style="margin-top:16px">
+        <div class="cardhead"><h2 style="margin:0">Custom subtitle source</h2><span class="mut">any site that returns links or JSON</span></div>
+        <div style="padding:14px">
+          <p class="sub">Templates use <code>{query} {lang} {imdb} {tmdb} {sxx} {exx} {year}</code>. Saved providers appear on the Subtitles tab (test them there).</p>
+          <div class="f2">
+            <div class="field"><label>id (no spaces)</label><input id="cp-id" placeholder="mysource"></div>
+            <div class="field"><label>name</label><input id="cp-name" placeholder="My source"></div>
+          </div>
+          <div class="field"><label>search URL template</label><input id="cp-search" class="mono" placeholder="https://example.com/api?q={query}&amp;lang={lang}"></div>
+          <div class="f2">
+            <div class="field"><label>response type</label><select id="cp-kind"><option value="html">HTML (regex)</option><option value="json">JSON</option></select></div>
+            <div class="field"><label>JSON items path / HTML regex</label><input id="cp-parse" class="mono" placeholder="data.items  or  &lt;a href=&quot;(?&lt;url&gt;[^&quot;]+)&quot;&gt;(?&lt;title&gt;[^&lt;]+)&lt;/a&gt;"></div>
+          </div>
+          <div class="field"><label>download URL template (optional, <code>{url}</code> = the found link)</label><input id="cp-download" class="mono"></div>
+          <div class="row"><button class="btn pri" id="btn-cp-save">save provider</button>
+            <span class="mut" id="cp-note"></span></div>
         </div>
       </div>
     </section>

@@ -10,7 +10,11 @@
 'use strict';
 
 const VMPlaylist = (() => {
-  let dragging = null;
+  // Drag & drop state. The HTML5 drag & drop API is not used: it never fires
+  // on touch devices and desktop browsers cancel it as soon as the pointer
+  // crosses any form control inside the row, which is why the order silently
+  // never changed. A plain pointer drag (see beginRowDrag) replaces it.
+  let dragState = null;
   let searchSeq = 0;
 
   const items = () => state.playlist.items || [];
@@ -161,7 +165,7 @@ const VMPlaylist = (() => {
       : tag('no subtitle');
     const templateTag = item.hasTemplate ? tag(templateLabel(item), 'alt') : tag(templateLabel(item));
     const session = item.session ? tag(`${item.session.clients || 0} client(s)`, 'info') : '';
-    return `<article class="pl-row${item.enabled ? '' : ' off'}" data-pl-row="${escapeHtml(item.streamId)}" draggable="true">
+    return `<article class="pl-row${item.enabled ? '' : ' off'}" data-pl-row="${escapeHtml(item.streamId)}" data-pl-index="${index}">
       <div class="pl-handle" title="drag to change the order" aria-hidden="true">⠿</div>
       <div class="pl-order">${index + 1}</div>
       <label class="pl-switch" title="include this item in every output">
@@ -190,6 +194,7 @@ const VMPlaylist = (() => {
   function renderTab() {
     const host = $('#playlist-items');
     if (!host) return;
+    if (dragState) return; // never redraw the list under an active drag
     const list = items();
     const summary = state.playlist.summary || {};
     const summaryEl = $('#list-summary');
@@ -226,40 +231,71 @@ const VMPlaylist = (() => {
     $$('[data-pl-up]', host).forEach((button) => button.addEventListener('click', () => move(Number(button.dataset.plUp), -1)));
     $$('[data-pl-down]', host).forEach((button) => button.addEventListener('click', () => move(Number(button.dataset.plDown), 1)));
 
-    // drag & drop ordering (HTML5 DnD: works with a mouse on desktop; the ▲▼
-    // buttons above are the touch-friendly equivalent).
+    // Drag & drop ordering: press anywhere on the row (the ⠿ handle is the
+    // obvious place) and drag up/down; the row under the pointer marks where it
+    // will land. Mouse, pen and finger all work because this is a pointer drag.
     $$('[data-pl-row]', host).forEach((row) => {
-      row.addEventListener('dragstart', (event) => {
-        dragging = row.dataset.plRow;
-        row.classList.add('dragging');
-        event.dataTransfer.effectAllowed = 'move';
-        try { event.dataTransfer.setData('text/plain', dragging); } catch { /* older browsers */ }
-      });
-      row.addEventListener('dragend', () => {
-        dragging = null;
-        $$('.pl-row', host).forEach((node) => node.classList.remove('dragging', 'drop-before', 'drop-after'));
-      });
-      row.addEventListener('dragover', (event) => {
-        if (!dragging || dragging === row.dataset.plRow) return;
-        event.preventDefault();
-        const rect = row.getBoundingClientRect();
-        const after = event.clientY > rect.top + rect.height / 2;
-        row.classList.toggle('drop-after', after);
-        row.classList.toggle('drop-before', !after);
-      });
-      row.addEventListener('dragleave', () => row.classList.remove('drop-before', 'drop-after'));
-      row.addEventListener('drop', (event) => {
-        event.preventDefault();
-        const target = row.dataset.plRow;
-        const after = row.classList.contains('drop-after');
-        row.classList.remove('drop-before', 'drop-after');
-        if (!dragging || dragging === target) return;
-        const order = items().map((item) => item.streamId).filter((id) => id !== dragging);
-        const index = order.indexOf(target);
-        order.splice(after ? index + 1 : index, 0, dragging);
-        reorder(order).catch(() => {});
-      });
+      row.addEventListener('pointerdown', (event) => onRowPointerDown(row, event));
     });
+  }
+
+  const DRAG_IGNORE = 'select,input,button,a,label,textarea';
+
+  function onRowPointerDown(row, event) {
+    if (event.button !== 0 && event.pointerType === 'mouse') return;
+    if (event.target.closest(DRAG_IGNORE)) return; // let the controls work normally
+    if (dragState) return;
+    const host = row.parentElement;
+    if (!host) return;
+    dragState = { host, row, streamId: row.dataset.plRow, pointerId: event.pointerId, target: null, after: false, moved: false };
+    row.classList.add('dragging');
+    try { row.setPointerCapture(event.pointerId); } catch { /* not supported */ }
+    // Listen on the window too, so the drag survives leaving the row when the
+    // browser has no pointer capture.
+    window.addEventListener('pointermove', onRowPointerMove);
+    window.addEventListener('pointerup', onRowPointerUp);
+    window.addEventListener('pointercancel', onRowPointerUp);
+    event.preventDefault(); // no text selection, no page scroll while dragging
+  }
+
+  /** Mark the row under the pointer as the drop target (above or below its middle). */
+  function markDropTarget(clientX, clientY) {
+    const state = dragState;
+    if (!state) return;
+    let over = document.elementFromPoint(clientX, clientY)?.closest?.('[data-pl-row]') || null;
+    if (over === state.row) over = null;
+    $$('.pl-row', state.host).forEach((node) => node.classList.remove('drop-before', 'drop-after'));
+    state.target = over?.dataset?.plRow || null;
+    if (!over) return;
+    const rect = over.getBoundingClientRect();
+    state.after = clientY > rect.top + rect.height / 2;
+    over.classList.add(state.after ? 'drop-after' : 'drop-before');
+  }
+
+  function onRowPointerMove(event) {
+    if (!dragState) return;
+    dragState.moved = true;
+    markDropTarget(event.clientX, event.clientY);
+    event.preventDefault();
+  }
+
+  function onRowPointerUp(event) {
+    const state = dragState;
+    if (!state) return;
+    dragState = null;
+    const { host, row, streamId, target, after } = state;
+    row.classList.remove('dragging');
+    window.removeEventListener('pointermove', onRowPointerMove);
+    window.removeEventListener('pointerup', onRowPointerUp);
+    window.removeEventListener('pointercancel', onRowPointerUp);
+    $$('.pl-row', host).forEach((node) => node.classList.remove('drop-before', 'drop-after'));
+    try { row.releasePointerCapture(event.pointerId); } catch { /* fine */ }
+    if (!target || target === streamId) return;
+    const order = items().map((item) => item.streamId).filter((id) => id !== streamId);
+    const index = order.indexOf(target);
+    if (index < 0) return;
+    order.splice(after ? index + 1 : index, 0, streamId);
+    reorder(order).catch(() => {});
   }
 
   function move(index, delta) {
