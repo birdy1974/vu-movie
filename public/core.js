@@ -43,6 +43,102 @@ function writeStoredText(key, value) {
   try { localStorage.setItem(key, String(value)); } catch { /* storage may be disabled */ }
 }
 
+/* ---------------- help tooltips ---------------- */
+
+/**
+ * The "i" that carries a page's explanatory text.
+ *
+ * Long prose ("every candidate is probed with ffprobe, dead mirrors …") used to
+ * sit in the layout on every tab. Instead it now lives in this tooltip, which
+ * hangs off the heading it belongs to and opens on hover *and* on keyboard
+ * focus. Same pattern as the FFmpeg parameter help, so every tab reads the
+ * same way: controls stay visible, explanations are one hover away.
+ */
+const tip = (text, label = 'more information') => (text
+  ? `<span class="tip" tabindex="0" role="note" aria-label="${escapeHtml(label)}" data-tip="${escapeHtml(text)}">i</span>`
+  : '');
+
+/** Same, for a heading element: `<h1>${titleWithTip('Search', 'text')}</h1>`. */
+const titleWithTip = (title, text, label) => `${escapeHtml(title)}${tip(text, label || `${title} — more information`)}`;
+
+/**
+ * One tooltip bubble for the whole app, appended to <body>.
+ *
+ * A CSS-only bubble (`.tip::after`) is clipped by every card that needs
+ * `overflow:hidden` — and the Stream/Playlist/Settings cards all do — so the
+ * bubble is a fixed-position element that is placed next to whichever "i" is
+ * hovered, focused or tapped. Delegated listeners mean it also works for the
+ * markup that playlist.js / ffmpeg-editor.js render later.
+ */
+function initTips() {
+  if (document.querySelector('.tipbubble')) return;
+  const bubble = document.createElement('div');
+  bubble.className = 'tipbubble';
+  bubble.setAttribute('role', 'tooltip');
+  bubble.hidden = true;
+  document.body.appendChild(bubble);
+  let anchor = null;
+
+  const hide = () => { anchor = null; bubble.hidden = true; };
+  const place = () => {
+    if (!anchor || bubble.hidden) return;
+    const rect = anchor.getBoundingClientRect();
+    const box = bubble.getBoundingClientRect();
+    const gap = 8;
+    let top = rect.top - box.height - gap;
+    if (top < 6) top = Math.min(window.innerHeight - box.height - 6, rect.bottom + gap);
+    let left = rect.left + rect.width / 2 - box.width / 2;
+    left = Math.max(8, Math.min(Math.max(8, window.innerWidth - box.width - 8), left));
+    bubble.style.top = `${Math.max(6, top)}px`;
+    bubble.style.left = `${left}px`;
+  };
+  const show = (element) => {
+    const text = element?.dataset?.tip || '';
+    if (!text) return hide();
+    anchor = element;
+    bubble.textContent = text;
+    bubble.hidden = false;
+    place();
+  };
+
+  document.addEventListener('mouseover', (event) => {
+    const found = event.target?.closest?.('.tip[data-tip]');
+    if (found) show(found);
+  });
+  document.addEventListener('mouseout', (event) => {
+    const from = event.target?.closest?.('.tip[data-tip]');
+    if (from && from === anchor && !event.relatedTarget?.closest?.('.tip[data-tip]')) hide();
+  });
+  document.addEventListener('focusin', (event) => {
+    const found = event.target?.closest?.('.tip[data-tip]');
+    if (found) show(found);
+  });
+  document.addEventListener('focusout', () => { if (anchor) hide(); });
+  // Tap support: on a phone there is no hover, so a tap opens and closes it.
+  // Capture phase on purpose — the tip sits inside buttons, <summary> folds and
+  // labels, and none of those may activate when the help bubble is the target.
+  document.addEventListener('click', (event) => {
+    const found = event.target?.closest?.('.tip[data-tip]');
+    if (!found) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (found === anchor) hide(); else show(found);
+  }, true);
+  document.addEventListener('click', (event) => {
+    if (anchor && !event.target?.closest?.('.tip[data-tip]')) hide();
+  });
+  // A press anywhere else closes the bubble at once (a tap outside, or a drag
+  // that never becomes a click).
+  document.addEventListener('pointerdown', (event) => {
+    if (!anchor) return;
+    const inside = event.target?.closest?.('.tip[data-tip]') || event.target?.closest?.('.tipbubble');
+    if (!inside) hide();
+  });
+  document.addEventListener('scroll', () => { if (anchor) place(); }, true);
+  window.addEventListener('resize', () => { if (anchor) place(); });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') hide(); });
+}
+
 /* ---------------- formatting ---------------- */
 
 const escapeHtml = (text) => String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

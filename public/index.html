@@ -42,11 +42,10 @@
   <main class="main">
     <!-- ============ MOBILE ============ -->
     <section id="p-mobile" class="hide">
-      <h1>Mobile</h1>
-      <p class="sub">Phone-sized view of the one workflow: find a title, pick a format, put it on the playlist, push it to the box.</p>
+      <h1>Mobile <span class="tip" tabindex="0" role="note" aria-label="About the Mobile tab" data-tip="Phone-sized view of the one workflow: find a title, pick a format, put it on the playlist, push it to the box.">i</span></h1>
 
       <div class="card">
-        <div class="cardhead"><h2 style="margin:0">1 · Search</h2>
+        <div class="cardhead"><h2 style="margin:0">1 · Search <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="Find a title on the enabled sources. Results come from the same search the Search tab uses.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-search" aria-expanded="true" title="hide / show this pane">▾</button></div>
         <div class="cardbody" data-fold-body="mob-search">
         <div class="field"><label for="mob-q">Title</label>
@@ -66,7 +65,7 @@
       </div>
 
       <div class="card">
-        <div class="cardhead"><h2 style="margin:0">2 · Format</h2>
+        <div class="cardhead"><h2 style="margin:0">2 · Format <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="Pick a title above: its metadata and every playable format appear here. Nothing is added to the playlist until you pick a format.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-format" aria-expanded="true" title="hide / show this pane">▾</button></div>
         <div class="cardbody" data-fold-body="mob-format">
         <div id="mob-formats" class="mob-formats"><div class="meta">Pick a title above — its metadata and every playable format appear here.</div></div>
@@ -74,7 +73,7 @@
       </div>
 
       <div class="card">
-        <div class="cardhead"><h2 style="margin:0">3 · Playlist</h2>
+        <div class="cardhead"><h2 style="margin:0">3 · Playlist <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="The playlist, phone-sized: enable or disable an item, assign an FFmpeg template beside the title, or remove it.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-playlist" aria-expanded="true" title="hide / show this pane">▾</button></div>
         <div class="cardbody" data-fold-body="mob-playlist">
         <div class="row" style="margin-bottom:8px">
@@ -86,7 +85,7 @@
       </div>
 
       <div class="card">
-        <div class="cardhead"><h2 style="margin:0">4 · Subtitles</h2>
+        <div class="cardhead"><h2 style="margin:0">4 · Subtitles <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="Searches with the title of the selected playlist item — no typing needed.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-subs" aria-expanded="true" title="hide / show this pane">▾</button></div>
         <div class="cardbody" data-fold-body="mob-subs">
         <div class="field"><label for="mob-sub-item">For which playlist item?</label>
@@ -100,7 +99,7 @@
       </div>
 
       <div class="card">
-        <div class="cardhead"><h2 style="margin:0">5 · Generate / push</h2>
+        <div class="cardhead"><h2 style="margin:0">5 · Generate / push <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="Write the .m3u or push the bouquet to the Enigma2 box, straight from the phone.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-out" aria-expanded="true" title="hide / show this pane">▾</button></div>
         <div class="cardbody" data-fold-body="mob-out">
         <div class="row">
@@ -118,8 +117,7 @@
 
     <!-- ============ DASHBOARD ============ -->
     <section id="p-dash">
-      <h1>Dashboard</h1>
-      <p class="sub">Health of the container, the hardware path and the receiver. Click a card for details in the log.</p>
+      <h1>Dashboard <span class="tip" tabindex="0" role="note" aria-label="About the dashboard" data-tip="Health of the container, the hardware path and the receiver. Click a card for details in the log.">i</span></h1>
       <div class="grid g4" id="dash-cards"></div>
       <div class="gl" style="margin-top:14px">
         <div class="card pad0">
@@ -128,7 +126,7 @@
           <div id="dash-jobs"><div class="meta" style="padding:14px">loading…</div></div>
         </div>
         <div class="card">
-          <h2>Sources</h2>
+          <h2>Sources <span class="tip" tabindex="0" role="note" aria-label="About the sources" data-tip="Sites the app can scrape. The dot shows the last health check; the switches enable or disable a site for searches.">i</span></h2>
           <div id="dash-sources"><div class="meta">loading…</div></div>
           <h2 style="margin-top:14px">Live sessions</h2>
           <div id="dash-sessions"><div class="meta">none</div></div>
@@ -143,8 +141,7 @@
 
     <!-- ============ SEARCH ============ -->
     <section id="p-find" class="hide">
-      <h1>Search</h1>
-      <p class="sub">Search the enabled sites, or paste the URL of the movie/series page you already have open. Titles found on several providers are grouped into one card; pick a format to add it to the playlist.</p>
+      <h1>Search <span class="tip" tabindex="0" role="note" aria-label="About the Search tab" data-tip="Search the enabled sites, or paste the URL of the movie/series page you already have open. Titles found on several providers are grouped into one card; pick a format to add it to the playlist.">i</span></h1>
       <div class="card">
         <div class="tabs" id="find-tabs">
           <button class="on" data-t="title">Search by title</button>
@@ -159,7 +156,7 @@
               <select id="q-type"><option value="">both</option><option value="movie">movie</option><option value="series">series</option></select></div>
           </div>
           <div class="field">
-            <label>Sources (click to toggle)</label>
+            <label>Sources (click to toggle) <span class="tip" tabindex="0" role="note" aria-label="About the source toggles" data-tip="Only the ticked sources are searched. “all”/“none” flip every source at once; a disabled source is skipped until you tick it again.">i</span></label>
             <div id="source-chips" class="row"><span class="meta">loading…</span></div>
             <div class="row" style="margin-top:7px">
               <button class="btn sm ghost" id="btn-sources-all">✓ enable all</button>
@@ -195,7 +192,7 @@
         </div>
 
         <div id="tab-browse" class="hide">
-          <p class="sub" style="margin:6px 0 10px">Open a source, find your title, copy the URL from the address bar and paste it in the “Paste URL” tab.</p>
+          <p class="sub" style="margin:6px 0 10px">Open a source and paste the player URL in the “Paste URL” tab. <span class="tip" tabindex="0" role="note" aria-label="About browsing sources" data-tip="Open a source, find your title, copy the URL from the address bar and paste it in the “Paste URL” tab.">i</span></p>
           <div class="row" id="browse-links"></div>
         </div>
       </div>
@@ -250,8 +247,7 @@
               </div>
             </div>
           </div>
-          <h3 style="margin-top:14px">Formats</h3>
-          <p class="sub" style="margin:4px 0 8px">Every resolved format of this title, with all metadata. Nothing is put on the playlist until you pick one.</p>
+          <h3 style="margin-top:14px">Formats</h3><span class="tip" tabindex="0" role="note" aria-label="About resolved formats" data-tip="Every resolved format of this title, with all metadata. Nothing is put on the playlist until you pick one. Every candidate is probed with ffprobe before it is offered: dead mirrors, expired tokens and geo-blocks are filtered out instead of failing later in VLC.">i</span>
           <div id="candidates"><div class="meta">No formats yet.</div></div>
           <div class="row" style="margin-top:12px" id="sel-actions"></div>
           <div id="sel-subtitle-panel" class="card pad0 hide" style="margin-top:12px">
@@ -264,19 +260,17 @@
             <div id="sel-subtitle-results"><div class="meta" style="padding:14px">no subtitle search yet</div></div>
             <div id="sel-subtitle-selection" class="note hide" style="margin:10px 12px 12px"></div>
           </div>
-          <div class="note" id="sel-note">Every candidate is probed with ffprobe before it is offered: dead mirrors, expired tokens and geo-blocks are filtered out instead of failing later in VLC.</div>
         </div>
       </div>
     </section>
 
     <!-- ============ SUBTITLES ============ -->
     <section id="p-subs" class="hide">
-      <h1>Subtitles</h1>
-      <p class="sub">Dutch first, English second. Pick the playlist items to search for — the titles come from the playlist, so nothing has to be typed.</p>
+      <h1>Subtitles <span class="tip" tabindex="0" role="note" aria-label="About the Subtitles tab" data-tip="Dutch first, English second. Pick the playlist items to search for — the titles come from the playlist, so nothing has to be typed.">i</span></h1>
       <div class="gl">
         <div>
           <div class="card pad0" style="margin-bottom:14px">
-            <div class="cardhead"><h2 style="margin:0">Providers</h2>
+            <div class="cardhead"><h2 style="margin:0">Providers <span class="tip" tabindex="0" role="note" aria-label="About subtitle providers" data-tip="Scraper-based sub sites. Test tells you whether the provider still answers; a provider that keeps failing can be switched off in Settings → Subtitles (disabled providers).">i</span></h2>
               <button class="btn sm ghost" id="btn-providers-refresh">refresh</button>
               <span class="mut">add your own in Settings → Subtitles</span></div>
             <div id="sub-providers"><div class="meta" style="padding:14px">loading…</div></div>
@@ -285,7 +279,7 @@
 
         <div>
           <div class="card" style="margin-bottom:14px">
-            <h2>Search</h2>
+            <h2>Search <span class="tip" tabindex="0" role="note" aria-label="About subtitle search" data-tip="Searches the languages chosen in Settings → Subtitles, in that order. Attaching a subtitle to a playlist item stores it next to the stream and restarts the relay.">i</span></h2>
             <div class="field">
               <label>Playlist items to search for</label>
               <div id="sub-targets" class="check-list"><div class="meta">loading the playlist…</div></div>
@@ -325,8 +319,7 @@
 
     <!-- ============ TRANSCODE ============ -->
     <section id="p-tpl" class="hide">
-      <h1>Transcode</h1>
-      <p class="sub">One FFmpeg template per streaming profile. Pick a template on the left, tune every parameter on the right — the command, the advice and the parameters always stay in step.</p>
+      <h1>Transcode <span class="tip" tabindex="0" role="note" aria-label="About the Transcode tab" data-tip="One FFmpeg template per streaming profile. Pick a template on the left, tune every parameter on the right — the command, the advice and the parameters always stay in step.">i</span></h1>
       <div class="ffmpeg-page">
         <div class="card pad0">
           <div class="cardhead">
@@ -348,12 +341,11 @@
 
     <!-- ============ PLAYLIST ============ -->
     <section id="p-list" class="hide">
-      <h1>Playlist</h1>
-      <p class="sub">The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue.</p>
+      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue.">i</span></h1>
       <div class="card">
         <div class="spread">
           <div class="row">
-            <span class="tag info" id="list-summary">—</span>
+            <span class="tag info" id="list-summary">—</span> <span class="tip" tabindex="0" role="note" aria-label="About the playlist order" data-tip="Enable/disable keeps an item in the playlist but out of every output. The order here is the order in the .m3u, the bouquet and the Xtream catalogue — drag the ⠿ handle to change it, or use ▲▼.">i</span>
             <span class="mut" id="list-hint"></span>
           </div>
           <div class="row">
@@ -376,8 +368,7 @@
 
     <!-- ============ STREAM (outputs of the playlist) ============ -->
     <section id="p-stream" class="hide">
-      <h1>Stream</h1>
-      <p class="sub">Every output URL of the complete playlist: VLC, playlists, Enigma2 bouquet and Xtream Codes. All of them read the Playlist tab — enable or reorder an item there and these URLs follow.</p>
+      <h1>Stream <span class="tip" tabindex="0" role="note" aria-label="About the Stream tab" data-tip="Every output URL of the complete playlist: VLC, playlists, Enigma2 bouquet and Xtream Codes. All of them read the Playlist tab — enable or reorder an item there and these URLs follow.">i</span></h1>
       <div class="card">
         <div class="spread">
           <div>
@@ -396,7 +387,7 @@
 
       <div class="card pad0" style="margin-top:14px">
         <div class="cardhead">
-          <h2 style="margin:0">Stream URLs</h2>
+          <h2 style="margin:0">Stream URLs</h2><span class="tip" tabindex="0" role="note" aria-label="About the stream URLs" data-tip="Guided profile builder, per-stream FFmpeg parameters and saved templates live on the Transcode tab; the relay session and the download use whatever that stream is set to.">i</span>
           <div class="row">
             <select id="st-pick" style="width:auto;min-width:220px" aria-label="Pick a stream"></select>
             <button class="btn sm ghost" id="btn-st-copy-all">copy all</button>
@@ -413,7 +404,6 @@
             <button class="btn ghost" id="btn-st-test-template">▷ test template</button>
             <span class="mut" id="st-url-note"></span>
           </div>
-          <div class="note" style="margin-top:10px">Guided profile builder, per-stream FFmpeg parameters and saved templates live on the <b>Transcode</b> tab; the relay session and the download use whatever that stream is set to.</div>
           <div class="log hide" id="st-url-log" style="margin-top:10px;max-height:200px"></div>
         </div>
       </div>
@@ -441,9 +431,8 @@
             <div id="st-monitor"><div class="meta">no session running</div></div>
           </div>
           <div class="card">
-            <h2>Receiver</h2>
+            <h2>Receiver <span class="tip" tabindex="0" role="note" aria-label="About the receiver" data-tip="Host, credentials, bouquet name and service type live in Settings → Enigma2.">i</span></h2>
             <div id="st-box" class="meta">unknown — press “test receiver”.</div>
-            <div class="meta" style="margin-top:8px">Host, credentials, bouquet name and service type live in <b>Settings → Enigma2</b>.</div>
           </div>
         </div>
       </div>
@@ -451,23 +440,19 @@
 
     <!-- ============ TEST ============ -->
     <section id="p-tpl-test" class="hide">
-      <h1>Test</h1>
-      <p class="sub">Same editor as the Transcode tab, plus an input source. Every individual parameter of the selected template can be changed here, and the raw ffmpeg output appears as it is produced.</p>
+      <h1>Test <span class="tip" tabindex="0" role="note" aria-label="About the Test tab" data-tip="Same editor as the Transcode tab, plus an input source. Every individual parameter of the selected template can be changed here, and the raw ffmpeg output appears as it is produced.">i</span></h1>
       <div class="ffmpeg-page">
         <div class="card pad0">
           <div class="cardhead"><h2 style="margin:0">What to test</h2></div>
           <div class="cardbody pad12">
-            <div class="field"><label for="test-template">FFmpeg template</label>
-              <select id="test-template"></select>
-              <div class="meta">Loads the template's parameters and command into the editor on the right; nothing is saved unless you press “save template”.</div></div>
-            <div class="field"><label for="test-source">Input source</label>
-              <select id="test-source"></select>
-              <div class="meta">Playlist items and saved streams run with their real upstream URL and headers (signed cookies included).</div></div>
+            <div class="field"><label for="test-template">FFmpeg template <span class="tip" tabindex="0" role="note" aria-label="About the template picker" data-tip="Loads the template's parameters and command into the editor on the right; nothing is saved unless you press “save template”.">i</span></label>
+              <select id="test-template"></select></div>
+            <div class="field"><label for="test-source">Input source <span class="tip" tabindex="0" role="note" aria-label="About the input source" data-tip="Playlist items and saved streams run with their real upstream URL and headers (signed cookies included).">i</span></label>
+              <select id="test-source"></select></div>
             <div class="field hide" id="test-url-field"><label for="test-url">Custom source URL</label>
               <input id="test-url" class="mono" placeholder="https://…/movie.mp4"></div>
-            <div class="field"><label for="test-duration">Run for (seconds)</label>
-              <input id="test-duration" type="number" min="1" max="30" step="1" value="5">
-              <div class="meta">Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.</div></div>
+            <div class="field"><label for="test-duration">Run for (seconds) <span class="tip" tabindex="0" role="note" aria-label="About the run duration" data-tip="Max 30 s — long enough to read one full keyframe, short enough that the relay never stalls.">i</span></label>
+              <input id="test-duration" type="number" min="1" max="30" step="1" value="5"></div>
           </div>
           <div class="row">
             <button class="btn pri" id="btn-test-run">▷ start test</button>
@@ -482,8 +467,7 @@
 
     <!-- ============ LOGS ============ -->
     <section id="p-logs" class="hide">
-      <h1>Logs</h1>
-      <p class="sub">Structured, levelled, greppable. When a site changes its player, the log says which stage broke and why.</p>
+      <h1>Logs <span class="tip" tabindex="0" role="note" aria-label="About the Logs tab" data-tip="Structured, levelled, greppable. When a site changes its player, the log says which stage broke and why.">i</span></h1>
       <div class="card">
         <div class="row" style="margin-bottom:10px">
           <select id="log-level" style="width:auto"><option value="debug">debug</option><option value="info" selected>info+</option><option value="warn">warn+</option><option value="error">error</option></select>
@@ -499,19 +483,18 @@
 
     <!-- ============ SETTINGS ============ -->
     <section id="p-set" class="hide">
-      <h1>Settings</h1>
-      <p class="sub">Stored in <code>/config/vumovie.json</code> (mounted volume). Environment variables always win.</p>
+      <h1>Settings <span class="tip" tabindex="0" role="note" aria-label="About the Settings tab" data-tip="Stored in /config/vumovie.json (mounted volume). Environment variables always win.">i</span></h1>
       <div class="grid g2" id="settings-grid"></div>
       <div class="row" style="margin-top:14px">
         <button class="btn pri" id="btn-save-settings">save settings</button>
         <button class="btn" id="btn-reload-settings">reload</button>
         <button class="btn" id="btn-hw-test">re-test hardware</button>
-        <button class="btn" id="btn-diag">ffmpeg diagnostics</button>
+        <button class="btn" id="btn-diag">ffmpeg diagnostics</button><span class="tip" tabindex="0" role="note" aria-label="About the ffmpeg diagnostics" data-tip="“ffmpeg diagnostics” times ffmpeg -version, shows what the container sees under /dev/dri and runs a 2 s VAAPI encode per installed driver (iHD, i965) — that is the fastest way to tell a slow disk from a missing binary from a broken driver.">i</span>
         <span class="mut" id="settings-hint"></span>
       </div>
-      <div class="note" id="diag-out" style="margin-top:12px">“ffmpeg diagnostics” times <code>ffmpeg -version</code>, shows what the container sees under <code>/dev/dri</code> and runs a 2 s VAAPI encode per installed driver (iHD, i965) — that is the fastest way to tell a slow disk from a missing binary from a broken driver.</div>
+<div class="note" id="diag-out" style="margin-top:12px">run “ffmpeg diagnostics” to see the report here.</div>
       <div class="card pad0" style="margin-top:16px">
-        <div class="cardhead"><h2 style="margin:0">Custom source</h2><span class="mut">add a site with its own search URL</span></div>
+        <div class="cardhead"><h2 style="margin:0">Custom source</h2><span class="mut">add a site with its own search URL</span><span class="tip" tabindex="0" role="note" aria-label="About custom sources" data-tip="Resolving uses the headless browser (network sniffing), so a custom source works even when the site obfuscates its player — the search URL is all you need.">i</span></div>
         <div style="padding:14px">
           <div class="f2">
             <div class="field"><label>id</label><input id="cs-id" placeholder="mysite"></div>
@@ -520,14 +503,12 @@
             <div class="field"><label>search URL template</label><input id="cs-search" class="mono" placeholder="https://example.com/search/{query}"></div>
           </div>
           <button class="btn pri" id="btn-cs-save">save source</button>
-          <div class="note">Resolving uses the headless browser (network sniffing), so a custom source works even when the site obfuscates its player — the search URL is all you need.</div>
         </div>
       </div>
 
       <div class="card pad0" style="margin-top:16px">
-        <div class="cardhead"><h2 style="margin:0">Custom subtitle source</h2><span class="mut">any site that returns links or JSON</span></div>
+        <div class="cardhead"><h2 style="margin:0">Custom subtitle source</h2><span class="mut">any site that returns links or JSON</span><span class="tip" tabindex="0" role="note" aria-label="About custom subtitle sources" data-tip="Templates use {query} {lang} {imdb} {tmdb} {sxx} {exx} {year}. Saved providers appear on the Subtitles tab (test them there).">i</span></div>
         <div style="padding:14px">
-          <p class="sub">Templates use <code>{query} {lang} {imdb} {tmdb} {sxx} {exx} {year}</code>. Saved providers appear on the Subtitles tab (test them there).</p>
           <div class="f2">
             <div class="field"><label>id (no spaces)</label><input id="cp-id" placeholder="mysource"></div>
             <div class="field"><label>name</label><input id="cp-name" placeholder="My source"></div>

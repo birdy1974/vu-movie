@@ -286,6 +286,88 @@ if (process.env.DUMP) {
   console.log('\n--- mobile pane ---\n' + pretty($('#p-mobile').innerHTML).slice(0, 2600));
   console.log('\n--- stream url card ---\n' + pretty($('#st-urls')?.closest('.card')?.outerHTML || '(none)').slice(0, 1800));
 }
+/* ---------------- 11. help tooltips on every tab ---------------- */
+
+const bubble = () => document.querySelector('.tipbubble');
+const hover = (element) => element.dispatchEvent(new window.MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+const unhover = (element) => element.dispatchEvent(new window.MouseEvent('mouseout', { bubbles: true, cancelable: true, relatedTarget: document.body }));
+
+check('one shared tooltip bubble lives on <body>', Boolean(bubble()) && bubble().parentElement === document.body);
+
+const TABS = [
+  ['mobile', 'Mobile'], ['dash', 'Dashboard'], ['find', 'Search'], ['subs', 'Subtitles'],
+  ['tpl', 'Transcode'], ['list', 'Playlist'], ['stream', 'Stream'], ['tpl-test', 'Test'],
+  ['logs', 'Logs'], ['set', 'Settings'],
+];
+for (const [page, label] of TABS) {
+  await window.App.go(page);
+  await tick(120);
+  const tips = $$(`#p-${page} .tip[data-tip]`);
+  const anchor = tips[0];
+  let shown = false;
+  if (anchor) {
+    hover(anchor);
+    shown = !bubble().hidden && bubble().textContent.trim().length > 10;
+    unhover(anchor);
+  }
+  check(`${label}: help tip opens on hover`,
+    tips.length >= 1 && shown,
+    `${tips.length} tip(s)${anchor ? ` · “${(anchor.dataset.tip || '').slice(0, 60)}…”` : ''}`);
+}
+check('the bubble closes again', bubble().hidden === true);
+
+/* keyboard + touch: the tip must be reachable without a mouse */
+await window.App.go('tpl');
+await tick(200);
+const focusTip = $$('#p-tpl h1 .tip[data-tip]')[0] || $$('#p-tpl .tip[data-tip]')[0];
+focusTip.focus();
+focusTip.dispatchEvent(new window.FocusEvent('focusin', { bubbles: true }));
+check('a focused tip opens too (keyboard / screen reader)', bubble().hidden === false && bubble().textContent.trim().length > 10, bubble().textContent.slice(0, 60));
+document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+check('Escape dismisses the tip', bubble().hidden === true);
+const tapTip = $$('#p-tpl .tip[data-tip]')[0];
+tapTip.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+const afterTap = bubble().hidden === false;
+tapTip.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+check('tap toggles the tip (no hover on a phone)', afterTap && bubble().hidden === true);
+/* a tip must not activate the control it sits in (button, <summary>, label) */
+const host = document.createElement('div');
+host.innerHTML = `<button type="button" id="host-btn">do it ${'<span class="tip" tabindex="0" role="note" aria-label="x" data-tip="why not">i</span>'}</button>`;
+document.body.appendChild(host);
+let activated = 0;
+$('#host-btn').addEventListener('click', () => { activated += 1; });
+const hostTip = $('#host-btn .tip');
+if (hostTip) hostTip.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+check('clicking a tip inside a button does not press the button', activated === 0 && bubble().hidden === false, `activated=${activated}`);
+const outside = document.createElement('div');
+document.body.appendChild(outside);
+const backInTpl = $$('#p-tpl .tip[data-tip]')[0];
+backInTpl.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+outside.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true }));
+check('tapping outside closes the tip', bubble().hidden === true);
+outside.remove();
+
+/* ---------------- 12. the prefilled parameter values come from the schema ---------------- */
+
+await window.App.go('tpl');
+await tick(200);
+const optionsOf = (key) => [...($(`#ff-${key}`)?.options || [])].map((o) => o.value);
+const videoCodecs = optionsOf('video_codec');
+const audioCodecs = optionsOf('audio_codec');
+const levels = optionsOf('level');
+const fpsList = optionsOf('fps');
+check('every video encoder from the schema is offered', ['libx264', 'libx265', 'libvpx-vp9', 'libsvtav1', 'mpeg2video', 'h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi', 'av1_vaapi', 'h264_qsv', 'hevc_qsv', 'h264_nvenc', 'hevc_nvenc', 'copy'].every((c) => videoCodecs.includes(c)), videoCodecs.join(','));
+check('every audio encoder from the schema is offered', ['aac', 'ac3', 'eac3', 'mp2', 'mp3', 'libmp3lame', 'libopus', 'libvorbis', 'flac', 'pcm_s16le', 'copy', 'none'].every((c) => audioCodecs.includes(c)), audioCodecs.join(','));
+check('H.264 levels cover the whole range (1 … 6.2, incl. 1b)', ['1', '1b', '2.2', '3.1', '4.1', '5.2', '6.2'].every((v) => levels.includes(v)), levels.join(' '));
+check('frame rates include the fractional and high rates', ['23.976', '29.97', '59.94', '120'].every((v) => fpsList.includes(v)), fpsList.join(' '));
+check('profiles include the x264 set', ['baseline', 'main', 'high', 'high10', 'high422', 'high444'].every((v) => optionsOf('profile').includes(v)), optionsOf('profile').join(' '));
+check('audio sample rates cover 32 … 192 kHz', ['32000', '44100', '48000', '96000', '192000'].every((v) => optionsOf('audio_rate').includes(v)), optionsOf('audio_rate').join(' '));
+const advFlagOptions = $$('#ff-editor-1-adv-flag option').map((o) => o.value).filter((v) => v.startsWith('-'));
+check('advanced flag picker is filled from the schema', advFlagOptions.length >= 25, `${advFlagOptions.length} flags`);
+check('advanced flags include the streaming-relevant ones',
+  ['-probesize', '-analyzeduration', '-reconnect', '-mpegts_flags', '-hls_flags', '-max_muxing_queue_size', '-flush_packets', '-live', '-tune', '-preset'].every((f) => advFlagOptions.includes(f)),
+  advFlagOptions.slice(0, 8).join(' '));
+
 check('no runtime errors collected', errors.length === 0, errors.slice(0, 3).join(' | '));
 console.log(`\n${failures ? `✗ ${failures} check(s) failed` : '✓ all checks passed'} — ${calls.length} API calls`);
 process.exit(failures ? 1 : 0);

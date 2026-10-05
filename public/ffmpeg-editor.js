@@ -22,8 +22,12 @@
 'use strict';
 
 const VMFfmpegEditor = (() => {
-  const VAAPI = ['h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi'];
-  const H264 = ['libx264', 'h264_vaapi', 'h264_qsv'];
+  // Fallbacks only: the real lists come from the server schema (see
+  // src/core/ffmpeg-options.js), so adding an encoder there updates the editor.
+  const VAAPI_FALLBACK = ['h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi', 'av1_vaapi'];
+  const H264_FALLBACK = ['libx264', 'h264_vaapi', 'h264_qsv', 'h264_nvenc'];
+  const VAAPI = () => (Array.isArray(schema()?.vaapiEncoders) && schema().vaapiEncoders.length ? schema().vaapiEncoders : VAAPI_FALLBACK);
+  const H264 = () => (Array.isArray(schema()?.h264Encoders) && schema().h264Encoders.length ? schema().h264Encoders : H264_FALLBACK);
   const QUALITY_RC = ['CQP', 'ICQ', 'QVBR'];
   const CUSTOM = '__custom__';
   const editors = new Map();
@@ -59,8 +63,8 @@ const VMFfmpegEditor = (() => {
   function computeActive(options = {}, container = 'mpegts') {
     const copy = (options.video_codec || 'copy') === 'copy';
     const transcode = !copy;
-    const vaapi = VAAPI.includes(options.video_codec);
-    const h264 = H264.includes(options.video_codec);
+    const vaapi = VAAPI().includes(options.video_codec);
+    const h264 = H264().includes(options.video_codec);
     const quality = vaapi && QUALITY_RC.includes(String(options.rc_mode || '').toUpperCase());
     const rateBased = transcode && !quality;
     const audioRateControl = options.audio_codec !== 'none' && options.audio_codec !== 'copy';
@@ -218,11 +222,6 @@ const VMFfmpegEditor = (() => {
   /* ------------------------------------------------------------------ *
    * controls
    * ------------------------------------------------------------------ */
-
-  /** Inline help is hidden behind this "i": hover or focus shows the text. */
-  const tip = (text, label = 'more information') => (text
-    ? `<span class="tip" tabindex="0" role="note" aria-label="${escapeHtml(label)}" data-tip="${escapeHtml(text)}">i</span>`
-    : '');
 
   const choiceLabel = (key, value) => {
     if (value === '') return ['rate', 'integer', 'number', 'positive'].includes(fieldDef(key)?.kind) || ['fps', 'gop', 'global_quality', 'async_depth', 'audio_channels', 'audio_rate', 'video_bitrate', 'maxrate', 'bufsize', 'audio_bitrate'].includes(key)

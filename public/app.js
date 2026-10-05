@@ -1465,7 +1465,7 @@ async function refreshStream(announce = false) {
         </div>
       </div>
       <div class="mono url-line">${escapeHtml(entry.url || '—')}</div>
-      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Also usable as an Xtream account in Tivimate/IPTV Smarters — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b>.</div>` : ''}
+      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Give these credentials to Tivimate, IPTV Smarters or any other Xtream-compatible app; the player API URL above is the server address.">i</span></div>` : ''}
     </div>`).join('');
 
   $('#st-item-count').textContent = `${state.playlist.items.length} item(s)`;
@@ -1835,12 +1835,10 @@ async function loadSettings() {
     const res = await api('/api/config');
     state.config = res.config;
     const draft = structuredClone(res.config);
-    const tip = (text) => (text ? `<span class="tip" tabindex="0" role="note" aria-label="more information" data-tip="${escapeHtml(text)}">i</span>` : '');
     $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
       <div class="card" data-set-section="${escapeHtml(section.key)}">
-        <div class="cardhead"><h2 style="margin:0">${escapeHtml(section.title)}</h2>
-          <span class="mut" title="${escapeHtml(SETTINGS_NOTES[section.key] || '')}">${section.fields.length} field(s)</span></div>
-        ${SETTINGS_NOTES[section.key] ? `<p class="sub" style="margin:2px 0 10px">${escapeHtml(SETTINGS_NOTES[section.key])}</p>` : ''}
+        <div class="cardhead"><h2 style="margin:0">${titleWithTip(section.title, SETTINGS_NOTES[section.key])}</h2>
+          <span class="mut">${section.fields.length} field(s)</span></div>
         <div class="set-fields">
         ${section.fields.map(([key, type, options]) => {
           const value = draft[section.key]?.[key];
@@ -2207,7 +2205,7 @@ function wireShell() {
     if (page && page !== currentPage) go(page, { hash: false });
   });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && event.target.matches('input,select,textarea')) event.target.blur();
+    if (event.key === 'Escape' && event.target?.matches?.('input,select,textarea')) event.target.blur();
   });
   document.addEventListener('click', (event) => {
     const hashLink = event.target.closest('a[href^="#"]');
@@ -2247,6 +2245,7 @@ Object.assign(App, {
 window.App = App;
 
 async function bootstrap() {
+  initTips();
   initSidebar();
   wireFolds();
   wireShell();

@@ -549,9 +549,8 @@ const VMPlaylist = (() => {
           <div class="f2">
             <div class="field"><label>Language</label>
               <select id="pick-file-lang"><option value="nl">nl</option><option value="en">en</option><option value="de">de</option><option value="fr">fr</option><option value="es">es</option></select></div>
-            <div class="field"><label>&nbsp;</label><button class="btn pri" id="btn-pick-upload">attach file</button></div>
+            <div class="field"><label>&nbsp;</label><button class="btn pri" id="btn-pick-upload">attach file <span class="tip" tabindex="0" role="note" aria-label="About attaching a subtitle file" data-tip="The file is stored next to the stream and muxed as a soft subtitle track — the relay restarts automatically.">i</span></button></div>
           </div>
-          <div class="meta">The file is stored next to the stream and muxed as a soft subtitle track — the relay restarts automatically.</div>
         </div>`,
       onMount: (root) => {
         $('#sub-pick-tabs', root).addEventListener('click', (event) => {
