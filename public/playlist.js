@@ -625,7 +625,11 @@ const VMPlaylist = (() => {
     try {
       const res = await api(`/api/streams/${encodeURIComponent(streamId)}`, { silent: true });
       const path = res.stream.profile?.subtitlePath;
-      const mode = res.stream.profile?.subtitles || 'none';
+      // The item owns the mode: "copy the .srt to the box" never writes the
+      // stream profile, so reading the profile alone would draw "off" again
+      // right after the push succeeded.
+      const mode = items().find((entry) => entry.streamId === streamId)?.subtitleMode
+        || res.stream.profile?.subtitles || 'none';
       host.innerHTML = path
         ? `Current subtitle: <b>${escapeHtml((res.stream.profile.subtitleLanguage || '').toUpperCase())}</b> · <span class="mono">${escapeHtml(path)}</span>
            <button class="btn sm ghost" id="btn-sub-detach" style="margin-left:8px">detach</button>

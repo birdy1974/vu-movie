@@ -45,9 +45,12 @@ const wants = [
     output: { vlcTs: '__self__', enigma2: '__self__' },
     options: {
       hw_accel: 'vaapi', device: '/dev/dri/renderD128', resolution: '1080p',
-      video_codec: 'h264_vaapi', video_bitrate: 8000, gop: 50,
+      // Rates carry their unit, exactly like the editor's own choices: a bare
+      // 8000 means 8000 bit/s to ffmpeg (rendered as `-b:v 8000`), which is an
+      // unusable stream — the seeded templates used to be broken that way.
+      video_codec: 'h264_vaapi', video_bitrate: '8000k', gop: 50,
       rc_mode: 'CQP', global_quality: 22, low_power: true,
-      audio_codec: 'aac', audio_bitrate: 192, audio_channels: 6, audio_rate: 48000,
+      audio_codec: 'aac', audio_bitrate: '192k', audio_channels: 6, audio_rate: 48000,
       subs: 'drop', output_format: 'mpegts',
     },
   },
@@ -58,8 +61,8 @@ const wants = [
     output: {},
     options: {
       hw_accel: 'vaapi', device: '/dev/dri/renderD128', resolution: '720p',
-      video_codec: 'h264_vaapi', video_bitrate: 3000,
-      audio_codec: 'aac', audio_bitrate: 128, audio_channels: 2, audio_rate: 48000,
+      video_codec: 'h264_vaapi', video_bitrate: '3000k',
+      audio_codec: 'aac', audio_bitrate: '128k', audio_channels: 2, audio_rate: 48000,
       subs: 'keep', output_format: 'matroska',
     },
   },

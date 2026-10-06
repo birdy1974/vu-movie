@@ -16,7 +16,6 @@
  */
 'use strict';
 
-const PAGE_KEY = 'vu-movie.active-page';
 const SEARCH_STATE_KEY = 'vu-movie.search-state.v2';
 const RESULT_VIEW_KEY = 'vu-movie.search-results-view';
 const RESULT_SORT_KEY = 'vu-movie.search-results-sort';
@@ -65,7 +64,6 @@ async function go(page, { hash = true, force = false } = {}) {
   $$('.nav button').forEach((button) => button.classList.toggle('on', button.dataset.p === page));
   APP_PAGES.forEach((name) => $(`#p-${name}`)?.classList.toggle('hide', name !== page));
   document.body.dataset.page = page;
-  writeStoredText(PAGE_KEY, page);
   if (hash && pageFromHash() !== page) {
     // `hash = page` keeps the back button working without a scroll jump.
     window.location.hash = `#${page}`;
@@ -1922,7 +1920,7 @@ const SETTINGS_LABELS = {
   'enigma2.password': ['Password', 'Stored in /config/vumovie.json; shown masked after a reload.'],
   'enigma2.bouquetName': ['Bouquet name', 'Name the playlist gets in the receiver bouquet list.'],
   'enigma2.rootDir': ['Root directory', 'Folder on the box for the bouquet and the subtitle files.'],
-  'enigma2.serviceType': ['Service type', 'Enigma2 service type, 1 = non-TS (4097 = stream), 1 = DVB.'],
+  'enigma2.serviceType': ['Service type', 'Enigma2 service type for the bouquet entries: 4097 = GStreamer (non-TS stream, the default), 1 = DVB.'],
   'enigma2.ftpEnabled': ['FTP upload', 'Upload the bouquet and subtitles over FTP instead of HTTP.'],
   'enigma2.ftpPort': ['FTP port', '21 by default.'],
   'enigma2.autoPush': ['Auto push', 'Push the bouquet after every playlist change.'],
@@ -2291,32 +2289,68 @@ function initSidebar() {
 
 /* ---------------- collapsible panes (the mobile sub-panes) ---------------- */
 
-const FOLD_KEY = 'vu-movie.folded';
+/**
+ * Where a pane remembers that it was opened or closed.
+ *
+ * `.v2`: the Mobile tab's five panes now start **collapsed** (they are the five
+ * steps of one workflow, and a phone should show the steps, not their forms).
+ * A preference stored under the old key says "everything open" — it would
+ * silently undo that default — so the key is bumped once; choices made from now
+ * on are remembered again.
+ */
+const FOLD_KEY = 'vu-movie.folded.v2';
 
 function foldedState() {
   const stored = readStoredJson(FOLD_KEY);
   return stored && typeof stored === 'object' ? stored : {};
 }
 
+/** Open/close one pane: body, glyph, aria and title move together. */
+function setFold(button, folded, persist = true) {
+  const key = button.dataset.fold;
+  const body = $(`[data-fold-body="${key}"]`);
+  if (!body) return;
+  body.classList.toggle('hide', folded);
+  button.textContent = folded ? '▸' : '▾';
+  button.setAttribute('aria-expanded', folded ? 'false' : 'true');
+  button.title = folded ? 'show this pane' : 'hide this pane';
+  if (persist) writeStoredText(FOLD_KEY, JSON.stringify({ ...foldedState(), [key]: folded }));
+  syncFoldAll();
+}
+
+/** Every foldable pane of the Mobile tab (the only tab that has them today). */
+const mobileFoldButtons = () => $$('#p-mobile .foldbtn[data-fold]');
+
+/** Keep the “collapse all / expand all” button in step with the panes. */
+function syncFoldAll() {
+  const button = $('#btn-mob-fold');
+  if (!button) return;
+  const buttons = mobileFoldButtons();
+  const folded = buttons.filter((entry) => entry.getAttribute('aria-expanded') !== 'true').length;
+  const allFolded = buttons.length > 0 && folded === buttons.length;
+  button.textContent = allFolded ? '▾ expand all' : '▸ collapse all';
+  button.title = allFolded ? 'open every pane of this tab' : 'close every pane of this tab';
+}
+
 function wireFolds() {
   const stored = foldedState();
-  const setFold = (button, folded, persist = true) => {
-    const key = button.dataset.fold;
-    const body = $(`[data-fold-body="${key}"]`);
-    if (!body) return;
-    body.classList.toggle('hide', folded);
-    button.textContent = folded ? '▸' : '▾';
-    button.setAttribute('aria-expanded', folded ? 'false' : 'true');
-    button.title = folded ? 'show this pane' : 'hide this pane';
-    if (persist) writeStoredText(FOLD_KEY, JSON.stringify({ ...foldedState(), [key]: folded }));
-  };
   $$('.foldbtn[data-fold]').forEach((button) => {
-    setFold(button, Boolean(stored[button.dataset.fold]), false);
+    // The markup carries the default: a button rendered with aria-expanded
+    // "false" means "this pane starts collapsed" (the five Mobile panes).
+    const fallback = button.getAttribute('aria-expanded') === 'false';
+    const saved = stored[button.dataset.fold];
+    setFold(button, typeof saved === 'boolean' ? saved : fallback, false);
     button.addEventListener('click', () => {
       const body = $(`[data-fold-body="${button.dataset.fold}"]`);
-      setFold(button, !body?.classList.contains('hide'));
+      if (body) setFold(button, !body.classList.contains('hide'));
     });
   });
+  $('#btn-mob-fold')?.addEventListener('click', () => {
+    const buttons = mobileFoldButtons();
+    const allFolded = buttons.every((entry) => entry.getAttribute('aria-expanded') !== 'true');
+    buttons.forEach((entry) => setFold(entry, !allFolded));
+  });
+  syncFoldAll();
 }
 
 function wireShell() {
@@ -2383,9 +2417,10 @@ async function bootstrap() {
   }, 15000);
   window.addEventListener('beforeunload', () => clearInterval(healthTimer));
 
-  const stored = readStoredText(PAGE_KEY);
-  const wanted = pageFromHash() || (isPhone() ? 'mobile' : (APP_PAGES.includes(stored) ? stored : 'dash'));
-  await go(wanted, { hash: false });
+  // The Mobile tab is the front door: it walks the same workflow as the desktop
+  // tabs, in the order it has to be used, so the site always opens there. A
+  // `#page` in the URL still wins, so deep links and bookmarks keep working.
+  await go(pageFromHash() || 'mobile', { hash: false });
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);

@@ -199,16 +199,16 @@ const VMFfmpegEditor = (() => {
       }
     }
     if (container === 'matroska' && options.subs === 'keep') {
-      out.push({ level: 'info', text: 'Matroska + “copy all” keeps the source text subtitles (SRT/ASS) as selectable tracks — this is the only combination that can.' });
+      out.push({ level: 'info', text: 'Subtitles “copy all” with the Matroska container keeps the source text subtitles (SRT/ASS) as selectable tracks — this is the only combination that can.' });
     }
     if (container !== 'matroska' && options.subs === 'keep') {
-      out.push({ level: 'err', text: '“Copy all” needs the Matroska container; MPEG-TS can only carry DVB bitmap subtitles.' });
+      out.push({ level: 'err', text: 'Subtitles “copy all” needs the Matroska container; MPEG-TS can only carry DVB bitmap subtitles. Set Output format to Matroska.' });
     }
     if (container !== 'matroska' && options.subs === 'dvb') {
       out.push({ level: 'warn', text: 'DVB subtitles are bitmaps and can only be copied from a source that already has DVB/PGS subtitles. A text .srt (the Playlist tab attachment) cannot be converted — use the Matroska container, or burn the subtitle into the picture.' });
     }
     if (container === 'matroska' && options.subs === 'dvb') {
-      out.push({ level: 'warn', text: 'DVB subtitles belong in MPEG-TS; for Matroska “copy all” keeps every track as it is.' });
+      out.push({ level: 'warn', text: 'DVB bitmap subtitles belong in MPEG-TS; for Matroska switch Subtitles to “copy all”, which keeps every track as it is.' });
     }
     if (container === 'mpegts' && options.output_format && options.output_format !== 'mpegts') {
       out.push({ level: 'err', text: 'The output format parameter and the container disagree — the server stores the container value.' });
@@ -234,11 +234,32 @@ const VMFfmpegEditor = (() => {
    * controls
    * ------------------------------------------------------------------ */
 
+  // Fallback only: the schema carries the labels (`labels: {value: label}`), so
+  // the wording lives next to the field definition on the server. This copy is
+  // used when the schema cannot be fetched — it must say exactly what
+  // src/core/ffmpeg-options.js says, because the advice pane and the validator
+  // use those words too (they say “copy all”, so the box cannot show `keep`:
+  // that is how "where do I set copy all?" happens).
+  const CHOICE_LABELS_FALLBACK = {
+    subs: {
+      drop: 'drop — no subtitles in the output',
+      dvb: 'DVB bitmaps — copy the source’s own DVB/PGS (MPEG-TS)',
+      keep: 'copy all — keep every track (Matroska)',
+    },
+  };
+
+  /** Choices as {value, label} — schema labels first, then the fallback map. */
+  const labelledChoices = (def) => (Array.isArray(def?.choices) ? def.choices : [])
+    .map((choice) => ({
+      value: choice,
+      label: def?.labels?.[choice] || CHOICE_LABELS_FALLBACK[def?.key]?.[choice] || choice,
+    }));
+
   const choiceLabel = (key, value) => {
     if (value === '') return ['rate', 'integer', 'number', 'positive'].includes(fieldDef(key)?.kind) || ['fps', 'gop', 'global_quality', 'async_depth', 'audio_channels', 'audio_rate', 'video_bitrate', 'maxrate', 'bufsize', 'audio_bitrate'].includes(key)
       ? '— (leave to ffmpeg)'
       : '— (default)';
-    return value;
+    return labelledChoices(fieldDef(key)).find((entry) => entry.value === value)?.label || value;
   };
 
   function controlMarkup(def, values = {}, scope = '') {
@@ -268,19 +289,28 @@ const VMFfmpegEditor = (() => {
     }
 
     const choices = Array.isArray(def.choices) ? def.choices : [];
+    // A value the schema does not list (a hand-written command that was just
+    // parsed) still has to be visible, or the select would silently jump to its
+    // first choice. For a field that is validated against its choices
+    // (`custom: false`) it stays visible but read-only — typing an arbitrary
+    // value there only produced a validation error, e.g. "copy all" instead of
+    // the keep choice that means it.
     const extra = value2 !== '' && !choices.includes(value2) ? [value2] : [];
     const optionList = [...choices, ...extra].map((choice) =>
       `<option value="${escapeHtml(choice)}"${String(choice) === value2 ? ' selected' : ''}>${escapeHtml(choiceLabel(key, choice))}</option>`).join('');
-    const customSelected = extra.length > 0;
-    const customInput = `<input id="${id}-custom" data-param-custom="${key}" class="mono ${customSelected ? '' : 'hide'}"
-      value="${escapeHtml(customSelected ? value2 : '')}" placeholder="custom value" autocomplete="off">`;
+    const allowCustom = def.custom !== false;
+    const customSelected = allowCustom && extra.length > 0;
+    const customInput = allowCustom
+      ? `<input id="${id}-custom" data-param-custom="${key}" class="mono ${customSelected ? '' : 'hide'}"
+      value="${escapeHtml(customSelected ? value2 : '')}" placeholder="custom value" autocomplete="off">`
+      : '';
+    const customOption = allowCustom ? `<option value="${CUSTOM}"${customSelected ? ' selected' : ''}>✎ custom value…</option>` : '';
     const placeholder = def.kind === 'resolution' ? 'e.g. 1280x720 or 900p'
       : def.kind === 'aspect' ? 'e.g. 16:9' : def.kind === 'rate' ? 'e.g. 8000k' : 'value';
     return `<div class="param-field" data-field="${key}">
       <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
       <div class="param-select-row">
-        <select id="${id}" data-param="${key}">${optionList}
-          <option value="${CUSTOM}"${customSelected ? ' selected' : ''}>✎ custom value…</option>
+        <select id="${id}" data-param="${key}">${optionList}${customOption}
         </select>
         ${customInput}
       </div></div>`;
@@ -873,28 +903,38 @@ const VMFfmpegEditor = (() => {
   /** How much text the panel keeps (the DOM is re-written from this array). */
   const TEST_MAX_LINES = 400;
   const TEST_MAX_CHARS = 200 * 1024;
-  /** One rendered line. Longer runs of bytes are media, not a log line. */
-  const TEST_MAX_LINE = 500;
+  /**
+   * One rendered line. Only a pathological run (a template that pipes media to
+   * stderr) hits this: real ffmpeg log lines — including the ones that embed a
+   * long signed source URL — must reach the panel *verbatim*, because that is
+   * what the pane promises. The CSS wraps (`white-space:pre-wrap`), so length
+   * costs nothing but the character budget above.
+   */
+  const TEST_MAX_LINE = 4000;
   const TEST_PLACEHOLDER = '— raw ffmpeg output appears here —';
   const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
 
   /**
    * What the panel may show for one line coming off the SSE stream.
    *
-   * A template that ends in `pipe:1` (vu-movie's own convention) writes the
-   * finished movie to stdout: the stream carries binary chunks with no newlines
-   * in them. Appending those into one <pre> text node — and re-splitting that
-   * node to trim it — locked the browser tab solid after a few seconds. Binary
-   * lines are summarised instead, and every line is clipped.
+   * ffmpeg logs on stderr and that text is printed as-is — no trimming, no
+   * summarising. The guard only catches a line that cannot be a log line at
+   * all: control bytes, or a run of bytes with no newline in it. The old
+   * version announced every such line as "binary output on pipe:1", which was
+   * wrong for stderr (and hid long error lines that name a signed CDN URL).
    *
+   * @param {string} line
+   * @param {'stderr'|'stdout'} source which pipe the line came off
    * @returns {string} '' when there is nothing worth showing.
    */
-  function testLineForDisplay(line) {
+  function testLineForDisplay(line, source = 'stderr') {
     const raw = String(line ?? '').replace(/\r/g, '');
     if (!raw) return '';
-    // A "line" this long out of a media pipe is a chunk of packets.
+    // A "line" this long out of a media pipe is a chunk of packets, not a log.
     if (raw.length > TEST_MAX_LINE || CONTROL_RE.test(raw)) {
-      return `# ${raw.length} bytes of binary output suppressed — this template writes the stream to stdout (pipe:1); the verdict shows the total`;
+      return source === 'stdout'
+        ? `# ${raw.length} bytes of binary output suppressed — this template writes the stream to stdout (pipe:1); the verdict shows the total`
+        : `# ${raw.length} bytes of non-text output suppressed (ffmpeg wrote bytes on stderr, not a log line)`;
     }
     return raw;
   }
@@ -921,8 +961,8 @@ const VMFfmpegEditor = (() => {
    * wall of media bytes) can never turn into an unbounded string operation on
    * the main thread.
    */
-  function appendTestLine(instance, line) {
-    const text = testLineForDisplay(line);
+  function appendTestLine(instance, line, source = 'stderr') {
+    const text = testLineForDisplay(line, source);
     if (!text) return;
     const buffer = instance.test.buffer || (instance.test.buffer = []);
     buffer.push(text);
@@ -972,9 +1012,14 @@ const VMFfmpegEditor = (() => {
         appendTestLine(instance, `# source: ${payload.stream?.title || payload.stream?.url || '—'} · container ${payload.container} · hardware ${payload.hardware?.available ? 'vaapi' : 'software'}`);
         appendTestLine(instance, '');
       },
-      stderr: (payload) => appendTestLine(instance, payload.line),
-      stdout: (payload) => appendTestLine(instance, payload.line),
+      stderr: (payload) => appendTestLine(instance, payload.line, 'stderr'),
+      stdout: (payload) => appendTestLine(instance, payload.line, 'stdout'),
       progress: (payload) => {
+        // ffmpeg's `-progress pipe:2` lines are part of the raw output: with
+        // `-loglevel warning` they are the only thing a healthy run prints, so
+        // they belong in the pane next to the errors. `raw` is the untouched
+        // line; the readout below stays as the at-a-glance summary.
+        if (payload.raw) appendTestLine(instance, payload.raw);
         const progress = $(`#${instance.id}-test-progress`);
         if (!progress) return;
         const bits = [
@@ -1034,7 +1079,11 @@ const VMFfmpegEditor = (() => {
       });
       const result = res.result || {};
       appendTestLine(instance, `$ ${result.command || instance.template.command}`);
-      appendTestLine(instance, (result.stderr || '').trim() || '# (no stderr)');
+      // The one-shot answer carries the tail of stderr as one string; split it so
+      // every line the runner kept is printed as its own raw line.
+      const stderrLines = String(result.stderr || '').trim().split('\n').filter((line) => line.trim());
+      if (stderrLines.length) for (const line of stderrLines) appendTestLine(instance, line);
+      else appendTestLine(instance, '# (no stderr)');
       if (verdict) {
         verdict.className = `tpl-test-verdict ${result.ok ? 'ok' : 'err'}`;
         verdict.textContent = result.ok

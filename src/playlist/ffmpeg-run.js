@@ -11,13 +11,21 @@
  *   event: start    { command, argv, container, output }
  *   event: stderr   { line }
  *   event: stdout   { line }          (usually empty — ffmpeg logs on stderr)
- *   event: progress { frame, fps, bitrate, speed, outTimeMs, … }
+ *   event: progress { frame, fps, bitrate, speed, outTimeMs, …, raw }
  *   event: done     { ok, exitCode, signal, bytesOut, durationMs, timedOut }
  *
  * The command is parsed into argv (never run through a shell) and validated with
  * the same validator the relay uses, so a test can neither smuggle shell syntax
  * nor run a command the relay would refuse. The run is always bounded: the
  * client asks for a duration and the server caps it at 30 s (MAX_TEST_MS).
+ *
+ * ffmpeg prints its `-progress pipe:2` stream as one key per line (frame=…,
+ * fps=…, bitrate=…, …), so the stats are accumulated across those lines into one
+ * object and every progress event also carries the exact line in `raw` — the
+ * output panel prints that verbatim. With `-loglevel warning` (the default in
+ * .env.example and in the bundled templates) those progress lines are the *only*
+ * thing a healthy run prints, so dropping the raw line left the panel looking
+ * empty while ffmpeg was working perfectly.
  *
  * Stdout is *not* the log channel — a template that ends in `pipe:1` (vu-movie's
  * own convention) writes the finished stream there, so stdout used to be sliced
@@ -158,6 +166,10 @@ router.post('/live-test', async (req, res) => {
   let bytesOut = 0;
   let stderrBuffer = '';
   let stdoutBuffer = '';
+  // ffmpeg's -progress output is one key per line, so accumulate it: every
+  // progress event then carries the whole picture (frame, fps, bitrate, speed)
+  // instead of whichever key happened to arrive last.
+  const progressStats = {};
   let timedOut = false;
   let finished = false;
 
@@ -264,7 +276,8 @@ router.post('/live-test', async (req, res) => {
     for (const line of lines) {
       if (!line.trim()) continue;
       if (/^[a-z_]+=/.test(line)) {
-        send('progress', parseProgressLine(line, {}));
+        // `raw` is the line exactly as ffmpeg wrote it — the panel shows that.
+        send('progress', { ...parseProgressLine(line, progressStats), raw: line });
         continue;
       }
       send('stderr', { line });

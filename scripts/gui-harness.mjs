@@ -41,17 +41,20 @@ try {
 } catch (error) {
   console.log(`(harness) could not reach the dev server for the real schema (${error.message}) — using the inline one`);
 }
+// Mirrors the real /api/ffmpeg/templates/schema for the fields the checks
+// below look at — including `custom: false`, which the server sets on every
+// field it validates against its choices.
 const schemaFields = [
-  { key: 'hw_accel', label: 'Hardware acceleration', kind: 'enum', options: ['none', 'vaapi', 'qsv'], help: 'none keeps everything in software.' },
+  { key: 'hw_accel', label: 'Hardware acceleration', kind: 'enum', options: ['none', 'vaapi', 'qsv'], custom: false, help: 'none keeps everything in software.' },
   { key: 'resolution', label: 'Resolution cap', kind: 'resolution', options: ['source', '720p', '1080p'], help: 'The longest edge of the output.' },
   { key: 'video_codec', label: 'Video codec', kind: 'enum', options: ['copy', 'libx264', 'h264_vaapi'], help: 'copy needs no CPU.' },
   { key: 'video_bitrate', label: 'Video bitrate', kind: 'rate', help: 'Target bitrate in kbps.' },
   { key: 'audio_codec', label: 'Audio codec', kind: 'enum', options: ['copy', 'aac'], help: 'aac re-encodes the audio.' },
-  { key: 'subs', label: 'Subtitles', kind: 'enum', options: ['drop', 'dvb', 'keep'], help: 'keep only works in Matroska.' },
+  { key: 'subs', label: 'Subtitles', kind: 'enum', options: ['drop', 'dvb', 'keep'], custom: false, help: 'keep only works in Matroska.' },
   { key: 'output_format', label: 'Output format', kind: 'enum', options: ['mpegts', 'matroska', 'hls'], help: 'mpegts is the live path.' },
 ];
 const inlineSchema = {
-  fields: schemaFields.map((f, i) => ({ ...f, choices: f.options, group: i < 4 ? 'video' : i === 4 ? 'audio' : i === 5 ? 'subtitles' : 'output' })),
+  fields: schemaFields.map((f, i) => ({ ...f, choices: f.options, custom: f.custom, group: i < 4 ? 'video' : i === 4 ? 'audio' : i === 5 ? 'subtitles' : 'output' })),
   groups: [{ id: 'video', label: 'Video' }, { id: 'audio', label: 'Audio' }, { id: 'subtitles', label: 'Subtitles' }, { id: 'output', label: 'Output' }],
   advanced: [],
   vfPresets: [],
@@ -147,7 +150,7 @@ for (const file of ['core.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
 }
 
 const dom = new JSDOM(html, {
-  url: 'http://127.0.0.1:8080/#dash',
+  url: 'http://127.0.0.1:8080/',
   runScripts: 'dangerously',
   pretendToBeVisual: true,
   beforeParse(window) {
@@ -189,6 +192,24 @@ const check = (label, condition, extra = '') => {
 
 await tick(150);
 
+/* ---------------- 0. the site opens on the Mobile tab ---------------- */
+
+check('startup lands on the Mobile tab', !$('#p-mobile')?.classList.contains('hide') && $('#p-dash')?.classList.contains('hide'),
+  `mobile=${$('#p-mobile')?.className} dash=${$('#p-dash')?.className}`);
+check('the nav highlights Mobile', $('[data-p="mobile"]')?.classList.contains('on') === true && !$('[data-p="dash"]')?.classList.contains('on'));
+check('body[data-page] is mobile (phone-sized CSS applies)', document.body.dataset.page === 'mobile', document.body.dataset.page);
+const foldBodies = $$('#p-mobile [data-fold-body]');
+check('all five Mobile panes start collapsed', foldBodies.length === 5 && foldBodies.every((b) => b.classList.contains('hide')),
+  foldBodies.map((b) => `${b.dataset.foldBody}:${b.classList.contains('hide') ? 'folded' : 'open'}`).join(' '));
+const foldAll = $('#btn-mob-fold');
+check('the Mobile title has a fold-all button that offers “expand all”', /expand all/.test(foldAll?.textContent || ''), foldAll?.textContent?.trim());
+foldAll?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(30);
+check('it opens every pane in one tap', foldBodies.every((b) => !b.classList.contains('hide')) && /collapse all/.test(foldAll.textContent));
+foldAll.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(30);
+check('and closes them again', foldBodies.every((b) => b.classList.contains('hide')) && /expand all/.test(foldAll.textContent));
+
 /* ---------------- 1. sidebar rail + pin ---------------- */
 
 const app = $('.app');
@@ -208,12 +229,14 @@ check('unpin returns to the rail', app.classList.contains('nav-mini'));
 const folds = $$('.foldbtn[data-fold]');
 check('5 mobile fold buttons', folds.length === 5, folds.map((f) => f.dataset.fold).join(','));
 const mobSearchBody = $('[data-fold-body="mob-search"]');
+// The panes start folded, so the first tap opens and the second closes.
 folds[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-check('folding hides the pane body', mobSearchBody.classList.contains('hide'));
-check('fold state persists', JSON.parse(window.localStorage.getItem('vu-movie.folded') || '{}')['mob-search'] === true,
-  String(window.localStorage.getItem('vu-movie.folded')));
+check('opening a pane shows its body', !mobSearchBody.classList.contains('hide'));
+check('a folded pane is remembered under the current key',
+  JSON.parse(window.localStorage.getItem('vu-movie.folded.v2') || '{}')['mob-search'] === false,
+  String(window.localStorage.getItem('vu-movie.folded.v2')));
 folds[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-check('unfolding shows it again', !mobSearchBody.classList.contains('hide'));
+check('closing it hides the pane again', mobSearchBody.classList.contains('hide'));
 
 /* ---------------- 3. mobile playlist template beside the title ---------------- */
 
@@ -494,6 +517,38 @@ check('advanced flag picker is filled from the schema', advFlagOptions.length >=
 check('advanced flags include the streaming-relevant ones',
   ['-probesize', '-analyzeduration', '-reconnect', '-mpegts_flags', '-hls_flags', '-max_muxing_queue_size', '-flush_packets', '-live', '-tune', '-preset'].every((f) => advFlagOptions.includes(f)),
   advFlagOptions.slice(0, 8).join(' '));
+
+// The advice pane and the validator talk about “copy all”, so the Subtitles box
+// must offer exactly that wording — the stored token (`keep`) is not a label an
+// operator can map to a behaviour.
+const subsOptions = [...($(`#ff-editor-1-ff-subs`)?.options || [])].map((o) => ({ value: o.value, label: o.textContent }));
+check('the Subtitles box names the subtitle modes instead of the stored tokens',
+  ['drop', 'dvb', 'keep'].every((v) => subsOptions.some((o) => o.value === v))
+  && subsOptions.some((o) => o.value === 'keep' && /copy all/i.test(o.label))
+  && subsOptions.some((o) => o.value === 'dvb' && /DVB/i.test(o.label))
+  && subsOptions.some((o) => o.value === 'drop' && /drop/i.test(o.label)),
+  subsOptions.map((o) => `${o.value}=${o.label}`).join(' | '));
+check('a field whose choices are validated offers no “custom value…” box',
+  !subsOptions.some((o) => o.value === '__custom__') && !$('#ff-editor-1-ff-subs-custom'),
+  subsOptions.map((o) => o.value).join(','));
+
+/* ---------------- 13. the test pane shows the raw ffmpeg output ---------------- */
+
+// The rules the output pane applies to each line it receives. They are pure
+// functions on the editor object, so they can be checked without running ffmpeg.
+const forDisplay = (line, source) => window.VMFfmpegEditor.testLineForDisplay(line, source);
+const longLine = `[https @ 0x55] HTTP error 403 — url=https://cdn.example/movie.mp4?token=${'a'.repeat(1200)}`;
+check('a long real ffmpeg line reaches the pane untouched', forDisplay(longLine) === longLine,
+  `${longLine.length} chars in, ${String(forDisplay(longLine)).length} out`);
+check('a plain stderr line is printed as-is', forDisplay('Stream #0:0: Video: h264 (High), 1920x1080') === 'Stream #0:0: Video: h264 (High), 1920x1080');
+check('a -progress line is part of the raw output', forDisplay('frame=120') === 'frame=120' && forDisplay('speed=1.02x') === 'speed=1.02x');
+check('only non-text bytes are summarised, and the note names the right pipe',
+  /non-text output suppressed/.test(forDisplay(`x\u0000${'y'.repeat(10)}`))
+  && /pipe:1/.test(forDisplay(`x\u0000${'y'.repeat(10)}`, 'stdout'))
+  && !/pipe:1/.test(forDisplay(`x\u0000${'y'.repeat(10)}`, 'stderr')),
+  forDisplay(`x\u0000${'y'.repeat(10)}`, 'stderr'));
+check('the placeholder promises the raw output', /raw ffmpeg output/.test($('#ff-editor-1-test-output')?.textContent || ''),
+  $('#ff-editor-1-test-output')?.textContent?.slice(0, 60));
 
 check('no runtime errors collected', errors.length === 0, errors.slice(0, 3).join(' | '));
 console.log(`\n${failures ? `✗ ${failures} check(s) failed` : '✓ all checks passed'} — ${calls.length} API calls`);
