@@ -200,15 +200,15 @@
       <div class="gl" style="margin-top:14px">
         <div class="card pad0">
           <div class="cardhead results-head">
-            <h2 style="margin:0">Results</h2>
+            <h2 style="margin:0">Results <span class="tip" tabindex="0" role="note" aria-label="About the result list" data-tip="Each card is one title; the same title found on several providers is one card with a chip per provider. Clicking the card resolves the formats of every provider on it, clicking a provider chip resolves only that provider's formats. “Title filter” and “Filter found title” only narrow the list — they never select or resolve anything.">i</span></h2>
             <div class="results-head-tools">
               <span class="mut" id="results-count"></span>
               <div class="results-filters" aria-label="Filter search results">
                 <label class="results-filter" for="results-title-filter"><span>Title filter</span>
                   <input id="results-title-filter" type="text" placeholder="Type to filter found titles…" autocomplete="off" aria-label="Filter found titles by text">
                 </label>
-                <label class="results-filter" for="results-title-select"><span>Found titles</span>
-                  <select id="results-title-select" aria-label="Select a found title"><option value="">Select a found title…</option></select>
+                <label class="results-filter" for="results-title-select"><span>Filter found title</span>
+                  <select id="results-title-select" aria-label="Filter the result list to one found title" title="Narrow the result list to one title — nothing is selected or resolved by choosing here"><option value="">All titles</option></select>
                 </label>
                 <label class="results-filter" for="results-provider-filter"><span>Provider</span>
                   <select id="results-provider-filter" aria-label="Filter results by provider"><option value="">All providers</option></select>
@@ -232,12 +232,13 @@
           <div id="results" class="results results-poster"><div class="meta">No search yet.</div></div>
         </div>
         <div class="card">
-          <h3>Selected title</h3>
+          <h3>Selected title <span class="tip" tabindex="0" role="note" aria-label="About the selected title" data-tip="Clicking a result resolves the formats of every provider on that card. The provider chips here (or inside a result card) resolve only that provider; “all providers” goes back to the whole card.">i</span></h3>
           <div id="sel-title" class="row" style="align-items:flex-start;gap:12px">
             <div class="poster small" id="sel-poster"><b>—</b></div>
             <div style="flex:1;min-width:0">
               <div id="sel-name" style="font-weight:600">nothing selected</div>
               <div class="meta" id="sel-meta">search or paste a URL, then pick a candidate below</div>
+              <div class="row" id="sel-providers"></div>
               <div id="sel-details" class="selected-details hide"></div>
               <div id="sel-meta-table" class="meta-table hide"></div>
               <div id="sel-episode-controls" class="selected-episodes hide">

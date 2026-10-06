@@ -95,6 +95,17 @@ permissions, Container Manager project import, firewall, where the data lives).
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
   from another source.
+* The result list says what it does: one card per title, one chip per provider.
+  Clicking the **card** resolves the formats of *every* provider on it; clicking a
+  **provider chip** (in the card, in the Selected-title panel — where “all
+  providers” goes back to the whole card — or on the Mobile tab) resolves only
+  that source, so a missing quality is never mistaken for “the source has
+  nothing else”. The two title filters and the provider filter only narrow the
+  list; they never select or resolve a title. Starting a search drops the
+  previous answer — cards, counts, filters, the selected title and its formats —
+  before the request goes out and shows what is running, so a fan-out that takes
+  half a minute cannot look like it answered with the old titles (the Mobile
+  tab's panes do the same).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.

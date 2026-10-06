@@ -349,6 +349,17 @@ const state = {
   selectedSources: [],
   results: [],
   providerErrors: [],
+  /* the Search panel's live state: what is running, what the last query
+     answered, and whether a search has ever completed (drives the empty
+     messages — a running search must never show the previous answer). */
+  searching: null,
+  searchError: null,
+  searched: false,
+  /* The Mobile tab's own search state (results, the open title, its formats
+     and the subtitle hits). app.js renders it; without it every mobile search
+     threw “Cannot set properties of undefined” and left the old rows on
+     screen. */
+  mobile: { group: null, activeSource: '', candidates: [], results: [], subs: [] },
   streams: [],
   providers: [],
   subResults: [],

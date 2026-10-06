@@ -30,6 +30,10 @@ const ui = {
   resultsView: 'poster',
   resultsSort: 'year-desc',
   titleFilter: '',
+  /* Exact-title filter: the key of one group, set by the “Filter found title”
+     box. Independent of `titleFilter` (the free-text one) — picking a title
+     narrows the list, it never selects or resolves it. */
+  titlePick: '',
   providerFilter: '',
   providers: [],
   selection: null,
@@ -37,8 +41,9 @@ const ui = {
   candidates: [],
   resolving: false,
   seasons: null,
-  mobile: { group: null, candidates: [], results: [], subs: [] },
 };
+// The Mobile tab's state lives on the shared `state` object (core.js), because
+// every mobile helper — search, formats, add, subtitles — reads it from there.
 
 let searchSeq = 0;
 let resolveSeq = 0;
@@ -359,6 +364,32 @@ function renderBrowseLinks() {
   host.innerHTML = state.sources.map((source) => `<a class="btn sm ghost" href="${escapeHtml(source.home)}" target="_blank" rel="noreferrer">${escapeHtml(source.name)} ↗</a>`).join('');
 }
 
+/**
+ * Reset the panel *before* the request goes out.
+ *
+ * A fan-out search takes seconds per provider, and the previous answer used to
+ * stay on screen the whole time — so right after pressing Search the list still
+ * showed the old query's titles, and its selection and formats stayed below it.
+ * Everything the previous search produced is dropped here (cards, counts,
+ * filters, the selected title and its formats) and the panel says what is
+ * running instead.
+ */
+function beginSearch(query) {
+  state.searching = { query, sources: state.selectedSources.length || state.sources.length || 0 };
+  state.searchError = null;
+  state.searched = false;
+  state.results = [];
+  state.groups = [];
+  state.providerErrors = [];
+  ui.titleFilter = '';
+  ui.titlePick = '';
+  ui.providerFilter = '';
+  if ($('#results-title-filter')) $('#results-title-filter').value = '';
+  clearSelection();
+  renderFindErrors([]);
+  renderResults();
+}
+
 async function doSearch() {
   const q = ($('#q')?.value || '').trim();
   if (!q) {
@@ -373,8 +404,8 @@ async function doSearch() {
   searchAbort = new AbortController();
   const seq = ++searchSeq;
   const hint = $('#find-hint');
-  if (hint) hint.textContent = 'searching…';
-  renderFindErrors([]);
+  if (hint) hint.textContent = `searching ${state.selectedSources.length || state.sources.length || 0} source(s)…`;
+  beginSearch(q);
   $('#btn-search').disabled = true;
   try {
     const params = new URLSearchParams({ q });
@@ -383,24 +414,26 @@ async function doSearch() {
     params.set('moviebox', ui.search.moviebox ? 'true' : 'false');
     const data = await api(`/api/find/search?${params}`, { silent: true, signal: searchAbort.signal });
     if (seq !== searchSeq) return;
+    state.searching = null;
+    state.searchError = null;
+    state.searched = true;
     state.results = data.results || [];
     state.providerErrors = data.providerErrors || [];
-    ui.titleFilter = '';
-    if ($('#results-title-filter')) $('#results-title-filter').value = '';
     renderFindErrors(state.providerErrors);
     renderResults();
-    if (!state.results.length) {
-      $('#results').innerHTML = '<div class="meta">No results. Open a site in the Browse tab, or paste the player URL in the Paste URL tab.</div>';
-    }
     if (hint) hint.textContent = `${state.results.length} result(s) on ${new Set(state.results.map((r) => r.sourceId)).size} provider(s)`;
     renderBrowseLinks();
   } catch (error) {
-    if (error.name !== 'AbortError') {
+    // An aborted search was replaced by a newer one: it owns the panel now.
+    if (error.name !== 'AbortError' && seq === searchSeq) {
+      state.searching = null;
+      state.searchError = error.message;
       renderFindErrors([{ sourceId: '', error: error.message }]);
       if (hint) hint.textContent = '';
+      renderResults();
     }
   } finally {
-    $('#btn-search').disabled = false;
+    if (seq === searchSeq) $('#btn-search').disabled = false;
   }
 }
 
@@ -445,10 +478,20 @@ function buildGroups(results) {
   return [...groups.values()];
 }
 
+/**
+ * Narrow the list of title cards.
+ *
+ * Three independent filters: the exact title picked in “Filter found title”
+ * (`ui.titlePick`, a group key), the free-text `ui.titleFilter`, and the
+ * provider filter. Filtering only decides what is *listed* — nothing is
+ * selected or resolved by filtering.
+ */
 function visibleGroups() {
+  const pick = ui.titlePick;
   const filter = titleKey(ui.titleFilter);
   const provider = ui.providerFilter;
   let groups = state.groups || [];
+  if (pick) groups = groups.filter((group) => group.key === pick);
   if (filter) groups = groups.filter((group) => titleKey(group.title).includes(filter));
   if (provider) groups = groups.map((group) => ({ ...group, entries: group.entries.filter((entry) => entry.sourceId === provider) })).filter((group) => group.entries.length);
   const sort = ui.resultsSort;
@@ -465,17 +508,66 @@ function isSelectedGroup(group) {
   return Boolean(state.selection?.key && state.selection.key === group.key);
 }
 
+/** “Dune: Part Two (2024)” — the label every list, chip and select uses. */
+function titleText(group) {
+  return `${group.title}${group.year ? ` (${group.year})` : ''}`;
+}
+
+/** The free-text title filter. Typing here drops an exact title pick. */
+function applyTitleFilter(value) {
+  ui.titleFilter = String(value ?? '');
+  ui.titlePick = '';
+  if ($('#results-title-select')) $('#results-title-select').value = '';
+  renderResults();
+}
+
+/**
+ * The “Filter found title” box narrows the list to one title.
+ *
+ * It used to call selectGroup(), i.e. pick a title and resolve its formats at
+ * once — which is what the cards are for. Choosing here now only filters, and
+ * it clears the other two filters so the title that was just chosen cannot be
+ * filtered away again.
+ */
+function applyTitlePick(key) {
+  ui.titlePick = String(key || '');
+  ui.titleFilter = '';
+  ui.providerFilter = '';
+  if ($('#results-title-filter')) $('#results-title-filter').value = '';
+  if ($('#results-provider-filter')) $('#results-provider-filter').value = '';
+  renderResults();
+}
+
+/** What the empty result area says — never the previous answer. */
+function emptyResultsMessage() {
+  if (state.searching) return `searching “${escapeHtml(state.searching.query)}” on ${state.searching.sources} source(s)…`;
+  if (state.searchError) return `search failed — ${escapeHtml(state.searchError)}`;
+  if ((state.results || []).length) return 'Nothing matches these filters.';
+  if (state.searched) return 'No results. Open a site in the Browse tab, or paste the player URL in the Paste URL tab.';
+  return 'No search yet.';
+}
+
+/**
+ * One chip per provider, plus “all providers” where the panel needs the way
+ * back. The chip is the click target that resolves a single provider; the card
+ * or the panel around it resolves every provider.
+ */
+function providerChipsMarkup(group, { activeSource = '', attr = 'data-provider', all = false, allLabel = 'all providers' } = {}) {
+  const ids = [...new Set(group.entries.map((entry) => entry.sourceId))];
+  if (!ids.length) return '';
+  const chip = (value, label, count, active) => `<button type="button" class="chip sm provider-chip${active ? ' on' : ''}" ${attr}="${escapeHtml(value)}" aria-pressed="${active ? 'true' : 'false'}" title="${escapeHtml(value ? `Resolve only the formats ${label} has for this title` : 'Resolve the formats of every provider on this title')}">${escapeHtml(label)}<span class="mut">${count}</span></button>`;
+  const chips = ids.map((id) => chip(id, sourceName(id), group.entries.filter((entry) => entry.sourceId === id).length, activeSource === id));
+  if (all) chips.unshift(chip('', allLabel, group.entries.length, !activeSource));
+  return chips.join('');
+}
+
 function renderResults() {
   const host = $('#results');
   if (!host) return;
   state.groups = buildGroups(state.results || []);
-  const groups = visibleGroups();
-  host.className = `results results-${ui.resultsView}`;
-  const count = $('#results-count');
-  if (count) {
-    const providers = new Set((state.results || []).map((result) => result.sourceId));
-    count.textContent = state.results?.length ? `${state.groups.length} title(s) · ${state.results.length} hit(s) · ${providers.size} provider(s)` : '';
-  }
+  // Re-sync the two filter controls *before* the list is computed: a provider
+  // filter left over from the previous search (or a picked title that is no
+  // longer in the results) must not be applied one render late.
   const providerSelect = $('#results-provider-filter');
   if (providerSelect) {
     const ids = [...new Set((state.results || []).map((result) => result.sourceId))];
@@ -486,12 +578,29 @@ function renderResults() {
   }
   const titleSelect = $('#results-title-select');
   if (titleSelect) {
-    const previous = titleSelect.value;
-    titleSelect.innerHTML = `<option value="">Select a found title…</option>${groups.map((group) => `<option value="${escapeHtml(group.key)}">${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''} — ${group.entries.length} format(s)</option>`).join('')}`;
-    if (groups.some((group) => group.key === previous)) titleSelect.value = previous;
+    // Every found title stays selectable, also while the list is filtered: the
+    // box is the way out of — and between — single-title views.
+    titleSelect.innerHTML = `<option value="">All titles</option>${(state.groups || []).map((group) => `<option value="${escapeHtml(group.key)}">${escapeHtml(titleText(group))} — ${group.entries.length} provider(s)</option>`).join('')}`;
+    const known = (state.groups || []).some((group) => group.key === ui.titlePick);
+    ui.titlePick = known ? ui.titlePick : '';
+    titleSelect.value = ui.titlePick;
+  }
+  const groups = visibleGroups();
+  const total = (state.groups || []).length;
+  const filtered = Boolean(ui.titlePick || ui.titleFilter || ui.providerFilter);
+  host.className = `results results-${ui.resultsView}`;
+  // While a search runs the panel is empty on purpose; tell assistive tech the
+  // area is busy instead of letting it read out the previous answer.
+  host.setAttribute('aria-busy', state.searching ? 'true' : 'false');
+  const count = $('#results-count');
+  if (count) {
+    const providers = new Set((state.results || []).map((result) => result.sourceId));
+    if (state.searching) count.textContent = 'searching…';
+    else if (!state.results?.length) count.textContent = '';
+    else count.textContent = `${filtered ? `${groups.length} of ${total}` : total} title(s) · ${state.results.length} hit(s) · ${providers.size} provider(s)`;
   }
   if (!groups.length) {
-    host.innerHTML = `<div class="meta">${(state.results || []).length ? 'Nothing matches these filters.' : 'No search yet.'}</div>`;
+    host.innerHTML = `<div class="meta">${emptyResultsMessage()}</div>`;
     return;
   }
   host.innerHTML = groups.map((group) => resultGroupMarkup(group)).join('');
@@ -503,6 +612,8 @@ function renderResults() {
       open();
     });
     card.addEventListener('keydown', (event) => {
+      // Enter/Space on a provider chip belongs to the chip, not to the card.
+      if (event.target.closest('a,button')) return;
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
     });
   });
@@ -514,7 +625,7 @@ function sourceName(id) {
 }
 
 function resultGroupMarkup(group) {
-  const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
+  const activeSource = isSelectedGroup(group) ? (state.selection?.activeSource || '') : '';
   const meta = group.entries.map((entry) => entry.releaseDate || '').filter(Boolean)[0];
   const rating = group.entries.map((entry) => Number(entry.rating)).filter((value) => value > 0).sort((a, b) => b - a)[0];
   const genres = group.entries.flatMap((entry) => (Array.isArray(entry.genres) ? entry.genres : [])).slice(0, 3);
@@ -531,7 +642,7 @@ function resultGroupMarkup(group) {
         ${genres.map((genre) => tag(genre)).join('')}
       </div>
       ${description ? `<p class="result-desc">${escapeHtml(String(description).slice(0, 260))}${String(description).length > 260 ? '…' : ''}</p>` : ''}
-      <div class="result-providers">${providers.map((id) => `<span class="chip on sm" title="${escapeHtml(sourceName(id))}">${escapeHtml(sourceName(id))}</span>`).join('')}</div>
+      <div class="result-providers">${providerChipsMarkup(group, { activeSource })}</div>
     </div>
     <div class="result-actions">
       <span class="tag info">${group.entries.length} format(s)</span>
@@ -556,16 +667,55 @@ function clearSelection() {
   state.selection = null;
   state.candidates = [];
   state.seasons = null;
+  // A resolve that was in flight belongs to the selection that is going away;
+  // without this the “resolving formats…” note could outlive it.
+  state.resolving = false;
   resolveAbort?.abort();
   $('#sel-name').textContent = 'nothing selected';
   $('#sel-meta').textContent = 'search or paste a URL, then pick a title to see its metadata and formats';
   $('#sel-poster').innerHTML = '<b>—</b>';
   if ($('#sel-note')) $('#sel-note').textContent = 'Pick a title to resolve its available qualities.';
+  if ($('#sel-providers')) $('#sel-providers').innerHTML = '';
+  // The subtitle hits belong to the title that is going away.
+  $('#sel-subtitle-panel')?.classList.add('hide');
   $('#sel-details')?.classList.add('hide');
   $('#sel-meta-table')?.classList.add('hide');
   $('#sel-episode-controls')?.classList.add('hide');
   $('#candidates').innerHTML = '<div class="meta">No formats yet.</div>';
   $('#sel-actions').innerHTML = '';
+  markSelectedCard();
+}
+
+/**
+ * Repaint “this card is open / this provider is the scope” in place.
+ *
+ * Re-rendering the whole list would work too, but it drops focus and the
+ * scroll position — and the list is the only place the active provider is
+ * visible while the formats below are being resolved.
+ */
+function markSelectedCard() {
+  const host = $('#results');
+  if (!host) return;
+  const key = state.selection?.key || '';
+  const active = state.selection?.activeSource || '';
+  $$('[data-group]', host).forEach((card) => {
+    const selected = Boolean(key) && card.dataset.group === key;
+    card.classList.toggle('selected', selected);
+    card.querySelectorAll('[data-provider]').forEach((chip) => {
+      const on = selected && chip.dataset.provider === active;
+      chip.classList.toggle('on', on);
+      chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  });
+}
+
+/** “all providers” plus one chip per provider: the panel's format scope. */
+function renderSelectionProviders(group, activeSource = '') {
+  const host = $('#sel-providers');
+  if (!host) return;
+  const ids = [...new Set(group.entries.map((entry) => entry.sourceId))];
+  // A single provider needs no switch — the card click already means it.
+  host.innerHTML = ids.length > 1 ? providerChipsMarkup(group, { activeSource, attr: 'data-sel-provider', all: true }) : '';
 }
 
 function metadataRows(group) {
@@ -684,23 +834,44 @@ function renderCandidates(candidates, meta = {}) {
   host.innerHTML = candidates.map((candidate, index) => candidateMarkup(candidate, index, meta)).join('');
 }
 
-async function selectGroup(group) {
+/**
+ * Open a title: fill the Selected-title panel and resolve its formats.
+ *
+ * `sourceId` is the provider scope. Called from a result card (or its
+ * “formats & metadata” button) it is empty and *every* provider on the card is
+ * resolved; called from a provider chip it is that one provider, and only its
+ * formats are fetched.
+ */
+async function selectGroup(group, { sourceId = '' } = {}) {
   if (!group) return;
+  // The group handed in may come from a filtered list (title pick, provider
+  // filter), whose `entries` are a subset. Re-read the full card from the
+  // unfiltered groups so a card click really does resolve all providers.
+  const full = (state.groups || []).find((candidate) => candidate.key === group.key) || group;
+  const entries = sourceId ? full.entries.filter((entry) => entry.sourceId === sourceId) : full.entries;
+  if (!entries.length) {
+    toast(`No ${sourceName(sourceId)} format for this title`, 'warn');
+    return;
+  }
   clearSelection();
   state.selection = {
-    key: group.key,
-    title: group.title,
-    year: group.year,
-    kind: group.kind,
-    poster: group.poster,
-    sourceId: group.entries[0]?.sourceId || '',
-    movieboxSubjectId: group.entries.find((entry) => entry.movieboxSubjectId)?.movieboxSubjectId || null,
-    entries: group.entries,
+    key: full.key,
+    title: full.title,
+    year: full.year,
+    kind: full.kind,
+    poster: full.poster,
+    sourceId: sourceId || full.entries[0]?.sourceId || '',
+    activeSource: sourceId || '',
+    movieboxSubjectId: full.entries.find((entry) => entry.movieboxSubjectId)?.movieboxSubjectId || null,
+    entries,
   };
-  const { rows, description } = metadataRows(group);
-  $('#sel-name').innerHTML = `${escapeHtml(group.title)}${group.year ? ` <span class="mut">(${group.year})</span>` : ''}`;
-  $('#sel-meta').textContent = `${group.kind} · ${group.entries.length} format(s) from ${new Set(group.entries.map((entry) => entry.sourceId)).size} provider(s)`;
-  if (group.poster) $('#sel-poster').innerHTML = `<img src="${escapeHtml(group.poster)}" alt="" onerror="this.remove()">`;
+  const providerCount = new Set(full.entries.map((entry) => entry.sourceId)).size;
+  const { rows, description } = metadataRows({ ...full, entries });
+  $('#sel-name').innerHTML = `${escapeHtml(full.title)}${full.year ? ` <span class="mut">(${full.year})</span>` : ''}`;
+  $('#sel-meta').textContent = sourceId
+    ? `${full.kind} · ${entries.length} format(s) from ${sourceName(sourceId)} only`
+    : `${full.kind} · ${entries.length} format(s) from ${providerCount} provider(s)`;
+  if (full.poster) $('#sel-poster').innerHTML = `<img src="${escapeHtml(full.poster)}" alt="" onerror="this.remove()">`;
   const details = $('#sel-details');
   if (details) {
     details.classList.toggle('hide', !description);
@@ -711,11 +882,17 @@ async function selectGroup(group) {
     table.classList.remove('hide');
     table.innerHTML = rows.map(([key, value]) => `<div class="meta-row"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('');
   }
+  renderSelectionProviders(full, sourceId);
   const selectionNote = $('#sel-note');
-  if (selectionNote) selectionNote.textContent = 'Formats come from every provider on this card. Nothing is put on the playlist until you press “add to playlist” on one quality.';
+  if (selectionNote) {
+    selectionNote.textContent = sourceId
+      ? `Formats come from ${sourceName(sourceId)} only — press “all providers” to resolve the other ${Math.max(0, providerCount - 1)}. Nothing is put on the playlist until you press “add to playlist” on one quality.`
+      : `Formats come from every provider on this card (${providerCount}). Press a provider chip to resolve only that source. Nothing is put on the playlist until you press “add to playlist” on one quality.`;
+  }
   renderSelectionActions();
+  markSelectedCard();
   await loadFormats();
-  if (group.kind === 'series' && state.selection.movieboxSubjectId) loadSeasons();
+  if (full.kind === 'series' && state.selection.movieboxSubjectId) loadSeasons();
 }
 
 function renderSelectionActions() {
@@ -741,7 +918,10 @@ async function loadFormats({ announce = false } = {}) {
   state.resolving = true;
   const note = $('#sel-format-note');
   const entries = selection.entries || [];
-  if (note) note.textContent = `resolving and probing 0/${entries.length} provider(s)…`;
+  // A provider chip narrowed the scope: say so, so a shorter format list is
+  // never mistaken for “the source has nothing else”.
+  const scope = selection.activeSource ? ` from ${sourceName(selection.activeSource)}` : '';
+  if (note) note.textContent = `resolving and probing 0/${entries.length} provider(s)${scope}…`;
   renderCandidates([], {});
   const collected = [];
   const errors = [];
@@ -753,8 +933,8 @@ async function loadFormats({ announce = false } = {}) {
     renderCandidates(state.candidates, {});
     const playable = state.candidates.filter((candidate) => candidate.ok !== false).length;
     if (note) note.textContent = finished < entries.length
-      ? `resolving and probing ${finished}/${entries.length} provider(s) · ${playable} quality option(s) ready`
-      : `${playable}/${state.candidates.length} playable quality option(s) · ${errors.length ? `${errors.length} provider(s) failed` : 'all providers answered'}`;
+      ? `resolving and probing ${finished}/${entries.length} provider(s)${scope} · ${playable} quality option(s) ready`
+      : `${playable}/${state.candidates.length} playable quality option(s)${scope} · ${errors.length ? `${errors.length} provider(s) failed` : 'all providers answered'}`;
   };
 
   // Providers are independent. Resolve them together and render each answer as
@@ -1096,14 +1276,9 @@ function wireFind() {
   }));
   $('#u-kind')?.addEventListener('change', () => { ui.search.urlKind = $('#u-kind').value; saveSearchState(); });
   $('#btn-resolve')?.addEventListener('click', doResolveFromUrl);
-  $('#results-title-filter')?.addEventListener('input', debounce(() => {
-    ui.titleFilter = $('#results-title-filter').value;
-    renderResults();
-  }, 200));
-  $('#results-title-select')?.addEventListener('change', () => {
-    const group = (state.groups || []).find((candidate) => candidate.key === $('#results-title-select').value);
-    if (group) selectGroup(group);
-  });
+  $('#results-title-filter')?.addEventListener('input', debounce(() => applyTitleFilter($('#results-title-filter').value), 200));
+  // Filtering, not selecting: the box narrows the list, the cards resolve.
+  $('#results-title-select')?.addEventListener('change', () => applyTitlePick($('#results-title-select').value));
   $('#results-provider-filter')?.addEventListener('change', () => {
     ui.providerFilter = $('#results-provider-filter').value;
     renderResults();
@@ -1122,11 +1297,25 @@ function wireFind() {
     renderResults();
   });
   $('#results')?.addEventListener('click', (event) => {
+    // A provider chip inside a card: only that provider's formats.
+    const provider = event.target.closest('[data-provider]');
+    if (provider) {
+      const card = provider.closest('[data-group]');
+      selectGroup((state.groups || []).find((group) => group.key === card?.dataset.group), { sourceId: provider.dataset.provider || '' });
+      return;
+    }
     if (event.target.closest('[data-open-formats]')) {
       const card = event.target.closest('[data-group]');
       selectGroup((state.groups || []).find((group) => group.key === card?.dataset.group));
       return;
     }
+  });
+  // The same switch in the Selected-title panel (all providers ↔ one provider).
+  $('#sel-providers')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('[data-sel-provider]');
+    if (!chip) return;
+    const group = (state.groups || []).find((candidate) => candidate.key === state.selection?.key);
+    if (group) selectGroup(group, { sourceId: chip.dataset.selProvider || '' });
   });
   $('#candidates')?.addEventListener('click', (event) => {
     const add = event.target.closest('[data-add-candidate]');
@@ -2075,12 +2264,25 @@ async function initMobile() {
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
   $('#mob-results')?.addEventListener('click', (event) => {
+    // A provider chip: only that provider's formats. The row itself: all of them.
+    const provider = event.target.closest('[data-mprovider]');
+    if (provider) {
+      const row = provider.closest('[data-mgroup]');
+      const group = state.mobile.results.find((candidate) => candidate.key === row?.dataset.mgroup);
+      mobileSelect(group, { sourceId: provider.dataset.mprovider || '' });
+      return;
+    }
     const card = event.target.closest('[data-mgroup]');
     if (!card) return;
     const group = state.mobile.results.find((candidate) => candidate.key === card.dataset.mgroup);
     mobileSelect(group);
   });
   $('#mob-formats')?.addEventListener('click', (event) => {
+    const scope = event.target.closest('[data-mscope-provider]');
+    if (scope) {
+      mobileSelect(state.mobile.group, { sourceId: scope.dataset.mscopeProvider || '' });
+      return;
+    }
     const add = event.target.closest('[data-madd]');
     if (!add) return;
     mobileAdd(Number(add.dataset.madd));
@@ -2128,10 +2330,27 @@ function mobileHint(text) {
   if (hint) hint.textContent = text;
 }
 
+/**
+ * The Mobile pane's version of beginSearch: the previous rows, the open title
+ * and its formats must go before the request goes out — a search that takes
+ * half a minute must not look like it answered with the old titles.
+ */
+function beginMobileSearch(query) {
+  state.mobile.results = [];
+  state.mobile.group = null;
+  state.mobile.activeSource = '';
+  state.mobile.candidates = [];
+  const host = $('#mob-results');
+  if (host) host.innerHTML = `<div class="meta">searching “${escapeHtml(query)}”…</div>`;
+  const formats = $('#mob-formats');
+  if (formats) formats.innerHTML = '<div class="meta">Pick a title above — its metadata and every playable format appear here.</div>';
+}
+
 async function mobileSearch() {
   const q = ($('#mob-q')?.value || '').trim();
   if (!q) { mobileHint('type a title first'); return; }
   mobileHint('searching…');
+  beginMobileSearch(q);
   const params = new URLSearchParams({ q, moviebox: 'true' });
   if ($('#mob-type')?.value) params.set('type', $('#mob-type').value);
   if ($('#mob-sources')?.value === 'enabled') params.set('sources', state.sources.filter((source) => source.enabled).map((source) => source.id).join(','));
@@ -2139,24 +2358,35 @@ async function mobileSearch() {
     const data = await api(`/api/find/search?${params}`, { silent: true });
     state.mobile.results = buildGroups(data.results || []).slice(0, 12);
     const host = $('#mob-results');
-    host.innerHTML = state.mobile.results.length ? state.mobile.results.map((group) => `
-      <button class="mob-result" data-mgroup="${escapeHtml(group.key)}">
-        <span class="mob-title">${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''}</span>
-        <span class="meta">${group.kind} · ${group.entries.length} provider(s)</span>
-      </button>`).join('') : '<div class="meta">nothing found</div>';
+    host.innerHTML = state.mobile.results.length ? state.mobile.results.map((group) => {
+      const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
+      return `<div class="mob-result-wrap" data-mgroup="${escapeHtml(group.key)}">
+        <button class="mob-result">
+          <span class="mob-title">${escapeHtml(titleText(group))}</span>
+          <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
+        </button>
+        ${providers.length > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(group, { attr: 'data-mprovider' })}</div>` : ''}
+      </div>`;
+    }).join('') : '<div class="meta">nothing found</div>';
     mobileHint(`${state.mobile.results.length} title(s)`);
   } catch (error) {
     mobileHint(error.message);
+    const host = $('#mob-results');
+    if (host) host.innerHTML = `<div class="meta">search failed — ${escapeHtml(error.message)}</div>`;
   }
 }
 
-async function mobileSelect(group) {
+async function mobileSelect(group, { sourceId = '' } = {}) {
   if (!group) return;
-  state.mobile.group = group;
+  const full = state.mobile.results.find((candidate) => candidate.key === group.key) || group;
+  const entries = sourceId ? full.entries.filter((entry) => entry.sourceId === sourceId) : full.entries;
+  if (!entries.length) { mobileHint(`no ${sourceName(sourceId)} format`); return; }
+  state.mobile.group = full;
+  state.mobile.activeSource = sourceId || '';
   const host = $('#mob-formats');
-  host.innerHTML = `<div class="meta">resolving ${group.entries.length} provider(s)…</div>`;
+  host.innerHTML = `<div class="meta">resolving ${entries.length} provider(s)${sourceId ? ` from ${escapeHtml(sourceName(sourceId))}` : ''}…</div>`;
   const collected = [];
-  for (const entry of group.entries) {
+  for (const entry of entries) {
     try {
       const data = await api('/api/find/resolve', {
         method: 'POST', silent: true,
@@ -2166,9 +2396,11 @@ async function mobileSelect(group) {
     } catch { /* show what the other providers gave */ }
   }
   state.mobile.candidates = expandCandidateQualities(collected);
+  const providerCount = new Set(full.entries.map((entry) => entry.sourceId)).size;
   host.innerHTML = `
-    <div class="mob-head"><b>${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''}</b>
-      <span class="meta">${escapeHtml(group.kind)} · pick a quality to add it to the playlist</span></div>
+    <div class="mob-head"><b>${escapeHtml(titleText(full))}</b>
+      <span class="meta">${escapeHtml(full.kind)} · ${sourceId ? `formats from ${escapeHtml(sourceName(sourceId))} only` : `formats from all ${providerCount} provider(s)`} · pick a quality to add it to the playlist</span></div>
+    ${providerCount > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(full, { activeSource: sourceId, attr: 'data-mscope-provider', all: true })}</div>` : ''}
     ${state.mobile.candidates.filter((candidate) => candidate.ok !== false).map((candidate) => {
       const index = state.mobile.candidates.indexOf(candidate);
       return `<button class="mob-format" data-madd="${index}">

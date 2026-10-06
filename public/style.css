@@ -275,6 +275,15 @@ tr.row-off td{opacity:.55}
 .result-desc{margin:6px 0 0;color:var(--mut);font-size:11.5px;line-height:1.4}
 .result-providers{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
 .chip.sm{font-size:10.5px;padding:1px 7px;cursor:default}
+/* A provider chip is a button: pressing it resolves only that provider's
+   formats for the title, pressing the card resolves all of them. */
+.provider-chip{cursor:pointer}
+.provider-chip:hover{border-color:var(--acc)}
+.provider-chip.on{background:rgba(14,165,233,.16)}
+.provider-chip .mut{font-size:10px;opacity:.8;margin-left:2px}
+.provider-chip.on .mut{opacity:.9}
+#sel-providers{flex-wrap:wrap;gap:4px}
+#sel-providers:not(:empty){margin-top:7px}
 .result-actions{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0}
 .results-thumbnails .result-desc{display:none}
 
@@ -388,6 +397,9 @@ tr.row-off td{opacity:.55}
 .mob-result,.mob-format{all:unset;cursor:pointer;display:flex;flex-direction:column;gap:2px;padding:9px 11px;
   border:1px solid var(--line);border-radius:10px;background:var(--bg2);color:var(--fg)}
 .mob-result:hover,.mob-format:hover{border-color:var(--acc)}
+.mob-result-wrap{display:flex;flex-direction:column;gap:4px;padding:4px 0}
+.mob-result-wrap .row{flex-wrap:wrap;gap:4px}
+.mob-provider-label{padding:2px 0}
 .mob-format{flex-direction:row;justify-content:space-between;align-items:center;gap:8px}
 .mob-title{font-weight:600}
 .mob-head{display:flex;flex-direction:column;gap:2px;padding:2px 0 6px}
