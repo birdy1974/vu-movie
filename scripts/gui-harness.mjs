@@ -532,6 +532,24 @@ check('a field whose choices are validated offers no “custom value…” box',
   !subsOptions.some((o) => o.value === '__custom__') && !$('#ff-editor-1-ff-subs-custom'),
   subsOptions.map((o) => o.value).join(','));
 
+/* ---------------- 13. the test pane shows the raw ffmpeg output ---------------- */
+
+// The rules the output pane applies to each line it receives. They are pure
+// functions on the editor object, so they can be checked without running ffmpeg.
+const forDisplay = (line, source) => window.VMFfmpegEditor.testLineForDisplay(line, source);
+const longLine = `[https @ 0x55] HTTP error 403 — url=https://cdn.example/movie.mp4?token=${'a'.repeat(1200)}`;
+check('a long real ffmpeg line reaches the pane untouched', forDisplay(longLine) === longLine,
+  `${longLine.length} chars in, ${String(forDisplay(longLine)).length} out`);
+check('a plain stderr line is printed as-is', forDisplay('Stream #0:0: Video: h264 (High), 1920x1080') === 'Stream #0:0: Video: h264 (High), 1920x1080');
+check('a -progress line is part of the raw output', forDisplay('frame=120') === 'frame=120' && forDisplay('speed=1.02x') === 'speed=1.02x');
+check('only non-text bytes are summarised, and the note names the right pipe',
+  /non-text output suppressed/.test(forDisplay(`x\u0000${'y'.repeat(10)}`))
+  && /pipe:1/.test(forDisplay(`x\u0000${'y'.repeat(10)}`, 'stdout'))
+  && !/pipe:1/.test(forDisplay(`x\u0000${'y'.repeat(10)}`, 'stderr')),
+  forDisplay(`x\u0000${'y'.repeat(10)}`, 'stderr'));
+check('the placeholder promises the raw output', /raw ffmpeg output/.test($('#ff-editor-1-test-output')?.textContent || ''),
+  $('#ff-editor-1-test-output')?.textContent?.slice(0, 60));
+
 check('no runtime errors collected', errors.length === 0, errors.slice(0, 3).join(' | '));
 console.log(`\n${failures ? `✗ ${failures} check(s) failed` : '✓ all checks passed'} — ${calls.length} API calls`);
 process.exit(failures ? 1 : 0);
