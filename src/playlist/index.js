@@ -36,6 +36,9 @@ import * as enigma2 from '../enigma2/index.js';
 
 const MAX_ITEMS = 300;
 
+/** How an item's attached subtitle reaches the player (profile.subtitles). */
+export const SUBTITLE_MODES = ['none', 'soft', 'burn'];
+
 const text = (value, fallback = '') => (value === undefined || value === null ? fallback : String(value));
 
 /* ------------------------------------------------------------------ *
@@ -234,6 +237,12 @@ export async function removeItem(streamId) {
 /**
  * Per-item flags: enabled, template, subtitle language. Sent as a patch so the
  * UI can flip one switch without resending the whole list.
+ *
+ * `subtitleMode` is the exception: it is not a playlist flag but the stream's
+ * `profile.subtitles` (none | soft | burn), because that is what the ffmpeg
+ * builder reads. "soft" muxes the attached .srt as a selectable track,
+ * "burn" hardcodes it into the picture — the only mode a receiver that ignores
+ * soft tracks (exteplayer3 on service id 5002) is guaranteed to show.
  */
 export async function updateItem(streamId, patch = {}) {
   const items = await sync();
@@ -248,6 +257,22 @@ export async function updateItem(streamId, patch = {}) {
   };
   items[index] = next;
   saveItems(items);
+
+  if (patch.subtitleMode !== undefined) {
+    const mode = text(patch.subtitleMode).trim().toLowerCase();
+    if (!SUBTITLE_MODES.includes(mode)) {
+      throw Object.assign(new Error(`subtitle mode must be one of: ${SUBTITLE_MODES.join(', ')}`), { status: 422 });
+    }
+    const stream = await store.getStream(streamId);
+    if (!stream) throw Object.assign(new Error('stream not found'), { status: 404 });
+    const before = text(stream.profile?.subtitles, 'none');
+    if (before !== mode) {
+      const profile = { ...(stream.profile || {}), subtitles: mode };
+      await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
+      relay.stopSession(stream.id, 'subtitle mode changed');
+      log.info('playlist', `subtitle mode of "${stream.title}" set to ${mode}`, { stream: stream.id, from: before });
+    }
+  }
   return next;
 }
 

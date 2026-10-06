@@ -137,6 +137,36 @@ Search, preview the cues, **shift the timing** (+/− ms), download the `.srt`, 
 push it to the receiver (`/media/hdd/movie/vumovie`, configurable) so the Duo2
 picks it up next to the recording.
 
+### Getting a subtitle onto the Duo2 (4097 / 5001 / 5002)
+The receiver reads subtitles out of the *stream*, so which container you play
+decides whether it can show them at all. Per playlist item, **▤ subtitle → How
+the box gets it** picks the mode:
+
+| Mode | What the relay writes | Plays on |
+|---|---|---|
+| **soft track** (default) | a real `subrip` track inside the Matroska `.mkv` (`.srt` attached via the Playlist tab), flagged `default` with its language tag | VLC/Kodi, and Enigma2 **4097** (the track appears in the subtitle menu). gstplayer **5001** shows it when ServiceApp's *embedded subtitles* switch is on. exteplayer3 **5002** plays embedded text tracks itself, but Enigma2's subtitle menu stays empty (external players do not publish their track list) — the `default` flag is what makes it show without pressing anything |
+| **burn into the picture** | `subtitles=filename=…` filter + a real encode (VAAPI or libx264) | every player, including service type **1** (DVB) and a 5002 box whose player ignores soft tracks. Costs CPU/GPU and cannot be switched off during playback |
+| **off** | nothing (the `.srt` stays on the NAS) | — |
+
+Two hard limits worth knowing:
+
+* **MPEG-TS/HLS cannot carry a text subtitle.** ffmpeg refuses to convert text
+  to the DVB bitmaps those containers need ("Subtitle encoding currently only
+  possible from text to text or bitmap to bitmap"). The relay therefore leaves
+  an attached `.srt` out of `.ts` output instead of dying on it, and says so in
+  the log — use the `.mkv` URL or burn in. *Transcode → template → Subtitles =
+  DVB bitmap* only works when the **source** already carries DVB/PGS subtitles
+  (`-c:s copy`).
+* **Burn-in is rendered by the guided profile builder.** If an FFmpeg template
+  is bound to the output the box plays (`enigma2`, `vlcMkv`, or the global
+  default), that template owns the filter chain and no subtitle is burned in —
+  unbind it for that output or use the soft track. The relay logs both cases
+  (`the subtitle nld attached to this item is not in this Matroska output …`).
+
+The relay logs one line per session when it muxes an attached subtitle and a
+warning when it cannot, so "the box shows nothing" is answerable from the Logs
+page instead of from guesswork.
+
 ### Enigma2 bouquet
 * Generates `userbouquet.<name>.tv` with `#SERVICE 4097:…` entries (GStreamer
   service type, so no tuner is used), `#DESCRIPTION` lines, and per-season
@@ -221,7 +251,7 @@ back in — an old hand-written template opens editable:
 | Video | `hw_accel` (none/VAAPI/QSV), `device`, `resolution` (source, 360p–4320p, `WIDTHxHEIGHT`, `900p`), `aspect`, `video_codec`, `vf_preset` (17 deinterlace / diagnostics filters) |
 | Rate control & VAAPI tuning | `video_bitrate`, `maxrate`, `bufsize`, `fps`, `gop`, `profile`, `level`, `rc_mode` (AUTO/CQP/CBR/VBR/ICQ/QVBR/AVBR), `global_quality`, `low_power`, `async_depth` |
 | Audio | `audio_codec`, `audio_bitrate`, `audio_channels`, `audio_rate` |
-| Subtitles | `subs` (drop / DVB bitmap / copy all — the last one needs Matroska) |
+| Subtitles | `subs` (drop / DVB bitmap — copies the source's own DVB/PGS bitmaps into TS / copy all — Matroska only) |
 | Output | `output_format` (mpegts / matroska / hls — the template's container) |
 | Extra | `extra_input`, `extra_output` raw flag boxes |
 | Advanced | one row per flag: `-rw_timeout`, `-reconnect*`, `-probesize`, `-analyzeduration`, `-thread_queue_size`, `-fflags`, `-err_detect`, `-user_agent`, `-referer`, `-preset`, `-crf`, `-tune`, `-threads`, `-fps_mode`, `-max_muxing_queue_size`, `-muxdelay`, `-flush_packets`, `-mpegts_flags`, `-hls_time`, `-hls_init_time`, `-hls_list_size`, `-hls_flags`, `-live`, `-metadata`, `-bsf:v`, or any custom flag with its own value |

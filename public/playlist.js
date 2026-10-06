@@ -179,8 +179,9 @@ const VMPlaylist = (() => {
       item.sourceId || '',
       item.kind === 'series' && item.season ? `S${item.season}E${item.episode || '?'}` : '',
     ].filter(Boolean).join(' · ');
+    const subtitleMode = item.subtitleMode || 'none';
     const subtitle = item.subtitlePath
-      ? tag(`subtitle ${(item.subtitleLanguageStored || '').toUpperCase() || ''}`.trim(), 'ok')
+      ? tag(`subtitle ${(item.subtitleLanguageStored || '').toUpperCase() || ''}${subtitleMode === 'burn' ? ' · burned in' : subtitleMode === 'none' ? ' · off' : ''}`.trim(), subtitleMode === 'none' ? '' : 'ok')
       : tag('no subtitle');
     const templateTag = item.hasTemplate ? tag(templateLabel(item), 'alt') : tag(templateLabel(item));
     const session = item.session ? tag(`${item.session.clients || 0} client(s)`, 'info') : '';
@@ -623,15 +624,35 @@ const VMPlaylist = (() => {
     try {
       const res = await api(`/api/streams/${encodeURIComponent(streamId)}`, { silent: true });
       const path = res.stream.profile?.subtitlePath;
+      const mode = res.stream.profile?.subtitles || 'none';
       host.innerHTML = path
         ? `Current subtitle: <b>${escapeHtml((res.stream.profile.subtitleLanguage || '').toUpperCase())}</b> · <span class="mono">${escapeHtml(path)}</span>
-           <button class="btn sm ghost" id="btn-sub-detach" style="margin-left:8px">detach</button>`
+           <button class="btn sm ghost" id="btn-sub-detach" style="margin-left:8px">detach</button>
+           <div class="field" style="margin-top:10px;max-width:520px"><label>How the box gets it</label>
+             <select id="sub-mode">
+               <option value="soft"${mode === 'soft' ? ' selected' : ''}>soft track — selectable, Matroska only</option>
+               <option value="burn"${mode === 'burn' ? ' selected' : ''}>burn into the picture — always visible</option>
+               <option value="none"${mode === 'none' ? ' selected' : ''}>off — do not mux it</option>
+             </select></div>
+           <div class="meta" style="max-width:620px">A soft track needs the Matroska (.mkv) URL and a player that selects it —
+             the VU+ with ServiceApp <b>5002</b> (exteplayer3) often ignores text tracks it cannot see in its subtitle menu.
+             Burn-in re-encodes the picture and is the only mode that shows on every receiver; it needs the guided profile
+             (an FFmpeg template bound to this output keeps its own filters).</div>`
         : 'No subtitle attached to this item yet.';
       $('#btn-sub-detach')?.addEventListener('click', async () => {
         await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'DELETE' });
         toast('Subtitle detached', 'info');
         await refresh();
         renderCurrentSubtitle(streamId);
+      });
+      $('#sub-mode')?.addEventListener('change', async (event) => {
+        const value = event.target.value;
+        try {
+          await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'PATCH', body: { subtitleMode: value } });
+          toast(value === 'burn' ? 'Subtitles will be burned into the picture' : value === 'soft' ? 'Soft subtitle track' : 'Subtitle off for this item', 'ok');
+          await refresh();
+          renderCurrentSubtitle(streamId);
+        } catch { /* api() already reported it */ }
       });
     } catch { /* modal already shows errors */ }
   }

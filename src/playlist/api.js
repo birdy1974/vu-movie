@@ -117,6 +117,8 @@ function publicItem(entry, baseUrl) {
     transcode: stream.profile?.transcode ?? null,
     subtitlePath: stream.profile?.subtitlePath || '',
     subtitleLanguageStored: stream.profile?.subtitleLanguage || '',
+    // none | soft | burn — see playlist.updateItem; the Playlist tab edits it.
+    subtitleMode: stream.profile?.subtitles || 'none',
     probe: stream.upstream?.probe || null,
     upstream: { url: stream.upstream?.url || '', kind: stream.upstream?.kind || null, via: stream.upstream?.via || null },
     urls: store.urlsFor(stream, baseUrl),
@@ -190,6 +192,7 @@ router.patch('/items/:id', wrap(async (req, res) => {
   const patch = req.body || {};
   if (patch.enabled !== undefined) log.info('playlist', `item ${req.params.id} ${patch.enabled === false ? 'disabled' : 'enabled'}`);
   if (patch.templateId !== undefined) log.info('playlist', `item ${req.params.id} template set to "${patch.templateId}"`);
+  if (patch.subtitleMode !== undefined) log.info('playlist', `item ${req.params.id} subtitle mode set to "${patch.subtitleMode}"`);
   const item = await playlist.updateItem(req.params.id, patch);
   const baseUrl = baseUrlFrom(req);
   const all = (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl));

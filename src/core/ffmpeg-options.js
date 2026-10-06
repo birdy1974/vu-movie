@@ -323,7 +323,7 @@ export const TEMPLATE_FIELDS = [
     choices: ['', '8000', '11025', '12000', '16000', '22050', '24000', '32000', '44100', '48000', '64000', '88200', '96000', '176400', '192000', '384000'],
   }),
   field('subs', 'Subtitles', 'subtitles', {
-    help: 'Drop removes subtitles. DVB keeps bitmap subtitles as a DVB track in an MPEG-TS output. Copy all requires Matroska for text and bitmap tracks; on TS/HLS it degrades to DVB. Burn-in needs the full command.',
+    help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed on top of this choice; burn-in needs the full command.',
     kind: 'enum', choices: [...SUB_MODES], custom: false,
   }),
   field('output_format', 'Output format', 'output', {
@@ -735,6 +735,9 @@ export function templateOptionWarnings(options = {}, { container = null } = {}) 
     }
     if (o.hw_accel === 'qsv' && !o.video_codec.endsWith('_qsv')) warnings.push(`hardware decode is set to Quick Sync but ${o.video_codec} is not a QSV encoder`);
     if (o.video_codec === 'libx265') warnings.push('HEVC encoding is CPU-only on this box (Apollo Lake has no HEVC encoder) — fine for downloads, not for live use');
+  }
+  if (o.subs === 'dvb' && (fmt === 'mpegts' || fmt === 'hls')) {
+    warnings.push('DVB subtitles are bitmaps: this only works when the source already carries DVB or PGS subtitles (ffmpeg cannot convert a text .srt to DVB) — attach an .srt and use the Matroska container, or burn the subtitle in');
   }
   if ((fmt === 'mpegts' || fmt === 'hls') && o.audio_codec && !TS_AUDIO_CODECS.includes(o.audio_codec)) {
     warnings.push(`${fmt === 'mpegts' ? 'MPEG-TS' : 'HLS'} carries AAC, AC-3, E-AC-3, MP2 or MP3 audio: ${o.audio_codec} needs the Matroska container`);

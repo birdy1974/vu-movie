@@ -23,7 +23,7 @@ const playerCalls = [];
 /* ---------------- mocked API data ---------------- */
 
 let playlistItems = [
-  { streamId: 's1', enabled: true, templateId: 'tpl-a', title: 'Dune: Part Two', year: 2024, kind: 'movie', sourceId: 'overlook', quality: '1080p', hasTemplate: true, profileTemplateName: 'VAAPI 1080p → MPEG-TS', urls: { ts: 'http://h/pl/tok/a.ts', mkv: 'http://h/pl/tok/a.mkv', hls: 'http://h/pl/tok/a.m3u8', playlist: 'http://h/pl/tok/a.m3u', forBox: 'http://h/pl/tok/bouquet.tv', direct: 'http://h/pl/tok/a?direct=1', download: 'http://h/pl/tok/a.dl', watch: 'http://h/pl/tok/watch/a', directNote: 'expires in 4 h' }, order: 0 },
+  { streamId: 's1', enabled: true, templateId: 'tpl-a', title: 'Dune: Part Two', year: 2024, kind: 'movie', sourceId: 'overlook', quality: '1080p', hasTemplate: true, subtitlePath: '/downloads/subtitles/dune-part-two.nl.srt', subtitleLanguageStored: 'nld', subtitleMode: 'soft', profileTemplateName: 'VAAPI 1080p → MPEG-TS', urls: { ts: 'http://h/pl/tok/a.ts', mkv: 'http://h/pl/tok/a.mkv', hls: 'http://h/pl/tok/a.m3u8', playlist: 'http://h/pl/tok/a.m3u', forBox: 'http://h/pl/tok/bouquet.tv', direct: 'http://h/pl/tok/a?direct=1', download: 'http://h/pl/tok/a.dl', watch: 'http://h/pl/tok/watch/a', directNote: 'expires in 4 h' }, order: 0 },
   { streamId: 's2', enabled: true, templateId: '', title: 'Alien: Romulus', year: 2024, kind: 'movie', sourceId: 'cinevo', quality: '720p', hasTemplate: false, urls: { ts: 'http://h/pl/tok/b.ts', watch: 'http://h/pl/tok/watch/b' }, order: 1 },
   { streamId: 's3', enabled: false, templateId: '', title: 'Blade Runner 2049', year: 2017, kind: 'movie', sourceId: 'flixhub', quality: '1080p', session: { clients: 1 }, urls: { ts: 'http://h/pl/tok/c.ts' }, order: 2 },
 ];
@@ -69,7 +69,10 @@ async function fetchMock(url, options = {}) {
   if (/^\/api\/streams\/[^/?]+$/.test(u) && method === 'GET') {
     const id = u.split('/').pop();
     const item = playlistItems.find((entry) => entry.streamId === id) || playlistItems[0];
-    return json({ ok: true, stream: { id, title: item.title, year: item.year, profile: { container: 'mpegts' }, upstream: { quality: item.quality } }, urls: item.urls || {} });
+    const profile = item.subtitlePath
+      ? { container: 'matroska', subtitlePath: item.subtitlePath, subtitleLanguage: 'nld', subtitles: item.subtitleMode || 'soft' }
+      : { container: 'mpegts' };
+    return json({ ok: true, stream: { id, title: item.title, year: item.year, profile, upstream: { quality: item.quality } }, urls: item.urls || {} });
   }
   if (u.startsWith('/api/streams') && method === 'GET') return json({ ok: true, streams: playlistItems.map((i) => ({ id: i.streamId, title: i.title, year: i.year, upstream: { quality: i.quality } })) });
   if (u.startsWith('/api/streams') && method === 'POST') {
@@ -294,6 +297,23 @@ const orderAfter = $$('#playlist-items .pl-row').map((r) => r.dataset.plRow);
 check('drag & drop reorders the playlist', orderAfter.join(',') === 's2,s3,s1', orderAfter.join(','));
 check('the reorder was sent to the API', calls.some((c) => c === 'PUT /api/playlist'), calls.filter((c) => c.includes('playlist')).slice(-3).join(' | '));
 check('the row is no longer marked as dragging', !rows.some((r) => r.classList.contains('dragging')));
+
+/* ---------------- 7b. per-item subtitle mode (soft / burn / off) ---------------- */
+
+await window.App.go('list');
+await tick(150);
+const subRow = $$('#playlist-items .pl-row').find((row) => row.dataset.plRow === 's1') || $$('#playlist-items .pl-row')[0];
+subRow.querySelector('[data-pl-sub]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(200);
+const modeSelect = $('#sub-mode');
+const modeValues = modeSelect ? [...modeSelect.options].map((o) => o.value) : [];
+check('the subtitle modal offers soft, burn and off', ['soft', 'burn', 'none'].every((v) => modeValues.includes(v)), modeValues.join(',') || 'no #sub-mode');
+check('the current mode comes from the stream profile', modeSelect?.value === 'soft', modeSelect?.value);
+modeSelect.value = 'burn';
+modeSelect.dispatchEvent(new window.Event('change', { bubbles: true }));
+await tick(200);
+check('switching to burn-in PATCHes the playlist item', calls.some((c) => c.startsWith('PATCH /api/playlist/items/')), calls.filter((c) => c.startsWith('PATCH')).slice(-2).join(' | '));
+window.App.closeModal();
 
 /* ---------------- 4. settings: sections + custom subtitle source ---------------- */
 

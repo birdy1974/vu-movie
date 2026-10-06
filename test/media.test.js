@@ -14,7 +14,8 @@ import path from 'node:path';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
   targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
-  parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf,
+  parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf, subtitleSessionNotes,
+  buildFfmpegTemplateArgs,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -223,9 +224,37 @@ test('burning in subtitles forces the software subtitle filter', () => {
   assert.ok(vf.includes('scale='));
 });
 
-test('soft-muxed subtitle sidecars are added as a second input and mapped', (t) => {
+test('a Matroska soft mux maps the sidecar first and marks it as the default track', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-sidecar-test-'));
   const subtitlePath = path.join(dir, 'selected subtitle.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const profile = normaliseProfile(
+    { mode: 'copy', container: 'matroska', subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' },
+    PROBE_4K_HEVC,
+  );
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mkv', kind: 'file' },
+    profile, hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  const secondInput = args.indexOf('-i', args.indexOf('-i') + 1);
+  assert.equal(args[secondInput + 1], subtitlePath, 'the sidecar is a second input');
+  // The sidecar is mapped *before* the source's own subtitle tracks, so it is
+  // always subtitle stream 0 — the disposition/metadata below rely on it.
+  const maps = [];
+  for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '1:s:0?', '0:s?'], 'sidecar before the source tracks');
+  assert.ok(args.includes('-disposition:s:0'), 'the track is flagged default for exteplayer3/Enigma2');
+  assert.equal(args[args.indexOf('-disposition:s:0') + 1], 'default');
+  assert.equal(args[args.indexOf('-metadata:s:s:0') + 1], 'language=nld');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'copy', 'source tracks are copied, never re-encoded');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt');
+});
+
+test('a text sidecar is never forced into MPEG-TS (ffmpeg cannot make DVB bitmaps from it)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-sidecar-ts-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
   fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -234,11 +263,27 @@ test('soft-muxed subtitle sidecars are added as a second input and mapped', (t) 
     source: { url: 'https://cdn/x.m3u8', kind: 'hls' },
     profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
   });
-  const secondInput = args.indexOf('-i', args.indexOf('-i') + 1);
-  assert.equal(args[secondInput + 1], subtitlePath);
-  assert.equal(args[args.indexOf('-map', args.indexOf('-map', args.indexOf('-map') + 1) + 1) + 1], '0:s?');
-  assert.ok(args.includes('1:s:0?'), 'selected SRT sidecar is mapped to the output subtitles');
-  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub');
+  assert.ok(!args.includes(subtitlePath), 'the .srt must not be an input of a TS mux');
+  assert.ok(!args.includes('1:s:0?'), 'and it must not be mapped either');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub', 'source DVB subtitles keep working');
+
+  const notes = subtitleSessionNotes(profile, 'mpegts', args);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /cannot convert a text \.srt/);
+});
+
+test('subtitleSessionNotes explains burn-in under a hand-written template', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-burn-note-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const profile = { subtitles: 'burn', subtitlePath, subtitleLanguage: 'nld' };
+  const notes = subtitleSessionNotes(profile, 'mpegts', ['-i', 'https://x', '-c:v', 'copy', '-f', 'mpegts', 'pipe:1']);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /only the guided builder hardcodes subtitles/);
+  // The guided builder really does apply it — no note then.
+  const burned = ['-vf', 'scale=w=1920:h=1080,subtitles=filename=/x.srt,format=yuv420p', '-f', 'mpegts', 'pipe:1'];
+  assert.deepEqual(subtitleSessionNotes(profile, 'mpegts', burned), []);
 });
 
 test('soft muxing picks the right subtitle codec per container', () => {
@@ -256,6 +301,70 @@ test('soft muxing picks the right subtitle codec per container', () => {
     hw: HW, mode: 'file', output: { container: 'matroska', target: '/downloads/x.mkv' },
   });
   assert.equal(mkv[mkv.indexOf('-c:s') + 1], 'srt');
+});
+
+test('an FFmpeg template keeps the subtitle attached to the playlist item', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-subs-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -f matroska <output>';
+  const profile = {
+    subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld', container: 'matroska',
+    ffmpegTemplate: template, ffmpegTemplateId: 'tpl1', ffmpegTemplateName: 'mkv',
+  };
+  const args = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4', kind: 'file' }, profile, mode: 'live',
+    output: { container: 'matroska', target: 'pipe:1' },
+  });
+  // The sidecar is a second input right behind the source, and it is mapped
+  // *before* the template's own maps so it is subtitle stream 0.
+  const inputIndex = args.indexOf('-i');
+  assert.equal(args[inputIndex + 1], 'https://cdn/movie.mp4');
+  assert.equal(args[inputIndex + 2], '-i');
+  assert.equal(args[inputIndex + 3], subtitlePath);
+  assert.equal(args[inputIndex + 4], '-map');
+  assert.equal(args[inputIndex + 5], '1:s:0?');
+  assert.ok(args.includes('-c:s:0'), 'the sidecar is encoded (text) instead of copied');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt');
+  assert.equal(args[args.indexOf('-disposition:s:0') + 1], 'default');
+  assert.equal(args[args.indexOf('-metadata:s:s:0') + 1], 'language=nld');
+  // The progress flags and the output target still come last.
+  assert.deepEqual(args.slice(-4), ['-progress', 'pipe:2', '-nostats', 'pipe:1']);
+  assert.deepEqual(subtitleSessionNotes(profile, 'matroska', args), [], 'nothing to warn about');
+});
+
+test('a template that drops subtitles is left alone — and says so', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-sn-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -sn -c:v copy -c:a copy -f matroska <output>';
+  const profile = { subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld', container: 'matroska', ffmpegTemplate: template };
+  const args = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4' }, profile, mode: 'live',
+    output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!args.includes(subtitlePath), 'the operator asked for -sn, so no subtitle input');
+  const notes = subtitleSessionNotes(profile, 'matroska', args);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /an FFmpeg template drops it/);
+});
+
+test('a sidecar is not injected into a template that already maps a second input', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-map1-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const template = 'ffmpeg -i <url> -i /downloads/fixed.srt -map 0:v:0 -map 1:s:0? -c:v copy -f matroska <output>';
+  const args = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4' }, profile: { subtitles: 'soft', subtitlePath },
+    mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!args.includes(subtitlePath), 'the template owns its inputs — do not shift its stream indices');
 });
 
 test('live playback is paced at 1x so a real-time client is never flooded', () => {

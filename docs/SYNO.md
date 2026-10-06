@@ -157,10 +157,13 @@ to 512 MB. On a 4 GB NAS with Plex/Jellyfin also running, lower
   service type 4097 (GStreamer), so watching them does not occupy a tuner. After
   the push the app reloads the service list; the bouquet appears under
   *Favourites* / *vu-movie*.
-* **Subtitles**: search NL/EN, attach to the stream (muxed for the VLC/MKV path or
-  served as a sidecar `.srt`), or push the `.srt` to `/media/hdd/movie/vumovie` on
-  the box. Filename must match the recording name for Enigma2 to auto-load it —
-  the app names it after the stream title.
+* **Subtitles**: search NL/EN and attach to the stream, then choose how the box
+  gets it (*Playlist → ▤ subtitle → How the box gets it*): a **soft track** in the
+  Matroska `.mkv` (flagged `default`), **burned into the picture** (works on every
+  player, costs an encode), or a sidecar `.srt` pushed to
+  `/media/hdd/movie/vumovie` (for recordings/local files — the filename must
+  match the recording, which the app arranges). MPEG-TS/HLS cannot carry a text
+  subtitle at all: the relay says so in the log instead of failing the stream.
 * **Download**: `Download` runs an ffmpeg copy job into `data/downloads` with
   progress in the job list; the resulting `.mkv` plays anywhere.
 
@@ -189,6 +192,7 @@ the new profile on the next request.
 | `no vaapi encode pipeline worked — using software encoding` | The container sees `/dev/dri` but no driver encodes: check the device permissions (Section 2) and run `sh scripts/doctor.sh` |
 | `/dev/dri device: missing` in the UI while the NAS has it | The compose `devices:` mapping did not apply to the running container: `docker compose up -d --force-recreate` |
 | Emoji/CP1252 subtitles show as `Ã©` | The app converts to UTF-8 on download; if a file still looks wrong, re-download with the *force UTF-8* switch |
+| Subtitles never appear on the Duo2, although a subtitle is attached | Read the relay's own verdict in the log first — it now names the reason: `not in this MPEG-TS output` (text `.srt` cannot become DVB bitmaps — use the `.mkv` URL or burn in), `an FFmpeg template drops it` (the template bound to the `enigma2`/`vlcMkv` output has `-sn`), `burn-in was requested … but this output runs an FFmpeg template` (unbind the template for that output). The box side: service **5002** (exteplayer3) renders embedded text tracks but exposes no subtitle menu entry, Enigma2 **4097** lists the track in the subtitle menu (gstplayer **5001** needs ServiceApp's *embedded subtitles* switch), and DVB bitmap subtitles need service type **1**. Last resort: switch the item to *burn into the picture* — that shows on every player |
 | Bouquet push fails | The app falls back to FTP/SCP; check `ENIGMA2_FTP=true` and that FTP is enabled on the box. WebIF's upload endpoint is disabled on some images |
 | Container restarts in a loop | `docker compose logs vu-movie` — the first lines name the missing piece (usually the database, if you set `REQUIRE_DB=true`) |
 | UI reachable but "database: memory" | Postgres is not up; the app still works but forgets streams on restart. `docker compose ps` and check the `db` healthcheck |

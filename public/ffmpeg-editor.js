@@ -199,6 +199,12 @@ const VMFfmpegEditor = (() => {
     if (container !== 'matroska' && options.subs === 'keep') {
       out.push({ level: 'err', text: '“Copy all” needs the Matroska container; MPEG-TS can only carry DVB bitmap subtitles.' });
     }
+    if (container !== 'matroska' && options.subs === 'dvb') {
+      out.push({ level: 'warn', text: 'DVB subtitles are bitmaps and can only be copied from a source that already has DVB/PGS subtitles. A text .srt (the Playlist tab attachment) cannot be converted — use the Matroska container, or burn the subtitle into the picture.' });
+    }
+    if (container === 'matroska' && options.subs === 'dvb') {
+      out.push({ level: 'warn', text: 'DVB subtitles belong in MPEG-TS; for Matroska “copy all” keeps every track as it is.' });
+    }
     if (container === 'mpegts' && options.output_format && options.output_format !== 'mpegts') {
       out.push({ level: 'err', text: 'The output format parameter and the container disagree — the server stores the container value.' });
     }

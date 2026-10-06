@@ -30,7 +30,7 @@ import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
-  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf,
+  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes,
 } from '../core/media.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
@@ -451,6 +451,13 @@ export async function ensureSession(stream, opts = {}) {
     log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || container} URL asked for ${expectedFormat} — players can mis-detect the stream`, {
       stream: stream.id, templateId: template?.templateId || '', template: template?.name || '',
     });
+  }
+
+  // "Subtitles never show on the box" is otherwise indistinguishable from "the
+  // receiver ignores them": say up front whether this session muxes the
+  // attached subtitle at all, and if not, why.
+  for (const note of subtitleSessionNotes(effectiveProfile, wantsHls ? 'hls' : container, args)) {
+    log.warn('relay', note, { stream: stream.id, output: outputType || container, title: stream.title });
   }
 
   const command = argsToCommand(args);
