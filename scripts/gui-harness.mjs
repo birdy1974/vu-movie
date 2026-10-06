@@ -41,17 +41,20 @@ try {
 } catch (error) {
   console.log(`(harness) could not reach the dev server for the real schema (${error.message}) — using the inline one`);
 }
+// Mirrors the real /api/ffmpeg/templates/schema for the fields the checks
+// below look at — including `custom: false`, which the server sets on every
+// field it validates against its choices.
 const schemaFields = [
-  { key: 'hw_accel', label: 'Hardware acceleration', kind: 'enum', options: ['none', 'vaapi', 'qsv'], help: 'none keeps everything in software.' },
+  { key: 'hw_accel', label: 'Hardware acceleration', kind: 'enum', options: ['none', 'vaapi', 'qsv'], custom: false, help: 'none keeps everything in software.' },
   { key: 'resolution', label: 'Resolution cap', kind: 'resolution', options: ['source', '720p', '1080p'], help: 'The longest edge of the output.' },
   { key: 'video_codec', label: 'Video codec', kind: 'enum', options: ['copy', 'libx264', 'h264_vaapi'], help: 'copy needs no CPU.' },
   { key: 'video_bitrate', label: 'Video bitrate', kind: 'rate', help: 'Target bitrate in kbps.' },
   { key: 'audio_codec', label: 'Audio codec', kind: 'enum', options: ['copy', 'aac'], help: 'aac re-encodes the audio.' },
-  { key: 'subs', label: 'Subtitles', kind: 'enum', options: ['drop', 'dvb', 'keep'], help: 'keep only works in Matroska.' },
+  { key: 'subs', label: 'Subtitles', kind: 'enum', options: ['drop', 'dvb', 'keep'], custom: false, help: 'keep only works in Matroska.' },
   { key: 'output_format', label: 'Output format', kind: 'enum', options: ['mpegts', 'matroska', 'hls'], help: 'mpegts is the live path.' },
 ];
 const inlineSchema = {
-  fields: schemaFields.map((f, i) => ({ ...f, choices: f.options, group: i < 4 ? 'video' : i === 4 ? 'audio' : i === 5 ? 'subtitles' : 'output' })),
+  fields: schemaFields.map((f, i) => ({ ...f, choices: f.options, custom: f.custom, group: i < 4 ? 'video' : i === 4 ? 'audio' : i === 5 ? 'subtitles' : 'output' })),
   groups: [{ id: 'video', label: 'Video' }, { id: 'audio', label: 'Audio' }, { id: 'subtitles', label: 'Subtitles' }, { id: 'output', label: 'Output' }],
   advanced: [],
   vfPresets: [],
@@ -494,6 +497,20 @@ check('advanced flag picker is filled from the schema', advFlagOptions.length >=
 check('advanced flags include the streaming-relevant ones',
   ['-probesize', '-analyzeduration', '-reconnect', '-mpegts_flags', '-hls_flags', '-max_muxing_queue_size', '-flush_packets', '-live', '-tune', '-preset'].every((f) => advFlagOptions.includes(f)),
   advFlagOptions.slice(0, 8).join(' '));
+
+// The advice pane and the validator talk about “copy all”, so the Subtitles box
+// must offer exactly that wording — the stored token (`keep`) is not a label an
+// operator can map to a behaviour.
+const subsOptions = [...($(`#ff-editor-1-ff-subs`)?.options || [])].map((o) => ({ value: o.value, label: o.textContent }));
+check('the Subtitles box names the subtitle modes instead of the stored tokens',
+  ['drop', 'dvb', 'keep'].every((v) => subsOptions.some((o) => o.value === v))
+  && subsOptions.some((o) => o.value === 'keep' && /copy all/i.test(o.label))
+  && subsOptions.some((o) => o.value === 'dvb' && /DVB/i.test(o.label))
+  && subsOptions.some((o) => o.value === 'drop' && /drop/i.test(o.label)),
+  subsOptions.map((o) => `${o.value}=${o.label}`).join(' | '));
+check('a field whose choices are validated offers no “custom value…” box',
+  !subsOptions.some((o) => o.value === '__custom__') && !$('#ff-editor-1-ff-subs-custom'),
+  subsOptions.map((o) => o.value).join(','));
 
 check('no runtime errors collected', errors.length === 0, errors.slice(0, 3).join(' | '));
 console.log(`\n${failures ? `✗ ${failures} check(s) failed` : '✓ all checks passed'} — ${calls.length} API calls`);

@@ -199,16 +199,16 @@ const VMFfmpegEditor = (() => {
       }
     }
     if (container === 'matroska' && options.subs === 'keep') {
-      out.push({ level: 'info', text: 'Matroska + “copy all” keeps the source text subtitles (SRT/ASS) as selectable tracks — this is the only combination that can.' });
+      out.push({ level: 'info', text: 'Subtitles “copy all” with the Matroska container keeps the source text subtitles (SRT/ASS) as selectable tracks — this is the only combination that can.' });
     }
     if (container !== 'matroska' && options.subs === 'keep') {
-      out.push({ level: 'err', text: '“Copy all” needs the Matroska container; MPEG-TS can only carry DVB bitmap subtitles.' });
+      out.push({ level: 'err', text: 'Subtitles “copy all” needs the Matroska container; MPEG-TS can only carry DVB bitmap subtitles. Set Output format to Matroska.' });
     }
     if (container !== 'matroska' && options.subs === 'dvb') {
       out.push({ level: 'warn', text: 'DVB subtitles are bitmaps and can only be copied from a source that already has DVB/PGS subtitles. A text .srt (the Playlist tab attachment) cannot be converted — use the Matroska container, or burn the subtitle into the picture.' });
     }
     if (container === 'matroska' && options.subs === 'dvb') {
-      out.push({ level: 'warn', text: 'DVB subtitles belong in MPEG-TS; for Matroska “copy all” keeps every track as it is.' });
+      out.push({ level: 'warn', text: 'DVB bitmap subtitles belong in MPEG-TS; for Matroska switch Subtitles to “copy all”, which keeps every track as it is.' });
     }
     if (container === 'mpegts' && options.output_format && options.output_format !== 'mpegts') {
       out.push({ level: 'err', text: 'The output format parameter and the container disagree — the server stores the container value.' });
@@ -234,11 +234,32 @@ const VMFfmpegEditor = (() => {
    * controls
    * ------------------------------------------------------------------ */
 
+  // Fallback only: the schema carries the labels (`labels: {value: label}`), so
+  // the wording lives next to the field definition on the server. This copy is
+  // used when the schema cannot be fetched — it must say exactly what
+  // src/core/ffmpeg-options.js says, because the advice pane and the validator
+  // use those words too (they say “copy all”, so the box cannot show `keep`:
+  // that is how "where do I set copy all?" happens).
+  const CHOICE_LABELS_FALLBACK = {
+    subs: {
+      drop: 'drop — no subtitles in the output',
+      dvb: 'DVB bitmaps — copy the source’s own DVB/PGS (MPEG-TS)',
+      keep: 'copy all — keep every track (Matroska)',
+    },
+  };
+
+  /** Choices as {value, label} — schema labels first, then the fallback map. */
+  const labelledChoices = (def) => (Array.isArray(def?.choices) ? def.choices : [])
+    .map((choice) => ({
+      value: choice,
+      label: def?.labels?.[choice] || CHOICE_LABELS_FALLBACK[def?.key]?.[choice] || choice,
+    }));
+
   const choiceLabel = (key, value) => {
     if (value === '') return ['rate', 'integer', 'number', 'positive'].includes(fieldDef(key)?.kind) || ['fps', 'gop', 'global_quality', 'async_depth', 'audio_channels', 'audio_rate', 'video_bitrate', 'maxrate', 'bufsize', 'audio_bitrate'].includes(key)
       ? '— (leave to ffmpeg)'
       : '— (default)';
-    return value;
+    return labelledChoices(fieldDef(key)).find((entry) => entry.value === value)?.label || value;
   };
 
   function controlMarkup(def, values = {}, scope = '') {
@@ -268,19 +289,28 @@ const VMFfmpegEditor = (() => {
     }
 
     const choices = Array.isArray(def.choices) ? def.choices : [];
+    // A value the schema does not list (a hand-written command that was just
+    // parsed) still has to be visible, or the select would silently jump to its
+    // first choice. For a field that is validated against its choices
+    // (`custom: false`) it stays visible but read-only — typing an arbitrary
+    // value there only produced a validation error, e.g. "copy all" instead of
+    // the keep choice that means it.
     const extra = value2 !== '' && !choices.includes(value2) ? [value2] : [];
     const optionList = [...choices, ...extra].map((choice) =>
       `<option value="${escapeHtml(choice)}"${String(choice) === value2 ? ' selected' : ''}>${escapeHtml(choiceLabel(key, choice))}</option>`).join('');
-    const customSelected = extra.length > 0;
-    const customInput = `<input id="${id}-custom" data-param-custom="${key}" class="mono ${customSelected ? '' : 'hide'}"
-      value="${escapeHtml(customSelected ? value2 : '')}" placeholder="custom value" autocomplete="off">`;
+    const allowCustom = def.custom !== false;
+    const customSelected = allowCustom && extra.length > 0;
+    const customInput = allowCustom
+      ? `<input id="${id}-custom" data-param-custom="${key}" class="mono ${customSelected ? '' : 'hide'}"
+      value="${escapeHtml(customSelected ? value2 : '')}" placeholder="custom value" autocomplete="off">`
+      : '';
+    const customOption = allowCustom ? `<option value="${CUSTOM}"${customSelected ? ' selected' : ''}>✎ custom value…</option>` : '';
     const placeholder = def.kind === 'resolution' ? 'e.g. 1280x720 or 900p'
       : def.kind === 'aspect' ? 'e.g. 16:9' : def.kind === 'rate' ? 'e.g. 8000k' : 'value';
     return `<div class="param-field" data-field="${key}">
       <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
       <div class="param-select-row">
-        <select id="${id}" data-param="${key}">${optionList}
-          <option value="${CUSTOM}"${customSelected ? ' selected' : ''}>✎ custom value…</option>
+        <select id="${id}" data-param="${key}">${optionList}${customOption}
         </select>
         ${customInput}
       </div></div>`;

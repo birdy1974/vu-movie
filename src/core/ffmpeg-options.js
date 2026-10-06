@@ -325,6 +325,13 @@ export const TEMPLATE_FIELDS = [
   field('subs', 'Subtitles', 'subtitles', {
     help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed on top of this choice; burn-in needs the full command.',
     kind: 'enum', choices: [...SUB_MODES], custom: false,
+    // The stored tokens are terse; the advice pane, the validator and the
+    // README all talk about “copy all”, so the box has to say it too.
+    labels: {
+      drop: 'drop — no subtitles in the output',
+      dvb: 'DVB bitmaps — copy the source’s own DVB/PGS (MPEG-TS)',
+      keep: 'copy all — keep every track (Matroska)',
+    },
   }),
   field('output_format', 'Output format', 'output', {
     help: 'MPEG-TS for live TV, Matroska for subtitle-capable VOD, or HLS segment files. This is the template\'s container; the relay picks the matching output target.',
