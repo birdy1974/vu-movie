@@ -74,7 +74,7 @@ function persistPlaylist(patch, description) {
     configWritable = false;
     if (!persistFailureLogged) {
       persistFailureLogged = true;
-      log.warn('playlist', `the config file is not writable — ${description} is kept in memory for this run only`,
+      log.warn('playlist', `the config file is not writable — ${description} could not be saved (kept in memory for this run only)`,
         { error: errorText(err) });
     }
     return false;
