@@ -25,9 +25,11 @@
  */
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { getConfig, saveConfig } from '../core/config.js';
 import { log, errorText } from '../core/log.js';
 import { normaliseProfile } from '../core/media.js';
+import { uploadSubtitleToReceiver } from '../subtitles/push.js';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
 import * as exporter from '../streams/export.js';
@@ -36,8 +38,24 @@ import * as enigma2 from '../enigma2/index.js';
 
 const MAX_ITEMS = 300;
 
-/** How an item's attached subtitle reaches the player (profile.subtitles). */
-export const SUBTITLE_MODES = ['none', 'soft', 'burn'];
+/**
+ * How an item's attached subtitle reaches the receiver.
+ *
+ *   none  attach nothing
+ *   soft  a selectable text track inside the Matroska output — no encode at all
+ *   burn  hardcoded into the picture: works on every player, but the relay has
+ *         to re-encode the video (the one mode that costs the NAS real CPU)
+ *   push  copy the .srt onto the box (FTP / mounted share) under the movie's
+ *         name — zero transcoding and zero muxing; Enigma2 picks it up next to
+ *         a recording of the same name
+ *
+ * The mode is stored on the *playlist item*; `soft`/`burn` additionally set the
+ * stream profile's `subtitles` field, because that is what the ffmpeg builder
+ * reads. `push` deliberately leaves the profile untouched (nothing is muxed).
+ */
+export const SUBTITLE_MODES = ['none', 'soft', 'burn', 'push'];
+/** Modes that reach the ffmpeg profile. */
+const MUX_SUBTITLE_MODES = ['none', 'soft', 'burn'];
 
 const text = (value, fallback = '') => (value === undefined || value === null ? fallback : String(value));
 
@@ -96,6 +114,10 @@ function normaliseItem(entry = {}) {
     enabled: entry.enabled !== false,
     templateId: text(entry.templateId).trim(),
     subtitleLanguage: text(entry.subtitleLanguage).trim().toLowerCase(),
+    // '' = not chosen yet: the item then follows the stream profile.
+    subtitleMode: SUBTITLE_MODES.includes(text(entry.subtitleMode).trim().toLowerCase())
+      ? text(entry.subtitleMode).trim().toLowerCase()
+      : '',
     addedAt: text(entry.addedAt, new Date().toISOString()),
   };
 }
@@ -235,14 +257,13 @@ export async function removeItem(streamId) {
 }
 
 /**
- * Per-item flags: enabled, template, subtitle language. Sent as a patch so the
- * UI can flip one switch without resending the whole list.
+ * Per-item flags: enabled, template, subtitle language, subtitle mode. Sent as
+ * a patch so the UI can flip one switch without resending the whole list.
  *
- * `subtitleMode` is the exception: it is not a playlist flag but the stream's
- * `profile.subtitles` (none | soft | burn), because that is what the ffmpeg
- * builder reads. "soft" muxes the attached .srt as a selectable track,
- * "burn" hardcodes it into the picture — the only mode a receiver that ignores
- * soft tracks (exteplayer3 on service id 5002) is guaranteed to show.
+ * See SUBTITLE_MODES for what the mode does. Changing it restarts a running
+ * session (the ffmpeg command changes) and, for `push`, copies the .srt to the
+ * receiver right away so the operator gets an answer instead of a silent
+ * "nothing happened".
  */
 export async function updateItem(streamId, patch = {}) {
   const items = await sync();
@@ -265,15 +286,57 @@ export async function updateItem(streamId, patch = {}) {
     }
     const stream = await store.getStream(streamId);
     if (!stream) throw Object.assign(new Error('stream not found'), { status: 404 });
-    const before = text(stream.profile?.subtitles, 'none');
-    if (before !== mode) {
-      const profile = { ...(stream.profile || {}), subtitles: mode };
-      await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
-      relay.stopSession(stream.id, 'subtitle mode changed');
-      log.info('playlist', `subtitle mode of "${stream.title}" set to ${mode}`, { stream: stream.id, from: before });
+
+    // Persist the choice on the item *before* the side effects, so a failed
+    // push (FTP down, no mount) still leaves the operator's intent recorded.
+    next.subtitleMode = mode;
+    items[index] = next;
+    saveItems(items);
+
+    if (MUX_SUBTITLE_MODES.includes(mode)) {
+      const before = text(stream.profile?.subtitles, 'none');
+      if (before !== mode) {
+        const profile = { ...(stream.profile || {}), subtitles: mode };
+        await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
+        relay.stopSession(stream.id, 'subtitle mode changed');
+        log.info('playlist', `subtitle mode of "${stream.title}" set to ${mode}`, { stream: stream.id, from: before });
+      }
+    } else {
+      // push: nothing is muxed, so the profile must not ask for a track either.
+      if (text(stream.profile?.subtitles, 'none') !== 'none') {
+        const profile = { ...(stream.profile || {}), subtitles: 'none' };
+        await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
+        relay.stopSession(stream.id, 'subtitle mode changed');
+      }
+      const pushed = await pushSubtitle(stream);
+      if (!pushed.ok) {
+        throw Object.assign(new Error(`could not copy the subtitle to the receiver: ${pushed.error}`), { status: 502 });
+      }
+      log.info('playlist', `subtitle of "${stream.title}" copied to the receiver ${pushed.path}`, { stream: stream.id, via: pushed.via });
+      next.pushed = pushed;
     }
   }
   return next;
+}
+
+/**
+ * Copy an item's attached .srt onto the receiver (FTP upload, or a copy into a
+ * mounted receiver share). No transcoding, no muxing — this is the cheapest way
+ * to get Dutch subtitles onto a Duo2 and the only one that costs the NAS
+ * literally nothing.
+ */
+export async function pushSubtitle(stream) {
+  const file = stream?.profile?.subtitlePath;
+  if (!file || !fs.existsSync(file)) return { ok: false, error: 'no subtitle is attached to this item yet' };
+  const language = text(stream.profile?.subtitleLanguage, '') || 'sub';
+  const name = `${store.slugify(`${stream.title}${stream.year ? `-${stream.year}` : ''}`)}.${String(language).slice(0, 3)}.srt`;
+  const dir = getConfig().subtitles.receiverDir || '/media/hdd/movie';
+  try {
+    const result = uploadSubtitleToReceiver(file, name, dir);
+    return result.ok === false ? result : { ...result, name, dir };
+  } catch (err) {
+    return { ok: false, error: errorText(err) };
+  }
 }
 
 /** Reorder the playlist; ids that are not in the list are ignored, missing ones keep their place at the end. */
@@ -386,12 +449,27 @@ export async function attachSubtitle(streamId, { result = null, srt = null, lang
     subtitles: stream.profile?.subtitles && stream.profile.subtitles !== 'none' ? stream.profile.subtitles : 'soft',
   };
   await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
-  await updateItem(streamId, { subtitleLanguage: fetched.language });
+  const item = await updateItem(streamId, { subtitleLanguage: fetched.language });
   relay.stopSession(stream.id, 'subtitle changed');
   log.info('playlist', `subtitle ${fetched.language} attached to "${stream.title}"`, {
     stream: stream.id, cues: fetched.cues, provider: fetched.provider,
   });
-  return { ...fetched, stored, stream: await store.getStream(streamId) };
+  // An item already set to "copy the .srt to the box" gets the new file right
+  // away — otherwise the receiver would keep the previous language/version while
+  // the UI happily reports the new one.
+  let pushed = null;
+  if (item.subtitleMode === 'push') {
+    const fresh = await store.getStream(streamId);
+    const result = await pushSubtitle(fresh);
+    if (result.ok) {
+      pushed = result;
+      log.info('playlist', `new subtitle for "${stream.title}" copied to the receiver`, { stream: stream.id, path: result.path });
+    } else {
+      log.warn('playlist', `could not copy the new subtitle of "${stream.title}" to the receiver`, { stream: stream.id, error: result.error });
+      pushed = result;
+    }
+  }
+  return { ...fetched, stored, pushed, stream: await store.getStream(streamId) };
 }
 
 /** Detach the stored subtitle from a playlist item. */
@@ -467,6 +545,6 @@ export async function summary() {
 
 export default {
   name, token, tokenMatches, saveItems, sync, entries, enabledStreams, addItems, removeItem,
-  updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, playlistText, bouquet, summary,
+  updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, pushSubtitle, playlistText, bouquet, summary,
   configWritableNow,
 };

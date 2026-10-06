@@ -312,7 +312,7 @@ const VMFfmpegEditor = (() => {
       optionsSynced: true,
       messages: [],
       building: false,
-      test: { running: null, source: { kind: 'stream', streamId: '', url: '' }, durationMs: 5000, lines: 0 },
+      test: { running: null, source: { kind: 'stream', streamId: '', url: '' }, durationMs: 5000, buffer: [], chars: 0, timer: null },
       requestSeq: 0,
     };
 
@@ -851,10 +851,44 @@ const VMFfmpegEditor = (() => {
   const testRunButton = (instance) => $(`#${instance.id}-test-run`) || (instance.externalTestControls ? $('#btn-test-run') : null);
   const testStopButton = (instance) => $(`#${instance.id}-test-stop`) || (instance.externalTestControls ? $('#btn-test-stop') : null);
 
+  /* ---------------- the test output panel ---------------- */
+
+  /** How much text the panel keeps (the DOM is re-written from this array). */
+  const TEST_MAX_LINES = 400;
+  const TEST_MAX_CHARS = 200 * 1024;
+  /** One rendered line. Longer runs of bytes are media, not a log line. */
+  const TEST_MAX_LINE = 500;
+  const TEST_PLACEHOLDER = '— raw ffmpeg output appears here —';
+  const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
+
+  /**
+   * What the panel may show for one line coming off the SSE stream.
+   *
+   * A template that ends in `pipe:1` (vu-movie's own convention) writes the
+   * finished movie to stdout: the stream carries binary chunks with no newlines
+   * in them. Appending those into one <pre> text node — and re-splitting that
+   * node to trim it — locked the browser tab solid after a few seconds. Binary
+   * lines are summarised instead, and every line is clipped.
+   *
+   * @returns {string} '' when there is nothing worth showing.
+   */
+  function testLineForDisplay(line) {
+    const raw = String(line ?? '').replace(/\r/g, '');
+    if (!raw) return '';
+    // A "line" this long out of a media pipe is a chunk of packets.
+    if (raw.length > TEST_MAX_LINE || CONTROL_RE.test(raw)) {
+      return `# ${raw.length} bytes of binary output suppressed — this template writes the stream to stdout (pipe:1); the verdict shows the total`;
+    }
+    return raw;
+  }
+
   function clearTestOutput(instance) {
     const output = $(`#${instance.id}-test-output`);
-    if (output) output.textContent = '— raw ffmpeg output appears here —';
-    instance.test.lines = 0;
+    instance.test.buffer = [];
+    instance.test.chars = 0;
+    instance.test.dirty = false;
+    if (instance.test.timer) { clearTimeout(instance.test.timer); instance.test.timer = null; }
+    if (output) output.textContent = TEST_PLACEHOLDER;
     const verdict = $(`#${instance.id}-test-verdict`);
     if (verdict) {
       verdict.className = 'tpl-test-verdict';
@@ -864,17 +898,29 @@ const VMFfmpegEditor = (() => {
     if (progress) progress.textContent = '';
   }
 
+  /**
+   * Queue one line. Rendering is coalesced into one DOM write per frame and the
+   * panel is bounded in both lines and characters, so a burst of output (or a
+   * wall of media bytes) can never turn into an unbounded string operation on
+   * the main thread.
+   */
   function appendTestLine(instance, line) {
-    const output = $(`#${instance.id}-test-output`);
-    if (!output) return;
-    if (!instance.test.lines) output.textContent = '';
-    instance.test.lines += 1;
-    output.textContent += `${line}\n`;
-    if (instance.test.lines > 500) {
-      output.textContent = output.textContent.split('\n').slice(-400).join('\n');
-      instance.test.lines = 400;
+    const text = testLineForDisplay(line);
+    if (!text) return;
+    const buffer = instance.test.buffer || (instance.test.buffer = []);
+    buffer.push(text);
+    instance.test.chars = (instance.test.chars || 0) + text.length + 1;
+    while (buffer.length > TEST_MAX_LINES || (instance.test.chars > TEST_MAX_CHARS && buffer.length > 20)) {
+      instance.test.chars -= buffer.shift().length + 1;
     }
-    output.scrollTop = output.scrollHeight;
+    if (instance.test.timer) return;
+    instance.test.timer = setTimeout(() => {
+      instance.test.timer = null;
+      const output = $(`#${instance.id}-test-output`);
+      if (!output) return;
+      output.textContent = buffer.join('\n');
+      output.scrollTop = output.scrollHeight;
+    }, 60);
   }
 
   async function runTest(instance, { source = null, durationMs = null } = {}) {
@@ -927,7 +973,11 @@ const VMFfmpegEditor = (() => {
         if (runButton && !instance.externalTestControls) runButton.textContent = '▷ run test';
         else if (runButton) runButton.disabled = false;
         if (stopButton) stopButton.disabled = true;
-        if (status) status.textContent = `finished in ${(Number(payload.durationMs) / 1000).toFixed(1)} s`;
+        if (status) {
+          const hidden = Number(payload.stdoutBinaryBytes || 0) + Number(payload.stdoutSuppressedBytes || 0);
+          const written = hidden > 0 ? ` · ${fmtBytes(payload.bytesOut)} written to stdout (not printed — see the note above)` : '';
+          status.textContent = `finished in ${(Number(payload.durationMs) / 1000).toFixed(1)} s${written}`;
+        }
         if (verdict) {
           verdict.className = `tpl-test-verdict ${payload.ok ? 'ok' : payload.bytesOut ? 'warn' : 'err'}`;
           verdict.textContent = payload.ok
@@ -1292,7 +1342,7 @@ const VMFfmpegEditor = (() => {
   return {
     ensureSchema, create, loadTemplate, saveTemplate, deleteTemplate, setDefaultTemplate,
     initLibrary, initTestTab, renderLibrary, selectTemplate, loadTestTemplate, wireLibraryTab,
-    runTestTab, stopTestTab, syncTabButtons, clearTestOutput, renderTestSources, renderTestTemplatePicker, adviceFor, computeActive,
+    runTestTab, stopTestTab, syncTabButtons, clearTestOutput, testLineForDisplay, renderTestSources, renderTestTemplatePicker, adviceFor, computeActive,
     get testEditor() { return testEditor; },
     get libraryEditor() { return libraryEditor; },
   };

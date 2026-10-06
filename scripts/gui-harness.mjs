@@ -307,7 +307,8 @@ subRow.querySelector('[data-pl-sub]').dispatchEvent(new window.MouseEvent('click
 await tick(200);
 const modeSelect = $('#sub-mode');
 const modeValues = modeSelect ? [...modeSelect.options].map((o) => o.value) : [];
-check('the subtitle modal offers soft, burn and off', ['soft', 'burn', 'none'].every((v) => modeValues.includes(v)), modeValues.join(',') || 'no #sub-mode');
+check('the subtitle modal offers push, soft, burn and off', ['push', 'soft', 'burn', 'none'].every((v) => modeValues.includes(v)), modeValues.join(',') || 'no #sub-mode');
+check('the no-CPU option is offered first', modeValues[0] === 'push', modeValues.join(','));
 check('the current mode comes from the stream profile', modeSelect?.value === 'soft', modeSelect?.value);
 modeSelect.value = 'burn';
 modeSelect.dispatchEvent(new window.Event('change', { bubbles: true }));

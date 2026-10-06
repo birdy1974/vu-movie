@@ -180,8 +180,9 @@ const VMPlaylist = (() => {
       item.kind === 'series' && item.season ? `S${item.season}E${item.episode || '?'}` : '',
     ].filter(Boolean).join(' · ');
     const subtitleMode = item.subtitleMode || 'none';
+    const modeSuffix = { burn: ' · burned in', none: ' · off', push: ' · on the box', soft: ' · soft track' }[subtitleMode] || '';
     const subtitle = item.subtitlePath
-      ? tag(`subtitle ${(item.subtitleLanguageStored || '').toUpperCase() || ''}${subtitleMode === 'burn' ? ' · burned in' : subtitleMode === 'none' ? ' · off' : ''}`.trim(), subtitleMode === 'none' ? '' : 'ok')
+      ? tag(`subtitle ${(item.subtitleLanguageStored || '').toUpperCase() || ''}${modeSuffix}`.trim(), subtitleMode === 'none' ? '' : 'ok')
       : tag('no subtitle');
     const templateTag = item.hasTemplate ? tag(templateLabel(item), 'alt') : tag(templateLabel(item));
     const session = item.session ? tag(`${item.session.clients || 0} client(s)`, 'info') : '';
@@ -628,16 +629,22 @@ const VMPlaylist = (() => {
       host.innerHTML = path
         ? `Current subtitle: <b>${escapeHtml((res.stream.profile.subtitleLanguage || '').toUpperCase())}</b> · <span class="mono">${escapeHtml(path)}</span>
            <button class="btn sm ghost" id="btn-sub-detach" style="margin-left:8px">detach</button>
-           <div class="field" style="margin-top:10px;max-width:520px"><label>How the box gets it</label>
+           <div class="field" style="margin-top:10px;max-width:640px"><label>How the box gets it</label>
              <select id="sub-mode">
-               <option value="soft"${mode === 'soft' ? ' selected' : ''}>soft track — selectable, Matroska only</option>
-               <option value="burn"${mode === 'burn' ? ' selected' : ''}>burn into the picture — always visible</option>
-               <option value="none"${mode === 'none' ? ' selected' : ''}>off — do not mux it</option>
+               <option value="push"${mode === 'push' ? ' selected' : ''}>copy the .srt to the box — no CPU at all</option>
+               <option value="soft"${mode === 'soft' ? ' selected' : ''}>soft track in the .mkv — no re-encode</option>
+               <option value="burn"${mode === 'burn' ? ' selected' : ''}>burn into the picture — costs an encode</option>
+               <option value="none"${mode === 'none' ? ' selected' : ''}>off — do not use it</option>
              </select></div>
-           <div class="meta" style="max-width:620px">A soft track needs the Matroska (.mkv) URL and a player that selects it —
-             the VU+ with ServiceApp <b>5002</b> (exteplayer3) often ignores text tracks it cannot see in its subtitle menu.
-             Burn-in re-encodes the picture and is the only mode that shows on every receiver; it needs the guided profile
-             (an FFmpeg template bound to this output keeps its own filters).</div>`
+           <div class="meta" style="max-width:640px">
+             <b>copy the .srt to the box</b> uploads the file to the receiver directory (FTP or a mounted share, named like the
+             movie) — the NAS does no transcoding at all. Enigma2/EMC pick it up next to a recording of the same name; it does
+             not show while merely zapping a live stream.<br>
+             <b>soft track</b> muxes the .srt into the Matroska (.mkv) output: no re-encode, but the player must select the
+             track — ServiceApp <b>5002</b> (exteplayer3) shows it, Enigma2's own menu does not list it.<br>
+             <b>burn into the picture</b> re-encodes the video (the only mode that costs the DS918+ real work) and shows on
+             every receiver, including service type 1. It needs the guided profile: an FFmpeg template bound to this output
+             keeps its own filters.</div>`
         : 'No subtitle attached to this item yet.';
       $('#btn-sub-detach')?.addEventListener('click', async () => {
         await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'DELETE' });
@@ -647,12 +654,23 @@ const VMPlaylist = (() => {
       });
       $('#sub-mode')?.addEventListener('change', async (event) => {
         const value = event.target.value;
+        const messages = {
+          burn: 'Subtitles will be burned into the picture (the relay re-encodes)',
+          soft: 'Soft subtitle track in the Matroska output',
+          push: 'Copying the .srt to the receiver…',
+          none: 'Subtitle off for this item',
+        };
         try {
-          await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'PATCH', body: { subtitleMode: value } });
-          toast(value === 'burn' ? 'Subtitles will be burned into the picture' : value === 'soft' ? 'Soft subtitle track' : 'Subtitle off for this item', 'ok');
+          const res = await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'PATCH', body: { subtitleMode: value } });
+          const pushed = res.item?.pushedSubtitle;
+          toast(pushed ? `Subtitle copied to the box (${pushed.via}): ${pushed.path}` : messages[value] || value, 'ok', pushed ? 6000 : 3000);
           await refresh();
           renderCurrentSubtitle(streamId);
-        } catch { /* api() already reported it */ }
+        } catch (error) {
+          // A failed copy leaves the mode saved; say why instead of pretending.
+          toast(error.message || 'could not change the subtitle mode', 'err', 6000);
+          renderCurrentSubtitle(streamId);
+        }
       });
     } catch { /* modal already shows errors */ }
   }
@@ -714,8 +732,10 @@ const VMPlaylist = (() => {
       button.disabled = true;
       button.textContent = 'attaching…';
       try {
-        await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'POST', body: { result } });
-        toast(`Subtitle attached (${String(result.language || '').toUpperCase()})`, 'ok');
+        const res = await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'POST', body: { result } });
+        if (res.pushed?.ok) toast(`Subtitle attached and copied to the box (${res.pushed.via})`, 'ok', 6000);
+        else if (res.pushed) toast(`Subtitle attached, but the copy to the box failed: ${res.pushed.error}`, 'warn', 6000);
+        else toast(`Subtitle attached (${String(result.language || '').toUpperCase()})`, 'ok');
         await refresh();
         renderCurrentSubtitle(streamId);
       } finally {
@@ -732,8 +752,10 @@ const VMPlaylist = (() => {
     const srt = await file.text();
     const language = $('#pick-file-lang')?.value || 'nl';
     try {
-      await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'POST', body: { srt, language } });
-      toast(`Subtitle file attached (${language})`, 'ok');
+      const res = await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, { method: 'POST', body: { srt, language } });
+      if (res.pushed?.ok) toast(`Subtitle attached and copied to the box (${res.pushed.via})`, 'ok', 6000);
+      else if (res.pushed) toast(`Subtitle attached, but the copy to the box failed: ${res.pushed.error}`, 'warn', 6000);
+      else toast(`Subtitle file attached (${language})`, 'ok');
       await refresh();
       renderCurrentSubtitle(streamId);
     } catch { /* api() already reported it */ }

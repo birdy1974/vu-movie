@@ -117,8 +117,10 @@ function publicItem(entry, baseUrl) {
     transcode: stream.profile?.transcode ?? null,
     subtitlePath: stream.profile?.subtitlePath || '',
     subtitleLanguageStored: stream.profile?.subtitleLanguage || '',
-    // none | soft | burn — see playlist.updateItem; the Playlist tab edits it.
-    subtitleMode: stream.profile?.subtitles || 'none',
+    // none | soft | burn | push — see playlist.SUBTITLE_MODES. The item owns the
+    // choice; before the mode was editable the profile was the only record, so
+    // fall back to it for items that predate this field.
+    subtitleMode: entry.subtitleMode || stream.profile?.subtitles || 'none',
     probe: stream.upstream?.probe || null,
     upstream: { url: stream.upstream?.url || '', kind: stream.upstream?.kind || null, via: stream.upstream?.via || null },
     urls: store.urlsFor(stream, baseUrl),
@@ -197,6 +199,9 @@ router.patch('/items/:id', wrap(async (req, res) => {
   const baseUrl = baseUrlFrom(req);
   const all = (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl));
   const updated = all.find((entry) => entry.streamId === item.streamId) || null;
+  // The subtitle-copy result is per request (where the file went), not state to
+  // store — the UI shows it in the confirmation toast.
+  if (updated && item.pushed) updated.pushedSubtitle = item.pushed;
   res.json({ ok: true, item: updated, items: all, ...storageMeta() });
 }));
 

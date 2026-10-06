@@ -45,8 +45,15 @@ async function requestJson(base, route, { method = 'GET', body } = {}) {
   return { response, json: await response.json() };
 }
 
-test('a playlist item can be switched between soft, burn and no subtitles', async (t) => {
-  config.saveConfig({ subtitles: { autoSearch: false }, enigma2: { autoPush: false } });
+test('a playlist item can be switched between soft, burn, push and no subtitles', async (t) => {
+  const receiverDir = path.join(tempDir, 'receiver-movie');
+  fs.mkdirSync(receiverDir, { recursive: true });
+  // FTP off + a "mount" that exists = the copy path uploadSubtitleToReceiver
+  // uses on a NAS that mounts the Duo2's media directory.
+  config.saveConfig({
+    subtitles: { autoSearch: false, receiverDir },
+    enigma2: { autoPush: false, ftpEnabled: false },
+  });
 
   const app = express();
   app.use(express.json({ limit: '2mb' }));
@@ -89,4 +96,70 @@ test('a playlist item can be switched between soft, burn and no subtitles', asyn
   assert.equal(bogus.response.status, 422);
   assert.match(bogus.json.error, /subtitle mode/);
   assert.equal((await store.getStream(stream.id)).profile.subtitles, 'none', 'a rejected patch changes nothing');
+});
+
+test('“copy to the box” stores the choice, touches no profile and needs no transcoding', async (t) => {
+  const receiverDir = path.join(tempDir, 'receiver-push');
+  fs.mkdirSync(receiverDir, { recursive: true });
+  config.saveConfig({
+    subtitles: { autoSearch: false, receiverDir },
+    enigma2: { autoPush: false, ftpEnabled: false },
+  });
+
+  const app = express();
+  app.use(express.json({ limit: '2mb' }));
+  app.use('/api/playlist', (await import('../src/playlist/api.js')).default);
+  const server = http.createServer(app);
+  const base = await listen(server);
+  t.after(async () => {
+    await new Promise((resolve) => { server.close(resolve); server.closeAllConnections?.(); });
+  });
+
+  const stream = await store.createStream({
+    title: 'Push Mode', year: 2026, kind: 'movie',
+    candidate: { url: 'https://cdn.example.test/x.mp4', kind: 'file', headers: {} },
+    profile: { container: 'mpegts', subtitles: 'burn' },
+  });
+  await playlist.addItems([stream.id]);
+  const srt = '1\n00:00:01,000 --> 00:00:02,000\nHallo\n';
+  await playlist.attachSubtitle(stream.id, { srt, language: 'nl' });
+
+  const res = await requestJson(base, `/playlist/items/${stream.id}`, { method: 'PATCH', body: { subtitleMode: 'push' } });
+  assert.equal(res.response.status, 200);
+  assert.equal(res.json.item.subtitleMode, 'push');
+  assert.equal(res.json.item.pushedSubtitle.via, 'mount');
+  // The file landed on the "receiver", named after the movie (that is what
+  // Enigma2/EMC match a recording against).
+  const copied = fs.readdirSync(receiverDir);
+  assert.deepEqual(copied, ['Push-Mode-2026.nld.srt']);
+  assert.equal(fs.readFileSync(path.join(receiverDir, copied[0]), 'utf8'), srt);
+  // Nothing is muxed for this mode — burn-in had to be switched off.
+  assert.equal((await store.getStream(stream.id)).profile.subtitles, 'none');
+});
+
+test('“copy to the box” reports a missing receiver instead of pretending', async (t) => {
+  config.saveConfig({
+    subtitles: { autoSearch: false, receiverDir: path.join(tempDir, 'not-mounted') },
+    enigma2: { autoPush: false, ftpEnabled: false },
+  });
+  const stream = await store.createStream({
+    title: 'No Receiver', kind: 'movie',
+    candidate: { url: 'https://cdn.example.test/y.mp4', kind: 'file', headers: {} },
+    profile: { container: 'mpegts' },
+  });
+  await playlist.addItems([stream.id]);
+  await playlist.attachSubtitle(stream.id, { srt: '1\n00:00:01,000 --> 00:00:02,000\nx\n', language: 'nl' });
+
+  const app = express();
+  app.use(express.json({ limit: '2mb' }));
+  app.use('/api/playlist', (await import('../src/playlist/api.js')).default);
+  const server = http.createServer(app);
+  const base = await listen(server);
+  t.after(async () => {
+    await new Promise((resolve) => { server.close(resolve); server.closeAllConnections?.(); });
+  });
+
+  const res = await requestJson(base, `/playlist/items/${stream.id}`, { method: 'PATCH', body: { subtitleMode: 'push' } });
+  assert.equal(res.response.status, 502);
+  assert.match(res.json.error, /enable Enigma2 FTP or mount the receiver directory/);
 });

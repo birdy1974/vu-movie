@@ -158,12 +158,13 @@ to 512 MB. On a 4 GB NAS with Plex/Jellyfin also running, lower
   the push the app reloads the service list; the bouquet appears under
   *Favourites* / *vu-movie*.
 * **Subtitles**: search NL/EN and attach to the stream, then choose how the box
-  gets it (*Playlist → ▤ subtitle → How the box gets it*): a **soft track** in the
-  Matroska `.mkv` (flagged `default`), **burned into the picture** (works on every
-  player, costs an encode), or a sidecar `.srt` pushed to
-  `/media/hdd/movie/vumovie` (for recordings/local files — the filename must
-  match the recording, which the app arranges). MPEG-TS/HLS cannot carry a text
-  subtitle at all: the relay says so in the log instead of failing the stream.
+  gets it (*Playlist → ▤ subtitle → How the box gets it*). Ordered by NAS cost:
+  **copy the `.srt` to the box** (FTP or a mounted share, named after the movie —
+  no transcoding at all, picked up next to a recording of the same name),
+  **soft track** in the Matroska `.mkv` (flagged `default`; no re-encode),
+  **burned into the picture** (works on every player but re-encodes the video),
+  or **off**. MPEG-TS/HLS cannot carry a text subtitle at all: the relay says so
+  in the log instead of failing the stream.
 * **Download**: `Download` runs an ffmpeg copy job into `data/downloads` with
   progress in the job list; the resulting `.mkv` plays anywhere.
 
@@ -197,6 +198,7 @@ the new profile on the next request.
 | Container restarts in a loop | `docker compose logs vu-movie` — the first lines name the missing piece (usually the database, if you set `REQUIRE_DB=true`) |
 | UI reachable but "database: memory" | Postgres is not up; the app still works but forgets streams on restart. `docker compose ps` and check the `db` healthcheck |
 | `WARN db slow query {"ms":759,…}` right after a start | The first read of a table comes off cold volumes and an empty Postgres cache — the same cold start that makes `ffmpeg -version` take ~20 s on a sleeping NAS. One slow query after a restart is expected and drops to single-digit ms once warm; the bar is `DB_SLOW_QUERY_MS` (default 1500 ms) and the line now reports the row count. Investigate only if it repeats on **every** load: compare the query in the log with the indexes in `migrations/0001_init.sql` |
+| *Run test* in the Transcode/Test tab shows no output, or the tab becomes unresponsive | Fixed: a template ending in `pipe:1` writes the **movie**, not a log, to stdout — the test used to forward those bytes as thousands of text lines (an 8 s run produced 6,036 events / 2.7 MB). Now binary stdout is counted, not printed (`# this template writes the finished stream to stdout (pipe:1) …`), stdout text is capped at 64 KB, and the panel keeps 400 lines rendered from one coalesced write. The verdict also reports the bytes the command wrote to `<output>`, so a file-writing template no longer reads as "no bytes reached the output" |
 | `WARN config … uses flat dotted key(s)`, `ignoring flat key(s)`, or `unknown option(s)` | `/config/vumovie.json` contains hand-written `"a.b"` keys. JSON has no dotted paths, so they are folded into the nested objects (or, when the nested value already exists, ignored — the nested value wins) and named in the log. Edit the nested object instead, or save once from the Settings page, which rewrites the file in the correct shape |
 
 For the outbound scraper check, run these on the NAS from the folder with
