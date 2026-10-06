@@ -895,6 +895,44 @@ export function realtimePacing(profile = {}) {
 const BITMAP_SUBTITLE_CODECS = new Set(['dvbsub', 'dvdsub', 'dvb_teletext', 'hdmv_pgs_subtitle', 'xsub']);
 
 /**
+ * Subtitle codecs the Matroska muxer can carry with stream copy (its
+ * S_TEXT/S_* codec tag table). Notably absent: MP4's `mov_text` (tx3g —
+ * ffmpeg codec id 94213) and the other text formats only the MP4/WebVTT world
+ * knows. Copying one of those into Matroska makes ffmpeg refuse the whole
+ * file before a single byte is written — "[matroska] Subtitle codec 94213 is
+ * not supported" → "Could not write header" — so a `-c:s copy` command needs
+ * per-stream re-encode overrides for every track NOT listed here.
+ */
+export const MATROSKA_SUBTITLE_CODECS = new Set([
+  'subrip', 'srt', 'text', 'ssa', 'ass',
+  'dvd_subtitle', 'dvb_subtitle', 'hdmv_pgs_subtitle', 'hdmv_text_subtitle',
+]);
+
+/**
+ * Source subtitle codecs that ARE bitmaps: they can be fed to the DVB bitmap
+ * encoder an MPEG-TS/HLS output needs (bitmap-to-bitmap is legal). Everything
+ * else (srt, mov_text, ass, …) is text and cannot become a DVB bitmap, so
+ * those tracks must not be mapped into an MPEG-TS/HLS encode.
+ */
+export const BITMAP_SOURCE_SUBTITLE_CODECS = new Set([
+  'dvd_subtitle', 'dvb_subtitle', 'hdmv_pgs_subtitle', 'xsub',
+]);
+
+/**
+ * The authoritative subtitle track list of a probe — or null when the probe
+ * cannot vouch for it. A probe that never parsed the stream list (`video`
+ * stayed null: ffprobe missing, the fetch cut short, the CDN refusing) can
+ * still carry `subtitles: []`, which must NOT be read as "definitely no
+ * subtitle tracks": the builder would then drop maps and overrides that the
+ * optimistic fallback still provides. `video` being present is the cheap
+ * proof that ffprobe actually walked the streams.
+ */
+export function probeSubtitleList(probe) {
+  if (!probe || !probe.video) return null;
+  return Array.isArray(probe.subtitles) ? probe.subtitles : [];
+}
+
+/**
  * The subtitle codec a template asks for — the value of the last `-c:s[:n]` /
  * `-codec:s` / `-scodec` option in its argv, lower-cased. Empty when the
  * template names no subtitle codec at all (then the muxer default applies).
@@ -909,6 +947,53 @@ function templateSubtitleCodecOf(args = []) {
     }
   }
   return codec;
+}
+
+/**
+ * The subtitle codec a command pins for EVERY subtitle stream: the last
+ * generic `-c:s` / `-codec:s` / `-scodec`, or — when there is none — the last
+ * catch-all `-c` / `-codec` (`-c copy` copies subtitles too). Per-stream
+ * options (`-c:s:0` …) do not count: they pin one stream only, the generic
+ * value still decides the rest.
+ */
+export function genericSubtitleCodecOf(args = []) {
+  let catchAll = '';
+  let subtitleSpecific = '';
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '');
+    const value = String(args[index + 1] || '').trim().toLowerCase();
+    if (!value || value.startsWith('-')) continue;
+    if (arg === '-scodec' || /^-(?:c|codec):s$/.test(arg)) subtitleSpecific = value;
+    else if (arg === '-c' || arg === '-codec') catchAll = value;
+  }
+  return subtitleSpecific || catchAll;
+}
+
+/**
+ * Which subtitle streams of input 0 reach the output, in output order.
+ * Reads the `-map` rows: `0:s` maps every source subtitle stream, `0:s:N` one
+ * specific stream, a bare `0` every stream of the input. Negative maps, other
+ * inputs (`1:…`) and video/audio maps are ignored.
+ */
+export function mappedSourceSubtitleStreams(args = [], trackCount = 0) {
+  const indexes = [];
+  const all = () => { for (let k = 0; k < trackCount; k += 1) indexes.push(k); };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '');
+    let spec = null;
+    if (arg === '-map') spec = String(args[index + 1] || '');
+    else {
+      const m = /^-map=(.+)$/.exec(arg);
+      if (m) spec = m[1];
+    }
+    if (spec === null) continue;
+    spec = spec.trim().replace(/\?$/, '');
+    if (!spec || spec.startsWith('-')) continue;
+    if (spec === '0' || spec === '0:s') { all(); continue; }
+    const m = /^0:s:(\d+)$/.exec(spec);
+    if (m && Number(m[1]) < trackCount) indexes.push(Number(m[1]));
+  }
+  return indexes;
 }
 
 /**
@@ -1004,6 +1089,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   const sidecarSubtitlePath = profile.subtitles === 'soft' && profile.subtitlePath && fs.existsSync(profile.subtitlePath)
     ? profile.subtitlePath
     : null;
+  let sidecarMapped = false;
   if (sidecarSubtitlePath) {
     // Any map that reads input 1 (`-map 1`, `-map 1:s:0?`, `-map 1,0`) means
     // the template already owns a second input — inserting ours would shift it.
@@ -1014,6 +1100,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     // instead of silently ignoring the attachment.
     const dropsSubs = args.some((arg) => arg === '-sn');
     if (!mapsSecondInput && !dropsSubs && container === 'matroska') {
+      sidecarMapped = true;
       // The URL token sits right behind the '-i' that precedes it; everything
       // the prefix added in front of it is already part of `args`.
       const urlTokenIndex = inputIndex + prefix.length + 1;
@@ -1047,6 +1134,40 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       }
       if (subtitleOutput.length) args.splice(outputIndex, 0, ...subtitleOutput);
     }
+  }
+
+  // --- source subtitle tracks the Matroska muxer cannot copy --------------
+  // `-c:s copy` (or a catch-all `-c copy`) passes every mapped subtitle
+  // stream through unchanged — except that Matroska has no packet format for
+  // some of them. MP4 sources carrying mov_text (tx3g, codec id 94213) tracks
+  // are the ones that hit this in the wild: the muxer refuses the whole file
+  // ("Subtitle codec 94213 is not supported" → "Could not write header")
+  // before a single byte is written, and the relay burned its whole restart
+  // budget on a failure no restart can fix. When the probe knows the source's
+  // subtitle codecs, every track the muxer cannot carry gets a per-stream
+  // re-encode to srt instead (text→text is legal); every track it CAN carry
+  // stays on copy, so ASS styling and PGS bitmaps are untouched.
+  const templateProbeSubtitles = Array.isArray(source?.subtitles) ? source.subtitles : null;
+  if (container === 'matroska' && templateProbeSubtitles?.length && genericSubtitleCodecOf(args) === 'copy') {
+    let mapped = mappedSourceSubtitleStreams(args, templateProbeSubtitles.length);
+    // No -map rows at all: ffmpeg's automatic stream selection takes at most
+    // ONE subtitle stream (the first) — with copy, the same restriction hits
+    // that one, so treat it as subtitle output stream 0.
+    if (!mapped.length && !sidecarMapped && !args.includes('-sn')
+      && !args.some((arg) => arg === '-map' || /^-map[=:]/.test(String(arg)))) {
+      mapped = [0];
+    }
+    const inserts = [];
+    let outPos = sidecarMapped ? 1 : 0;
+    for (const srcIndex of mapped) {
+      const codec = String(templateProbeSubtitles[srcIndex]?.codec || '').toLowerCase();
+      // An explicit per-stream setting by the operator always wins.
+      if (codec && !MATROSKA_SUBTITLE_CODECS.has(codec) && !args.includes(`-c:s:${outPos}`)) {
+        inserts.push(`-c:s:${outPos}`, 'srt');
+      }
+      outPos += 1;
+    }
+    if (inserts.length) args.splice(args.length - 1, 0, ...inserts);
   }
 
   if (mode === 'live') {
@@ -1398,11 +1519,24 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // bitmap"), which used to kill the whole ffmpeg process as soon as a movie had
   // an .srt attached while the stream was set to MPEG-TS. Map it only where it
   // can actually be carried; subtitleSessionNotes() tells the operator why not.
+  const probeSubtitles = Array.isArray(source.subtitles) ? source.subtitles : null;
   if (p.softMux) {
     // The sidecar goes first so it is always subtitle stream 0: the default
     // disposition and language metadata below then need no index arithmetic.
     if (sidecarFitsContainer) args.push('-map', '1:s:0?');
-    args.push('-map', '0:s?');
+    // MPEG-TS/HLS only carry DVB bitmaps: mapping a text track (srt, mov_text,
+    // ass, …) next to `-c:s dvbsub` makes ffmpeg refuse the whole command, so
+    // a probed source only maps its bitmap tracks there. Without probe info the
+    // optimistic `-map 0:s?` stays — better to try than to drop tracks blind.
+    if (container === 'matroska' || !probeSubtitles?.length) {
+      args.push('-map', '0:s?');
+    } else {
+      probeSubtitles.forEach((track, index) => {
+        if (BITMAP_SOURCE_SUBTITLE_CODECS.has(String(track?.codec || '').toLowerCase())) {
+          args.push('-map', `0:s:${index}?`);
+        }
+      });
+    }
   }
   args.push('-dn');
   if (!p.softMux) args.push('-sn');
@@ -1479,11 +1613,14 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // --- subtitles (soft mux) ---
   if (p.softMux) {
     if (container === 'matroska') {
-      // Matroska carries every subtitle codec it can demux, so copying the
-      // source tracks keeps ASS styling, PGS bitmaps and text as they are
-      // (encoding a bitmap source to srt is impossible and used to fail the
-      // whole command). The attached sidecar is text, so it is tagged as srt —
-      // stream 0 is the sidecar because it is mapped first above.
+      // Copy keeps everything the Matroska muxer can carry exactly as it is —
+      // ASS styling, PGS bitmaps, SRT text. The tracks it CANNOT carry get a
+      // per-stream re-encode instead: MP4 sources ship mov_text (tx3g) tracks,
+      // and a blanket copy of those makes the muxer refuse the whole file
+      // ("Subtitle codec 94213 is not supported" → "Could not write header").
+      // The old blanket `-c:s srt` had the mirror failure: encoding a bitmap
+      // source (PGS/VobSub) to text is impossible. The attached sidecar is
+      // text, so it is tagged as srt — stream 0 because it is mapped first.
       if (sidecarFitsContainer) {
         args.push('-c:s', 'copy', '-c:s:0', 'srt');
         // The VU+ jumps into the movie without a menu: the subtitle must be
@@ -1493,8 +1630,15 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
         const language = String(p.subtitleLanguage || '').trim();
         if (language) args.push('-metadata:s:s:0', `language=${language}`);
       } else {
-        args.push('-c:s', 'srt');
+        args.push('-c:s', 'copy');
       }
+      const offset = sidecarFitsContainer ? 1 : 0;
+      (probeSubtitles || []).forEach((track, index) => {
+        const codec = String(track?.codec || '').toLowerCase();
+        if (codec && !MATROSKA_SUBTITLE_CODECS.has(codec)) {
+          args.push(`-c:s:${index + offset}`, 'srt');
+        }
+      });
     } else {
       // MPEG-TS/HLS carry DVB subtitles — this is what Enigma2 understands.
       args.push('-c:s', 'dvbsub');

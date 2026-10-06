@@ -17,6 +17,7 @@ import { dbState, isPostgres } from '../core/db.js';
 import {
   hardware, hardwareStatus, hardwarePending, binariesStatus,
   diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand, validateFfmpegTemplate,
+  probeSubtitleList,
 } from '../core/media.js';
 import {
   buildTemplateCommand, parseTemplateCommand, renderTemplate, validateTemplateOptions,
@@ -926,7 +927,12 @@ async function renderStreamCommand(stream, profileInput, { outputType = '' } = {
     ? { available: null, reason: 'custom FFmpeg template is authoritative', fpsVariant: null, encoder: null }
     : await hardware({ waitMs: 15000 });
   const args = buildFfmpegArgs({
-    source: { url: stream.upstream?.url, headers: stream.upstream?.headers || {}, kind: stream.upstream?.kind || undefined, container: stream.upstream?.probe?.container || null },
+    source: {
+      url: stream.upstream?.url, headers: stream.upstream?.headers || {},
+      kind: stream.upstream?.kind || undefined,
+      container: stream.upstream?.probe?.container || null,
+      subtitles: probeSubtitleList(stream.upstream?.probe),
+    },
     profile, hw, mode: 'live', output: commandOutput(profile, stream),
   });
   return {

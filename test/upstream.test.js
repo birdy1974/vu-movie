@@ -16,7 +16,7 @@ import {
   createUpstreamProxy, closeUpstreamProxy, rewriteDashManifest, parseClientRange,
   shouldProxyUpstream, upstreamProxyMiddleware, proxyStats, listUpstreamProxies,
 } from '../src/streams/upstream.js';
-import { decideRestart, argsWithResume, releaseUpstreamProxy } from '../src/streams/relay.js';
+import { decideRestart, argsWithResume, releaseUpstreamProxy, fatalFfmpegFailure } from '../src/streams/relay.js';
 import { getConfig } from '../src/core/config.js';
 
 /* ------------------------------------------------------------------ *
@@ -47,6 +47,25 @@ test('decideRestart: restarts on errors and on early clean EOFs, not on the real
   assert.equal(decideRestart({ ...base, code: 0, outTimeMs: 7195000, durationSec: 7200 }).restart, false);
   // Unknown duration + clean EOF → better to try once more than go black.
   assert.equal(decideRestart({ ...base, code: 0 }).restart, true);
+});
+
+test('fatalFfmpegFailure: deterministic startup errors stop the restart loop', () => {
+  // The field failure: an MP4 mov_text track (codec id 94213) copied into
+  // Matroska — the muxer refuses the header, ffmpeg exits before one byte is
+  // written, and the old restart loop burned its whole budget on it.
+  const movText = [
+    '[matroska @ 0x55f23a64b700] Subtitle codec 94213 is not supported.',
+    'Could not write header for output file #0 (incorrect codec parameters ?): Function not implemented',
+    'Error initializing output stream 0:1 -- ',
+  ];
+  assert.ok(fatalFfmpegFailure(movText, { bytesOut: 0, code: 1 })?.hint, 'the mov_text/matroska header failure');
+  assert.equal(fatalFfmpegFailure(movText, { bytesOut: 8192, code: 1 }), null, 'a pipe session that already streamed bytes restarts (mid-stream drop)');
+  assert.equal(fatalFfmpegFailure(['Connection timed out'], { bytesOut: 0, code: 1 }), null, 'an unknown error may be transient');
+  assert.equal(fatalFfmpegFailure(movText, { bytesOut: 0, code: 0 }), null, 'a clean exit is never fatal');
+  assert.ok(fatalFfmpegFailure(
+    ['[AVHWDeviceContext] Failed to initialise VAAPI connection: -1 (unknown libva error).', 'Device creation failed: -5.'],
+    { bytesOut: 0, code: 1, kind: 'hls' },
+  )?.hint, 'a dead VAAPI device cannot recover by restarting');
 });
 
 test('argsWithResume splices an input-side -ss in front of the first -i', () => {

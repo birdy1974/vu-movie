@@ -42,7 +42,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { log, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { buildFfmpegTemplateArgs, hardware, argsToCommand, ffmpegPath, ffmpegEnv, validateFfmpegTemplate } from '../core/media.js';
+import { buildFfmpegTemplateArgs, hardware, argsToCommand, ffmpegPath, ffmpegEnv, validateFfmpegTemplate, probeSubtitleList } from '../core/media.js';
 import { parseProgressLine } from '../core/media.js';
 import * as store from '../streams/store.js';
 
@@ -136,7 +136,12 @@ router.post('/live-test', async (req, res) => {
   try {
     args = buildFfmpegTemplateArgs({
       template: command,
-      source: { url: stream.upstream.url, headers: stream.upstream.headers || {}, kind: stream.upstream.kind || undefined },
+      source: {
+        url: stream.upstream.url, headers: stream.upstream.headers || {},
+        kind: stream.upstream.kind || undefined,
+        container: stream.upstream.probe?.container || null,
+        subtitles: probeSubtitleList(stream.upstream.probe),
+      },
       profile: { container: effectiveContainer },
       mode: 'file',
       output: { container: effectiveContainer, target },

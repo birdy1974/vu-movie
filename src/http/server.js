@@ -21,7 +21,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv } from '../core/media.js';
+import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv, probeSubtitleList } from '../core/media.js';
 import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -241,6 +241,7 @@ export function createApp() {
       source: {
         url: stream.upstream?.url, headers: stream.upstream?.headers || {},
         kind: stream.upstream?.kind || undefined, container: stream.upstream?.probe?.container || null,
+        subtitles: probeSubtitleList(stream.upstream?.probe),
       },
       profile, hw, mode: 'file', output: { container, target: 'pipe:1' },
     });

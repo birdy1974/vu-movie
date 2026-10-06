@@ -13,6 +13,7 @@ import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   buildFfmpegArgs, argsToCommand, hardware, ffmpegPath, ffmpegEnv, normaliseProfile, parseProgressLine,
+  probeSubtitleList,
 } from '../core/media.js';
 import { JobQueue } from '../core/jobs.js';
 import { urlsFor, slugify } from './store.js';
@@ -80,6 +81,7 @@ export function startDownload(stream, { profile = {}, filename = null } = {}) {
           headers: stream.upstream?.headers || {},
           kind: stream.upstream?.kind || undefined,
           container: stream.upstream?.probe?.container || null,
+          subtitles: probeSubtitleList(stream.upstream?.probe),
         },
         profile: normalised,
         hw,
