@@ -110,8 +110,11 @@ async function openPage(page, { force = false } = {}) {
       refreshSubTargets();
       break;
     case 'tpl':
+      // Refresh on every visit. A title can be added in Search after this editor
+      // was first opened, and its test-source picker must reflect the playlist
+      // immediately instead of staying empty until a full page reload.
+      await Promise.all([VMPlaylist.load({ silent: false }), loadStreams()]);
       await once('tpl', async () => {
-        await VMPlaylist.load().catch(() => {});
         await VMFfmpegEditor.initLibrary();
         VMFfmpegEditor.wireLibraryTab();
       });
@@ -127,14 +130,13 @@ async function openPage(page, { force = false } = {}) {
       await refreshStream();
       break;
     case 'tpl-test':
+      await Promise.all([VMPlaylist.load({ silent: false }), loadStreams()]);
       await once('tpl-test', async () => {
-        await VMPlaylist.load().catch(() => {});
         await VMFfmpegEditor.initTestTab();
         wireTestSourcePicker();
         wireTestControls();
       });
       renderTestSourcePicker();
-      VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
       break;
     case 'logs':
       await once('logs', initLogs);
@@ -560,6 +562,7 @@ function clearSelection() {
   $('#sel-name').textContent = 'nothing selected';
   $('#sel-meta').textContent = 'search or paste a URL, then pick a title to see its metadata and formats';
   $('#sel-poster').innerHTML = '<b>—</b>';
+  if ($('#sel-note')) $('#sel-note').textContent = 'Pick a title to resolve its available qualities.';
   $('#sel-details')?.classList.add('hide');
   $('#sel-meta-table')?.classList.add('hide');
   $('#sel-episode-controls')?.classList.add('hide');
@@ -585,26 +588,89 @@ function metadataRows(group) {
   return { rows, description };
 }
 
+/**
+ * HLS resolvers return one master candidate with its renditions in `variants`.
+ * A master URL leaves the bitrate choice to FFmpeg (normally the largest one),
+ * which made the Search panel look as if only one quality existed. Turn every
+ * rendition into a real selectable candidate so the URL stored in the playlist
+ * is the exact quality the user picked.
+ */
+function expandCandidateQualities(candidates = []) {
+  const expanded = [];
+  for (const candidate of candidates) {
+    const variants = Array.isArray(candidate?.variants)
+      ? candidate.variants.filter((variant) => variant?.url)
+      : [];
+    if (!variants.length) {
+      expanded.push(candidate);
+      continue;
+    }
+    for (const variant of variants) {
+      const height = Number(variant.height) || Number(String(variant.quality || '').match(/(\d{3,4})/)?.[1]) || null;
+      const sourceVideo = candidate.probe?.video || null;
+      const width = Number(variant.width)
+        || (height && sourceVideo?.width && sourceVideo?.height ? Math.round((sourceVideo.width / sourceVideo.height) * height) : null);
+      expanded.push({
+        ...candidate,
+        ...variant,
+        url: variant.url,
+        quality: variant.quality || (height ? `${height}p` : candidate.quality),
+        label: variant.label || variant.name || (height ? `${height}p` : candidate.label),
+        headers: variant.headers || candidate.headers || {},
+        variants: null,
+        _entry: candidate._entry,
+        _fromMaster: true,
+        probe: candidate.probe ? {
+          ...candidate.probe,
+          bitrate: Number(variant.bandwidth) || candidate.probe.bitrate,
+          video: sourceVideo ? {
+            ...sourceVideo,
+            ...(height ? { height } : {}),
+            ...(width ? { width } : {}),
+            ...(variant.bandwidth ? { bitrate: Number(variant.bandwidth) } : {}),
+          } : null,
+        } : null,
+      });
+    }
+  }
+  const seen = new Set();
+  return expanded.filter((candidate) => {
+    const key = String(candidate?.url || '');
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((a, b) => {
+    if ((a.ok !== false) !== (b.ok !== false)) return a.ok === false ? 1 : -1;
+    const height = (candidate) => Number(candidate.height)
+      || Number(String(candidate.quality || '').match(/(\d{3,4})/)?.[1]) || 0;
+    return height(b) - height(a) || (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0);
+  });
+}
+
 /** One card per provider/file inside a title — the "formats" list. */
 function candidateMarkup(candidate, index, meta = {}) {
   const probe = candidate.probe || null;
   const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.width ? ` ${probe.video.width}×${probe.video.height}` : ''}` : '';
-  const audio = probe?.audio ? `${probe.audio.codec || '?'}${probe.audio.channels ? ` ${probe.audio.channels}ch` : ''}` : '';
+  const firstAudio = Array.isArray(probe?.audio) ? probe.audio[0] : probe?.audio;
+  const audio = firstAudio ? `${firstAudio.codec || '?'}${firstAudio.channels ? ` ${firstAudio.channels}ch` : ''}` : '';
+  const bitrate = Number(candidate.bandwidth) || Number(probe?.bitrate) || 0;
   const ok = candidate.ok !== false;
   const error = candidate.error || null;
+  const quality = candidate.quality || candidate.label || 'format';
   return `<div class="cand ${ok ? '' : 'bad'}" data-candidate="${index}">
     <div class="cand-main">
-      <div class="cand-title">${escapeHtml(candidate.quality || candidate.label || 'format')}
+      <div class="cand-title">${escapeHtml(quality)}
         ${tag(meta.sourceName || sourceName(candidate.sourceId), 'alt')}
-        ${ok ? tag('probe ok', 'ok') : tag('unplayable', 'err')}</div>
-      <div class="cand-meta">${video ? tag(video) : ''}${audio ? tag(audio) : ''}${probe?.durationSec ? tag(fmtDuration(probe.durationSec)) : ''}${probe?.bitrate ? tag(`${Math.round(probe.bitrate / 1000)} kbps`) : ''}
+        ${candidate._fromMaster ? tag('HLS quality', 'info') : ''}
+        ${ok ? tag('playable', 'ok') : tag('unplayable', 'err')}</div>
+      <div class="cand-meta">${video ? tag(video) : ''}${audio ? tag(audio) : ''}${probe?.durationSec ? tag(fmtDuration(probe.durationSec)) : ''}${bitrate ? tag(`${Math.round(bitrate / 1000)} kbps`) : ''}
         ${(probe?.subtitles || []).length ? tag(`${probe.subtitles.length} subtitle track(s)`) : ''}</div>
       ${meta.seasonEpisode ? `<div class="meta">${escapeHtml(meta.seasonEpisode)}</div>` : ''}
       <div class="mono cand-url">${escapeHtml(String(candidate.url || '').slice(0, 160))}</div>
       ${error ? `<div class="err-text">${escapeHtml(error)}</div>` : ''}
     </div>
     <div class="cand-side">
-      <button class="btn sm pri" data-add-candidate="${index}" ${ok ? '' : 'disabled'}>+ add to playlist</button>
+      <button class="btn sm pri" data-add-candidate="${index}" ${ok ? '' : 'disabled'}>+ add ${escapeHtml(quality)}</button>
       <button class="btn sm ghost" data-probe-url="${escapeHtml(candidate.url || '')}">probe</button>
     </div>
   </div>`;
@@ -647,7 +713,8 @@ async function selectGroup(group) {
     table.classList.remove('hide');
     table.innerHTML = rows.map(([key, value]) => `<div class="meta-row"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('');
   }
-  $('#sel-note').textContent = 'Formats come from every provider on this card. Nothing is put on the playlist until you press “add to playlist” on one format.';
+  const selectionNote = $('#sel-note');
+  if (selectionNote) selectionNote.textContent = 'Formats come from every provider on this card. Nothing is put on the playlist until you press “add to playlist” on one quality.';
   renderSelectionActions();
   await loadFormats();
   if (group.kind === 'series' && state.selection.movieboxSubjectId) loadSeasons();
@@ -675,11 +742,27 @@ async function loadFormats({ announce = false } = {}) {
   resolveAbort = new AbortController();
   state.resolving = true;
   const note = $('#sel-format-note');
-  if (note) note.textContent = 'resolving and probing…';
+  const entries = selection.entries || [];
+  if (note) note.textContent = `resolving and probing 0/${entries.length} provider(s)…`;
   renderCandidates([], {});
   const collected = [];
   const errors = [];
-  for (const entry of selection.entries) {
+  let finished = 0;
+
+  const updateVisibleCandidates = () => {
+    if (seq !== resolveSeq) return;
+    state.candidates = expandCandidateQualities(collected);
+    renderCandidates(state.candidates, {});
+    const playable = state.candidates.filter((candidate) => candidate.ok !== false).length;
+    if (note) note.textContent = finished < entries.length
+      ? `resolving and probing ${finished}/${entries.length} provider(s) · ${playable} quality option(s) ready`
+      : `${playable}/${state.candidates.length} playable quality option(s) · ${errors.length ? `${errors.length} provider(s) failed` : 'all providers answered'}`;
+  };
+
+  // Providers are independent. Resolve them together and render each answer as
+  // soon as it arrives: one slow/dead site must not hide the qualities already
+  // returned by another site for up to several minutes.
+  await Promise.all(entries.map(async (entry) => {
     if (seq !== resolveSeq) return;
     try {
       const body = {
@@ -700,17 +783,17 @@ async function loadFormats({ announce = false } = {}) {
       }
       if (data.error) errors.push({ sourceId: entry.sourceId, error: data.error });
     } catch (error) {
-      if (error.name === 'AbortError') return;
-      errors.push({ sourceId: entry.sourceId, error: error.message });
+      if (error.name !== 'AbortError') errors.push({ sourceId: entry.sourceId, error: error.message });
+    } finally {
+      finished += 1;
+      updateVisibleCandidates();
     }
-  }
+  }));
   if (seq !== resolveSeq) return;
   state.resolving = false;
-  state.candidates = collected;
-  renderCandidates(collected, {});
-  if (note) note.textContent = `${collected.filter((candidate) => candidate.ok !== false).length}/${collected.length} playable · ${errors.length ? `${errors.length} provider(s) failed` : 'all providers answered'}`;
+  updateVisibleCandidates();
   if (errors.length) renderFindErrors(errors.map((entry) => ({ sourceId: entry.sourceId, error: entry.error })));
-  if (announce) toast(collected.length ? `${collected.length} format(s) resolved` : 'No formats resolved', collected.length ? 'ok' : 'warn');
+  if (announce) toast(state.candidates.length ? `${state.candidates.length} quality option(s) resolved` : 'No formats resolved', state.candidates.length ? 'ok' : 'warn');
 }
 
 async function addCandidateToPlaylist(index) {
@@ -857,14 +940,46 @@ async function openSelectionSubtitles() {
 
 function subtitleRowMarkup(result, index, scope) {
   return `<div class="pick-row">
-    <div>
+    <div class="pick-main">
       <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
         ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
         ${result.rating ? tag(`★ ${result.rating}`) : ''}</div>
       <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
     </div>
-    <button class="btn sm pri" data-attach-sub="${index}" data-scope="${scope}">attach</button>
+    <div class="row">
+      <button class="btn sm ghost" data-download-sub="${index}" data-scope="${scope}">⤓ download .srt</button>
+      <button class="btn sm pri" data-attach-sub="${index}" data-scope="${scope}">attach to playlist</button>
+    </div>
   </div>`;
+}
+
+function subtitleDownloadName(result, selection = {}) {
+  const title = String(selection.title || result.title || result.release || 'subtitle')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'subtitle';
+  const year = Number(selection.year) || Number(result.year) || '';
+  const language = String(result.language || 'sub').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 8) || 'sub';
+  return `${title}${year ? `-${year}` : ''}.${language}.srt`;
+}
+
+/** Download a provider result without requiring the title to be in the playlist. */
+async function downloadSubtitle(result, selection = state.selection || {}) {
+  if (!result?.providerId) return;
+  const data = await api('/api/subtitles/download', {
+    method: 'POST',
+    body: { result, push: false },
+    silent: true,
+  });
+  if (!data.srt) throw new Error('the subtitle provider returned an empty file');
+  const blob = new Blob([data.srt], { type: 'application/x-subrip;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = subtitleDownloadName(result, selection);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`Downloaded ${link.download}`, 'ok');
 }
 
 async function attachSubtitle(result, { streamId = null, language = null } = {}) {
@@ -932,10 +1047,10 @@ async function doResolveFromUrl() {
       signal: resolveAbort.signal,
     });
     if (seq !== resolveSeq) return;
-    state.candidates = (data.candidates || []).map((candidate) => ({ ...candidate, _entry: { sourceId: candidate.sourceId } }));
+    state.candidates = expandCandidateQualities((data.candidates || []).map((candidate) => ({ ...candidate, _entry: { sourceId: candidate.sourceId } })));
     state.resolving = false;
     renderCandidates(state.candidates, {});
-    $('#sel-meta').textContent = `${state.candidates.length} format(s) found${data.error ? ` — ${data.error}` : ''}`;
+    $('#sel-meta').textContent = `${state.candidates.length} quality option(s) found${data.error ? ` — ${data.error}` : ''}`;
     renderSelectionActions();
   } catch (error) {
     if (error.name === 'AbortError') return;
@@ -1023,6 +1138,15 @@ function wireFind() {
   });
   $('#btn-sel-subs-close')?.addEventListener('click', () => $('#sel-subtitle-panel')?.classList.add('hide'));
   $('#sel-subtitle-results')?.addEventListener('click', (event) => {
+    const download = event.target.closest('[data-download-sub]');
+    if (download) {
+      const result = state.findSubtitleResults[Number(download.dataset.downloadSub)];
+      download.disabled = true;
+      downloadSubtitle(result)
+        .catch((error) => toast(`Subtitle download failed: ${error.message}`, 'err'))
+        .finally(() => { download.disabled = false; });
+      return;
+    }
     const button = event.target.closest('[data-attach-sub]');
     if (!button) return;
     const result = state.findSubtitleResults[Number(button.dataset.attachSub)];
@@ -2043,12 +2167,12 @@ async function mobileSelect(group) {
       for (const candidate of data.candidates || []) collected.push({ ...candidate, _entry: entry });
     } catch { /* show what the other providers gave */ }
   }
-  state.mobile.candidates = collected;
+  state.mobile.candidates = expandCandidateQualities(collected);
   host.innerHTML = `
     <div class="mob-head"><b>${escapeHtml(group.title)}${group.year ? ` (${group.year})` : ''}</b>
-      <span class="meta">${escapeHtml(group.kind)} · pick a format to add it to the playlist</span></div>
-    ${collected.filter((candidate) => candidate.ok !== false).map((candidate) => {
-      const index = collected.indexOf(candidate);
+      <span class="meta">${escapeHtml(group.kind)} · pick a quality to add it to the playlist</span></div>
+    ${state.mobile.candidates.filter((candidate) => candidate.ok !== false).map((candidate) => {
+      const index = state.mobile.candidates.indexOf(candidate);
       return `<button class="mob-format" data-madd="${index}">
         <span>${escapeHtml(candidate.quality || candidate.label || 'format')}</span>
         <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video ? ` · ${escapeHtml(` ${candidate.probe.video.width}×${candidate.probe.video.height}`)}` : ''}</span>
@@ -2233,11 +2357,12 @@ Object.assign(App, {
     state.ffmpegTemplatesLoaded = true;
     return state.ffmpegTemplates;
   },
-  onTemplatesChanged: () => {
-    VMPlaylist.refresh({ render: currentPage === 'list' }).catch(() => {});
+  onTemplatesChanged: async () => {
+    await VMPlaylist.refresh({ render: currentPage === 'list' }).catch(() => {});
     VMFfmpegEditor.renderLibrary();
     VMFfmpegEditor.renderTestTemplatePicker();
-    VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
+    if (VMFfmpegEditor.libraryEditor) VMFfmpegEditor.renderTestSources(VMFfmpegEditor.libraryEditor);
+    if (currentPage === 'tpl-test') renderTestSourcePicker();
   },
   openStream: (id) => VMPlaylist.openMetadata(id, { popup: true }),
   cancelJob: async (id) => { await api(`/api/jobs/${id}/cancel`, { method: 'POST' }); loadJobs(); },

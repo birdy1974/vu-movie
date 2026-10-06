@@ -18,6 +18,7 @@ const { JSDOM } = require('jsdom');
 const ROOT = path.resolve(import.meta.dirname, '..', 'public');
 const calls = [];
 const errors = [];
+const playerCalls = [];
 
 /* ---------------- mocked API data ---------------- */
 
@@ -65,9 +66,30 @@ async function fetchMock(url, options = {}) {
   const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
   if (u.startsWith('/api/health')) return json({ ok: true, version: '1.0.0', uptimeSec: 12, ffmpeg: { ok: true, version: '6.1' }, hwaccel: { available: false, reason: 'no /dev/dri' }, postgres: false, enigma2: { configured: false } });
   if (u.startsWith('/api/jobs')) return json({ ok: true, jobs: [] });
+  if (/^\/api\/streams\/[^/?]+$/.test(u) && method === 'GET') {
+    const id = u.split('/').pop();
+    const item = playlistItems.find((entry) => entry.streamId === id) || playlistItems[0];
+    return json({ ok: true, stream: { id, title: item.title, year: item.year, profile: { container: 'mpegts' }, upstream: { quality: item.quality } }, urls: item.urls || {} });
+  }
   if (u.startsWith('/api/streams') && method === 'GET') return json({ ok: true, streams: playlistItems.map((i) => ({ id: i.streamId, title: i.title, year: i.year, upstream: { quality: i.quality } })) });
-  if (u.startsWith('/api/streams') && method === 'POST') return json({ ok: true, stream: { id: 'new1', title: 'New' }, urls: {} });
-  if (u.startsWith('/api/sources')) return json({ ok: true, sources: [] });
+  if (u.startsWith('/api/streams') && method === 'POST') {
+    const body = JSON.parse(options.body || '{}');
+    return json({ ok: true, stream: { id: 'new1', title: body.title || 'New', upstream: { quality: body.candidate?.quality } }, urls: {} });
+  }
+  if (u.startsWith('/api/find/search')) return json({ ok: true, results: [{
+    title: 'Quality Movie', year: 2026, kind: 'movie', sourceId: 'overlook', sourceName: 'Overlook',
+    url: 'https://catalog.example/movie', poster: '/api/poster?url=https%3A%2F%2Fimages.example%2Fposter.jpg&ref=&sig=test',
+    description: 'A result with selectable HLS renditions.',
+  }], providerErrors: [] });
+  if (u.startsWith('/api/find/resolve')) return json({ ok: true, candidates: [{
+    url: 'https://cdn.example/master.m3u8', sourceId: 'overlook', quality: '1080p', ok: true,
+    probe: { video: { codec: 'h264', width: 1920, height: 1080 }, audio: [{ codec: 'aac', channels: 2 }], bitrate: 5000000, subtitles: [] },
+    variants: [
+      { url: 'https://cdn.example/1080.m3u8', quality: '1080p', width: 1920, height: 1080, bandwidth: 5000000 },
+      { url: 'https://cdn.example/720.m3u8', quality: '720p', width: 1280, height: 720, bandwidth: 2500000 },
+    ],
+  }] });
+  if (u.startsWith('/api/sources')) return json({ ok: true, sources: [{ id: 'overlook', name: 'Overlook', enabled: true, home: 'https://overlook.example' }] });
   if (u.startsWith('/api/config/hwaccel')) return json({ ok: true, hwaccel: { available: false, reason: 'no /dev/dri' } });
   if (u.startsWith('/api/config')) return json({ ok: true, config: {
     app: { port: 8080, baseUrl: '', username: '', password: '••••••', logLevel: 'info', tokenTtlMinutes: 4320 },
@@ -77,6 +99,8 @@ async function fetchMock(url, options = {}) {
     scraper: { browserConcurrency: 1, browserIdleSeconds: 180, resolveTimeoutMs: 45000, probeCandidates: true, maxCandidates: 12, flaresolverrUrl: '', externalExtractorUrl: '', sessionDir: '/data/sessions', userAgent: 'Mozilla/5.0' },
     storage: { downloads: '/downloads', tmp: '/tmp', cacheBudgetMb: 2048 },
   } });
+  if (u.startsWith('/api/subtitles/search')) return json({ ok: true, results: [{ providerId: 'podnapisi', language: 'en', title: 'Quality Movie', release: 'Quality.Movie.2026.1080p', url: 'https://subs.example/file.srt' }] });
+  if (u.startsWith('/api/subtitles/download')) return json({ ok: true, language: 'en', srt: '1\n00:00:01,000 --> 00:00:02,000\nHello\n' });
   if (u.startsWith('/api/subtitles/providers')) return json({ ok: true, providers: [] });
   if (u.startsWith('/api/ffmpeg/templates/schema')) return json({ ok: true, schema: realSchema || inlineSchema });
   if (u.startsWith('/api/ffmpeg/templates/build')) {
@@ -126,6 +150,23 @@ const dom = new JSDOM(html, {
     window.fetch = fetchMock;
     window.Response = Response;
     window.EventSource = class { constructor() { this.readyState = 0; } addEventListener() {} close() {} };
+    window.mpegts = {
+      Events: { ERROR: 'error' },
+      isSupported: () => true,
+      createPlayer: ({ url }) => {
+        playerCalls.push(`create:${url}`);
+        return {
+          attachMediaElement: () => playerCalls.push('attach'),
+          on: () => {},
+          load: () => playerCalls.push('load'),
+          play: () => { playerCalls.push('play'); return Promise.resolve(); },
+          pause: () => playerCalls.push('pause'),
+          unload: () => playerCalls.push('unload'),
+          detachMediaElement: () => playerCalls.push('detach'),
+          destroy: () => playerCalls.push('destroy'),
+        };
+      },
+    };
     window.addEventListener('error', (e) => errors.push(String(e.error || e.message)));
     window.addEventListener('unhandledrejection', (e) => errors.push(`unhandled rejection: ${e.reason}`));
   },
@@ -182,6 +223,27 @@ check('template select sits beside the title block, not under it',
   Boolean(mobRows[0].querySelector('.mob-item-main + .mob-tpl')),
   mobRows[0]?.outerHTML.replace(/\s+/g, ' ').slice(0, 150));
 
+/* ---------------- Search: selectable HLS qualities + subtitles ---------------- */
+
+await window.App.go('find');
+await tick(80);
+$('#q').value = 'Quality Movie';
+$('#btn-search').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(120);
+check('search result poster is rendered as an image', Boolean($('#results .poster img')));
+$('#results [data-open-formats]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(160);
+const qualityButtons = $$('#candidates [data-add-candidate]');
+check('HLS master expands into each available quality', qualityButtons.length === 2, qualityButtons.map((button) => button.textContent.trim()).join(' | '));
+check('required quality can be added directly', qualityButtons.some((button) => button.textContent.includes('720p')));
+const quality720 = qualityButtons.find((button) => button.textContent.includes('720p'));
+quality720?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(100);
+check('selected quality is posted to the stream API', calls.includes('POST /api/streams'));
+$('#btn-sel-subs').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(120);
+check('selected-title subtitle result has a direct .srt download', Boolean($('#sel-subtitle-results [data-download-sub]')));
+
 /* ---------------- 8. stream tab: VLC / playlist URLs ---------------- */
 
 await window.App.go('stream');
@@ -203,6 +265,11 @@ await window.App.go('list');
 await tick(150);
 const rows = $$('#playlist-items .pl-row');
 check('playlist rendered with 3 rows', rows.length === 3, `${rows.length}`);
+rows[0].querySelector('[data-pl-play]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(120);
+check('web preview uses the local MPEG-TS transmuxer', playerCalls.some((entry) => entry.startsWith('create:')) && playerCalls.includes('load'), playerCalls.join(','));
+window.App.closeModal();
+check('closing preview destroys the player', playerCalls.includes('destroy'), playerCalls.join(','));
 rows.forEach((row, index) => {
   row.getBoundingClientRect = () => ({ top: index * 40, bottom: index * 40 + 36, height: 36, left: 0, right: 600, width: 600, x: 0, y: index * 40 });
 });
@@ -258,6 +325,10 @@ check('no inline help paragraphs in the editor', $$('.ff-editor .param-hint').le
 const tips = $$('.ff-editor .tip[data-tip]');
 check('help text moved into "i" tooltips', tips.length >= 5, `${tips.length} tips`);
 check('tips carry real text', tips.every((t) => (t.dataset.tip || '').length > 8), tips[0]?.dataset.tip);
+const transcodeTestSource = $('#ff-editor-1-test-source');
+check('Transcode final-command input lists playlist items',
+  Boolean(transcodeTestSource) && [...transcodeTestSource.options].filter((option) => option.value.startsWith('stream:')).length === 3,
+  transcodeTestSource ? [...transcodeTestSource.options].map((option) => option.textContent).join(' | ') : '(missing select)');
 
 /* ---------------- 9. test tab: start button ---------------- */
 

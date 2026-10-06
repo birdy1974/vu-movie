@@ -800,9 +800,11 @@ const VMFfmpegEditor = (() => {
   /* ---------------- test pane ---------------- */
 
   function renderTestSources(instance) {
+    if (!instance?.id) return;
     const select = $(`#${instance.id}-test-source`);
     if (!select) return;
-    const previous = select.value || instance.test.source.streamId || '';
+    const rememberedId = instance.test?.source?.streamId || '';
+    const previous = select.value || (rememberedId ? `stream:${rememberedId}` : '');
     const playlistItems = VMPlaylist.items();
     const saved = state.streams || [];
     const seen = new Set();

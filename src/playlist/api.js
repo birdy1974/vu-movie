@@ -27,6 +27,7 @@ import * as store from '../streams/store.js';
 import * as exporter from '../streams/export.js';
 import * as relay from '../streams/relay.js';
 import * as enigma2 from '../enigma2/index.js';
+import { publicPosterUrl } from '../http/poster-proxy.js';
 import { OUTPUT_LABELS, OUTPUT_TYPES } from '../http/api.js';
 import * as playlist from './index.js';
 
@@ -91,7 +92,7 @@ function publicItem(entry, baseUrl) {
     year: stream.year,
     kind: stream.kind,
     sourceId: stream.source_id,
-    poster: stream.poster,
+    poster: stream.poster ? publicPosterUrl(stream.poster, stream.payload?.meta?.posterReferer || '') : '',
     description: stream.description,
     quality: stream.upstream?.quality || null,
     season: stream.upstream?.season || null,

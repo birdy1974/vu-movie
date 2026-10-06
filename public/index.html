@@ -248,6 +248,7 @@
             </div>
           </div>
           <h3 style="margin-top:14px">Formats</h3><span class="tip" tabindex="0" role="note" aria-label="About resolved formats" data-tip="Every resolved format of this title, with all metadata. Nothing is put on the playlist until you pick one. Every candidate is probed with ffprobe before it is offered: dead mirrors, expired tokens and geo-blocks are filtered out instead of failing later in VLC.">i</span>
+          <div id="sel-note" class="meta">Pick a title to resolve its available qualities.</div>
           <div id="candidates"><div class="meta">No formats yet.</div></div>
           <div class="row" style="margin-top:12px" id="sel-actions"></div>
           <div id="sel-subtitle-panel" class="card pad0 hide" style="margin-top:12px">
@@ -540,6 +541,7 @@
 </div>
 
 <div id="toasts"></div>
+<script src="/vendor/mpegts.js"></script>
 <script src="/core.js"></script>
 <script src="/playlist.js"></script>
 <script src="/ffmpeg-editor.js"></script>
