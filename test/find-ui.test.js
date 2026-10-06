@@ -398,6 +398,56 @@ test('the free-text filter and the title pick clear each other', () => {
   assert.match(app.el('#results').innerHTML, /Nothing matches these filters\./);
 });
 
+test('the kind filter narrows the list to movies or series', async () => {
+  const app = loadApp({ onFetch: standardFetch() });
+  app.run('initFind()');            // the real wiring: the change handlers are registered here
+  await tick();
+  app.run(`state.results = ${JSON.stringify([...SMURFS, ...DUNE])}; renderResults();`);
+  assert.equal(app.run('visibleGroups().length'), 3);
+
+  // (The control's markup — “All / movie / series” — is checked against the real
+  // page in scripts/find-panel-smoke.mjs; here the panel's handling is what runs.)
+  app.el('#results-kind-filter').value = 'movie';
+  fire(app.el('#results-kind-filter'), 'change');
+  assert.equal(app.run('ui.kindFilter'), 'movie');
+  assert.equal(app.run('visibleGroups().length'), 2, 'the 1981 series is filtered out');
+  assert.match(app.el('#results').innerHTML, /Dune: Part Two/);
+  assert.doesNotMatch(app.el('#results').innerHTML, /\(1981\)/);
+  assert.match(app.el('#results-count').textContent, /2 of 3 title\(s\)/);
+
+  app.el('#results-kind-filter').value = 'series';
+  fire(app.el('#results-kind-filter'), 'change');
+  assert.equal(app.run('visibleGroups().length'), 1);
+  assert.match(app.el('#results').innerHTML, /\(1981\)/);
+  assert.doesNotMatch(app.el('#results').innerHTML, /Dune: Part Two/);
+  assert.match(app.el('#results-count').textContent, /1 of 3 title\(s\)/);
+
+  app.el('#results-kind-filter').value = '';
+  fire(app.el('#results-kind-filter'), 'change');
+  assert.equal(app.run('ui.kindFilter'), '');
+  assert.equal(app.run('visibleGroups().length'), 3);
+  assert.match(app.el('#results-count').textContent, /^3 title\(s\)/);
+});
+
+test('a new search and a title pick reset the kind filter too', () => {
+  const app = loadApp({ onFetch: standardFetch() });
+  app.run(`state.sources = ${JSON.stringify(SOURCES)}; state.results = ${JSON.stringify([...SMURFS, ...DUNE])}; renderResults();`);
+  app.run('ui.kindFilter = "series"; renderResults();');
+  assert.equal(app.run('visibleGroups().length'), 1);
+
+  // Picking a (movie) title must not leave it hidden by a series-only filter.
+  const movie = app.run('state.groups.find((group) => group.year === 2024).key');
+  app.run(`applyTitlePick(${JSON.stringify(movie)})`);
+  assert.equal(app.run('ui.kindFilter'), '');
+  assert.equal(app.el('#results-kind-filter').value, '');
+  assert.match(app.el('#results').innerHTML, /Dune: Part Two/);
+
+  app.run('ui.kindFilter = "movie"; renderResults();');
+  app.run('beginSearch("smurfs")');
+  assert.equal(app.run('ui.kindFilter'), '');
+  assert.equal(app.el('#results-kind-filter').value, '');
+});
+
 test('picking a title clears a provider filter that would hide it', () => {
   const app = loadApp({ onFetch: standardFetch() });
   app.run(`state.sources = ${JSON.stringify(SOURCES)}; state.results = ${JSON.stringify([...SMURFS, ...DUNE])}; renderResults();`);

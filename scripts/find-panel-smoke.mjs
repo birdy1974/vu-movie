@@ -170,6 +170,26 @@ click('#sel-providers [data-sel-provider=""]');
 await tick(80);
 check('“all providers” resolves both again', resolves.length === 2, JSON.stringify(resolves.map((r) => r.sourceId)));
 
+/* the Kind filter: All / movie / series */
+const kindOptions = [...$('#results-kind-filter').options].map((option) => `${option.value}:${option.textContent}`);
+check('the Kind control offers all / movie / series', kindOptions.join(',') === ':All,movie:movie,series:series', kindOptions.join(','));
+$('#results-kind-filter').value = 'series';
+$('#results-kind-filter').dispatchEvent(new win.Event('change'));
+await tick(30);
+check('Kind=series keeps only the series card',
+  doc.querySelectorAll('#results [data-group]').length === 1 && /\(1981\)/.test($('#results').innerHTML),
+  $('#results').innerHTML.slice(0, 160));
+check('the count accounts for the Kind filter', /1 of 2 title\(s\)/.test($('#results-count').textContent), $('#results-count').textContent);
+$('#results-kind-filter').value = 'movie';
+$('#results-kind-filter').dispatchEvent(new win.Event('change'));
+await tick(30);
+check('Kind=movie drops the series card', !/\(1981\)/.test($('#results').innerHTML) && /The Smurfs/.test($('#results').innerHTML));
+$('#results-kind-filter').value = '';
+$('#results-kind-filter').dispatchEvent(new win.Event('change'));
+await tick(30);
+check('Kind=All restores every card', doc.querySelectorAll('#results [data-group]').length === 2, doc.querySelectorAll('#results [data-group]').length);
+check('the count is unfiltered again', /^2 title\(s\)/.test($('#results-count').textContent), $('#results-count').textContent);
+
 /* the Found-titles box filters; it must not select */
 const selectedBefore = $('#sel-name').textContent;
 const options = [...$('#results-title-select').options];

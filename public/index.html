@@ -200,7 +200,7 @@
       <div class="gl" style="margin-top:14px">
         <div class="card pad0">
           <div class="cardhead results-head">
-            <h2 style="margin:0">Results <span class="tip" tabindex="0" role="note" aria-label="About the result list" data-tip="Each card is one title; the same title found on several providers is one card with a chip per provider. Clicking the card resolves the formats of every provider on it, clicking a provider chip resolves only that provider's formats. “Title filter” and “Filter found title” only narrow the list — they never select or resolve anything.">i</span></h2>
+            <h2 style="margin:0">Results <span class="tip" tabindex="0" role="note" aria-label="About the result list" data-tip="Each card is one title; the same title found on several providers is one card with a chip per provider. Clicking the card resolves the formats of every provider on it, clicking a provider chip resolves only that provider's formats. The Title / found-title / Provider and Kind boxes only narrow the list — they never select or resolve anything. Kind = All, movie or series.">i</span></h2>
             <div class="results-head-tools">
               <span class="mut" id="results-count"></span>
               <div class="results-filters" aria-label="Filter search results">
@@ -212,6 +212,13 @@
                 </label>
                 <label class="results-filter" for="results-provider-filter"><span>Provider</span>
                   <select id="results-provider-filter" aria-label="Filter results by provider"><option value="">All providers</option></select>
+                </label>
+                <label class="results-filter" for="results-kind-filter"><span>Kind</span>
+                  <select id="results-kind-filter" aria-label="Filter results by kind — all, movie or series">
+                    <option value="">All</option>
+                    <option value="movie">movie</option>
+                    <option value="series">series</option>
+                  </select>
                 </label>
                 <label class="results-filter" for="results-sort"><span>Sort</span>
                   <select id="results-sort" aria-label="Sort results">

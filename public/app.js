@@ -35,6 +35,8 @@ const ui = {
      narrows the list, it never selects or resolves it. */
   titlePick: '',
   providerFilter: '',
+  /* “All / movie / series” — filters the cards by their kind. */
+  kindFilter: '',
   providers: [],
   selection: null,
   groups: [],
@@ -384,6 +386,7 @@ function beginSearch(query) {
   ui.titleFilter = '';
   ui.titlePick = '';
   ui.providerFilter = '';
+  ui.kindFilter = '';
   if ($('#results-title-filter')) $('#results-title-filter').value = '';
   clearSelection();
   renderFindErrors([]);
@@ -482,17 +485,19 @@ function buildGroups(results) {
  * Narrow the list of title cards.
  *
  * Three independent filters: the exact title picked in “Filter found title”
- * (`ui.titlePick`, a group key), the free-text `ui.titleFilter`, and the
- * provider filter. Filtering only decides what is *listed* — nothing is
- * selected or resolved by filtering.
+ * (`ui.titlePick`, a group key), the free-text `ui.titleFilter`, the provider
+ * filter and the “All / movie / series” kind filter. Filtering only decides what
+ * is *listed* — nothing is selected or resolved by filtering.
  */
 function visibleGroups() {
   const pick = ui.titlePick;
   const filter = titleKey(ui.titleFilter);
   const provider = ui.providerFilter;
+  const kind = ui.kindFilter;
   let groups = state.groups || [];
   if (pick) groups = groups.filter((group) => group.key === pick);
   if (filter) groups = groups.filter((group) => titleKey(group.title).includes(filter));
+  if (kind) groups = groups.filter((group) => (group.kind || 'movie') === kind);
   if (provider) groups = groups.map((group) => ({ ...group, entries: group.entries.filter((entry) => entry.sourceId === provider) })).filter((group) => group.entries.length);
   const sort = ui.resultsSort;
   const year = (group) => Number(group.year) || 0;
@@ -533,8 +538,10 @@ function applyTitlePick(key) {
   ui.titlePick = String(key || '');
   ui.titleFilter = '';
   ui.providerFilter = '';
+  ui.kindFilter = '';
   if ($('#results-title-filter')) $('#results-title-filter').value = '';
   if ($('#results-provider-filter')) $('#results-provider-filter').value = '';
+  if ($('#results-kind-filter')) $('#results-kind-filter').value = '';
   renderResults();
 }
 
@@ -585,9 +592,12 @@ function renderResults() {
     ui.titlePick = known ? ui.titlePick : '';
     titleSelect.value = ui.titlePick;
   }
+  // The kind filter's options are static (all/movie/series); just keep the
+  // control on the value the panel is filtering by.
+  if ($('#results-kind-filter')) $('#results-kind-filter').value = ui.kindFilter;
   const groups = visibleGroups();
   const total = (state.groups || []).length;
-  const filtered = Boolean(ui.titlePick || ui.titleFilter || ui.providerFilter);
+  const filtered = Boolean(ui.titlePick || ui.titleFilter || ui.providerFilter || ui.kindFilter);
   host.className = `results results-${ui.resultsView}`;
   // While a search runs the panel is empty on purpose; tell assistive tech the
   // area is busy instead of letting it read out the previous answer.
@@ -1281,6 +1291,10 @@ function wireFind() {
   $('#results-title-select')?.addEventListener('change', () => applyTitlePick($('#results-title-select').value));
   $('#results-provider-filter')?.addEventListener('change', () => {
     ui.providerFilter = $('#results-provider-filter').value;
+    renderResults();
+  });
+  $('#results-kind-filter')?.addEventListener('change', () => {
+    ui.kindFilter = $('#results-kind-filter').value;
     renderResults();
   });
   $('#results-sort')?.addEventListener('change', () => {

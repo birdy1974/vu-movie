@@ -100,8 +100,10 @@ permissions, Container Manager project import, firewall, where the data lives).
   **provider chip** (in the card, in the Selected-title panel — where “all
   providers” goes back to the whole card — or on the Mobile tab) resolves only
   that source, so a missing quality is never mistaken for “the source has
-  nothing else”. The two title filters and the provider filter only narrow the
-  list; they never select or resolve a title. Starting a search drops the
+  nothing else”. Four filters narrow the list and nothing else: the free-text
+  **Title filter**, **Filter found title** (one exact title), **Provider** and
+  **Kind** (*All / movie / series*) — none of them selects or resolves a title.
+  Starting a search drops the
   previous answer — cards, counts, filters, the selected title and its formats —
   before the request goes out and shows what is running, so a fan-out that takes
   half a minute cannot look like it answered with the old titles (the Mobile
