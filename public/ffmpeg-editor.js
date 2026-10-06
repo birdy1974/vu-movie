@@ -105,6 +105,10 @@ const VMFfmpegEditor = (() => {
   function adviceFor(options, container, extra = []) {
     const facts = computeActive(options, container);
     const out = [...extra];
+    // The server renderer (templateOptionWarnings) reports the same three
+    // conditions in its own words; adding ours as well made one setting look
+    // like two problems.
+    const saidByServer = (needle) => out.some((entry) => String(entry?.text || '').includes(needle));
     const rate = (value) => Number(String(value || '').replace(/[kKmM]$/, '')) * (/[mM]$/.test(String(value)) ? 1000 : 1);
     const bitrate = rate(options.video_bitrate);
     const maxrate = rate(options.maxrate);
@@ -163,13 +167,14 @@ const VMFfmpegEditor = (() => {
       if (options.video_codec === 'hevc_vaapi') {
         out.push({ level: 'info', text: 'Apollo Lake can decode HEVC but not encode it — hevc_vaapi will fail here. Use h264_vaapi for live playback.' });
       }
-      if (options.video_codec === 'libx265') {
+      if (options.video_codec === 'libx265' && !saidByServer('is CPU-only on this box')) {
         out.push({ level: 'info', text: 'libx265 is CPU-only on this box: fine for downloads, too slow for live playback.' });
       }
-      if (options.hw_accel === 'vaapi' && options.video_codec && !VAAPI.includes(options.video_codec) && options.video_codec !== 'copy') {
+      if (options.hw_accel === 'vaapi' && options.video_codec && !VAAPI().includes(options.video_codec) && options.video_codec !== 'copy'
+        && !saidByServer('is a CPU encoder: frames will be copied back')) {
         out.push({ level: 'info', text: 'VAAPI decoding feeds a CPU encoder: the frames are copied back to system memory on every frame. h264_vaapi keeps everything on the GPU.' });
       }
-      if (options.hw_accel === 'none' && facts.vaapi) {
+      if (options.hw_accel === 'none' && facts.vaapi && !saidByServer('hardware decoding is set to none')) {
         out.push({ level: 'warn', text: `${options.video_codec} is a GPU encoder but hardware decoding is off — the GPU still encodes, yet ffmpeg has to upload every frame. Set “Video decoding” to VAAPI.` });
       }
       if (options.hw_accel === 'vaapi' && options.vf_preset && options.vf_preset !== 'none') {
@@ -236,11 +241,14 @@ const VMFfmpegEditor = (() => {
     return value;
   };
 
-  function controlMarkup(def, values = {}) {
+  function controlMarkup(def, values = {}, scope = '') {
     const key = def.key;
     const value = values[key];
     const value2 = value === undefined || value === null ? '' : String(value);
-    const id = `ff-${def.key}`;
+    // Scope the id to the editor: the Transcode and Test tabs both live in the
+    // document, and with a plain `ff-<key>` the second one duplicated every id
+    // (so `label for=` pointed at the other pane's input).
+    const id = `${scope}ff-${key}`;
     const hint = tip(def.help, def.label ? `${def.label} — more information` : 'more information');
 
     if (def.kind === 'bool') {
@@ -412,7 +420,7 @@ const VMFfmpegEditor = (() => {
     grid.innerHTML = groups().map((group) => {
       const list = fields().filter((def) => def.group === group.id);
       if (!list.length) return '';
-      return `<div class="param-group">${escapeHtml(group.label)}</div>${list.map((def) => controlMarkup(def, options)).join('')}`;
+      return `<div class="param-group">${escapeHtml(group.label)}</div>${list.map((def) => controlMarkup(def, options, `${instance.id}-`)).join('')}`;
     }).join('');
     refreshDisabled(instance);
   }
@@ -509,7 +517,16 @@ const VMFfmpegEditor = (() => {
   function renderAdvice(instance, serverMessages = instance.messages) {
     const host = $(`#${instance.id}-advice`);
     if (!host) return;
-    const advice = adviceFor(instance.options || {}, instance.container, serverMessages || []);
+    // The advisor is a suggestion engine: if it ever throws, the pane must say
+    // so *now*. Before, a throw left the previous verdicts on screen, so an
+    // operator who had just fixed a setting kept reading the old warning.
+    let advice;
+    try {
+      advice = adviceFor(instance.options || {}, instance.container, serverMessages || []);
+    } catch (error) {
+      host.innerHTML = `<div class="param-msg err">⛔ the advice pane failed: ${escapeHtml(error?.message || String(error))} — the command above is still the one that will run. Please report this</div>`;
+      return;
+    }
     if (!advice.length) {
       host.innerHTML = '<div class="param-msg ok">No remarks — the parameter set is internally consistent.</div>';
       return;
@@ -600,7 +617,7 @@ const VMFfmpegEditor = (() => {
       if (seq === instance.requestSeq) {
         setStatus(instance, `could not render: ${error.message}`, 'err');
         instance.messages = [{ level: 'err', text: `could not render the command: ${error.message}` }];
-        renderAdvice(instance);
+        try { renderAdvice(instance); } catch { /* never let the reporter throw */ }
       }
       return false;
     }

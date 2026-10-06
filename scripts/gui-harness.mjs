@@ -30,6 +30,7 @@ let playlistItems = [
 const templates = [
   { id: 'tpl-a', name: 'VAAPI 1080p → MPEG-TS', container: 'mpegts', enabled: true, isDefault: true, command: 'ffmpeg -hide_banner -i <url> -c copy -f mpegts pipe:1', options: { output_format: 'mpegts', hw_accel: 'none', video_codec: 'copy', audio_codec: 'copy' } },
   { id: 'tpl-b', name: 'Passthrough remux', container: 'matroska', enabled: true, isDefault: false, command: 'ffmpeg -hide_banner -i <url> -c copy -f matroska pipe:1', options: { output_format: 'matroska', hw_accel: 'none', video_codec: 'copy', audio_codec: 'copy' } },
+  { id: 'tpl-vaapi', name: 'VAAPI 720p → MPEG-TS', container: 'mpegts', enabled: true, isDefault: false, command: 'ffmpeg -hide_banner -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -i <url> -c:v h264_vaapi -f mpegts pipe:1', options: { output_format: 'mpegts', hw_accel: 'vaapi', device: '/dev/dri/renderD128', resolution: '720p', aspect: '16:9', video_codec: 'h264_vaapi', video_bitrate: '4000k', audio_codec: 'copy', subs: 'drop', vf_preset: 'none', rc_mode: 'VBR', advanced: [] } },
 ];
 let realSchema = null;
 try {
@@ -351,6 +352,40 @@ check('Transcode final-command input lists playlist items',
   Boolean(transcodeTestSource) && [...transcodeTestSource.options].filter((option) => option.value.startsWith('stream:')).length === 3,
   transcodeTestSource ? [...transcodeTestSource.options].map((option) => option.textContent).join(' | ') : '(missing select)');
 
+/* ---------------- 5b. the advice pane on a VAAPI template ---------------- */
+
+// Regression: the VAAPI/CPU-encoder hint compared against the *accessor* instead
+// of the list, so selecting any VAAPI template threw while painting the pane.
+// The pane then kept the previous verdicts on screen — which is how a template
+// that really is set to "Video decoding: vaapi" kept showing the Quick Sync
+// warning. The harness's global error listener catches the throw.
+const vaapiRow = $('#tpl-list [data-tpl="tpl-vaapi"]');
+check('VAAPI template row is listed', Boolean(vaapiRow));
+vaapiRow?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(300);
+const adviceText = () => $$('#ff-editor-1-advice .param-msg').map((el) => el.textContent.trim()).join('\n');
+check('a VAAPI template paints its advice', adviceText().includes('VAAPI'), adviceText().slice(0, 100) || '(pane empty)');
+check('the pane never says “could not render”', !($('#ff-editor-1-sync-status')?.textContent || '').includes('could not render'),
+  $('#ff-editor-1-sync-status')?.textContent || '(no status)');
+
+const setParam = async (id, value) => {
+  const el = $(id);
+  el.value = value;
+  el.dispatchEvent(new window.Event('change', { bubbles: true }));
+  el.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await tick(450); // the editor debounces the rebuild by 220 ms
+};
+await setParam('#ff-editor-1-ff-video_codec', 'libx264');
+check('the copy-back hint appears for a CPU encoder behind VAAPI decoding',
+  adviceText().includes('VAAPI decoding feeds a CPU encoder'), adviceText().slice(0, 160) || '(pane empty)');
+await setParam('#ff-editor-1-ff-video_codec', 'h264_vaapi');
+check('switching back to h264_vaapi drops the copy-back hint',
+  !adviceText().includes('VAAPI decoding feeds a CPU encoder'), adviceText().slice(0, 160) || '(pane empty)');
+await setParam('#ff-editor-1-ff-hw_accel', 'none');
+check('the pane follows the setting instead of leaving the old verdicts',
+  adviceText().includes('is a GPU encoder but hardware decoding is off') && !adviceText().includes('Keep everything on the GPU.'),
+  adviceText().slice(0, 200) || '(pane empty)');
+
 /* ---------------- 9. test tab: start button ---------------- */
 
 try { await window.VMFfmpegEditor.initTestTab(); } catch (error) { console.log('DEBUG initTestTab threw:', error.stack); }
@@ -443,7 +478,7 @@ outside.remove();
 
 await window.App.go('tpl');
 await tick(200);
-const optionsOf = (key) => [...($(`#ff-${key}`)?.options || [])].map((o) => o.value);
+const optionsOf = (key) => [...($(`#ff-editor-1-ff-${key}`)?.options || [])].map((o) => o.value);
 const videoCodecs = optionsOf('video_codec');
 const audioCodecs = optionsOf('audio_codec');
 const levels = optionsOf('level');
