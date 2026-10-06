@@ -68,13 +68,14 @@
     "search": {
       "kind": "browser",
       "url": "https://cinejoy.pk/search/{query}",
-      "linkPattern": "/(movie|tv|series|watch)/"
+      "linkPattern": "/(movie|tv|series|watch)/",
+      "waitMs": 15000
     },
     "resolve": {
       "kind": "browser",
       "playerPathPrefix": "/watch"
     },
-    "notes": "Encrypted player API (POST /g on api.wing.st, decrypted by a WASM blob in the browser). If the detail page hides its CTA, resolution falls back from /movie/... to /watch/movie/...; the browser sniffer then reads the URL after the site decrypts it."
+    "notes": "Encrypted player API (POST /g on api.wing.st, decrypted by a WASM blob in the browser). Behind DDoS-Guard and fully client-rendered: results appear ~5-10s after load, hence search.waitMs. If the detail page hides its CTA, resolution falls back from /movie/... to /watch/movie/...; the browser sniffer then reads the URL after the site decrypts it."
   },
   {
     "id": "flixhub",
@@ -107,12 +108,13 @@
     "search": {
       "kind": "browser",
       "url": "https://redflix.club/browse?q={query}",
-      "linkPattern": "/play\\?id=|/(movie|film|tv|series?|watch|title)/"
+      "linkPattern": "/play\\?id=|/(movie|film|tv|series?|watch|title)/",
+      "waitMs": 15000
     },
     "resolve": {
       "kind": "browser"
     },
-    "notes": "Aggregator front-end. If its own search is JS-only, the search page may need selector tuning — the resolve path is unaffected."
+    "notes": "Aggregator front-end (Next.js): the shell is server-rendered but the result cards appear only after the client fetches them, so search needs a long wait (search.waitMs) instead of the default settle."
   },
   {
     "id": "flex1",
@@ -126,12 +128,13 @@
     "search": {
       "kind": "browser",
       "url": "https://www.1flex.org/search?q={query}",
-      "linkPattern": "/(movie|tv|watch)/"
+      "linkPattern": "/(movie|tv|watch)/",
+      "waitMs": 15000
     },
     "resolve": {
       "kind": "browser"
     },
-    "notes": "Flixer clone (same player farm as Overlook/Flixhub)."
+    "notes": "Flixer clone (same player farm as Overlook/Flixhub). Its search page fires an ad pop-under that navigates the tab to youtube.com a few hundred ms after domcontentloaded — the browser layer blocks the redirect and retries once in a fresh tab, which is why the wait has to outlast the first (hijacked) load."
   },
   {
     "id": "cinezo",

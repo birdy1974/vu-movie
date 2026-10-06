@@ -500,8 +500,17 @@ router.post('/sources/test', wrap(async (req, res) => {
   const source = registry.getSource(sourceId);
   if (!source) return res.status(404).json({ ok: false, error: `unknown source ${sourceId}` });
   registry.resetSourceHealth(sourceId);
-  const results = await registry.searchSource(source, query || 'matrix');
-  res.json({ ok: true, results, health: registry.healthOf(sourceId) });
+  // detailed: true so a failing test carries *why* (how many links the page
+  // exposed, whether a pop-under replaced the tab, how long we waited) instead
+  // of an empty list the operator has to guess about.
+  const outcome = await registry.searchSource(source, query || 'matrix', { detailed: true });
+  res.json({
+    ok: true,
+    results: outcome.results,
+    error: outcome.error || null,
+    diagnostics: outcome.diagnostics || null,
+    health: registry.healthOf(sourceId),
+  });
 }));
 
 /** Reset the circuit breaker for a source (or all sources when id="*"). */

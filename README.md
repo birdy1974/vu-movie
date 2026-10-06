@@ -82,6 +82,15 @@ permissions, Container Manager project import, firewall, where the data lives).
   (`/wefeed-h5api-bff` on `h5-api.aoneroom.com` and the public site mirrors) —
   different hosts, so it survives blocks that target the mobile API
   (`MOVIEBOX_TRANSPORT=auto|h5|mobile`, see §6 of that document).
+* Search pages are treated as live documents, not static HTML: the browser layer
+  waits for the **result cards** instead of guessing with `networkidle` (the flixer
+  clones ship an empty shell and fetch their results over XHR), and a site that
+  fires an ad pop-under (1flex redirects its own tab to `youtube.com`) has the
+  redirect blocked and the search retried once in a fresh tab. A source that still
+  comes back empty says *why* — in the log line and in the UI's error row: how many
+  links the page exposed, how long we waited, and a sample of the links the recipe
+  pattern rejected. Per-source waits live in the recipe (`search.waitMs`), the
+  global budget in `SEARCH_WAIT_MS`.
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
@@ -357,6 +366,7 @@ The ones that matter most on a DS918+:
 | `DEFAULT_FPS` | `25` | fixed output rate for the requested live-transcode profile |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | passed through by `docker-compose.yml` |
 | `BROWSER_CONCURRENCY` | `1` | one headless Chromium is ~300 MB |
+| `SEARCH_WAIT_MS` | `12000` | how long a search page may take to render its result cards (recipes can override it per source with `search.waitMs`); the search stops as soon as the cards stop growing |
 | `DB_SLOW_QUERY_MS` | `1500` | warns when one query is slower; the first read after a start is cold-disk I/O, not a database fault |
 | `ENIGMA2_HOST` | — | your Duo2, e.g. `192.168.1.50` |
 

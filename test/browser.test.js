@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import browser, {
   isNetworkNavigationError, isSameSiteNavigation, flaresolverrEndpoint, parseFlareSolverrResult, looksLikeMedia,
   describeFlareSolverrError, sanitizeSolverUrl, flaresolverrConfigIssue, describeSolverNotUsable,
-  DEFAULT_FLARESOLVERR_URL,
+  DEFAULT_FLARESOLVERR_URL, looksLikeResultLink, planSearchRetry, shouldRetryFlareSolverrFailure,
+  normalizeSearchRows, waitForResultLinks,
 } from '../src/scrapers/browser.js';
 
 test('browser facade exposes the FlareSolverr status helper used at startup', () => {
@@ -214,4 +215,178 @@ test('flaresolverrStatus() reports the default address it found', async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('result-shaped links are recognized from a recipe pattern or the generic detail routes', () => {
+  const base = 'https://flixhub.studio/search?q=dune';
+  // The recipe pattern is tested against the raw (usually relative) href…
+  assert.equal(looksLikeResultLink('/watch.html?type=movie&id=1377237', { pattern: 'watch\\.html\\?type=', baseUrl: base }), true);
+  assert.equal(looksLikeResultLink('/play?id=5687&type=tv', { pattern: '/play\\?id=', baseUrl: base }), true);
+  assert.equal(looksLikeResultLink('/movie/936108-smurfs-2025', { pattern: '/(movie|tv|series|watch)/', baseUrl: base }), true);
+  // …and without a pattern the generic detail-route detection is the fallback.
+  assert.equal(looksLikeResultLink('/tv/238955', { baseUrl: base }), true);
+  assert.equal(looksLikeResultLink('/browse', { baseUrl: base }), false);
+  assert.equal(looksLikeResultLink('/login', { baseUrl: base }), false);
+  // Navigator chrome, other sites and non-http schemes are never results.
+  assert.equal(looksLikeResultLink('#', { baseUrl: base }), false);
+  assert.equal(looksLikeResultLink('javascript:void(0)', { baseUrl: base }), false);
+  assert.equal(looksLikeResultLink('https://www.youtube.com/watch?v=123', { baseUrl: base }), false);
+  assert.equal(looksLikeResultLink('', { baseUrl: base }), false);
+});
+
+test('a search is only retried in a fresh tab when the page was taken over', () => {
+  // Results found → never retry.
+  assert.equal(planSearchRetry({ attempt: 1, usableResults: 3, blockedOffsiteNavigation: 'https://youtube.com/watch?v=1' }).retry, false);
+  // 1flex's pop-under: the tab was redirected to youtube.com.
+  const hijacked = planSearchRetry({
+    attempt: 1,
+    usableResults: 0,
+    blockedOffsiteNavigation: 'https://www.youtube.com/watch?v=jy4qYmf3TxA',
+    finalUrl: 'https://www.1flex.org/search?q=smurfs',
+    searchUrl: 'https://www.1flex.org/search?q=smurfs',
+  });
+  assert.equal(hijacked.retry, true);
+  assert.match(hijacked.reason, /redirect the tab to www\.youtube\.com/);
+  // A blank/replaced tab (renderer died, window.close()) is the other retry case.
+  const replaced = planSearchRetry({ attempt: 1, usableResults: 0, finalUrl: 'about:blank', searchUrl: 'https://cinejoy.pk/search/smurfs' });
+  assert.equal(replaced.retry, true);
+  assert.match(replaced.reason, /tab was replaced/);
+  // A page that simply had no results is not worth a second 12 s wait.
+  const empty = planSearchRetry({ attempt: 1, usableResults: 0, finalUrl: 'https://cinejoy.pk/search/smurfs', searchUrl: 'https://cinejoy.pk/search/smurfs' });
+  assert.equal(empty.retry, false);
+  // …and the retry budget is finite.
+  assert.equal(planSearchRetry({ attempt: 2, maxAttempts: 2, blockedOffsiteNavigation: 'https://www.youtube.com/x' }).retry, false);
+});
+
+test('FlareSolverr failures are retried once only when they are fast transport failures', () => {
+  const refused = Object.assign(new Error('connect ECONNREFUSED 172.20.0.4:8192'), { code: 'ECONNREFUSED' });
+  assert.equal(shouldRetryFlareSolverrFailure({ error: refused, elapsedMs: 120, attempt: 1 }), true);
+  assert.equal(shouldRetryFlareSolverrFailure({ error: new Error('socket hang up'), elapsedMs: 3000, attempt: 1 }), true);
+  assert.equal(shouldRetryFlareSolverrFailure({ error: new Error('HTTP 500'), elapsedMs: 800, attempt: 1 }), true);
+  // A slow solver (our own transport timeout) is a CPU problem, not a blip:
+  // retrying only doubles the wait for a source that will be skipped anyway.
+  const timedOut = Object.assign(new Error('POST flaresolverr timed out after 35000ms'), { timedOut: true });
+  assert.equal(shouldRetryFlareSolverrFailure({ error: timedOut, elapsedMs: 35_000, attempt: 1 }), false);
+  assert.equal(shouldRetryFlareSolverrFailure({ error: new Error('Error solving the challenge. Timeout after 30.0 seconds.'), elapsedMs: 400 }), false);
+  // A transport failure that took 8 s to surface is not a startup blip either.
+  assert.equal(shouldRetryFlareSolverrFailure({ error: refused, elapsedMs: 8_000, attempt: 1 }), false);
+  // One retry, no more.
+  assert.equal(shouldRetryFlareSolverrFailure({ error: refused, elapsedMs: 100, attempt: 2, maxAttempts: 2 }), false);
+});
+
+test('a transport timeout is reported as a solver timeout, not as a client abort', () => {
+  // requestFlareSolverr() feeds its own timeout through this describer, which is
+  // what the log/UI show instead of the bare "failed permanently" line.
+  const described = describeFlareSolverrError('timed out after 35000 ms', { endpoint: 'http://flaresolverr:8192/v1' });
+  assert.match(described, /timed out solving the challenge/);
+  assert.match(described, /flaresolverr:8192/);
+  assert.doesNotMatch(described, /not reachable/);
+});
+
+test('poster-only result cards keep the title, not the alt text', () => {
+  // redflix/1flex render `<a href="/play?id=…"><img alt="Poster for The Smurfs">`,
+  // so the only text the collector can see is the alt attribute.
+  const results = normalizeSearchRows([
+    {
+      href: '/play?id=5687&type=tv',
+      title: 'Poster for The Smurfs',
+      titleRank: 2,
+      text: '',
+      cardText: '',
+      hasImage: true,
+      poster: 'https://image.tmdb.org/t/p/w185/cezQyM5cO454vUdLiLOkv78K64D.jpg',
+    },
+    {
+      href: '/play?id=936108&type=movie',
+      title: 'Still from Smurfs',
+      titleRank: 2,
+      text: '',
+      cardText: '',
+      hasImage: true,
+    },
+  ], {
+    pageUrl: 'https://redflix.club/browse?q=smurfs',
+    baseUrl: 'https://redflix.club/',
+    query: 'smurfs',
+    resultPattern: '/play\\?id=|/(movie|film|tv|series?|watch|title)/',
+    siteId: 'redflix',
+    siteName: 'Redflix',
+  });
+  assert.equal(results.length, 2);
+  assert.equal(results[0].title, 'The Smurfs');
+  assert.equal(results[1].title, 'Smurfs');
+  assert.equal(results[0].kind, 'series');
+  assert.equal(results[0].url, 'https://redflix.club/play?id=5687&type=tv');
+});
+
+test('the result wait polls until the cards appear, then stops early', async () => {
+  // A client-rendered catalogue: nav links first, results a few hundred ms later.
+  const script = [
+    ['/', '/movies', '/shows', '/login'],
+    ['/', '/movies', '/shows', '/login'],
+    ['/', '/movies', '/movie/936108-smurfs-2025', '/series/5687-the-smurfs'],
+    ['/', '/movies', '/movie/936108-smurfs-2025', '/series/5687-the-smurfs'],
+    ['/', '/movies', '/movie/936108-smurfs-2025', '/series/5687-the-smurfs'],
+  ];
+  let polls = 0;
+  const page = {
+    $$eval: async () => script[Math.min(polls++, script.length - 1)],
+    url: () => 'https://cinejoy.pk/search/smurfs',
+  };
+  const started = Date.now();
+  const wait = await waitForResultLinks(page, {
+    pattern: '/(movie|tv|series|watch)/', timeoutMs: 5000, settleMs: 200, pollMs: 40,
+  });
+  assert.equal(wait.count, 2, 'both result-shaped links are counted, nav links are not');
+  assert.equal(wait.last, 2);
+  assert.equal(wait.stable, true, 'the wait stops once the count stops growing');
+  assert.ok(Date.now() - started < 5000, 'it must not sit out the whole timeout');
+});
+
+test('the result wait reports a page that never renders, and survives a wiped DOM', async () => {
+  const never = { $$eval: async () => ['/', '/movies', '/login'], url: () => 'https://redflix.club/browse?q=smurfs' };
+  const empty = await waitForResultLinks(never, { pattern: '/play\\?id=', timeoutMs: 250, pollMs: 40 });
+  assert.equal(empty.count, 0);
+  assert.equal(empty.stable, false, 'nothing rendered: the timeout ended the wait');
+
+  // The pop-under case: the cards appear, then the ad script wipes the body.
+  const sequence = [
+    ['/play?id=5687&type=tv'], ['/play?id=5687&type=tv'], [], [], [],
+  ];
+  let polls = 0;
+  const wiped = { $$eval: async () => sequence[Math.min(polls++, sequence.length - 1)], url: () => 'https://redflix.club/browse?q=smurfs' };
+  const wait = await waitForResultLinks(wiped, { pattern: '/play\\?id=', timeoutMs: 2000, settleMs: 150, pollMs: 40 });
+  assert.equal(wait.count, 1, 'the best count seen is kept even after the DOM is destroyed');
+  assert.equal(wait.last, 0, 'the final poll saw nothing — which is what the log reports');
+});
+
+test('the result wait stops immediately when the caller aborts', async () => {
+  const page = { $$eval: async () => [], url: () => 'https://redflix.club/browse?q=smurfs' };
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    waitForResultLinks(page, { timeoutMs: 5000, signal: controller.signal }),
+    (error) => error.name === 'AbortError',
+  );
+});
+
+test('a Chromium launch failure is one actionable line, not Playwright’s banner', () => {
+  const playwrightStyle = new Error([
+    "browserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/chromium-1243/chrome-linux/chrome",
+    '╔════════════════════════════════════════════════════════════╗',
+    '║ Looks like Playwright was just installed or updated.       ║',
+    '║ Please run the following command to download new browsers: ║',
+    '║                                                            ║',
+    '║     npx playwright install                                 ║',
+    '╚════════════════════════════════════════════════════════════╝',
+  ].join('\n'));
+  const message = browser.browserLaunchError(playwrightStyle).message;
+  assert.match(message, /^Chromium could not be started: browserType\.launch: Executable doesn't exist/);
+  assert.match(message, /rebuild the image/);
+  assert.doesNotMatch(message, /npx playwright install/);
+  assert.ok(!message.includes('\n'), 'the provider-error row must stay on one line');
+
+  // A crash on a loaded NAS has its own hint.
+  const crashed = browser.browserLaunchError(new Error('Target page, context or browser has been closed'));
+  assert.match(crashed.message, /out of memory/);
 });
