@@ -82,10 +82,32 @@ permissions, Container Manager project import, firewall, where the data lives).
   (`/wefeed-h5api-bff` on `h5-api.aoneroom.com` and the public site mirrors) —
   different hosts, so it survives blocks that target the mobile API
   (`MOVIEBOX_TRANSPORT=auto|h5|mobile`, see §6 of that document).
+* Search pages are treated as live documents, not static HTML: the browser layer
+  waits for the **result cards** instead of guessing with `networkidle` (the flixer
+  clones ship an empty shell and fetch their results over XHR), and a site that
+  fires an ad pop-under (1flex redirects its own tab to `youtube.com`) has the
+  redirect blocked and the search retried once in a fresh tab. A source that still
+  comes back empty says *why* — in the log line and in the UI's error row: how many
+  links the page exposed, how long we waited, and a sample of the links the recipe
+  pattern rejected. Per-source waits live in the recipe (`search.waitMs`), the
+  global budget in `SEARCH_WAIT_MS`.
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
   from another source.
+* The result list says what it does: one card per title, one chip per provider.
+  Clicking the **card** resolves the formats of *every* provider on it; clicking a
+  **provider chip** (in the card, in the Selected-title panel — where “all
+  providers” goes back to the whole card — or on the Mobile tab) resolves only
+  that source, so a missing quality is never mistaken for “the source has
+  nothing else”. Four filters narrow the list and nothing else: the free-text
+  **Title filter**, **Filter found title** (one exact title), **Provider** and
+  **Kind** (*All / movie / series*) — none of them selects or resolves a title.
+  Starting a search drops the
+  previous answer — cards, counts, filters, the selected title and its formats —
+  before the request goes out and shows what is running, so a fan-out that takes
+  half a minute cannot look like it answered with the old titles (the Mobile
+  tab's panes do the same).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
@@ -194,6 +216,19 @@ page instead of from guesswork.
 ### Operations
 * **Jobs** for every long action, with progress, logs and a cancel button
   (cancelling kills the underlying Chromium/ffmpeg process).
+* **“Check streams” on the Playlist tab** answers the question a playlist can't:
+  is anything in it still playing? Every item's upstream URL is probed with
+  ffprobe — the same proof the Search tab runs before offering a format — and
+  each row gets a verdict: **working** (with what was found: container, codec,
+  resolution, duration), **not working**, **token expired** (the stream's own
+  upstream-token TTL passed) or **unverified** (probing is switched off in
+  Settings or ffprobe is missing). The line next to the button summarises the
+  run (`3/5 working · 2 not working: …`), broken rows are outlined red, a single
+  row can be re-checked with its own ⚡ button, and a check never changes,
+  disables or deletes anything. API: `POST /api/playlist/check`
+  `{ "streamIds": ["…"] }` (omit it for the whole list) → `{ results: [{ streamId,
+  state, error, probeMs, probe }], summary, unknown }`
+  with `state` ∈ `working | dead | expired | unverified | skipped`.
 * **Live log view** in the UI (`/api/events`, SSE) with level/component filters —
   made for "why is this film not playing" debugging.
 * **Detailed, levelled, component-tagged logging** in the container log too
@@ -244,6 +279,55 @@ A stream can also override any individual slot from the Stream tab
 writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
 the query string when it builds the service reference — a 720p H.264 template
 bound to the `enigma2` slot is what actually runs on the Duo2.
+
+The **browser preview is an eighth output** (`web`, URL `/s/{token}/{slug}.ts.web`).
+It is the one slot no template can be assigned to — see below.
+
+#### The web preview (the browser player)
+
+The ▶ **preview** button in the Playlist tab (and the `/watch/{token}` page) does
+not play an FFmpeg template's output. The player is
+[mpegts.js](https://github.com/xqq/mpegts.js): it transmuxes MPEG-TS into
+fragmented MP4 and feeds that to Media Source Extensions, so what can be played
+is decided by **the browser in front of the stream** — not by VLC, not by the
+Duo2, and not by the template the item carries.
+
+Before playback starts the page asks its own browser what it can decode
+(`MediaSource.isTypeSupported` over H.264/HEVC/AV1/VP9 and
+AAC/AC-3/E-AC-3/Opus/MP3) and hands that report to the relay as a query string —
+a query, because a plain `<video src>` fallback can carry it too:
+
+```
+/s/{token}/{slug}.ts.web?codecs=1&vcodecs=avc1,hvc1&acodecs=mp4a,ac-3
+```
+
+The relay answers with a session that
+
+* **drops every subtitle** — no sidecar `.srt`, no source track, no
+  `-c:s dvbsub`: the command always carries `-sn -dn`. A text track cannot be
+  muxed into TS at all, a DVB bitmap track makes the browser transmuxer fail, and
+  the preview player has no subtitle UI;
+* **ignores the item's and the global templates** for every other slot (they are
+  written for the receiver — DVB subtitles, HEVC, AC-3). The guided profile
+  builder runs instead, so the item's resolution cap and bitrates still apply;
+* **copies what the browser can play and re-encodes the rest**: H.264 video plus
+  a supported audio track is a plain remux (no CPU at all), anything else becomes
+  H.264 + AAC (VAAPI when the NAS has it, libx264 otherwise). HEVC/AV1/VP9 always
+  transcode, even in a browser whose MediaSource claims support, because
+  mpegts.js only transmuxes H.264 reliably.
+
+The modal prints the verdict under the video — `playing — web preview: transcode
+hevc → h264 + transcode eac3 → aac, subtitles dropped (… support)` — together
+with the exact preview URL, so a surprise transcode is explained in the player
+instead of in the log. `GET /api/streams/{id}` returns the same as
+`session.webDecisions` (`{ copy, reported, video: { source, family, supported,
+action }, audio: { … }, subtitles: 'dropped', reasons }`).
+
+Subtitles therefore never show in the web preview, by design, and the relay says
+so once per session (`web preview profile for stream …: … subtitles dropped`).
+The `.ts`/`.mkv` URLs are unaffected: the same modal's **open in VLC** plays the
+`.ts` URL with the item's template and its subtitle track, and *Watch in browser*
+in the URLs panel shows the preview URL for a bug report.
 
 #### Building the command from fields
 
@@ -357,6 +441,7 @@ The ones that matter most on a DS918+:
 | `DEFAULT_FPS` | `25` | fixed output rate for the requested live-transcode profile |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | passed through by `docker-compose.yml` |
 | `BROWSER_CONCURRENCY` | `1` | one headless Chromium is ~300 MB |
+| `SEARCH_WAIT_MS` | `12000` | how long a search page may take to render its result cards (recipes can override it per source with `search.waitMs`); the search stops as soon as the cards stop growing |
 | `DB_SLOW_QUERY_MS` | `1500` | warns when one query is slower; the first read after a start is cold-disk I/O, not a database fault |
 | `ENIGMA2_HOST` | — | your Duo2, e.g. `192.168.1.50` |
 

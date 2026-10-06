@@ -278,3 +278,15 @@ test('updated browser source recipes use their active query-string search routes
   assert.equal(getSource('flex1').search.url, 'https://www.1flex.org/search?q={query}');
   assert.equal(getSource('cinezo').search.url, 'https://cinezo.st/search?q={query}');
 });
+
+test('the client-rendered sources ask for a longer render wait than the default', () => {
+  // These three ship an empty shell and fetch their result cards over XHR, so
+  // they override the global SEARCH_WAIT_MS budget per recipe; the sites that
+  // return server-rendered HTML keep the (shorter) default.
+  assert.equal(getSource('redflix').search.waitMs, 15000);
+  assert.equal(getSource('cinejoy').search.waitMs, 15000);
+  assert.equal(getSource('flex1').search.waitMs, 15000);
+  for (const id of ['overlook', 'flixhub', 'cinezo', 'cinevo']) {
+    assert.equal(getSource(id).search.waitMs, undefined, `${id} should use the global budget`);
+  }
+});

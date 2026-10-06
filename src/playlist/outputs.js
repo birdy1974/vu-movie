@@ -106,7 +106,7 @@ router.get('/pl/:token', async (req, res) => {
     return `<tr><td>${index + 1}</td><td>${escapeHtml(entry.stream.title)}${entry.stream.year ? ` (${entry.stream.year})` : ''}</td>
       <td class="mono">${escapeHtml(entry.stream.upstream?.quality || '—')}</td>
       <td class="mono">${escapeHtml(entry.templateId || entry.stream.profile?.ffmpegTemplateName || 'guided')}</td>
-      <td><a href="${escapeHtml(urls.ts)}">.ts</a> · <a href="${escapeHtml(urls.playlist)}">.m3u</a> · <a href="${escapeHtml(urls.watch)}">watch</a></td></tr>`;
+      <td><a href="${escapeHtml(urls.ts)}">.ts</a> · <a href="${escapeHtml(urls.playlist)}">.m3u</a> · <a href="${escapeHtml(urls.watch)}">watch</a> · <a href="${escapeHtml(urls.web)}" title="browser preview: no subtitles, codecs from the browser">browser</a></td></tr>`;
   }).join('');
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -151,7 +151,7 @@ router.get('/pl/:token/:file', async (req, res) => {
           subtitle: entry.stream.profile?.subtitlePath || null,
           poster: entry.stream.poster || null,
           url: urls.ts,
-          urls: { ts: urls.ts, mkv: urls.mkv, hls: urls.hls, playlist: urls.playlist, watch: urls.watch },
+          urls: { ts: urls.ts, web: urls.web, mkv: urls.mkv, hls: urls.hls, playlist: urls.playlist, watch: urls.watch },
         };
       }),
     });

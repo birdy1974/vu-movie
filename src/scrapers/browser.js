@@ -75,6 +75,23 @@ export function isNetworkNavigationError(error) {
   return /ERR_(?:CONNECTION_(?:REFUSED|RESET|CLOSED|ABORTED|TIMED_OUT)|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|NETWORK_CHANGED|NETWORK_ACCESS_DENIED|PROXY_CONNECTION_FAILED)/i.test(message);
 }
 
+/**
+ * One-line, actionable version of a Chromium launch failure.
+ *
+ * Playwright's own message is a multi-line banner aimed at a developer
+ * (`npx playwright install`) — useless inside a container that installs Debian
+ * chromium from the Dockerfile, and it is exactly what the UI's provider-error
+ * row (and the search log) would otherwise show verbatim.
+ */
+export function browserLaunchError(error) {
+  const text = String(error?.message || error || '').replace(/\s+/g, ' ').trim();
+  const reason = text.split(/ Looks like Playwright| ╔| ╚/)[0].trim() || text;
+  const hint = /doesn't exist|does not exist|playwright install/i.test(text)
+    ? 'the Chromium binary is missing inside the container — rebuild the image (the Dockerfile installs Debian chromium and points CHROMIUM_PATH at it)'
+    : 'the NAS may be out of memory or the container was restarted mid-run — check `docker compose logs vu-movie`';
+  return new Error(`Chromium could not be started: ${truncate(reason, 200)} — ${hint}`);
+}
+
 export function browserInfo() {
   return {
     available: Boolean(browser?.isConnected?.()),
@@ -139,10 +156,11 @@ export async function getBrowser() {
     lastError = null;
     return browser;
   })().catch((err) => {
-    lastError = err.message;
-    logError('browser', `Chromium could not be started: ${err.message}`, err);
+    const friendly = browserLaunchError(err);
+    lastError = friendly.message;
+    logError('browser', friendly.message, err);
     launching = null;
-    throw err;
+    throw friendly;
   });
   const b = await launching;
   launching = null;
@@ -643,7 +661,9 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       });
     }
   } catch (err) {
-    if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
+    // Same rule as searchSite(): an AbortError that is not ours to raise (a
+    // transport timeout, a Playwright internal) is a failure to report.
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     result.error = err.message;
     log.error('browser', `sniffer failed on ${safeHost(url)}: ${err.message}`);
   } finally {
@@ -774,6 +794,9 @@ function titleFromPath(url) {
 
 function cleanResultTitle(value) {
   let title = plainText(value)
+    // Poster-only cards (redflix, 1flex) put their alt text in the anchor, so
+    // the title arrives as "Poster for The Smurfs" / "Still from The Smurfs".
+    .replace(/^(?:poster|image|thumbnail|still|cover|backdrop)\s+(?:for|of|from)\s+/i, '')
     .replace(/\s*(?:poster|cover|thumbnail)\s*$/i, '')
     .replace(/^(?:watch|play|open)\s+(?:now\s+)?/i, '')
     .replace(/\s*[★⭐]\s*\d+(?:[.,]\d+)?/g, ' ')
@@ -1108,30 +1131,90 @@ function solverTimeoutMs() {
   return Number.isFinite(configured) && configured > 0 ? configured : 30_000;
 }
 
+/**
+ * How much longer than the solver's own `maxTimeout` our transport may wait.
+ *
+ * This has to leave real room: the solver first has to *start* Chromium when
+ * the container was just recreated (a cold Chromium on an Apollo Lake NAS takes
+ * ~1 min), and only then does its own budget begin. With the old 5 s grace a
+ * busy box hit our timeout first, which is why the log said
+ * `POST flaresolverr failed permanently` with no reason attached.
+ */
+export const SOLVER_TRANSPORT_GRACE_MS = 15_000;
+/** Attempts per solve; the second one only happens for a fast transport failure. */
+export const SOLVER_ATTEMPTS = 2;
+
+/**
+ * Is this FlareSolverr failure worth one more request?
+ *
+ * Two very different failures look identical in a log line:
+ *   - the sidecar was not up yet / crashed on boot / its Chromium is still
+ *     starting → the connection is refused or dropped *immediately* (retry: yes,
+ *     the second attempt usually succeeds);
+ *   - the challenge itself is slow (NAS starved of CPU) → we time out after
+ *     `maxTimeout` (retry: no, that only doubles the wait for a source that
+ *     will be skipped anyway — the operator needs the fix, not a second wait).
+ */
+export function shouldRetryFlareSolverrFailure({ error = null, elapsedMs = 0, attempt = 1, maxAttempts = SOLVER_ATTEMPTS } = {}) {
+  if (attempt >= maxAttempts) return false;
+  if (error?.timedOut) return false;
+  const message = String(error?.message ?? error ?? '');
+  if (/timed out|timeout/i.test(message)) return false;
+  if (Number(elapsedMs) > 5_000) return false;
+  return /ECONNREFUSED|ECONNRESET|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|socket hang up|fetch failed|terminated|other side closed|empty reply|HTTP 5\d\d/i
+    .test(message);
+}
+
 async function requestFlareSolverr(url, { signal = null } = {}) {
   const endpoint = flaresolverrEndpoint();
   if (!endpoint) return null;
   const maxTimeout = solverTimeoutMs();
-  const response = await request(endpoint, {
-    method: 'POST',
-    body: { cmd: 'request.get', url, maxTimeout },
-    json: true,
-    allowFailure: true,
-    // Leave the solver a little more room than its own budget, otherwise the
-    // transport cuts the connection first and the error says "timed out"
-    // instead of whatever FlareSolverr would have reported.
-    timeoutMs: maxTimeout + 5_000,
-    retries: 0,
-    signal,
-  });
-  if (!response.ok) {
-    // Prefer FlareSolverr's own `message` (it explains *why* it failed) but
-    // always fall back to the transport error, then translate both into a
-    // cause+named fix instead of a bare "FlareSolverr HTTP 500".
-    const reason = response.data?.message || response.error || `HTTP ${response.status}`;
-    throw new Error(describeFlareSolverrError(reason, { endpoint }));
+  let lastError = null;
+  for (let attempt = 1; attempt <= SOLVER_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    try {
+      const response = await request(endpoint, {
+        method: 'POST',
+        body: { cmd: 'request.get', url, maxTimeout },
+        json: true,
+        allowFailure: true,
+        // Leave the solver room beyond its own budget (see the constant above).
+        timeoutMs: maxTimeout + SOLVER_TRANSPORT_GRACE_MS,
+        retries: 0,
+        signal,
+      });
+      if (!response.ok) {
+        // Prefer FlareSolverr's own `message` (it explains *why* it failed) but
+        // always fall back to the transport error, then translate both into a
+        // cause+named fix instead of a bare "FlareSolverr HTTP 500".
+        const reason = response.data?.message || response.error || `HTTP ${response.status}`;
+        throw Object.assign(new Error(describeFlareSolverrError(reason, { endpoint })), {
+          solverReported: true, status: response.status,
+        });
+      }
+      return parseFlareSolverrResult(response.data, url);
+    } catch (err) {
+      // Only *our* signal means "the caller gave up". `request()`'s own timeout
+      // is marked `timedOut` and must be reported, not rethrown as an abort.
+      if (signal?.aborted) throw abortError(signal);
+      const elapsedMs = Date.now() - startedAt;
+      lastError = err?.solverReported
+        ? err
+        : new Error(describeFlareSolverrError(
+          err?.timedOut ? `timed out after ${elapsedMs} ms` : err,
+          { endpoint },
+        ));
+      if (shouldRetryFlareSolverrFailure({ error: err, elapsedMs, attempt })) {
+        log.warn('browser', `FlareSolverr did not answer on attempt ${attempt}/${SOLVER_ATTEMPTS} — retrying once`, {
+          endpoint, ms: elapsedMs, error: errorText(err),
+        });
+        await sleep(1_500);
+        continue;
+      }
+      throw lastError;
+    }
   }
-  return parseFlareSolverrResult(response.data, url);
+  throw lastError || new Error('FlareSolverr failed');
 }
 
 /**
@@ -1240,6 +1323,124 @@ export function normalizeSearchRows(rows, {
   return [...found.values()].slice(0, limit).map((entry) => entry.result);
 }
 
+/** The link-bearing elements a search card can hide its target in. */
+const SEARCH_LINK_SELECTOR = 'a[href], [data-href], [data-url], [data-link]';
+const SEARCH_HREF_SAMPLE_LIMIT = 600;
+
+/**
+ * Does this href look like a link to a title?
+ *
+ * Deliberately not the same thing as "will this result be kept" (that is
+ * normalizeSearchRows' job, and it also weighs the card text). This is the
+ * cheap predicate the search uses to answer one question: *has this page
+ * rendered its results yet?* — which is why a recipe pattern wins, with the
+ * generic detail-route detection as the fallback.
+ */
+export function looksLikeResultLink(href, { pattern = null, baseUrl = null } = {}) {
+  const value = String(href || '').trim();
+  if (!value || value.startsWith('#') || /^(?:javascript|mailto|tel|data|blob):/i.test(value)) return false;
+  let target;
+  try { target = new URL(value, baseUrl || undefined); } catch { return false; }
+  if (!['http:', 'https:'].includes(target.protocol)) return false;
+  if (baseUrl) {
+    try {
+      const base = new URL(baseUrl);
+      if (!sameSiteHost(target.hostname.toLowerCase(), base.hostname.toLowerCase())) return false;
+    } catch { /* unparsable base: keep the candidate */ }
+  }
+  const pathAndQuery = `${target.pathname}${target.search}`;
+  if (pattern) {
+    try {
+      const re = new RegExp(pattern, 'i');
+      // Test the raw attribute too: relative hrefs are the normal case and the
+      // absolute form can hide a pattern anchored on the path (e.g. /play\?id=).
+      return re.test(value) || re.test(pathAndQuery);
+    } catch { /* a broken recipe pattern falls through to route detection */ }
+  }
+  return SEARCH_RESULT_ROUTE.test(pathAndQuery)
+    || hasDetailIdentifier(target)
+    || Boolean(target.searchParams.get('type') && (target.searchParams.get('id') || target.searchParams.get('tmdb')));
+}
+
+/** Collect the (capped) set of link hrefs currently in the page. */
+async function collectHrefs(page) {
+  return page.$$eval(SEARCH_LINK_SELECTOR, (elements, limit) => {
+    const out = [];
+    for (const element of elements) {
+      for (const attribute of ['href', 'data-href', 'data-url', 'data-link']) {
+        const value = element.getAttribute(attribute);
+        if (value) { out.push(value); break; }
+      }
+      if (out.length >= limit) break;
+    }
+    return out;
+  }, SEARCH_HREF_SAMPLE_LIMIT).catch(() => []);
+}
+
+/**
+ * Count result-shaped links on the page, repeatedly.
+ *
+ * Replaces the old "networkidle + sleep(1200)" guess. Those two signals mean
+ * different things: `networkidle` is about *requests* and a client-rendered
+ * catalogue fires its last XHR long before its cards are in the DOM (and some
+ * sites keep a beacon or a websocket open, so networkidle never fires at all).
+ * The redflix/cinejoy/1flex searches in a real log went from "no usable result
+ * links" to 20-28 rows purely by waiting for the links themselves.
+ *
+ * Returns the best count seen (the DOM can shrink: an ad script can wipe the
+ * body) plus how the wait ended, so the caller can log a reason instead of a
+ * shrug.
+ */
+export async function waitForResultLinks(page, {
+  pattern = null, timeoutMs = 12_000, settleMs = 700, pollMs = 350, signal = null,
+} = {}) {
+  const startedAt = Date.now();
+  let best = 0;
+  let last = 0;
+  let lastGrowth = Date.now();
+  let samples = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) throw abortError(signal);
+    const hrefs = await collectHrefs(page);
+    const baseUrl = page.url();
+    const count = hrefs.reduce((total, href) => total + (looksLikeResultLink(href, { pattern, baseUrl }) ? 1 : 0), 0);
+    samples += 1;
+    last = count;
+    if (count > best) { best = count; lastGrowth = Date.now(); }
+    // Stop as soon as we saw results and the page stopped adding more.
+    if (best > 0 && Date.now() - lastGrowth >= settleMs) {
+      return { count: best, last, samples, stable: true, ms: Date.now() - startedAt };
+    }
+    await sleep(pollMs);
+  }
+  return { count: best, last, samples, stable: false, ms: Date.now() - startedAt };
+}
+
+/**
+ * Decide whether an empty search is worth one more attempt in a fresh tab.
+ *
+ * The old code only retried right after the first navigation, which misses the
+ * case that actually breaks these sites: the ad script fires a few hundred ms
+ * *after* domcontentloaded (urlscan captured 1flex.org redirecting to
+ * youtube.com), the results are still loading, and by the time we collect the
+ * rows the DOM we wanted is gone. A fresh tab in the same context is what the
+ * site's own JavaScript needs — the pop-under only fires on a tab's first load.
+ */
+export function planSearchRetry({
+  attempt = 1, maxAttempts = 2, usableResults = 0, blockedOffsiteNavigation = null,
+  finalUrl = null, searchUrl = null,
+} = {}) {
+  if (attempt >= maxAttempts) return { retry: false, reason: 'the retry budget is spent' };
+  if (usableResults > 0) return { retry: false, reason: 'results were found' };
+  if (blockedOffsiteNavigation) {
+    return { retry: true, reason: `an ad script tried to redirect the tab to ${safeHost(blockedOffsiteNavigation)}` };
+  }
+  const replaced = finalUrl
+    && (!/^https?:/i.test(String(finalUrl)) || !isSameSiteNavigation(finalUrl, searchUrl || ''));
+  if (replaced) return { retry: true, reason: `the tab was replaced (now ${String(finalUrl).slice(0, 60)})` };
+  return { retry: false, reason: 'the page stayed on the search URL and simply exposed no results' };
+}
+
 /**
  * Search a site for a title.
  *
@@ -1271,7 +1472,7 @@ export async function searchSite(siteOrOpts, maybeQuery) {
   if (opts.signal?.aborted) throw abortError(opts.signal);
   const ctx = await getContext(site.id);
   if (opts.signal?.aborted) throw abortError(opts.signal);
-  const page = await ctx.newPage();
+  let page = await ctx.newPage();
   activePages += 1;
   const closeOnAbort = () => { page.close().catch(() => {}); };
   opts.signal?.addEventListener('abort', closeOnAbort, { once: true });
@@ -1285,7 +1486,13 @@ export async function searchSite(siteOrOpts, maybeQuery) {
   let blockedOffsiteNavigation = null;
   let flareSolverrError = null;
   let usedFlareSolverr = false;
-  const selector = opts.linkSelector || 'a[href], [data-href], [data-url], [data-link]';
+  /** What the "wait for the cards to render" poll saw (reported when we find nothing). */
+  let resultWait = null;
+  /** A few links the result filters rejected — the fastest way to spot a stale recipe pattern. */
+  let rejectedHrefs = [];
+  /** How many times we loaded the search page (a pop-under forces a fresh tab). */
+  let attemptNumber = 1;
+  const selector = opts.linkSelector || SEARCH_LINK_SELECTOR;
   const collectRows = async () => page.$$eval(selector, (elements) => {
     const clean = (value) => String(value || '').replace(/[\s\u00a0]+/g, ' ').trim();
     const cardSelector = 'article, [data-movie-id], [class*="movie-card" i], [class*="film-card" i], [class*="result" i], [class*="poster" i], [class*="tile" i], [class*="card" i]';
@@ -1442,10 +1649,50 @@ export async function searchSite(siteOrOpts, maybeQuery) {
     const snapshot = await collectRows().catch(() => []);
     if (snapshot.length > 0) {
       earlyRows = snapshot;
-      log.debug('browser', `${site.name}: captured ${snapshot.length} link(s) at domcontentloaded (pre-hydration)`);
+      log.debug('browser', `${site.name}: captured ${snapshot.length} link(s) at domcontentloaded (pre-hydration)`, {
+        attempt: attemptNumber,
+      });
     }
   };
-  page.on('domcontentloaded', () => { captureEarlyRows().catch(() => {}); });
+
+  /**
+   * Everything that is tied to one specific tab.
+   *
+   * Retrying after a pop-under needs a *new* tab (the ad script fires on the
+   * first load of a tab, and Chromium shows an error page in the one it
+   * hijacked), so this is a function rather than a block of one-shot listeners
+   * — otherwise the retry would run against a dead page.
+   */
+  const attachPage = (target) => {
+    target.on('domcontentloaded', () => { captureEarlyRows().catch(() => {}); });
+    target.route('**/*', async (route) => {
+      const pageRequest = route.request();
+      if (pageRequest.isNavigationRequest()) {
+        try {
+          if (pageRequest.frame() === target.mainFrame() && !isSameSiteNavigation(pageRequest.url(), url)) {
+            blockedOffsiteNavigation ||= pageRequest.url();
+            log.warn('browser', `blocked off-site redirect during ${site.name} search`, {
+              destination: safeHost(pageRequest.url()),
+            });
+            await route.abort('blockedbyclient');
+            return;
+          }
+        } catch { /* the navigation frame may already have been detached */ }
+      }
+      await route.continue().catch(() => {});
+    });
+  };
+
+  /** Swap in a clean tab (the retry path — see planSearchRetry). */
+  const freshPage = async () => {
+    const previous = page;
+    page = await ctx.newPage();
+    attachPage(page);
+    earlyRows = [];
+    earlyRowsCaptured = false;
+    await previous.close().catch(() => {});
+    return page;
+  };
 
   /**
    * Quick liveness probe for FlareSolverr so we can tell the operator
@@ -1467,37 +1714,10 @@ export async function searchSite(siteOrOpts, maybeQuery) {
 
   try {
     log.info('browser', `searching ${site.name} for "${query}"`, { url: url.slice(0, 200) });
-    await page.route('**/*', async (route) => {
-      const pageRequest = route.request();
-      if (pageRequest.isNavigationRequest()) {
-        try {
-          if (pageRequest.frame() === page.mainFrame() && !isSameSiteNavigation(pageRequest.url(), url)) {
-            blockedOffsiteNavigation ||= pageRequest.url();
-            log.warn('browser', `blocked off-site redirect during ${site.name} search`, {
-              destination: safeHost(pageRequest.url()),
-            });
-            await route.abort('blockedbyclient');
-            return;
-          }
-        } catch { /* the navigation frame may already have been detached */ }
-      }
-      await route.continue().catch(() => {});
-    });
+    attachPage(page);
 
     let response = await performSearchNavigation(url);
     if (opts.signal?.aborted) throw abortError(opts.signal);
-
-    // If the first navigation was torpedoed by a pop-under *before* our
-    // domcontentloaded snapshot had a chance to run, blank the tab and try once
-    // more — ad scripts usually only fire on the first page load of a tab.
-    if (blockedOffsiteNavigation && earlyRows.length === 0) {
-      log.info('browser', `${site.name}: reloading search page once after blocked off-site redirect`);
-      earlyRowsCaptured = false;
-      blockedOffsiteNavigation = null;
-      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
-      response = await performSearchNavigation(url, { attempt: 2 });
-      if (opts.signal?.aborted) throw abortError(opts.signal);
-    }
 
     status = response?.status?.() ?? null;
     if (isSameSiteNavigation(page.url(), url)) searchPageUrl = page.url();
@@ -1539,7 +1759,10 @@ export async function searchSite(siteOrOpts, maybeQuery) {
               status, cookies: cookies.length, url: searchPageUrl.slice(0, 180),
             });
           } catch (err) {
-            if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
+            // `requestFlareSolverr` already turned its own transport timeout
+            // into a sentence naming the cause and the fix; do not lose it by
+            // treating the AbortError as a client cancellation.
+            if (opts.signal?.aborted) throw abortError(opts.signal);
             flareSolverrError = String(err?.message || err);
             log.warn('browser', `FlareSolverr could not recover ${site.name} search`, { error: flareSolverrError });
           }
@@ -1552,60 +1775,123 @@ export async function searchSite(siteOrOpts, maybeQuery) {
       }
     }
 
-    if (!usedFlareSolverr) {
-      // Client-rendered catalogues need a moment after networkidle to hydrate cards.
-      await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
-      if (opts.signal?.aborted) throw abortError(opts.signal);
-      await sleep(1200);
-      if (opts.signal?.aborted) throw abortError(opts.signal);
-    }
+    const configuredWait = Number(opts.waitMs) || Number(getConfig().scraper.searchWaitMs) || 12_000;
+    const maxAttempts = Math.max(1, Math.min(3, Number(opts.retries) || 2));
 
-    const currentPageUrl = page.url();
-    if (!usedFlareSolverr && isSameSiteNavigation(currentPageUrl, url)) searchPageUrl = currentPageUrl;
-    else if (!usedFlareSolverr && currentPageUrl !== 'about:blank' && !isSameSiteNavigation(currentPageUrl, url)) {
-      blockedOffsiteNavigation ||= currentPageUrl;
-    }
-    const rows = await collectRows();
-    if (opts.signal?.aborted) throw abortError(opts.signal);
-    rawLinkCount = rows.length;
-    // Merge in the pre-hydration snapshot. If the live DOM was torn down by an
-    // intercepted ad-redirect, rows may be empty while earlyRows still has the
-    // real results. De-dupe happens by URL inside normalizeSearchRows (Map),
-    // but we also seed with the later/hydrated rows first because they have
-    // richer metadata (lazy posters, year, rating).
-    const mergedRows = [...rows];
-    if (earlyRows.length && earlyRows.length > rows.length) {
-      log.debug('browser', `${site.name}: using pre-hydration snapshot to supplement results`, {
-        liveRows: rows.length, earlyRows: earlyRows.length,
+    /**
+     * Wait, then collect — and if a pop-under ate the page, start over in a
+     * fresh tab. The loop is what makes the flixer clones searchable: 1flex's
+     * redirect fires *after* domcontentloaded (urlscan caught it landing on
+     * youtube.com), i.e. after the old code had already given up.
+     */
+    for (;;) {
+      if (!usedFlareSolverr) {
+        // `networkidle` first, but capped at 4 s: several of these sites keep a
+        // beacon/websocket open so it never fires, and the old 6 s cap was pure
+        // waiting before the real wait even started. The real wait is now the
+        // cards themselves (shorter on a retry: the context is warm by then).
+        await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
+        if (opts.signal?.aborted) throw abortError(opts.signal);
+        resultWait = await waitForResultLinks(page, {
+          pattern: site.resultPattern,
+          timeoutMs: attemptNumber === 1 ? configuredWait : Math.round(configuredWait * 0.6),
+          signal: opts.signal,
+        });
+      }
+
+      const currentPageUrl = page.url();
+      if (!usedFlareSolverr && isSameSiteNavigation(currentPageUrl, url)) searchPageUrl = currentPageUrl;
+      else if (!usedFlareSolverr && currentPageUrl !== 'about:blank' && !isSameSiteNavigation(currentPageUrl, url)) {
+        blockedOffsiteNavigation ||= currentPageUrl;
+      }
+      const rows = await collectRows();
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+      rawLinkCount = Math.max(rawLinkCount, rows.length);
+      // Merge in the pre-hydration snapshot. If the live DOM was torn down by an
+      // intercepted ad-redirect, rows may be empty while earlyRows still has the
+      // real results. De-dupe happens by URL inside normalizeSearchRows (Map),
+      // but we also seed with the later/hydrated rows first because they have
+      // richer metadata (lazy posters, year, rating).
+      const mergedRows = [...rows];
+      if (earlyRows.length && earlyRows.length > rows.length) {
+        log.debug('browser', `${site.name}: using pre-hydration snapshot to supplement results`, {
+          liveRows: rows.length, earlyRows: earlyRows.length,
+        });
+        for (const row of earlyRows) mergedRows.push(row);
+      }
+      results.length = 0;
+      results.push(...normalizeSearchRows(mergedRows, {
+        pageUrl: searchPageUrl,
+        baseUrl: opts.baseUrl || url,
+        query,
+        resultPattern: site.resultPattern,
+        siteId: site.id,
+        siteName: site.name,
+        limit: 40,
+      }));
+      pageTitle = await page.title().catch(() => pageTitle);
+      if (results.length) break;
+
+      const plan = planSearchRetry({
+        attempt: attemptNumber,
+        maxAttempts,
+        usableResults: results.length,
+        blockedOffsiteNavigation,
+        finalUrl: page.url(),
+        searchUrl: url,
       });
-      for (const row of earlyRows) mergedRows.push(row);
+      if (!plan.retry) break;
+      attemptNumber += 1;
+      log.info('browser', `${site.name}: retrying the search in a fresh tab (attempt ${attemptNumber}/${maxAttempts}) — ${plan.reason}`);
+      blockedOffsiteNavigation = null;
+      usedFlareSolverr = false;
+      await freshPage();
+      response = await performSearchNavigation(url, { attempt: attemptNumber });
+      if (opts.signal?.aborted) throw abortError(opts.signal);
+      status = response?.status?.() ?? status;
+      await sleep(400);
     }
-    results.push(...normalizeSearchRows(mergedRows, {
-      pageUrl: searchPageUrl,
-      baseUrl: opts.baseUrl || url,
-      query,
-      resultPattern: site.resultPattern,
-      siteId: site.id,
-      siteName: site.name,
-      limit: 40,
-    }));
-    pageTitle = await page.title().catch(() => pageTitle);
 
     if (results.length) {
       log.info('browser', `${site.name}: ${results.length} result(s) for "${query}"`, {
         status, links: rawLinkCount, finalUrl: searchPageUrl.slice(0, 180),
+        attempts: attemptNumber,
         ...(blockedOffsiteNavigation ? { blockedRedirect: safeHost(blockedOffsiteNavigation) } : {}),
       });
     } else {
       const bodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => initialBodyText);
       const pageLooksUnavailable = status >= 400
         || /\b404\b|page not found|does not exist|bad gateway|just a moment|security verification|verify you are human|access denied|captcha/i.test(`${pageTitle || ''} ${bodyText.slice(0, 500)}`);
+      // Which links did this page actually expose? "no usable result links" is
+      // useless on its own: it cannot distinguish a stale recipe pattern, a
+      // client-rendered page that never hydrated, and a site that moved its
+      // detail routes. A handful of real hrefs answers that immediately.
+      const hrefs = await collectHrefs(page);
+      const baseHref = page.url();
+      const matchingHrefs = hrefs.filter((href) => looksLikeResultLink(href, { pattern: site.resultPattern, baseUrl: baseHref }));
+      const matching = new Set(matchingHrefs);
+      rejectedHrefs = [...new Set(hrefs
+        .filter((href) => !matching.has(href))
+        .map((href) => String(href).slice(0, 90)))]
+        .slice(0, 6);
+      const sample = rejectedHrefs.slice(0, 3).join(', ');
+      const resultCards = resultWait?.count ?? 0;
+
       if (blockedOffsiteNavigation) {
-        error = `search page redirected off-site to ${safeHost(blockedOffsiteNavigation)} (likely a pop-under/ad script); the site may be parked, dead, or behind a captcha`;
+        const where = `${safeHost(blockedOffsiteNavigation)} (likely a pop-under/ad script)`;
+        error = attemptNumber > 1
+          ? `search page redirected off-site to ${where} on all ${attemptNumber} attempts; the site may be parked, dead, or behind a captcha`
+          : `search page redirected off-site to ${where}; the site may be parked, dead, or behind a captcha`;
       } else if (pageLooksUnavailable) {
         error = `search page unavailable${status ? ` (HTTP ${status})` : ''}${pageTitle ? `: ${pageTitle}` : ''}`;
+      } else if (matchingHrefs.length) {
+        error = `the page showed ${matchingHrefs.length} result-shaped link(s) (${matchingHrefs.slice(0, 2).map((href) => String(href).slice(0, 60)).join(', ')}), but the result filters dropped them all — the cards' titles/metadata could not be read`;
       } else if (rawLinkCount > 0) {
-        error = `search page exposed ${rawLinkCount} candidate link(s), but none matched the result filters`;
+        error = `search page exposed ${rawLinkCount} candidate link(s), but none matched the result filters${sample ? ` (sample: ${sample})` : ''}`;
+      } else if (hrefs.length) {
+        error = `search page rendered ${hrefs.length} link(s) and none is a title link — the results may need a click/scroll, or the recipe points at the wrong route${sample ? ` (sample: ${sample})` : ''}`;
+      } else {
+        error = `search page rendered no links at all after ${Math.round((resultWait?.ms ?? 0) / 1000)}s — the site may be showing a consent/interstitial wall, or the results load behind an interaction`;
       }
       if (flareSolverrError) {
         // The FlareSolverr message is the most actionable hint we have — make
@@ -1614,15 +1900,21 @@ export async function searchSite(siteOrOpts, maybeQuery) {
         error = error ? `${error}; ${flareSolverrError}` : flareSolverrError;
       }
       log.warn('browser', `${site.name}: no usable result links for "${query}"`, {
-        status, title: pageTitle, links: rawLinkCount,
+        status, title: pageTitle, links: rawLinkCount, resultCards, hrefs: hrefs.length,
+        attempts: attemptNumber, waitedMs: resultWait?.ms ?? null,
         finalUrl: searchPageUrl.slice(0, 180),
+        ...(rejectedHrefs.length ? { rejectedSample: sample } : {}),
         ...(blockedOffsiteNavigation ? { blockedRedirect: safeHost(blockedOffsiteNavigation) } : {}),
         preview: bodyText.slice(0, 180).replace(/\s+/g, ' '),
         ...(flareSolverrError ? { flareSolverrError } : {}),
       });
     }
   } catch (err) {
-    if (opts.signal?.aborted || err?.name === 'AbortError') throw abortError(opts.signal);
+    // Only *our* signal means "the caller gave up": an AbortError raised by our
+    // own transport timeout is a failure to report, not a reason to abort the
+    // whole source (that is how a slow FlareSolverr turned into
+    // "cinevo: search failed — browser request aborted").
+    if (opts.signal?.aborted) throw abortError(opts.signal);
     error = err.message;
     log.error('browser', `search failed on ${site.name}: ${err.message}`);
   } finally {
@@ -1631,7 +1923,23 @@ export async function searchSite(siteOrOpts, maybeQuery) {
     await page.close().catch(() => {});
     scheduleIdleClose();
   }
-  return { results, error, site: { id: site.id, name: site.name }, url };
+  return {
+    results,
+    error,
+    site: { id: site.id, name: site.name },
+    url,
+    // Structured form of the same story, for /api/sources/test and the UI.
+    diagnostics: {
+      status,
+      title: pageTitle,
+      links: rawLinkCount,
+      resultCards: resultWait?.count ?? 0,
+      attempts: attemptNumber,
+      waitedMs: resultWait?.ms ?? null,
+      blockedRedirect: blockedOffsiteNavigation || null,
+      rejectedSample: rejectedHrefs.slice(0, 4),
+    },
+  };
 }
 
 function scheduleIdleClose() {
@@ -1754,7 +2062,8 @@ export function hasSession(siteId) {
 }
 
 export default {
-  getBrowser, sniff, searchSite, browserInfo, closeBrowser, closeContexts,
+  getBrowser, sniff, searchSite, browserInfo, browserLaunchError, closeBrowser, closeContexts,
   flaresolverrStatus, describeSolverBootState,
+  looksLikeResultLink, waitForResultLinks, planSearchRetry, shouldRetryFlareSolverrFailure,
   sessionFile, hasSession,
 };

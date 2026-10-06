@@ -251,6 +251,21 @@ export async function request(url, opts = {}) {
     if (cookie) finalHeaders.Cookie = finalHeaders.Cookie ? `${finalHeaders.Cookie}; ${cookie}` : cookie;
   }
 
+  /**
+   * Our *own* timeout, named as such.
+   *
+   * `AbortController.abort()` (the timer below) makes fetch reject with an
+   * AbortError, which is indistinguishable from "the caller cancelled" unless
+   * we say so. That confusion is not academic: FlareSolverr's transport timeout
+   * travelled up as an AbortError, every caller's `err.name === 'AbortError'`
+   * check rethrew it, and the source reported "browser request aborted" /
+   * "search failed" instead of "the solver did not answer within 35 s".
+   */
+  const timeoutError = () => Object.assign(
+    new Error(`${method} ${safeHost(url)} timed out after ${timeoutMs}ms`),
+    { name: 'TimeoutError', code: 'ETIMEDOUT', timedOut: true },
+  );
+
   let lastErr = null;
   if (signal?.aborted) {
     throw signal.reason instanceof Error
@@ -277,7 +292,13 @@ export async function request(url, opts = {}) {
       let dispatcher;
       if (shouldProxy(url)) dispatcher = await dispatcherFor(url);
       if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : Object.assign(new Error('request aborted'), { name: 'AbortError' });
-      if (controller.signal.aborted) throw Object.assign(new Error('request aborted'), { name: 'AbortError', cause: signal?.reason });
+      if (controller.signal.aborted) {
+        // The timer fired while the dispatcher was resolving — same story as
+        // the catch below, just without an err to look at.
+        lastErr = timeoutError();
+        if (attempt < retries) { await sleep(500 * (attempt + 1)); continue; }
+        throw lastErr;
+      }
       const res = await fetch(url, {
         method, headers: finalHeaders, body, redirect,
         signal: controller.signal,
@@ -336,11 +357,15 @@ export async function request(url, opts = {}) {
         error,
       };
     } catch (err) {
-      lastErr = err;
       if (signal?.aborted) throw err;
+      // Distinguish "we ran out of time" from "the caller cancelled": only the
+      // former is a TimeoutError, and only the former may consume a retry.
+      lastErr = (controller.signal.aborted && err?.name === 'AbortError' && !err?.timedOut)
+        ? Object.assign(timeoutError(), { cause: err })
+        : err;
       const isLast = attempt >= retries;
       if (!isLast) {
-        log.warn('http', `${method} ${safeHost(url)} failed — retry ${attempt + 1}/${retries}`, { error: errorText(err) });
+        log.warn('http', `${method} ${safeHost(url)} failed — retry ${attempt + 1}/${retries}`, { error: errorText(lastErr) });
         await sleep(500 * (attempt + 1));
         continue;
       }

@@ -135,3 +135,13 @@ test('knownOptionPaths() describes the writable surface and every secret path ex
   assert.ok(paths.includes('subtitles.keys.subdl'));
   assert.ok(!paths.some((p) => p.startsWith('_')), 'comment helpers are not options');
 });
+
+test('the search render budget has a documented default and is env-overridable', () => {
+  // The flixer clones need a long wait (they fetch their cards after hydration);
+  // SEARCH_WAIT_MS is the global budget, a recipe's search.waitMs overrides it.
+  assert.equal(config.getConfig().scraper.searchWaitMs, 12000);
+  assert.ok(config.knownOptionPaths().includes('scraper.searchWaitMs'));
+  const patched = config.saveConfig({ scraper: { searchWaitMs: 20000 } });
+  assert.equal(patched.scraper.searchWaitMs, 20000);
+  config.saveConfig({ scraper: { searchWaitMs: 12000 } });
+});

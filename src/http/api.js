@@ -47,7 +47,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
   res.status(err.status || 500).json({ ok: false, error: errorText(err) });
 });
 
-function requestAbortSignal(req, res) {
+export function requestAbortSignal(req, res) {
   const controller = new AbortController();
   const onRequestAborted = () => controller.abort();
   const onResponseClosed = () => {
@@ -126,6 +126,10 @@ const OUTPUT_LABELS = {
   enigma2: 'Enigma2 / Duo2',
   direct: 'Direct upstream link (302)',
   download: 'Download to NAS',
+  // Not in OUTPUT_TYPES on purpose: the browser preview session is built by the
+  // app (no subtitles, codecs from the browser's own report), never from an
+  // operator template. The label only names it in the sessions list.
+  web: 'Web preview (no subtitles)',
 };
 export { OUTPUT_TYPES, OUTPUT_LABELS };
 
@@ -500,8 +504,17 @@ router.post('/sources/test', wrap(async (req, res) => {
   const source = registry.getSource(sourceId);
   if (!source) return res.status(404).json({ ok: false, error: `unknown source ${sourceId}` });
   registry.resetSourceHealth(sourceId);
-  const results = await registry.searchSource(source, query || 'matrix');
-  res.json({ ok: true, results, health: registry.healthOf(sourceId) });
+  // detailed: true so a failing test carries *why* (how many links the page
+  // exposed, whether a pop-under replaced the tab, how long we waited) instead
+  // of an empty list the operator has to guess about.
+  const outcome = await registry.searchSource(source, query || 'matrix', { detailed: true });
+  res.json({
+    ok: true,
+    results: outcome.results,
+    error: outcome.error || null,
+    diagnostics: outcome.diagnostics || null,
+    health: registry.healthOf(sourceId),
+  });
 }));
 
 /** Reset the circuit breaker for a source (or all sources when id="*"). */

@@ -114,3 +114,35 @@ test('a configured proxy carries outbound hosts but never internal service names
   delete process.env.HTTP_PROXY;
   assert.equal(shouldProxy('https://api6.aoneroom.com/x'), false);
 });
+
+test('a request that runs out of its own time is a TimeoutError, not a caller abort', async (t) => {
+  // `request()` aborts its internal controller to enforce `timeoutMs`, and fetch
+  // surfaces that as an AbortError. Callers used to read that as "the client
+  // cancelled" (`err.name === 'AbortError'`) and rethrow — which is how a slow
+  // FlareSolverr turned into "cinevo: search failed — browser request aborted".
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (_url, { signal }) => {
+    calls += 1;
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })), { once: true });
+    });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  await assert.rejects(
+    request('https://solver.test/v1', { timeoutMs: 40, retries: 0 }),
+    (error) => {
+      assert.equal(error.name, 'TimeoutError');
+      assert.equal(error.timedOut, true);
+      assert.equal(error.code, 'ETIMEDOUT');
+      assert.match(error.message, /solver\.test timed out after 40ms/);
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+
+  // A timeout still consumes retries (it is a failure, not a cancellation).
+  await assert.rejects(request('https://solver.test/v1', { timeoutMs: 40, retries: 1 }), (error) => error.timedOut === true);
+  assert.equal(calls, 3);
+});

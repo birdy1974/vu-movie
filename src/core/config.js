@@ -65,6 +65,17 @@ export const DEFAULTS = {
     browserIdleSeconds: Number(process.env.BROWSER_IDLE_SECONDS || 180),
     /** Page/network timeout for a resolve attempt. */
     resolveTimeoutMs: Number(process.env.RESOLVE_TIMEOUT_MS || 45000),
+    /**
+     * How long a source's search page may take to render its result cards.
+     *
+     * The flixer clones (redflix, cinejoy, 1flex …) ship an empty shell and then
+     * fetch the results over XHR, so a fixed "networkidle + 1.2 s" wait is a
+     * coin flip: the log says "no usable result links" while the site is simply
+     * still loading. We poll for result-shaped links for up to this long and
+     * stop as soon as the count stops growing. Per-source overrides live in the
+     * recipe (`search.waitMs` in builtin-sources.json / /config/sources/*.json).
+     */
+    searchWaitMs: Number(process.env.SEARCH_WAIT_MS || 12000),
     /** Probe every candidate with ffprobe before offering it (recommended). */
     probeCandidates: String(process.env.PROBE_CANDIDATES || 'true').toLowerCase() !== 'false',
     maxCandidates: Number(process.env.MAX_CANDIDATES || 12),
@@ -447,6 +458,7 @@ function envOverrides() {
   if (process.env.MOVIEBOX_BROWSER_FALLBACK) set('scraper.movieboxBrowserFallback', String(process.env.MOVIEBOX_BROWSER_FALLBACK).toLowerCase() !== 'false');
   if (process.env.MOVIEBOX_TRANSPORT) set('scraper.movieboxTransport', String(process.env.MOVIEBOX_TRANSPORT).toLowerCase());
   if (Number(process.env.FLARESOLVERR_TIMEOUT_MS) > 0) set('scraper.flaresolverrTimeoutMs', Number(process.env.FLARESOLVERR_TIMEOUT_MS));
+  if (Number(process.env.SEARCH_WAIT_MS) > 0) set('scraper.searchWaitMs', Number(process.env.SEARCH_WAIT_MS));
   return o;
 }
 

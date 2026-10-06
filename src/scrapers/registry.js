@@ -214,7 +214,7 @@ function firstMappedField(item, map, key, aliases = []) {
  */
 export async function searchSource(source, query, { signal = null, detailed = false } = {}) {
   const started = Date.now();
-  const finish = (results, error = null) => detailed ? { results, error } : results;
+  const finish = (results, error = null, extra = null) => (detailed ? { results, error, ...(extra || {}) } : results);
   try {
     if (signal?.aborted) throw Object.assign(new Error('search aborted'), { name: 'AbortError' });
     if (source.search?.kind === 'api') {
@@ -286,6 +286,8 @@ export async function searchSource(source, query, { signal = null, detailed = fa
       query,
       linkSelector: source.search?.linkSelector,
       linkPattern: source.search?.linkPattern,
+      // How long this site may take to render its cards (recipe > config).
+      waitMs: Number(source.search?.waitMs) || undefined,
       signal,
     });
     const rows = (res.results || []).map((r) => {
@@ -302,8 +304,14 @@ export async function searchSource(source, query, { signal = null, detailed = fa
       };
     });
     noteHealth(source.id, rows.length > 0, res.error || (rows.length ? `${rows.length} results` : 'search page returned no links'));
-    log.info('scraper', `${source.id}: browser search → ${rows.length} results`, { ms: Date.now() - started, error: res.error });
-    return finish(rows, res.error || null);
+    log.info('scraper', `${source.id}: browser search → ${rows.length} results`, {
+      ms: Date.now() - started,
+      error: res.error,
+      // Only interesting when the search came back empty: the counts tell a
+      // bug report apart from "the site was simply still loading".
+      ...(rows.length ? {} : { diagnostics: res.diagnostics }),
+    });
+    return finish(rows, res.error || null, { diagnostics: res.diagnostics });
   } catch (err) {
     if (signal?.aborted) throw err;
     const message = errorText(err);
@@ -503,7 +511,14 @@ export async function searchAll(query, {
     }
     const outcome = await searchSource(source, query, { signal, detailed: true });
     results.push(...outcome.results);
-    if (outcome.error) providerErrors.push({ sourceId: source.id, sourceName: source.name, error: outcome.error });
+    if (outcome.error) {
+      providerErrors.push({
+        sourceId: source.id,
+        sourceName: source.name,
+        error: outcome.error,
+        ...(outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}),
+      });
+    }
   });
   const pool = 3;
   let idx = 0;

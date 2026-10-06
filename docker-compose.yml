@@ -76,6 +76,10 @@ services:
       # --- scraping (raise these only on a stronger NAS) ---
       BROWSER_CONCURRENCY: "${BROWSER_CONCURRENCY:-1}"
       RESOLVE_TIMEOUT_MS: "${RESOLVE_TIMEOUT_MS:-45000}"
+      # How long a search page may take to render its cards before the source
+      # reports "no usable result links" (per-source overrides live in the
+      # recipe's search.waitMs; overrides SEARCH_WAIT_MS when set).
+      SEARCH_WAIT_MS: "${SEARCH_WAIT_MS:-12000}"
       # FlareSolverr listens on 8192 inside the container; on the NAS it is
       # published on 8193 by default (see FLARESOLVERR_HOST_PORT below).
       FLARESOLVERR_URL: "${FLARESOLVERR_URL:-http://flaresolverr:8192}"
