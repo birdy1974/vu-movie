@@ -335,6 +335,63 @@ test('an FFmpeg template keeps the subtitle attached to the playlist item', (t) 
   assert.deepEqual(subtitleSessionNotes(profile, 'matroska', args), [], 'nothing to warn about');
 });
 
+test('a template without -map rows keeps video and audio when the sidecar is muxed', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-nomap-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // Hand-written templates (and every template saved before the structured
+  // editor existed) frequently have no -map at all and rely on ffmpeg's
+  // automatic stream selection. Adding a map for the sidecar alone turns that
+  // selection off, so the command used to deliver a subtitle-only Matroska:
+  // no picture, no sound. The sidecar must bring the main streams with it.
+  const template = 'ffmpeg -i <url> -c copy -f matroska <output>';
+  const profile = { subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld', container: 'matroska', ffmpegTemplate: template };
+  const args = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4', kind: 'file' }, profile, mode: 'live',
+    output: { container: 'matroska', target: 'pipe:1' },
+  });
+
+  const maps = [];
+  for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '1:s:0?'], 'the source keeps its video and audio next to the sidecar');
+  const inputIndex = args.indexOf('-i');
+  assert.equal(args[inputIndex + 2], '-i');
+  assert.equal(args[inputIndex + 3], subtitlePath, 'the sidecar is still the second input');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt');
+  assert.equal(args[args.indexOf('-disposition:s:0') + 1], 'default');
+  assert.equal(args[args.indexOf('-metadata:s:s:0') + 1], 'language=nld');
+  assert.deepEqual(subtitleSessionNotes(profile, 'matroska', args), [], 'the subtitle really is in the output');
+});
+
+test('a text sidecar is never encoded to the template’s bitmap subtitle codec', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-dvbsub-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // -c:s dvbsub + a text .srt = ffmpeg refuses the whole command ("text to
+  // bitmap"). The sidecar therefore keeps a text codec for subtitle stream 0.
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -c:s dvbsub -f matroska <output>';
+  const args = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4', kind: 'file' },
+    profile: { subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' },
+    mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub', 'the template’s own setting is untouched');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt', 'the text sidecar is written as text');
+
+  // A template that already names a text codec wins — no duplicate flag.
+  const textTemplate = 'ffmpeg -i <url> -map 0:v:0 -c:v copy -c:s copy -f matroska <output>';
+  const textArgs = buildFfmpegTemplateArgs({
+    template: textTemplate, source: { url: 'https://cdn/movie.mp4', kind: 'file' },
+    profile: { subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' },
+    mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!textArgs.includes('-c:s:0'), 'copy/srt/ass are fine for a text track');
+});
+
 test('a template that drops subtitles is left alone — and says so', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-sn-test-'));
   const subtitlePath = path.join(dir, 'movie.nl.srt');
@@ -365,6 +422,17 @@ test('a sidecar is not injected into a template that already maps a second input
     mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
   });
   assert.ok(!args.includes(subtitlePath), 'the template owns its inputs — do not shift its stream indices');
+
+  // `-map 1` (a whole second input) counts as owning it too, with or without
+  // the stream specifier.
+  for (const map of ['-map 1', '-map 1:a:0?', '-map 1,0']) {
+    const owns = `ffmpeg -i <url> -i /downloads/fixed.srt ${map} -c:v copy -f matroska <output>`;
+    const owned = buildFfmpegTemplateArgs({
+      template: owns, source: { url: 'https://cdn/movie.mp4' }, profile: { subtitles: 'soft', subtitlePath },
+      mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+    });
+    assert.ok(!owned.includes(subtitlePath), `${map} owns input 1`);
+  }
 });
 
 test('live playback is paced at 1x so a real-time client is never flooded', () => {

@@ -886,6 +886,32 @@ export function realtimePacing(profile = {}) {
 }
 
 /**
+ * Subtitle encoders that take *bitmap* frames only. A text track (the .srt an
+ * item carries) cannot be fed to them: ffmpeg rejects the whole command with
+ * "Subtitle encoding currently only possible from text to text or bitmap to
+ * bitmap", so the builder must not let a template's DVB/PGS setting swallow the
+ * sidecar. See templateSubtitleCodecOf() and the sidecar block below.
+ */
+const BITMAP_SUBTITLE_CODECS = new Set(['dvbsub', 'dvdsub', 'dvb_teletext', 'hdmv_pgs_subtitle', 'xsub']);
+
+/**
+ * The subtitle codec a template asks for — the value of the last `-c:s[:n]` /
+ * `-codec:s` / `-scodec` option in its argv, lower-cased. Empty when the
+ * template names no subtitle codec at all (then the muxer default applies).
+ */
+function templateSubtitleCodecOf(args = []) {
+  let codec = '';
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '');
+    if (arg === '-scodec' || /^-(?:c|codec):s(?::[0-9]+)?$/.test(arg)) {
+      const value = String(args[index + 1] || '').trim().toLowerCase();
+      if (value) codec = value;
+    }
+  }
+  return codec;
+}
+
+/**
  * Render a template to an argv list. Source URLs and private request headers are
  * inserted as individual argv values, never interpolated into shell text.
  */
@@ -979,8 +1005,10 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     ? profile.subtitlePath
     : null;
   if (sidecarSubtitlePath) {
-    const mapsSecondInput = args.some((arg, index) => (arg === '-map' && /^1:/.test(String(args[index + 1] || '')))
-      || /^-map[= ]1:/.test(arg));
+    // Any map that reads input 1 (`-map 1`, `-map 1:s:0?`, `-map 1,0`) means
+    // the template already owns a second input — inserting ours would shift it.
+    const mapsSecondInput = args.some((arg, index) => (arg === '-map' && /^1(?::|,|$)/.test(String(args[index + 1] || '')))
+      || /^-map[= ]1(?::|,|$)/.test(arg));
     // A template that says -sn drops subtitles on purpose: the operator's
     // command wins, but the session log says so (see subtitleSessionNotes)
     // instead of silently ignoring the attachment.
@@ -989,11 +1017,29 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       // The URL token sits right behind the '-i' that precedes it; everything
       // the prefix added in front of it is already part of `args`.
       const urlTokenIndex = inputIndex + prefix.length + 1;
-      args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath), '-map', '1:s:0?');
+      // A template that maps nothing at all relies on ffmpeg picking the
+      // source's video and audio automatically — and *one* `-map` row switches
+      // that off completely. Mapping only the sidecar therefore produced a
+      // subtitle-only file (video and audio gone: the player shows nothing), so
+      // a template without its own -map rows gets the main streams mapped next
+      // to the sidecar. A template that maps its own streams is left exactly as
+      // it is: only the sidecar row is added in front of them.
+      const mapsOwnStreams = args.some((arg) => arg === '-map' || /^-map[=:]/.test(arg));
+      const sidecarMaps = mapsOwnStreams
+        ? ['-map', '1:s:0?']
+        : ['-map', '0:v:0', '-map', '0:a:0?', '-map', '1:s:0?'];
+      args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath), ...sidecarMaps);
       const outputIndex = args.length - 1;
       const subtitleOutput = [];
-      const hasSubtitleCodec = args.some((arg) => /^-(?:c|codec):s/.test(arg) || arg === '-scodec');
-      if (!hasSubtitleCodec) subtitleOutput.push('-c:s:0', 'srt');
+      // The sidecar is a text track. A template that codes subtitles to a bitmap
+      // format (DVB, PGS) makes ffmpeg refuse the whole command — "Subtitle
+      // encoding currently only possible from text to text or bitmap to bitmap"
+      // — so the sidecar keeps a text codec unless the template pins one that
+      // text can be written in (copy, subrip, ass, …).
+      const templateSubtitleCodec = templateSubtitleCodecOf(args);
+      if (!templateSubtitleCodec || BITMAP_SUBTITLE_CODECS.has(templateSubtitleCodec)) {
+        subtitleOutput.push('-c:s:0', 'srt');
+      }
       if (!args.some((arg) => arg.startsWith('-disposition'))) subtitleOutput.push('-disposition:s:0', 'default');
       const language = String(profile.subtitleLanguage || '').trim();
       if (language && !args.some((arg) => arg.startsWith('-metadata:s:s'))) {
