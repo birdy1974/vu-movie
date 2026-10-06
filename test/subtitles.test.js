@@ -6,7 +6,7 @@ import {
   decodeSubtitle, cleanSrt, countCues, vttToSrt, applyOffset, scoreResult,
   normaliseLang, extractSubtitleFromBuffer, isZip,
 } from '../src/subtitles/util.js';
-import { listProviders } from '../src/subtitles/index.js';
+import { listProviders, parseAddic7edRows, parseTvsubsSeason, parseTvsubsEpisode } from '../src/subtitles/index.js';
 
 
 /* ------------------------------------------------------------------ *
@@ -155,8 +155,77 @@ test('subtitle archives are unpacked without external tools', () => {
 test('provider registry exposes the documented providers', () => {
   const providers = listProviders();
   const ids = providers.map((p) => p.id);
-  for (const expected of ['opensubtitles-org', 'opensubtitles-com', 'subdl', 'podnapisi', 'tvsubtitles']) {
+  for (const expected of ['opensubtitles-org', 'opensubtitles-com', 'subdl', 'podnapisi', 'tvsubtitles', 'addic7ed', 'tvsubs']) {
     assert.ok(ids.includes(expected), `missing provider ${expected} (got ${ids.join(', ')})`);
   }
   assert.ok(providers.every((p) => Array.isArray(p.languages) && typeof p.enabled === 'boolean'));
+  // Addic7ed is gated on the free-account credentials (anonymous downloads are
+  // throttled to nothing), so without credentials it is present but disabled.
+  const addic7ed = providers.find((p) => p.id === 'addic7ed');
+  assert.equal(addic7ed.enabled, false, 'addic7ed stays off until ADDIC7ED_USER/PASS are set');
+  assert.ok(addic7ed.note.includes('account'), 'the note tells the operator what is needed');
+});
+
+test('parseAddic7edRows reads the show-page season table', () => {
+  // Reconstruction of the live /show/<id> table: one <tr> per subtitle file,
+  // season/episode cells + /serie/ link, a language cell, a release cell and
+  // the /updated/<langId>/<fileId>/<n> download link.
+  const html = `
+    <table><tr><td>S</td><td>E</td><td>Title</td><td>Language</td><td>Version</td></tr>
+    <tr>
+      <td>4</td><td>1</td>
+      <td class="NewsTitle"><a href="/serie/True_Detective/4/1/Night_Country">Night Country - Part 1</a></td>
+      <td class="language">English</td><td class="re_version">HMAX-NTb</td><td>Completed</td>
+      <td>&nbsp;</td><td>&nbsp;</td>
+      <td class="download"><a href="/updated/1/187824/0">Download</a></td>
+    </tr>
+    <tr>
+      <td>4</td><td>1</td>
+      <td class="NewsTitle"><a href="/serie/True_Detective/4/1/Night_Country">Night Country - Part 1</a></td>
+      <td class="language">Dutch</td><td class="re_version">1080p.WEB.h264-ETHEL</td><td>Completed</td>
+      <td class="download"><a href="/updated/17/187824/4">Download</a></td>
+    </tr>
+    <tr><td>no download link here — a layout row, must be skipped</td></tr>
+    </table>`;
+  const rows = parseAddic7edRows(html);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], {
+    season: 4, episode: 1, title: 'Night Country - Part 1', language: 'en',
+    release: 'HMAX-NTb', url: 'https://www.addic7ed.com/updated/1/187824/0',
+  });
+  assert.equal(rows[1].language, 'nl', 'the language name wins over guessing');
+  assert.equal(rows[1].release, '1080p.WEB.h264-ETHEL');
+  assert.equal(rows[1].url, 'https://www.addic7ed.com/updated/17/187824/4');
+});
+
+test('parseTvsubsSeason pairs episode numbers with their per-language pages', () => {
+  // Reconstruction of the live tvshow-<id>-<season>.html episode list: flag
+  // links episode-<epId>-<lang>.html, then "NN. <a href=episode-<epId>.html>".
+  const html = `
+    <ul>
+      <li><a href="episode-107732-en.html"><img src="images/flags/en.gif" /></a>
+          <a href="subtitle-289726.html"><img src="images/flags/bg.gif" /></a>
+          01. <a href="episode-107732.html"><b>The Great War and Modern Memory</b></a></li>
+      <li><a href="episode-107733-en.html"><img src="images/flags/en.gif" /></a>
+          <a href="episode-107733-nl.html"><img src="images/flags/nl.gif" /></a>
+          02. <a href="episode-107733.html"><b>Kiss Tomorrow Goodbye</b></a></li>
+    </ul>`;
+  const { episodes, langs } = parseTvsubsSeason(html);
+  assert.deepEqual([...episodes.entries()], [[1, '107732'], [2, '107733']]);
+  assert.deepEqual(langs.get('107732'), ['en'], 'the bg flag links a subtitle page, not a language page');
+  assert.deepEqual(langs.get('107733'), ['en', 'nl']);
+});
+
+test('parseTvsubsEpisode lists the subtitle files of an episode-language page', () => {
+  const html = `
+    <b>English subtitles</b>
+    <ul>
+      <li><a href="subtitle-247178.html">True.Detective.S03E01.720p.Web-DL.NTb.en.srt</a></li>
+      <li><a href="subtitle-247179.html">True.Detective.S03E01.720p.Web-DL.NTb.en.srt <img src="images/hearingimpaired.svg" alt="HI"/></a></li>
+    </ul>`;
+  const entries = parseTvsubsEpisode(html);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].id, '247178');
+  assert.equal(entries[0].release, 'True.Detective.S03E01.720p.Web-DL.NTb.en.srt');
+  assert.equal(entries[1].id, '247179');
 });

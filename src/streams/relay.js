@@ -30,7 +30,7 @@ import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
-  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes,
+  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes, probeSubtitleList,
 } from '../core/media.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
@@ -94,7 +94,12 @@ export async function runTemplateTest({ template, stream, container = null, dura
   try {
     args = buildFfmpegTemplateArgs({
       template,
-      source: { url: stream.upstream.url, headers: stream.upstream.headers || {}, kind: stream.upstream.kind || undefined },
+      source: {
+        url: stream.upstream.url, headers: stream.upstream.headers || {},
+        kind: stream.upstream.kind || undefined,
+        container: stream.upstream.probe?.container || null,
+        subtitles: probeSubtitleList(stream.upstream.probe),
+      },
       profile: { container: effectiveContainer },
       mode: 'file',
       output: { container: effectiveContainer, target },
@@ -335,6 +340,47 @@ export function decideRestart({ clients = 0, restarts = 0, code = null, signal =
   return { restart: true, reason: 'clean EOF while clients are watching — upstream likely ended the transfer early (chunked CDN), resuming' };
 }
 
+/**
+ * Startup failures that no restart can fix. The restart budget exists for
+ * upstreams that drop mid-movie; a command ffmpeg rejects before writing a
+ * single byte fails identically on every attempt. Retrying used to burn all
+ * three attempts (~20 s of dead air) before the client was told anything.
+ * Each entry carries the operator-facing hint for the log line.
+ */
+const FATAL_FFMPEG_PATTERNS = [
+  {
+    pattern: /subtitle codec \d+ is not supported|could not write header for output file|error initializing output stream/i,
+    hint: 'the output muxer cannot carry one of the mapped streams — typically an MP4 mov_text subtitle track copied into Matroska; re-resolve the stream so the probe can fix the subtitle handling, or pick a template that re-encodes subtitles',
+  },
+  {
+    pattern: /subtitle encoding currently only possible from text to text or bitmap to bitmap/i,
+    hint: 'a text subtitle track was mapped into a bitmap subtitle codec (or the other way round)',
+  },
+  {
+    pattern: /failed to initialise vaapi connection|device creation failed|failed to set value 'vaapi=/i,
+    hint: 'the VAAPI device is not usable in this container — pass /dev/dri through (docker-compose devices:) and check LIBVA_DRIVER_NAME',
+  },
+];
+
+/**
+ * Pure: does this exit describe a failure a restart cannot fix?
+ * Returns `{ hint }` for a fatal startup failure, otherwise null.
+ *
+ * A pipe session that already produced bytes failed mid-stream (an upstream
+ * drop) — exactly the case the restart budget exists for, so bytesOut > 0 is
+ * never fatal. HLS sessions write to disk, so bytesOut says nothing there;
+ * the patterns only fire at startup, which keeps that case safe too.
+ */
+export function fatalFfmpegFailure(stderrTail = [], { bytesOut = 0, code = 0, kind = 'pipe' } = {}) {
+  if (code === 0) return null;
+  if (kind !== 'hls' && bytesOut > 0) return null;
+  const text = Array.isArray(stderrTail) ? stderrTail.join('\n') : String(stderrTail || '');
+  for (const { pattern, hint } of FATAL_FFMPEG_PATTERNS) {
+    if (pattern.test(text)) return { hint };
+  }
+  return null;
+}
+
 /** Splice an input-side `-ss` in front of the first `-i` so a restart resumes. */
 export function argsWithResume(args, seconds) {
   const at = Number(seconds);
@@ -439,6 +485,7 @@ export async function ensureSession(stream, opts = {}) {
       headers: upProxy ? {} : (stream.upstream?.headers || {}),
       kind: stream.upstream?.kind || undefined,
       container: stream.upstream?.probe?.container || null,
+      subtitles: probeSubtitleList(stream.upstream?.probe),
     },
     profile: effectiveProfile,
     hw,
@@ -462,8 +509,10 @@ export async function ensureSession(stream, opts = {}) {
 
   // "Subtitles never show on the box" is otherwise indistinguishable from "the
   // receiver ignores them": say up front whether this session muxes the
-  // attached subtitle at all, and if not, why.
-  for (const note of subtitleSessionNotes(effectiveProfile, wantsHls ? 'hls' : container, args)) {
+  // attached subtitle at all, and if not, why. The notes must describe the
+  // container ffmpeg REALLY writes (a Matroska template bound to the .ts slot
+  // still muxes the text sidecar) — not the container the URL promised.
+  for (const note of subtitleSessionNotes(effectiveProfile, actualFormat || (wantsHls ? 'hls' : container), args)) {
     log.warn('relay', note, { stream: stream.id, output: outputType || container, title: stream.title });
   }
 
@@ -641,15 +690,28 @@ function spawnFfmpeg(session) {
     // Restart while clients are still attached — upstream URLs drop, and the
     // chunked CDNs end transfers early; decideRestart() tells the two cases
     // apart from a genuine end-of-movie. On a mid-movie restart we resume at
-    // the last play head instead of starting over.
-    const decision = decideRestart({
-      clients: session.clients.size,
-      restarts: session.restarts,
-      code, signal,
-      outTimeMs: session.stats?.outTimeMs ?? null,
-      durationSec: session.stream?.upstream?.probe?.durationSec ?? null,
-      maxRestarts: Math.max(1, Number(getConfig().transcode.maxRestarts) || 3),
+    // the last play head instead of starting over. Fatal startup failures (a muxer
+    // that cannot carry a mapped track, a dead VAAPI device) never recover by
+    // restarting, so they short-circuit the budget.
+    const fatal = fatalFfmpegFailure(session.stderrTail, {
+      bytesOut: session.bytesOut, code, kind: session.kind,
     });
+    const decision = fatal
+      ? { restart: false, reason: 'fatal ffmpeg startup error — a restart repeats it' }
+      : decideRestart({
+        clients: session.clients.size,
+        restarts: session.restarts,
+        code, signal,
+        outTimeMs: session.stats?.outTimeMs ?? null,
+        durationSec: session.stream?.upstream?.probe?.durationSec ?? null,
+        maxRestarts: Math.max(1, Number(getConfig().transcode.maxRestarts) || 3),
+      });
+    if (fatal) {
+      log.error('relay', `ffmpeg cannot process this stream — not restarting`, {
+        session: session.id, hint: fatal.hint,
+        stderr: truncate(session.stderrTail.slice(-4).join(' | '), 400),
+      });
+    }
     if (decision.restart) {
       session.restarts += 1;
       const playedSec = Number.isFinite(session.stats?.outTimeMs) ? session.stats.outTimeMs / 1000 : 0;
@@ -667,7 +729,10 @@ function spawnFfmpeg(session) {
       return;
     }
 
-    endClients(session, code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`);
+    const endReason = fatal
+      ? `ffmpeg cannot process this source (${truncate(fatal.hint, 160)})`
+      : code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`;
+    endClients(session, endReason);
     sessions.delete(session.streamId);
     releaseUpstreamProxy(session, decision.reason, { graceMs: 0 });
 

@@ -300,7 +300,109 @@ test('soft muxing picks the right subtitle codec per container', () => {
     profile: normaliseProfile({ ...base, container: 'matroska' }, PROBE_4K_HEVC),
     hw: HW, mode: 'file', output: { container: 'matroska', target: '/downloads/x.mkv' },
   });
-  assert.equal(mkv[mkv.indexOf('-c:s') + 1], 'srt');
+  // Matroska copies what its muxer can carry (the probed subrip track here):
+  // a blanket srt re-encode used to die on bitmap sources, and a blanket copy
+  // dies on MP4 mov_text sources (see the override tests below).
+  assert.equal(mkv[mkv.indexOf('-c:s') + 1], 'copy');
+});
+
+test('matroska re-encodes the mov_text tracks a blanket copy cannot carry', () => {
+  // The field failure: an MP4 source with a mov_text track (codec id 94213)
+  // and `-c:s copy` → "Subtitle codec 94213 is not supported" → the muxer
+  // refuses the whole file. The probe knows the track list, so the builder
+  // converts just that track to srt and leaves everything else on copy.
+  const probe = {
+    ...PROBE_1080P_H264,
+    subtitles: [{ codec: 'mov_text', language: 'eng' }, { codec: 'hdmv_pgs_subtitle', language: 'eng' }],
+  };
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file', subtitles: probe.subtitles },
+    profile: normaliseProfile({ mode: 'copy', container: 'matroska', subtitles: 'soft' }, probe),
+    hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.equal(args[args.indexOf('-c:s') + 1], 'copy');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt', 'the mov_text track is re-encoded');
+  assert.ok(!args.includes('-c:s:1'), 'the PGS track stays on copy');
+
+  // With an attached sidecar the source tracks shift one position.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-movtext-test-'));
+  const subtitlePath = path.join(dir, 'movie.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  const withSidecar = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file', subtitles: probe.subtitles },
+    profile: normaliseProfile({ mode: 'copy', container: 'matroska', subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' }, probe),
+    hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.equal(withSidecar[withSidecar.indexOf('-c:s') + 1], 'copy');
+  assert.equal(withSidecar[withSidecar.indexOf('-c:s:0') + 1], 'srt', 'the sidecar');
+  assert.equal(withSidecar[withSidecar.indexOf('-c:s:1') + 1], 'srt', 'mov_text moves to position 1');
+  assert.ok(!withSidecar.includes('-c:s:2'), 'PGS stays on copy at position 2');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('mpegts only maps the bitmap subtitle tracks of a probed source', () => {
+  const subs = [{ codec: 'mov_text', language: 'eng' }, { codec: 'hdmv_pgs_subtitle', language: 'eng' }];
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts', subtitles: 'soft' }, PROBE_1080P_H264);
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file', subtitles: subs },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(!args.includes('0:s?'), 'no blanket subtitle map when the probe knows better');
+  assert.ok(args.includes('0:s:1?'), 'the PGS track is mapped …');
+  assert.ok(!args.some((a, i) => a === '-map' && args[i + 1] === '0:s:0?'), '… the mov_text track is not (dvbsub cannot eat text)');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'dvbsub');
+
+  // A text-only source maps nothing — no crash, and the session notes still
+  // explain why the attached subtitle is absent.
+  const textOnly = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file', subtitles: [{ codec: 'mov_text' }] },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  const maps = textOnly.filter((a, i) => textOnly[i - 1] === '-map');
+  assert.ok(!maps.some((m) => /^0:s/.test(m)));
+
+  // Without probe info the optimistic blanket map stays.
+  const unknown = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file' },
+    profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(unknown.includes('0:s?'));
+});
+
+test('a template that copies subtitles re-encodes the mov_text tracks Matroska cannot carry', () => {
+  // The exact shape of the field template: maps every source subtitle track
+  // and copies them into a live Matroska pipe.
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v copy -c:a copy -c:s copy -f matroska pipe:1';
+  const args = buildFfmpegTemplateArgs({
+    template,
+    source: { url: 'https://cdn/movie.mp4', kind: 'file', subtitles: [{ codec: 'mov_text', language: 'eng' }] },
+    profile: {}, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.equal(args[args.indexOf('-c:s') + 1], 'copy', 'the template’s own setting is untouched');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt', 'the uncopyable track gets a per-stream re-encode');
+
+  // A subrip track copies fine — no override appears.
+  const plain = buildFfmpegTemplateArgs({
+    template,
+    source: { url: 'https://cdn/movie.mp4', kind: 'file', subtitles: [{ codec: 'subrip', language: 'nld' }] },
+    profile: {}, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!plain.includes('-c:s:0'));
+
+  // No probe info → no override (nothing to know), command stays as written.
+  const noProbe = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4', kind: 'file' },
+    profile: {}, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.ok(!noProbe.includes('-c:s:0'));
+
+  // A catch-all `-c copy` copies subtitles too and needs the same override.
+  const catchAll = buildFfmpegTemplateArgs({
+    template: 'ffmpeg -i <url> -c copy -f matroska pipe:1',
+    source: { url: 'https://cdn/movie.mp4', kind: 'file', subtitles: [{ codec: 'mov_text' }] },
+    profile: {}, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  assert.equal(catchAll[catchAll.indexOf('-c:s:0') + 1], 'srt', 'automatic stream selection picks the first subtitle track');
 });
 
 test('an FFmpeg template keeps the subtitle attached to the playlist item', (t) => {
