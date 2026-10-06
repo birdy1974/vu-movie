@@ -10,6 +10,7 @@
  *   GET    /api/playlist              items (stream + urls) + every output URL
  *   PUT    /api/playlist              reorder (`streamIds`) and/or replace items
  *   POST   /api/playlist/items        add streams by id
+ *   POST   /api/playlist/check        “are these upstreams still working?” (ffprobe)
  *   PATCH  /api/playlist/items/:id    enable/disable, assign template, language
  *   DELETE /api/playlist/items/:id    remove from the playlist
  *   POST   /api/playlist/items/:id/template   assign a saved FFmpeg template
@@ -28,8 +29,17 @@ import * as exporter from '../streams/export.js';
 import * as relay from '../streams/relay.js';
 import * as enigma2 from '../enigma2/index.js';
 import { publicPosterUrl } from '../http/poster-proxy.js';
-import { OUTPUT_LABELS, OUTPUT_TYPES } from '../http/api.js';
+import { OUTPUT_LABELS, OUTPUT_TYPES, requestAbortSignal } from '../http/api.js';
 import * as playlist from './index.js';
+import { checkStreams } from './check.js';
+
+/**
+ * How many upstreams are probed at once by POST /api/playlist/check when the
+ * caller does not say. Two: a NAS has one uplink and each probe holds a
+ * connection for its whole duration, so more workers queue on the wire while
+ * the log becomes unreadable.
+ */
+const CHECK_CONCURRENCY = 2;
 
 const router = express.Router();
 
@@ -180,6 +190,58 @@ router.put('/', wrap(async (req, res) => {
   }
   const baseUrl = baseUrlFrom(req);
   res.json({ ok: true, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
+}));
+
+/* ---------- stream health ---------- */
+
+/**
+ * “Are the streams in the playlist still working?”
+ *
+ * Body: `{ streamIds?: string[], concurrency?: 1..4 }`. With no `streamIds`
+ * every item is checked; the Playlist tab sends one id per request so each row
+ * can be painted the moment its probe answers instead of waiting for the whole
+ * list. Each item costs one ffprobe run (HLS masters are expanded and the
+ * DNS/TCP preflight is shared with the search pipeline), so the answer carries
+ * `summary.probing: false` when probing is switched off in Settings — the items
+ * then come back `unverified` instead of being reported dead.
+ */
+router.post('/check', wrap(async (req, res) => {
+  const body = req.body || {};
+  const wanted = Array.isArray(body.streamIds) && body.streamIds.length
+    ? body.streamIds.map((id) => String(id))
+    : null;
+  const requested = Number(body.concurrency);
+  const concurrency = Number.isFinite(requested) ? Math.min(4, Math.max(1, Math.round(requested))) : CHECK_CONCURRENCY;
+  const request = requestAbortSignal(req, res);
+  try {
+    const list = await playlist.entries();
+    const chosen = wanted ? list.filter((entry) => wanted.includes(String(entry.stream.id))) : list;
+    const targets = chosen.map((entry) => ({
+      streamId: entry.stream.id,
+      title: entry.stream.title,
+      sourceId: entry.stream.source_id,
+      enabled: entry.enabled,
+      url: entry.stream.upstream?.url || '',
+      headers: entry.stream.upstream?.headers || {},
+      kind: entry.stream.upstream?.kind || entry.stream.kind || null,
+      expiresAt: entry.stream.expires_at || null,
+    }));
+    // Ids that are not in the playlist are named instead of silently ignored:
+    // the UI can then say “that item is gone” rather than showing it as dead.
+    const unknown = wanted
+      ? wanted.filter((id) => !list.some((entry) => String(entry.stream.id) === id))
+      : [];
+    const { results, summary } = await checkStreams(targets, { signal: request.signal, concurrency });
+    if (request.signal.aborted) return;
+    res.json({
+      ok: true,
+      summary: { ...summary, concurrency, requested: wanted ? wanted.length : list.length },
+      results,
+      ...(unknown.length ? { unknown } : {}),
+    });
+  } finally {
+    request.dispose();
+  }
 }));
 
 router.post('/items', wrap(async (req, res) => {

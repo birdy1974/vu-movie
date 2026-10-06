@@ -172,6 +172,187 @@ const VMPlaylist = (() => {
     </div>`;
   }
 
+  /* ---------------- stream health: “is this one still working?” ------------- */
+
+  /**
+   * The upstream URLs in a playlist rot (signed tokens expire, mirrors die,
+   * CDNs start geo-blocking) and the only honest answer is a probe. Results
+   * live in `state.playlist.health[streamId]` and are painted per row, so a
+   * long playlist fills in one item at a time instead of blocking on one
+   * request that probes everything.
+   */
+  const healthOf = (streamId) => (state.playlist.health || {})[String(streamId)] || null;
+  const isChecking = (streamId) => (state.playlist.checkingIds || new Set()).has(String(streamId));
+
+  /** What ffprobe found, in one line: “1920×1080 h264 · 1h 32m”. */
+  function probeLine(health) {
+    const probe = health?.probe;
+    if (!probe) return '';
+    const video = probe.video && probe.video.height
+      ? ` ${probe.video.width ? `${probe.video.width}×` : ''}${probe.video.height}${probe.video.codec ? ` ${probe.video.codec}` : ''}`
+      : '';
+    const duration = probe.durationSec ? ` · ${fmtDuration(probe.durationSec)}` : '';
+    return `${video}${duration}`;
+  }
+
+  /** One state → the tag the row shows, with the full reason in the tooltip. */
+  function healthTag(health) {
+    if (!health) return '';
+    const probe = probeLine(health);
+    if (health.state === 'working') {
+      const ms = health.probeMs ? ` (${Math.round(health.probeMs / 1000)} s)` : '';
+      return tag(`working${probe}${ms}`, 'ok');
+    }
+    if (health.state === 'dead') return tag('not working', 'err');
+    if (health.state === 'expired') return tag('token expired', 'err');
+    if (health.state === 'unverified') return tag('unverified', 'warn');
+    return tag('cannot check', 'warn');
+  }
+
+  /** The `title` attribute: the ffprobe detail on success, the reason on failure. */
+  function healthTitle(health) {
+    if (!health) return '';
+    const probe = health.probe;
+    const found = probe
+      ? [
+        probe.container ? `container ${probe.container}` : '',
+        probe.video?.codec ? `video ${probe.video.codec}${probe.video.width ? ` ${probe.video.width}×${probe.video.height}` : ''}` : '',
+        probe.audio?.length ? `audio ${probe.audio.map((track) => track.codec).filter(Boolean).join('/')}` : '',
+        probe.durationSec ? `duration ${fmtDuration(probe.durationSec)}` : 'live / unknown duration',
+        probe.subtitleTracks ? `${probe.subtitleTracks} subtitle track(s)` : '',
+      ].filter(Boolean).join(' · ')
+      : '';
+    if (health.state === 'working') return `checked${health.at ? ` ${fmtTime(health.at)}` : ''}${found ? ` — ${found}` : ''}`;
+    if (health.state === 'unverified') return `not proven: ${health.error || 'probing is switched off in Settings or ffprobe is missing'}`;
+    if (health.state === 'skipped') return health.error || 'no upstream URL stored for this stream';
+    return `${health.error || 'the upstream URL did not answer'}${health.at ? ` (checked ${fmtTime(health.at)})` : ''}`;
+  }
+
+  /** The row's health cell — replaced in place while a check is running. */
+  function healthCellMarkup(item) {
+    const health = healthOf(item.streamId);
+    const checking = isChecking(item.streamId);
+    if (checking) return tag('checking…', 'info');
+    if (!health) return '';
+    return `<span class="pl-health-tag" title="${escapeHtml(healthTitle(health))}">${healthTag(health)}</span>`;
+  }
+
+  /** Repaint one row's health without re-rendering the list under the user. */
+  function renderRowHealth(streamId) {
+    const item = itemFor(streamId);
+    if (!item) return;
+    $$('[data-pl-health]').forEach((node) => {
+      if (String(node.dataset.plHealth) !== String(streamId)) return;
+      node.innerHTML = healthCellMarkup(item);
+      node.closest('[data-pl-row]')?.classList.toggle('bad', ['dead', 'expired'].includes(healthOf(streamId)?.state));
+    });
+    const button = $(`[data-pl-check="${String(streamId).replace(/"/g, '')}"]`);
+    if (button) {
+      button.disabled = isChecking(streamId);
+      button.textContent = isChecking(streamId) ? '…' : '⚡';
+    }
+  }
+
+  function renderCheckNote() {
+    const note = $('#list-check-note');
+    const button = $('#btn-list-check');
+    const progress = state.playlist.checkProgress || null;
+    const running = (state.playlist.checkingIds || new Set()).size > 0;
+    if (button) button.disabled = running || !items().length;
+    if (!note) return;
+    if (running && progress) {
+      note.textContent = `checking ${progress.done}/${progress.total} stream(s)…`;
+      return;
+    }
+    const health = Object.entries(state.playlist.health || {})
+      .filter(([streamId]) => itemFor(streamId))
+      .map(([, value]) => value);
+    if (!health.length) {
+      note.textContent = '';
+      return;
+    }
+    const broken = health.filter((result) => ['dead', 'expired'].includes(result.state));
+    const working = health.filter((result) => result.state === 'working').length;
+    const unknown = health.filter((result) => ['unverified', 'skipped'].includes(result.state)).length;
+    const parts = [`${working}/${health.length} working`];
+    if (broken.length) {
+      const names = broken.slice(0, 3).map((result) => `${result.title || result.streamId} (${result.error || result.state})`);
+      parts.push(`${broken.length} not working: ${names.join('; ')}${broken.length > 3 ? ` +${broken.length - 3} more` : ''}`);
+    }
+    if (unknown) parts.push(`${unknown} unverified`);
+    note.textContent = parts.join(' · ');
+    note.classList.toggle('has-broken', broken.length > 0);
+  }
+
+  /**
+   * Check the upstreams. The Playlist tab asks per item (two in flight) so each
+   * row is painted as soon as its probe answers; `checkAll` is also usable with
+   * a batch, which is what curl/ops would do.
+   */
+  async function checkStreams(streamIds = null, { concurrency = 2 } = {}) {
+    const wanted = streamIds ? streamIds.map(String) : null;
+    const list = wanted ? items().filter((item) => wanted.includes(String(item.streamId))) : items();
+    if (!list.length) {
+      toast('Nothing to check — the playlist is empty', 'warn');
+      return null;
+    }
+    state.playlist.health = { ...(state.playlist.health || {}) };
+    for (const item of list) delete state.playlist.health[String(item.streamId)];
+    state.playlist.checkingIds = new Set(list.map((item) => String(item.streamId)));
+    state.playlist.checkProgress = { done: 0, total: list.length };
+    for (const item of list) renderRowHealth(item.streamId);
+    renderCheckNote();
+
+    let index = 0;
+    let requestFailures = 0;
+    await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), list.length) }, async () => {
+      while (index < list.length) {
+        const item = list[index++];
+        try {
+          const data = await api('/api/playlist/check', {
+            method: 'POST', silent: true,
+            body: { streamIds: [String(item.streamId)], concurrency: 1 },
+          });
+          for (const result of data.results || []) {
+            state.playlist.health[String(result.streamId)] = { ...result, at: data.summary?.checkedAt || new Date().toISOString() };
+          }
+          if (!data.results?.length) {
+            state.playlist.health[String(item.streamId)] = {
+              streamId: item.streamId, state: 'skipped', title: item.title,
+              error: 'the server did not answer for this stream', at: new Date().toISOString(),
+            };
+          }
+        } catch (error) {
+          requestFailures += 1;
+          state.playlist.health[String(item.streamId)] = {
+            streamId: item.streamId, title: item.title, state: 'dead',
+            error: `check failed: ${error.message}`, probeMs: null, probe: null, at: new Date().toISOString(),
+          };
+        } finally {
+          state.playlist.checkingIds.delete(String(item.streamId));
+          state.playlist.checkProgress.done += 1;
+          renderRowHealth(item.streamId);
+          renderCheckNote();
+        }
+      }
+    }));
+
+    state.playlist.checkingIds = new Set();
+    renderCheckNote();
+    const health = list.map((item) => healthOf(item.streamId)).filter(Boolean);
+    const broken = health.filter((result) => ['dead', 'expired'].includes(result.state));
+    if (broken.length) {
+      toast(`${broken.length} of ${health.length} stream(s) are not working: ${broken.slice(0, 3).map((result) => result.title || result.streamId).join(', ')}`, 'err', 12000);
+    } else if (health.some((result) => result.state === 'unverified')) {
+      toast('Checked — probing is off or ffprobe is missing, so the streams are unverified', 'warn', 9000);
+    } else if (requestFailures) {
+      toast(`${requestFailures} check(s) could not reach the server`, 'err');
+    } else {
+      toast(`All ${health.length} stream(s) answered`, 'ok');
+    }
+    return { health };
+  }
+
   function rowMarkup(item, index) {
     const meta = [
       item.year ? String(item.year) : '',
@@ -186,7 +367,10 @@ const VMPlaylist = (() => {
       : tag('no subtitle');
     const templateTag = item.hasTemplate ? tag(templateLabel(item), 'alt') : tag(templateLabel(item));
     const session = item.session ? tag(`${item.session.clients || 0} client(s)`, 'info') : '';
-    return `<article class="pl-row${item.enabled ? '' : ' off'}" data-pl-row="${escapeHtml(item.streamId)}" data-pl-index="${index}">
+    const health = healthOf(item.streamId);
+    const broken = ['dead', 'expired'].includes(health?.state);
+    const checking = isChecking(item.streamId);
+    return `<article class="pl-row${item.enabled ? '' : ' off'}${broken ? ' bad' : ''}" data-pl-row="${escapeHtml(item.streamId)}" data-pl-index="${index}">
       <div class="pl-handle" title="drag to change the order" aria-hidden="true">⠿</div>
       <div class="pl-order">${index + 1}</div>
       <label class="pl-switch" title="include this item in every output">
@@ -197,10 +381,11 @@ const VMPlaylist = (() => {
       <div class="pl-main">
         <div class="pl-title">${escapeHtml(item.title || 'Untitled')}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
         <div class="meta">${escapeHtml(meta || '—')}</div>
-        <div class="pl-tags">${templateTag}${subtitle}${session}</div>
+        <div class="pl-tags">${templateTag}${subtitle}${session}<span class="pl-health" data-pl-health="${escapeHtml(item.streamId)}">${healthCellMarkup(item)}</span></div>
       </div>
       ${templateSelect(item)}
       <div class="pl-actions">
+        <button class="btn sm ghost" data-pl-check="${escapeHtml(item.streamId)}" ${checking ? 'disabled' : ''} title="check whether this stream still works (ffprobe on the upstream URL)">${checking ? '…' : '⚡'}</button>
         <button class="btn sm" data-pl-play="${escapeHtml(item.streamId)}" title="start the preview web player">▶ preview</button>
         <button class="btn sm ghost" data-pl-meta="${escapeHtml(item.streamId)}" title="show all metadata">ⓘ meta</button>
         <button class="btn sm ghost" data-pl-sub="${escapeHtml(item.streamId)}" title="assign a subtitle file">▤ subtitle</button>
@@ -233,6 +418,7 @@ const VMPlaylist = (() => {
     }
     const openStreamBtn = $('#btn-list-open-stream');
     if (openStreamBtn) openStreamBtn.disabled = !list.length;
+    renderCheckNote();
 
     if (!list.length) {
       host.innerHTML = '<div class="card"><div class="meta">The playlist is empty. Search a title on the Search tab and pick a format, or use “add a stream” above.</div></div>';
@@ -249,6 +435,7 @@ const VMPlaylist = (() => {
     $$('[data-pl-template]', host).forEach((select) => select.addEventListener('change', () => {
       assignTemplate(select.dataset.plTemplate, select.value);
     }));
+    $$('[data-pl-check]', host).forEach((button) => button.addEventListener('click', () => checkStreams([button.dataset.plCheck])));
     $$('[data-pl-play]', host).forEach((button) => button.addEventListener('click', () => openPlayer(button.dataset.plPlay)));
     $$('[data-pl-meta]', host).forEach((button) => button.addEventListener('click', () => openMetadata(button.dataset.plMeta)));
     $$('[data-pl-sub]', host).forEach((button) => button.addEventListener('click', () => openSubtitlePicker(button.dataset.plSub)));
@@ -769,6 +956,7 @@ const VMPlaylist = (() => {
 
   function wire() {
     $('#btn-list-refresh')?.addEventListener('click', () => refresh().then(() => toast('Playlist reloaded', 'ok', 2500)));
+    $('#btn-list-check')?.addEventListener('click', () => checkStreams());
     $('#btn-list-enable-all')?.addEventListener('click', () => setAllEnabled(true));
     $('#btn-list-disable-all')?.addEventListener('click', () => setAllEnabled(false));
     $('#btn-list-add')?.addEventListener('click', async () => {
@@ -791,6 +979,7 @@ const VMPlaylist = (() => {
     load, refresh, wire, renderTab, renderAddPicker, addToPlaylist, patchItem, assignTemplate,
     removeItem, removeStream, reorder, setAllEnabled, openMetadata, openPlayer, openSubtitlePicker,
     items, enabledItems, itemFor, templates, urls, templateLabel, thumbMarkup,
+    checkStreams, healthOf, renderRowHealth, renderCheckNote,
   };
 })();
 

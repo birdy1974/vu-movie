@@ -47,7 +47,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
   res.status(err.status || 500).json({ ok: false, error: errorText(err) });
 });
 
-function requestAbortSignal(req, res) {
+export function requestAbortSignal(req, res) {
   const controller = new AbortController();
   const onRequestAborted = () => controller.abort();
   const onResponseClosed = () => {

@@ -216,6 +216,19 @@ page instead of from guesswork.
 ### Operations
 * **Jobs** for every long action, with progress, logs and a cancel button
   (cancelling kills the underlying Chromium/ffmpeg process).
+* **“Check streams” on the Playlist tab** answers the question a playlist can't:
+  is anything in it still playing? Every item's upstream URL is probed with
+  ffprobe — the same proof the Search tab runs before offering a format — and
+  each row gets a verdict: **working** (with what was found: container, codec,
+  resolution, duration), **not working**, **token expired** (the stream's own
+  upstream-token TTL passed) or **unverified** (probing is switched off in
+  Settings or ffprobe is missing). The line next to the button summarises the
+  run (`3/5 working · 2 not working: …`), broken rows are outlined red, a single
+  row can be re-checked with its own ⚡ button, and a check never changes,
+  disables or deletes anything. API: `POST /api/playlist/check`
+  `{ "streamIds": ["…"] }` (omit it for the whole list) → `{ results: [{ streamId,
+  state, error, probeMs, probe }], summary, unknown }`
+  with `state` ∈ `working | dead | expired | unverified | skipped`.
 * **Live log view** in the UI (`/api/events`, SSE) with level/component filters —
   made for "why is this film not playing" debugging.
 * **Detailed, levelled, component-tagged logging** in the container log too

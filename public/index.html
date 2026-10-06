@@ -350,7 +350,7 @@
 
     <!-- ============ PLAYLIST ============ -->
     <section id="p-list" class="hide">
-      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue.">i</span></h1>
+      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue. “Check streams” probes the upstream URL behind every item and marks the dead ones instead of leaving you to find out in VLC.">i</span></h1>
       <div class="card">
         <div class="spread">
           <div class="row">
@@ -360,6 +360,8 @@
           <div class="row">
             <button class="btn sm ghost" id="btn-list-enable-all">✓ enable all</button>
             <button class="btn sm ghost" id="btn-list-disable-all">✕ disable all</button>
+            <button class="btn sm" id="btn-list-check" title="probe every upstream URL in the playlist with ffprobe">⚡ check streams <span class="tip" tabindex="0" role="note" aria-label="About checking streams" data-tip="Probes every item's upstream URL with ffprobe — the same proof the Search tab runs before offering a format. Each row shows working / dead / token expired / unverified, with the reason in its tooltip; the line next to the button summarises the result. Nothing is changed or removed by a check.">i</span></button>
+            <span class="mut" id="list-check-note" role="status" aria-live="polite"></span>
             <button class="btn sm ghost" id="btn-list-refresh">⟳ refresh</button>
           </div>
         </div>
