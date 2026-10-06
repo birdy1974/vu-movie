@@ -204,6 +204,12 @@ router.put('/', wrap(async (req, res) => {
  * DNS/TCP preflight is shared with the search pipeline), so the answer carries
  * `summary.probing: false` when probing is switched off in Settings — the items
  * then come back `unverified` instead of being reported dead.
+ *
+ * Order contract: a request that names ids gets its answers **in that order**
+ * (a batch lookup), a request without ids gets the playlist order. Without this
+ * the order was whatever the playlist happened to hold — two streams created in
+ * the same millisecond tie on `created_at` and can come back either way, which
+ * a batch caller cannot use.
  */
 router.post('/check', wrap(async (req, res) => {
   const body = req.body || {};
@@ -236,7 +242,9 @@ router.post('/check', wrap(async (req, res) => {
     res.json({
       ok: true,
       summary: { ...summary, concurrency, requested: wanted ? wanted.length : list.length },
-      results,
+      results: wanted
+        ? [...results].sort((a, b) => wanted.indexOf(String(a.streamId)) - wanted.indexOf(String(b.streamId)))
+        : results,
       ...(unknown.length ? { unknown } : {}),
     });
   } finally {

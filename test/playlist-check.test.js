@@ -201,6 +201,9 @@ test('POST /api/playlist/check answers per item, without a network', async () =>
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.ok, true);
+    // Named ids come back in the order they were asked for (a batch lookup);
+    // the playlist's own order is not stable for streams created in the same
+    // millisecond, which is what made this assertion flaky before.
     assert.deepEqual(body.results.map((result) => result.streamId), [noUrl.id, expired.id]);
     assert.deepEqual(body.results.map((result) => result.state), ['skipped', 'expired']);
     assert.deepEqual(body.unknown, ['does-not-exist'], 'an id that is not in the playlist is named, not silently dropped');
