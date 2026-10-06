@@ -402,10 +402,10 @@ const VMPlaylist = (() => {
   /**
    * Play a stream in the browser.
    *
-   * Browsers refuse raw MPEG-TS in a <video> element, so this tries, in order:
-   *   1. the plain URL (works for sources that already are MP4/MKV)
-   *   2. Media Source Extensions with the TS muxer, when the browser supports it
-   *   3. a clear message with the links that always work (VLC, .m3u, download)
+   * Chrome/Firefox do not demux MPEG-TS in <video> and do not accept video/mp2t
+   * SourceBuffers. mpegts.js transmuxes the relay's TS bytes to fragmented MP4
+   * in MediaSource, locally in the browser. Safari/native playback remains the
+   * fallback, and VLC is always offered for a codec the browser cannot decode.
    */
   async function openPlayer(streamId) {
     openModal({
@@ -431,18 +431,16 @@ const VMPlaylist = (() => {
               <button class="btn sm ghost" data-player-newtab>open /watch page ↗</button>
               <button class="btn sm ghost" data-player-sub>▤ subtitle</button>
             </div>
-            <div class="meta" style="margin-top:8px">If the picture stays black, the browser cannot demux this source (MPEG-TS without MSE support). VLC and the VU+ always can — the same URL is used everywhere.</div>
+            <div class="meta" style="margin-top:8px">The web player transmuxes the MPEG-TS relay in your browser. If the source uses a browser-unsupported codec such as HEVC, use VLC or assign an H.264/AAC transcode template.</div>
           </div>`,
         onMount: (root) => {
           const video = $('#player-video', root);
           const statusEl = $('#player-status', root);
-          const preferHls = stream.profile?.container === 'hls' && urls.hls;
-          const candidate = preferHls || urls.raw || urls.ts;
           $('[data-player-vlc]', root)?.addEventListener('click', () => { window.location.href = String(urls.ts).replace(/^https?:/, 'vlc:'); });
           $('[data-player-copy]', root)?.addEventListener('click', () => copyText(urls.ts || ''));
           $('[data-player-newtab]', root)?.addEventListener('click', () => window.open(urls.watch || '', '_blank'));
           $('[data-player-sub]', root)?.addEventListener('click', () => openSubtitlePicker(stream.id));
-          startPlayback({ stream, urls, candidate, video, statusEl, preferHls });
+          return startPlayback({ stream, urls, video, statusEl });
         },
       });
     } catch (error) {
@@ -450,70 +448,72 @@ const VMPlaylist = (() => {
     }
   }
 
-  function startPlayback({ stream, urls, candidate, video, statusEl, preferHls }) {
-    if (!video) return;
-    let settled = false;
+  function startPlayback({ stream, urls, video, statusEl }) {
+    if (!video) return null;
+    let player = null;
+    let stopped = false;
     const fallback = (message) => {
-      if (settled) return;
-      settled = true;
+      if (stopped) return;
       statusEl.className = 'note warn';
       statusEl.innerHTML = `${escapeHtml(message)}<br>
         <span class="mut">Stream URL: <code>${escapeHtml(urls.ts || '')}</code></span>`;
     };
-
-    const tryMse = () => {
-      const mime = 'video/mp2t; codecs="avc1.42E01E,mp4a.40.2"';
-      if (!window.MediaSource || !window.MediaSource.isTypeSupported(mime)) {
-        fallback('This browser cannot play MPEG-TS directly (no Media Source support for video/mp2t).');
-        return;
-      }
-      statusEl.textContent = 'streaming through Media Source Extensions…';
-      try {
-        const ms = new MediaSource();
-        video.src = URL.createObjectURL(ms);
-        ms.addEventListener('sourceopen', () => {
-          let buffer;
-          try { buffer = ms.addSourceBuffer(mime); } catch { fallback('Media Source rejected the MPEG-TS muxer.'); return; }
-          let queue = [];
-          const append = () => {
-            if (!queue.length || buffer.updating || ms.readyState !== 'open') return;
-            const chunk = queue.shift();
-            try { buffer.appendBuffer(chunk); } catch { /* dropped chunk */ }
-          };
-          buffer.addEventListener('updateend', () => {
-            const back = video.buffered;
-            const behind = back.length ? video.currentTime - back.start(0) : 0;
-            if (behind > 12) video.currentTime = back.start(0) + 1;
-            if (ms.duration !== Infinity && back.length) { try { ms.duration = back.end(back.length - 1); } catch { /* ignore */ } }
-            append();
-          });
-          fetch(urls.ts).then((response) => response.body.getReader()).then((reader) => {
-            const pump = () => reader.read().then(({ value, done }) => {
-              if (done) { try { ms.endOfStream(); } catch { /* ignore */ } return; }
-              queue.push(value);
-              append();
-              pump();
-            }).catch(() => {});
-            pump();
-          }).catch(() => fallback('The relay session ended before the player could start.'));
-          video.play().catch(() => { /* autoplay may be blocked; the controls work */ });
-        }, { once: true });
-      } catch {
-        fallback('Media Source Extensions failed to start.');
-      }
-    };
-
-    video.addEventListener('error', () => tryMse(), { once: true });
-    statusEl.innerHTML = `<span class="spin"></span> buffering ${escapeHtml(preferHls ? 'the HLS playlist' : 'the stream')}…`;
-    video.addEventListener('playing', () => {
-      settled = true;
+    const markPlaying = () => {
+      if (stopped) return;
       statusEl.className = 'meta ok-text';
       statusEl.textContent = 'playing';
-    }, { once: true });
-    video.src = candidate;
-    video.play().catch(() => { /* autoplay blocked — user presses play */ });
-    // A black tag with no error event is the common "TS in Chrome" case.
-    setTimeout(() => { if (!settled && video.readyState === 0) tryMse(); }, 2500);
+    };
+    video.addEventListener('playing', markPlaying);
+    statusEl.innerHTML = '<span class="spin"></span> starting the MPEG-TS relay and buffering…';
+
+    if (window.mpegts?.isSupported?.() && urls.ts) {
+      try {
+        player = window.mpegts.createPlayer({
+          type: 'mpegts',
+          isLive: true,
+          url: urls.ts,
+        }, {
+          enableWorker: true,
+          lazyLoad: false,
+          liveBufferLatencyChasing: true,
+          liveBufferLatencyMaxLatency: 8,
+          liveBufferLatencyMinRemain: 1,
+        });
+        player.attachMediaElement(video);
+        player.on(window.mpegts.Events.ERROR, (type, detail, info) => {
+          const reason = info?.msg || info?.message || detail || type || 'unknown playback error';
+          fallback(`Web preview failed: ${reason}. The source codec may not be supported by this browser.`);
+        });
+        player.load();
+        player.play().catch(() => {
+          if (!stopped) statusEl.textContent = 'ready — press Play to start';
+        });
+      } catch (error) {
+        fallback(`Could not start the browser transmuxer: ${error.message}`);
+      }
+    } else {
+      // Safari can play some relay/container combinations natively. Keep this as
+      // a fallback for browsers without MediaSource/mpegts.js.
+      const nativeUrl = urls.raw || urls.ts;
+      video.src = nativeUrl;
+      video.addEventListener('error', () => fallback('This browser cannot play the relay natively and MPEG-TS transmuxing is unavailable.'), { once: true });
+      video.play().catch(() => {
+        if (!stopped) statusEl.textContent = 'ready — press Play to start';
+      });
+    }
+
+    // openModal/closeModal calls this cleanup. Without it, closing Preview left
+    // the fetch open and FFmpeg kept running until the idle timeout.
+    return () => {
+      stopped = true;
+      video.removeEventListener('playing', markPlaying);
+      try { player?.pause(); } catch { /* ignore */ }
+      try { player?.unload(); } catch { /* ignore */ }
+      try { player?.detachMediaElement(); } catch { /* ignore */ }
+      try { player?.destroy(); } catch { /* ignore */ }
+      player = null;
+      try { video.pause(); video.removeAttribute('src'); video.load(); } catch { /* ignore */ }
+    };
   }
 
   /* ---------------- subtitle assignment ---------------- */

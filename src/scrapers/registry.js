@@ -950,6 +950,7 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
           ...cand,
           url: v.url,
           quality: v.height ? `${v.height}p` : cand.quality,
+          width: v.width || null,
           height: v.height || null,
           bandwidth: v.bandwidth || null,
           label: v.name || (v.height ? `${v.height}p` : 'variant'),

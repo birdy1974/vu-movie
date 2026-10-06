@@ -259,17 +259,25 @@ function apiSse(path, body, handlers = {}) {
 function openModal({ title = '', body = '', className = '', onMount = null } = {}) {
   const root = $('#modal-root');
   if (!root) return;
+  const modalBody = $('#modal-body');
+  try { modalBody?._cleanup?.(); } catch { /* a modal cleanup must never block the next modal */ }
+  if (modalBody) modalBody._cleanup = null;
   $('#modal-title').textContent = title;
-  $('#modal-body').innerHTML = body;
+  if (modalBody) modalBody.innerHTML = body;
   $('.modal', root).className = `modal ${className}`;
   root.classList.remove('hide');
-  onMount?.($('#modal-body'));
+  const cleanup = onMount?.(modalBody);
+  if (modalBody && typeof cleanup === 'function') modalBody._cleanup = cleanup;
 }
 
 function closeModal() {
   $('#modal-root')?.classList.add('hide');
   const body = $('#modal-body');
-  if (body) body.innerHTML = '';
+  if (body) {
+    try { body._cleanup?.(); } catch { /* best-effort player/request cleanup */ }
+    body._cleanup = null;
+    body.innerHTML = '';
+  }
 }
 
 function isPhone() {
