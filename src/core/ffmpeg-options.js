@@ -52,17 +52,50 @@ export const BASE_INPUT_FLAGS = ['-hide_banner', '-nostdin', '-loglevel', 'warni
  * ------------------------------------------------------------------ */
 
 export const HW_ACCELERATION = ['none', 'vaapi', 'qsv'];
-export const VIDEO_CODECS = ['copy', 'libx264', 'libx265', 'h264_vaapi', 'hevc_vaapi', 'h264_qsv', 'hevc_qsv'];
-export const AUDIO_CODECS = ['aac', 'ac3', 'eac3', 'mp2', 'libmp3lame', 'mp3', 'libopus', 'flac', 'copy', 'none'];
+
+/**
+ * Video encoders offered in the dropdown, copy first. Every one of these is a
+ * real ffmpeg encoder name (``ffmpeg -encoders``); whether a given build has it
+ * depends on how ffmpeg was compiled, which is why custom values are still
+ * accepted. Grouped: no re-encode, CPU, VAAPI, Quick Sync, NVENC.
+ */
+export const VIDEO_CODECS = [
+  'copy',
+  'libx264', 'libx265', 'libvpx-vp9', 'libsvtav1', 'mpeg2video',
+  'h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi', 'av1_vaapi',
+  'h264_qsv', 'hevc_qsv',
+  'h264_nvenc', 'hevc_nvenc',
+];
+
+/**
+ * Audio encoders. AAC is mandatory for MPEG-TS and HLS; AC-3/E-AC-3, MP2 and
+ * DTS are what set-top boxes understand; Opus/Vorbis need Matroska; PCM and
+ * FLAC are lossless (Matroska). `copy` keeps the source, `none` removes audio.
+ */
+export const AUDIO_CODECS = ['aac', 'ac3', 'eac3', 'mp2', 'mp3', 'libmp3lame', 'libopus', 'libvorbis', 'flac', 'pcm_s16le', 'copy', 'none'];
+
+/**
+ * Audio the transport streams actually carry (ISO/IEC 13818-1 registration and
+ * the HLS spec both assume these): AAC, AC-3, E-AC-3, MP2 or MP3. Opus/Vorbis,
+ * FLAC and PCM need Matroska, so combining them with MPEG-TS or HLS gets a
+ * warning instead of a stream that silently fails to decode.
+ */
+const TS_AUDIO_CODECS = ['aac', 'ac3', 'eac3', 'mp2', 'mp3', 'libmp3lame', 'copy', 'none'];
 export const RC_MODES = ['AUTO', 'CQP', 'CBR', 'VBR', 'ICQ', 'QVBR', 'AVBR'];
 export const SUB_MODES = ['drop', 'dvb', 'keep'];
-export const PROFILES = ['baseline', 'main', 'high'];
-export const LEVELS = ['3.0', '3.1', '3.2', '4.0', '4.1', '4.2', '5.0', '5.1', '5.2', '6.0', '6.1', '6.2'];
 
-/** Encoders that accept VAAPI-only tuning (-low_power/-rc_mode/-async_depth). */
-export const VAAPI_ENCODERS = ['h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi'];
-/** Encoders that accept -profile:v/-level (the H.264 family). */
-export const H264_ENCODERS = ['libx264', 'h264_vaapi', 'h264_qsv'];
+/** `-profile:v` for libx264/h264_vaapi/h264_qsv (see x264 --fullhelp). */
+export const PROFILES = ['baseline', 'main', 'high', 'high10', 'high422', 'high444'];
+/** H.264 levels as ffmpeg/x264 take them (annex A: 1 … 6.2, plus the 1b level). */
+export const LEVELS = [
+  '1', '1b', '1.1', '1.2', '1.3', '2', '2.1', '2.2', '3', '3.1', '3.2',
+  '4', '4.1', '4.2', '5', '5.1', '5.2', '6', '6.1', '6.2',
+];
+
+/** Encoders that accept VAAPI-only tuning (-low_power/-rc_mode/-async_depth/…). */
+export const VAAPI_ENCODERS = ['h264_vaapi', 'hevc_vaapi', 'vp8_vaapi', 'vp9_vaapi', 'av1_vaapi'];
+/** Encoders that accept -profile:v/-level (the H.264 family, incl. NVENC/VAAPI/QSV). */
+export const H264_ENCODERS = ['libx264', 'h264_vaapi', 'h264_qsv', 'h264_nvenc'];
 /** Rate-control modes where a fixed quantiser, not a bitrate, drives quality. */
 const QUALITY_RC_MODES = ['CQP', 'ICQ', 'QVBR'];
 
@@ -237,7 +270,7 @@ export const TEMPLATE_FIELDS = [
   }),
   field('fps', 'Output FPS', 'tuning', {
     help: 'Output frames per second while re-encoding. Blank keeps source timing. Decimal rates such as 23.976 or 59.94 are supported.',
-    kind: 'positive', choices: ['', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60'],
+    kind: 'positive', choices: ['', '15', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60', '100', '120'],
   }),
   field('gop', 'Keyframe interval', 'tuning', {
     help: 'Maximum frames between keyframes. At 25 FPS, 50 is roughly two seconds. 0 is intra-only; blank uses the encoder default.',
@@ -245,11 +278,11 @@ export const TEMPLATE_FIELDS = [
     choices: ['', '0', '1', '24', '25', '48', '50', '60', '100', '120', '250'],
   }),
   field('profile', 'H.264 profile', 'tuning', {
-    help: 'H.264 compatibility profile. Baseline suits older decoders; main/high improve compression. Blank lets ffmpeg choose. Only emitted for H.264 encoders.',
+    help: 'H.264 compatibility profile. Baseline suits older decoders; main/high improve compression; high10/high422/high444 add bit depth and chroma (and cost decoder support). Blank lets ffmpeg choose. Only emitted for H.264 encoders.',
     kind: 'enum', choices: ['', ...PROFILES], custom: false,
   }),
   field('level', 'H.264 level', 'tuning', {
-    help: 'H.264 decoder limits (resolution, rate and bitrate). 4.1 is common for 1080p; larger or faster video may need 5.x/6.x. Blank is automatic.',
+    help: 'H.264 decoder limits (resolution, rate and bitrate): the values ffmpeg/x264 accept are 1–6.2, including 1b. 4.1 is common for 1080p; larger or faster video may need 5.x/6.x. Blank is automatic.',
     kind: 'enum', choices: ['', ...LEVELS], custom: true,
   }),
   field('rc_mode', 'VAAPI rate control', 'tuning', {
@@ -278,7 +311,7 @@ export const TEMPLATE_FIELDS = [
   }),
   field('audio_bitrate', 'Audio bitrate', 'audio', {
     help: 'Target audio bits/second. 128k–192k is common for stereo AAC; surround often needs 384k–640k. Blank is automatic; ignored for copy/none.',
-    kind: 'rate', choices: ['', '64k', '96k', '128k', '160k', '192k', '256k', '320k', '384k', '448k', '640k'],
+    kind: 'rate', choices: ['', '48k', '64k', '96k', '112k', '128k', '160k', '192k', '224k', '256k', '320k', '384k', '448k', '512k', '640k'],
   }),
   field('audio_channels', 'Audio channels', 'audio', {
     help: 'Number of encoded audio channels: 1 mono, 2 stereo, 6 for 5.1, 8 for 7.1. Blank preserves the input layout; ignored for copy/none.',
@@ -287,10 +320,10 @@ export const TEMPLATE_FIELDS = [
   field('audio_rate', 'Audio sample rate', 'audio', {
     help: 'Encoded audio samples/second (Hz). 48000 is standard for video. Blank keeps the source rate; ignored for copy/none.',
     kind: 'integer', min: 8000, max: 384000,
-    choices: ['', '8000', '16000', '22050', '24000', '32000', '44100', '48000', '88200', '96000', '192000'],
+    choices: ['', '8000', '11025', '12000', '16000', '22050', '24000', '32000', '44100', '48000', '64000', '88200', '96000', '176400', '192000', '384000'],
   }),
   field('subs', 'Subtitles', 'subtitles', {
-    help: 'Drop removes subtitles. DVB keeps bitmap subtitles as a DVB track in an MPEG-TS output. Copy all requires Matroska for text and bitmap tracks; on TS/HLS it degrades to DVB. Burn-in needs the full command.',
+    help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed on top of this choice; burn-in needs the full command.',
     kind: 'enum', choices: [...SUB_MODES], custom: false,
   }),
   field('output_format', 'Output format', 'output', {
@@ -319,7 +352,7 @@ const adv = (flag, side, label, help, kind = 'text', choices = [], min = null, m
 
 export const ADVANCED_OPTIONS = [
   /* input side */
-  adv('-rw_timeout', 'input', 'Network read timeout (µs)', 'Microseconds waiting for network reads. 10000000 = 10 seconds; 0 disables the timeout.', 'integer', ['0', '5000000', '10000000', '20000000', '30000000'], 0, 2147483647),
+  adv('-rw_timeout', 'input', 'Network read timeout (µs)', 'Microseconds waiting for network reads. 10000000 = 10 seconds; 0 disables the timeout. Slow IPTV panels are happy with 60 s.', 'integer', ['0', '5000000', '10000000', '20000000', '30000000', '60000000'], 0, 2147483647),
   adv('-reconnect', 'input', 'Reconnect on disconnect', 'HTTP reconnect after an unexpected disconnect: 0 off, 1 on.', 'integer', ['0', '1'], 0, 1),
   adv('-reconnect_at_eof', 'input', 'Reconnect at end of input', '1 treats end-of-file as an error and reconnects. Prefer 0 for finite VOD files.', 'integer', ['0', '1'], 0, 1),
   adv('-reconnect_streamed', 'input', 'Reconnect non-seekable input', '1 permits reconnecting streamed/non-seekable HTTP inputs.', 'integer', ['0', '1'], 0, 1),
@@ -330,13 +363,13 @@ export const ADVANCED_OPTIONS = [
   adv('-thread_queue_size', 'input', 'Input packet queue', 'Maximum queued packets. More tolerates bursts but uses memory and can add latency.', 'integer', ['8', '64', '256', '512', '1024'], 1, 2147483647),
   adv('-fflags', 'input', 'Input format flags', 'Combine flags with +. nobuffer reduces buffering but can hurt unreliable sources.', 'text', ['+genpts+discardcorrupt', '+genpts', '+nobuffer', '+genpts+nobuffer+discardcorrupt']),
   adv('-err_detect', 'input', 'Decoder error handling', 'ignore_err continues after errors; careful/compliant/strict are progressively stricter.', 'text', ['ignore_err', 'careful', 'compliant', 'strict']),
-  adv('-user_agent', 'input', 'HTTP User-Agent', 'User-Agent presented to the source. A template override wins over the automatic player identity.', 'text', []),
+  adv('-user_agent', 'input', 'HTTP User-Agent', 'User-Agent presented to the source. The presets are the ones stalker-proxy-manager ships (ffmpeg’s own Lavf identity, and the VLC identity some portals insist on). A template override wins over the automatic player identity.', 'text', ['Lavf/61.7.100', 'VLC/3.0.21 LibVLC/3.0.21']),
   adv('-referer', 'input', 'HTTP Referer', 'Optional source website URL sent as the HTTP Referer header.', 'text', []),
   adv('-headers', 'input', 'Extra HTTP headers', 'Additional HTTP request headers, one per line ending with a backslash-n. Values containing a colon need quoting.', 'text', []),
   /* output side */
-  adv('-preset', 'output', 'Encoder speed preset', 'CPU x264/x265: faster saves CPU but needs more bitrate.', 'text', ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']),
+  adv('-preset', 'output', 'Encoder speed preset', 'CPU x264/x265: faster saves CPU but needs more bitrate.', 'text', ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow', 'placebo']),
   adv('-crf', 'output', 'CPU constant quality (CRF)', 'x264/x265 quality target: lower is better and larger. Remove the video bitrate to avoid mixing rate targets.', 'number', ['18', '20', '22', '23', '24', '26', '28', '30'], 0, 51),
-  adv('-tune', 'output', 'Encoder tuning', 'Encoder-specific content/latency tuning. zerolatency reduces buffering.', 'text', ['zerolatency', 'film', 'animation', 'grain', 'stillimage', 'fastdecode']),
+  adv('-tune', 'output', 'Encoder tuning', 'Encoder-specific content/latency tuning. zerolatency reduces buffering.', 'text', ['zerolatency', 'film', 'animation', 'grain', 'stillimage', 'psnr', 'ssim', 'fastdecode']),
   adv('-threads', 'output', 'Encoder threads', '0 is automatic. Larger values use more CPU; support depends on the encoder.', 'integer', ['0', '1', '2', '4', '8', '16'], 0, 2147483647),
   adv('-max_muxing_queue_size', 'output', 'Muxing packet queue', 'Packets buffered while waiting for all output streams. Raising it may resolve a queue overflow.', 'integer', ['128', '512', '1024', '4096'], 1, 2147483647),
   adv('-muxdelay', 'output', 'Mux delay (s)', 'Maximum mux delay in seconds. For TS, 0 can reduce startup latency.', 'number', ['0', '0.1', '0.5', '0.7', '1'], 0, 3600),
@@ -446,7 +479,9 @@ export const FORM_OWNED_FLAGS = new Set([
   '-b:v', '-maxrate', '-bufsize', '-g', '-r', '-profile:v', '-level',
   '-rc_mode', '-global_quality', '-low_power', '-async_depth',
   '-b:a', '-ac', '-ar', '-f', '-init_hw_device', '-hwaccel', '-hwaccel_device',
-  '-hwaccel_output_format', '-fps_mode', '-hide_banner', '-nostdin', '-loglevel', '-progress', '-nostats',
+  // -fps_mode is NOT here: it may be added as an advanced flag (the form never
+  // writes it — the relay builder in media.js owns the VAAPI cfr handling).
+  '-hwaccel_output_format', '-hide_banner', '-nostdin', '-loglevel', '-progress', '-nostats',
 ]);
 
 /* ------------------------------------------------------------------ *
@@ -700,6 +735,12 @@ export function templateOptionWarnings(options = {}, { container = null } = {}) 
     }
     if (o.hw_accel === 'qsv' && !o.video_codec.endsWith('_qsv')) warnings.push(`hardware decode is set to Quick Sync but ${o.video_codec} is not a QSV encoder`);
     if (o.video_codec === 'libx265') warnings.push('HEVC encoding is CPU-only on this box (Apollo Lake has no HEVC encoder) — fine for downloads, not for live use');
+  }
+  if (o.subs === 'dvb' && (fmt === 'mpegts' || fmt === 'hls')) {
+    warnings.push('DVB subtitles are bitmaps: this only works when the source already carries DVB or PGS subtitles (ffmpeg cannot convert a text .srt to DVB) — attach an .srt and use the Matroska container, or burn the subtitle in');
+  }
+  if ((fmt === 'mpegts' || fmt === 'hls') && o.audio_codec && !TS_AUDIO_CODECS.includes(o.audio_codec)) {
+    warnings.push(`${fmt === 'mpegts' ? 'MPEG-TS' : 'HLS'} carries AAC, AC-3, E-AC-3, MP2 or MP3 audio: ${o.audio_codec} needs the Matroska container`);
   }
   const snippet = vfSnippet(o.vf_preset, o.hw_accel);
   if (VF_PRESET_IDS.has(o.vf_preset) && o.vf_preset !== 'none' && !snippet) {
@@ -1134,6 +1175,11 @@ export function templateOptionsSchema() {
     hwAcceleration: HW_ACCELERATION,
     videoCodecs: VIDEO_CODECS,
     audioCodecs: AUDIO_CODECS,
+    // The editor needs to know which encoders accept VAAPI tuning and which
+    // take -profile:v/-level; sending them avoids a second hard-coded copy in
+    // public/ffmpeg-editor.js drifting away from this file.
+    vaapiEncoders: VAAPI_ENCODERS,
+    h264Encoders: H264_ENCODERS,
     rcModes: RC_MODES,
     subModes: SUB_MODES,
     resolutions: Object.keys(RESOLUTIONS),

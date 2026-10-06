@@ -157,10 +157,14 @@ to 512 MB. On a 4 GB NAS with Plex/Jellyfin also running, lower
   service type 4097 (GStreamer), so watching them does not occupy a tuner. After
   the push the app reloads the service list; the bouquet appears under
   *Favourites* / *vu-movie*.
-* **Subtitles**: search NL/EN, attach to the stream (muxed for the VLC/MKV path or
-  served as a sidecar `.srt`), or push the `.srt` to `/media/hdd/movie/vumovie` on
-  the box. Filename must match the recording name for Enigma2 to auto-load it —
-  the app names it after the stream title.
+* **Subtitles**: search NL/EN and attach to the stream, then choose how the box
+  gets it (*Playlist → ▤ subtitle → How the box gets it*). Ordered by NAS cost:
+  **copy the `.srt` to the box** (FTP or a mounted share, named after the movie —
+  no transcoding at all, picked up next to a recording of the same name),
+  **soft track** in the Matroska `.mkv` (flagged `default`; no re-encode),
+  **burned into the picture** (works on every player but re-encodes the video),
+  or **off**. MPEG-TS/HLS cannot carry a text subtitle at all: the relay says so
+  in the log instead of failing the stream.
 * **Download**: `Download` runs an ffmpeg copy job into `data/downloads` with
   progress in the job list; the resulting `.mkv` plays anywhere.
 
@@ -189,10 +193,13 @@ the new profile on the next request.
 | `no vaapi encode pipeline worked — using software encoding` | The container sees `/dev/dri` but no driver encodes: check the device permissions (Section 2) and run `sh scripts/doctor.sh` |
 | `/dev/dri device: missing` in the UI while the NAS has it | The compose `devices:` mapping did not apply to the running container: `docker compose up -d --force-recreate` |
 | Emoji/CP1252 subtitles show as `Ã©` | The app converts to UTF-8 on download; if a file still looks wrong, re-download with the *force UTF-8* switch |
+| Subtitles never appear on the Duo2, although a subtitle is attached | Read the relay's own verdict in the log first — it now names the reason: `not in this MPEG-TS output` (text `.srt` cannot become DVB bitmaps — use the `.mkv` URL or burn in), `an FFmpeg template drops it` (the template bound to the `enigma2`/`vlcMkv` output has `-sn`), `burn-in was requested … but this output runs an FFmpeg template` (unbind the template for that output). The box side: service **5002** (exteplayer3) renders embedded text tracks but exposes no subtitle menu entry, Enigma2 **4097** lists the track in the subtitle menu (gstplayer **5001** needs ServiceApp's *embedded subtitles* switch), and DVB bitmap subtitles need service type **1**. Last resort: switch the item to *burn into the picture* — that shows on every player |
 | Bouquet push fails | The app falls back to FTP/SCP; check `ENIGMA2_FTP=true` and that FTP is enabled on the box. WebIF's upload endpoint is disabled on some images |
 | Container restarts in a loop | `docker compose logs vu-movie` — the first lines name the missing piece (usually the database, if you set `REQUIRE_DB=true`) |
 | UI reachable but "database: memory" | Postgres is not up; the app still works but forgets streams on restart. `docker compose ps` and check the `db` healthcheck |
 | `WARN db slow query {"ms":759,…}` right after a start | The first read of a table comes off cold volumes and an empty Postgres cache — the same cold start that makes `ffmpeg -version` take ~20 s on a sleeping NAS. One slow query after a restart is expected and drops to single-digit ms once warm; the bar is `DB_SLOW_QUERY_MS` (default 1500 ms) and the line now reports the row count. Investigate only if it repeats on **every** load: compare the query in the log with the indexes in `migrations/0001_init.sql` |
+| *Run test* in the Transcode/Test tab shows no output, or the tab becomes unresponsive | Fixed: a template ending in `pipe:1` writes the **movie**, not a log, to stdout — the test used to forward those bytes as thousands of text lines (an 8 s run produced 6,036 events / 2.7 MB). Now binary stdout is counted, not printed (`# this template writes the finished stream to stdout (pipe:1) …`), stdout text is capped at 64 KB, and the panel keeps 400 lines rendered from one coalesced write. The verdict also reports the bytes the command wrote to `<output>`, so a file-writing template no longer reads as "no bytes reached the output" |
+| The Transcode tab says *could not render: …* and a warning stays on screen after you changed it | Fixed: the pane threw while painting its advice, so `build()` reported "could not render" and the *previous* warnings stayed visible (a template set to *Video decoding: vaapi* + *h264_vaapi* kept showing "hardware decode is set to Quick Sync"). The advice pane is now fault-tolerant and repaints from the current parameters — if it ever fails it says so instead of leaving the old verdicts |
 | `WARN config … uses flat dotted key(s)`, `ignoring flat key(s)`, or `unknown option(s)` | `/config/vumovie.json` contains hand-written `"a.b"` keys. JSON has no dotted paths, so they are folded into the nested objects (or, when the nested value already exists, ignored — the nested value wins) and named in the log. Edit the nested object instead, or save once from the Settings page, which rewrites the file in the correct shape |
 
 For the outbound scraper check, run these on the NAS from the folder with

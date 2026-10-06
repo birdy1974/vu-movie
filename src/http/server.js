@@ -28,9 +28,13 @@ import * as relay from '../streams/relay.js';
 import * as exporter from '../streams/export.js';
 import { upstreamProxyMiddleware } from '../streams/upstream.js';
 import apiRouter from './api.js';
+import playlistApiRouter from '../playlist/api.js';
+import playlistOutputsRouter from '../playlist/outputs.js';
+import ffmpegRunRouter from '../playlist/ffmpeg-run.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = process.env.PUBLIC_DIR || path.resolve(__dirname, '../../public');
+const MPEGTS_BROWSER_FILE = path.resolve(__dirname, '../../node_modules/mpegts.js/dist/mpegts.js');
 
 /** Resolve a stream by token and attach it to the relay session. */
 async function streamByToken(token) {
@@ -68,7 +72,11 @@ export function createApp() {
   app.use((req, res, next) => {
     const { username, password } = cfg.app;
     if (!username) return next();
-    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/') || req.path === '/api/health') return next();
+    // The stream endpoints and the playlist outputs are token-protected
+    // (/s/<token>/…, /pl/<token>/…, /xtream/<token>/…): VLC, the VU+ and IPTV
+    // apps cannot send a password, so they carry an unguessable path instead.
+    if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/')
+      || req.path.startsWith('/pl/') || req.path.startsWith('/xtream/') || req.path === '/api/health') return next();
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -80,9 +88,27 @@ export function createApp() {
     return res.status(401).send('vu-movie: authentication required');
   });
 
+  // Browser MPEG-TS → MediaSource transmuxer. It is installed from npm and
+  // served locally so the preview player works on an offline LAN and never
+  // depends on a third-party CDN.
+  app.get('/vendor/mpegts.js', (req, res) => {
+    if (!fs.existsSync(MPEGTS_BROWSER_FILE)) return res.status(404).type('text').send('mpegts.js is not installed');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(MPEGTS_BROWSER_FILE);
+  });
+
   // ---- chunked upstream proxy (/up/<secret>/…) — the loopback input for ----
   // ---- ffmpeg when a session fetches its source in ranged chunks      ----
   app.use(upstreamProxyMiddleware);
+
+  // ---- playlist outputs (token-protected, no password) ----
+  // /pl/<token>/… (m3u, m3u8, json, userbouquet.tv) and
+  // /xtream/<token>/… (player_api.php, get.php, xmltv.php).
+  app.use(playlistOutputsRouter);
+
+  // ---- playlist + live FFmpeg test API (before the main router) ----
+  app.use('/api/playlist', playlistApiRouter);
+  app.use('/api/ffmpeg', ffmpegRunRouter);
 
   app.use('/api', apiRouter);
 
@@ -244,14 +270,19 @@ export function createApp() {
     const stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+    const tsUrlJson = JSON.stringify(urls.ts).replace(/</g, '\\u003c');
+    const rawUrlJson = JSON.stringify(urls.raw).replace(/</g, '\\u003c');
     res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
 <title>${escapeHtml(stream.title)} — vu-movie</title>
 <style>body{background:#0b0f16;color:#e6edf7;font:14px system-ui;margin:0;padding:24px}
-video{width:100%;max-width:1100px;background:#000;border-radius:12px}
-a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px}</style></head>
+video{width:100%;max-width:1100px;background:#000;border-radius:12px}#status{color:#94a3b8;margin:10px 0}
+a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px}</style>
+<script src="/vendor/mpegts.js"></script></head>
 <body><h1>${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}</h1>
-<video controls autoplay src="${urls.raw}"></video>
-<p>Direct link: <code>${urls.raw}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>
+<video id="video" controls autoplay playsinline></video><div id="status">starting the MPEG-TS relay…</div>
+<p>Stream link: <code>${escapeHtml(urls.ts)}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>
+<script>(()=>{const video=document.getElementById('video');const status=document.getElementById('status');const ts=${tsUrlJson};let failed=false;
+if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.createPlayer({type:'mpegts',isLive:true,url:ts},{enableWorker:true,lazyLoad:false,liveBufferLatencyChasing:true});player.attachMediaElement(video);player.on(window.mpegts.Events.ERROR,(type,detail,info)=>{failed=true;const reason=String((info&&info.msg)||detail||type||'');status.textContent='Playback failed: '+(/endOfStream before demuxer|COULD_NOT_OPEN|not supported/i.test(reason)?'the relay sent no playable video — the source did not start (dead mirror, expired link, or ffmpeg unavailable)':reason)+'. Try VLC or an H.264/AAC template.'});player.load();player.play().catch(()=>{if(!failed)status.textContent='ready — press Play to start'});video.addEventListener('playing',()=>{status.textContent='playing'},{once:true});window.addEventListener('beforeunload',()=>{try{player.destroy()}catch{}})}else{video.src=${rawUrlJson};status.textContent='native browser playback fallback';video.play().catch(()=>{})}})();</script>
 </body></html>`);
   });
 

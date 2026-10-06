@@ -968,6 +968,41 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   }
   args.splice(inputIndex, 0, ...prefix);
 
+  // --- the subtitle attached to this playlist item --------------------------
+  // A template is written by hand in the editor and knows nothing about the
+  // .srt the operator attached per item, so the subtitle used to be dropped
+  // here: the Matroska (and .ts.enigma2) output carried video + audio only and
+  // the box had nothing to show. Insert the sidecar as an input and map it as
+  // subtitle stream 0 — before the template's own -map rows, so the index stays
+  // 0 no matter how many subtitle tracks the source itself has.
+  const sidecarSubtitlePath = profile.subtitles === 'soft' && profile.subtitlePath && fs.existsSync(profile.subtitlePath)
+    ? profile.subtitlePath
+    : null;
+  if (sidecarSubtitlePath) {
+    const mapsSecondInput = args.some((arg, index) => (arg === '-map' && /^1:/.test(String(args[index + 1] || '')))
+      || /^-map[= ]1:/.test(arg));
+    // A template that says -sn drops subtitles on purpose: the operator's
+    // command wins, but the session log says so (see subtitleSessionNotes)
+    // instead of silently ignoring the attachment.
+    const dropsSubs = args.some((arg) => arg === '-sn');
+    if (!mapsSecondInput && !dropsSubs && container === 'matroska') {
+      // The URL token sits right behind the '-i' that precedes it; everything
+      // the prefix added in front of it is already part of `args`.
+      const urlTokenIndex = inputIndex + prefix.length + 1;
+      args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath), '-map', '1:s:0?');
+      const outputIndex = args.length - 1;
+      const subtitleOutput = [];
+      const hasSubtitleCodec = args.some((arg) => /^-(?:c|codec):s/.test(arg) || arg === '-scodec');
+      if (!hasSubtitleCodec) subtitleOutput.push('-c:s:0', 'srt');
+      if (!args.some((arg) => arg.startsWith('-disposition'))) subtitleOutput.push('-disposition:s:0', 'default');
+      const language = String(profile.subtitleLanguage || '').trim();
+      if (language && !args.some((arg) => arg.startsWith('-metadata:s:s'))) {
+        subtitleOutput.push('-metadata:s:s:0', `language=${language}`);
+      }
+      if (subtitleOutput.length) args.splice(outputIndex, 0, ...subtitleOutput);
+    }
+  }
+
   if (mode === 'live') {
     const outputIndex = args.length - 1;
     const progress = [];
@@ -1225,9 +1260,12 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // hw.available), i.e. a command ffmpeg is guaranteed to reject. Fall back to
   // the software encoder, shaped by transcode.encoderFallback below.
   const encoder = p.transcode && p.encoder === 'vaapi' && !hw?.available ? 'libx264' : p.encoder;
+  // "soft" + an existing file is not enough: a text sidecar can only live in a
+  // container that carries text tracks (see the mapping block below).
   const sidecarSubtitlePath = p.subtitles === 'soft' && p.subtitlePath && fs.existsSync(p.subtitlePath)
     ? p.subtitlePath
     : null;
+  const sidecarFitsContainer = Boolean(sidecarSubtitlePath) && container === 'matroska';
 
   // --- input resilience (keep the supplied command's option order) ---
   if (isHttp) {
@@ -1274,7 +1312,7 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
 
   args.push('-i', source.url);
-  if (sidecarSubtitlePath) args.push('-i', sidecarSubtitlePath);
+  if (sidecarFitsContainer) args.push('-i', sidecarSubtitlePath);
 
   // --- video filter chain ---
   const vf = [];
@@ -1308,9 +1346,17 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 
   // --- stream mapping ---
   args.push('-map', '0:v:0', '-map', '0:a:0?');
+  // A text sidecar only fits a container that can hold text tracks. MPEG-TS/HLS
+  // need bitmap (DVB) subtitles, and ffmpeg refuses to convert text to bitmap
+  // ("Subtitle encoding currently only possible from text to text or bitmap to
+  // bitmap"), which used to kill the whole ffmpeg process as soon as a movie had
+  // an .srt attached while the stream was set to MPEG-TS. Map it only where it
+  // can actually be carried; subtitleSessionNotes() tells the operator why not.
   if (p.softMux) {
+    // The sidecar goes first so it is always subtitle stream 0: the default
+    // disposition and language metadata below then need no index arithmetic.
+    if (sidecarFitsContainer) args.push('-map', '1:s:0?');
     args.push('-map', '0:s?');
-    if (sidecarSubtitlePath) args.push('-map', '1:s:0?');
   }
   args.push('-dn');
   if (!p.softMux) args.push('-sn');
@@ -1386,8 +1432,24 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 
   // --- subtitles (soft mux) ---
   if (p.softMux) {
-    if (container === 'matroska') args.push('-c:s', 'srt');
-    else {
+    if (container === 'matroska') {
+      // Matroska carries every subtitle codec it can demux, so copying the
+      // source tracks keeps ASS styling, PGS bitmaps and text as they are
+      // (encoding a bitmap source to srt is impossible and used to fail the
+      // whole command). The attached sidecar is text, so it is tagged as srt —
+      // stream 0 is the sidecar because it is mapped first above.
+      if (sidecarFitsContainer) {
+        args.push('-c:s', 'copy', '-c:s:0', 'srt');
+        // The VU+ jumps into the movie without a menu: the subtitle must be
+        // marked as the default track or Enigma2/exteplayer3 picks "none" and
+        // shows a picture without subtitles even though the track is present.
+        args.push('-disposition:s:0', 'default');
+        const language = String(p.subtitleLanguage || '').trim();
+        if (language) args.push('-metadata:s:s:0', `language=${language}`);
+      } else {
+        args.push('-c:s', 'srt');
+      }
+    } else {
       // MPEG-TS/HLS carry DVB subtitles — this is what Enigma2 understands.
       args.push('-c:s', 'dvbsub');
     }
@@ -1443,6 +1505,49 @@ export function outputFormatOf(args = []) {
   if (index < 0 || index + 1 >= args.length) return null;
   const value = String(args[index + 1]).trim().toLowerCase();
   return value || null;
+}
+
+/**
+ * Why the subtitle this item carries is *not* in the bytes ffmpeg is about to
+ * write (empty array = it is, or none was asked for).
+ *
+ * An attached .srt is a text track: it fits Matroska, it cannot be put in
+ * MPEG-TS/HLS (ffmpeg cannot convert text to the DVB bitmap those containers
+ * need) and it disappears when an FFmpeg template says -sn or when burn-in was
+ * requested but the output runs a template that has no subtitle filter. The
+ * relay logs each returned sentence, so a receiver showing no subtitles is
+ * explainable from the log instead of guessed at.
+ *
+ * Pure on purpose: the caller passes the arguments it is about to spawn.
+ */
+export function subtitleSessionNotes(profile = {}, container = '', args = []) {
+  const notes = [];
+  const path = String(profile?.subtitlePath || '');
+  const mode = String(profile?.subtitles || 'none');
+  if (!path || mode === 'none') return notes;
+  const language = String(profile?.subtitleLanguage || '').trim();
+  const label = `${language || 'subtitle'}${language ? ' ' : ''}attached to this item`;
+  if (!fs.existsSync(path)) {
+    notes.push(`the subtitle file for this item is gone (${path}) — attach it again from the Playlist tab`);
+    return notes;
+  }
+  const mappedSubtitle = args.some((arg, index) => arg === '-map' && /^(\d+:)?s/.test(String(args[index + 1] || '')));
+  if (mode === 'burn') {
+    // Burn-in is rendered by the guided builder only: the subtitles filter has
+    // to be spliced into the filter chain, which a hand-written template owns.
+    if (!args.some((arg) => String(arg).includes('subtitles=filename='))) {
+      notes.push(`burn-in was requested for the subtitle ${label}, but this output runs an FFmpeg template: only the guided builder hardcodes subtitles — unbind the template for this output or switch the item back to a soft track`);
+    }
+    return notes;
+  }
+  if (container === 'matroska') {
+    if (!mappedSubtitle) {
+      notes.push(`the subtitle ${label} is not in this Matroska output — an FFmpeg template drops it (e.g. -sn or its own -map rows); remove that flag or the subtitle will never show on the box`);
+    }
+    return notes;
+  }
+  notes.push(`the subtitle ${label} is not in this ${container === 'hls' ? 'HLS' : 'MPEG-TS'} output: those containers only carry DVB bitmap subtitles and ffmpeg cannot convert a text .srt to one — use the Matroska URL (or switch the item to burn-in) to see subtitles on the box`);
+  return notes;
 }
 
 /**

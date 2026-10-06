@@ -22,7 +22,7 @@ export async function createStream({
   created_at: existingCreatedAt = null, expires_at: existingExpiresAt,
   playlist_name: existingPlaylistName = null, subtitle_id: existingSubtitleId = null,
   payload: existingPayload = null, source_id: existingSourceId = null,
-  title, year = null, kind = 'movie', poster = null, description = null, sourceId = null,
+  title, year = null, kind = 'movie', poster = null, posterReferer = '', description = null, sourceId = null,
   candidate, profile = {}, subtitleId = null, season = null, episode = null,
 }) {
   const cfg = getConfig();
@@ -82,7 +82,13 @@ export async function createStream({
     playlist_name: existingPlaylistName || `${title || 'vu-movie'}${year ? ` (${year})` : ''}`,
     created_at: existingCreatedAt || now.toISOString(),
     expires_at: expires ? (expires instanceof Date ? expires.toISOString() : expires) : null,
-    payload: existingPayload || { sourceId: candidate?.sourceId || null, meta: candidate?.meta || {} },
+    payload: existingPayload || {
+      sourceId: candidate?.sourceId || null,
+      meta: {
+        ...(candidate?.meta || {}),
+        ...(posterReferer ? { posterReferer } : {}),
+      },
+    },
     updated_at: now.toISOString(),
   };
 
@@ -113,6 +119,7 @@ export async function listStreams() {
     year: r.year,
     kind: r.kind,
     poster: r.poster,
+    posterReferer: r.payload?.meta?.posterReferer || '',
     description: r.description,
     sourceId: r.source_id,
     quality: r.upstream?.quality || null,

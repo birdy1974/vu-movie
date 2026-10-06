@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
+    "mpegts.js": "^1.8.2",
     "pg": "^8.13.1",
     "playwright-core": "^1.49.0",
     "undici": "^6.24.1"

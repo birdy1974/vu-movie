@@ -30,7 +30,7 @@ import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
-  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf,
+  validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes,
 } from '../core/media.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
@@ -111,7 +111,9 @@ export async function runTemplateTest({ template, stream, container = null, dura
 
   return await new Promise((resolve) => {
     const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
-    let bytesOut = 0;
+    // stdout is only part of the story: the test normally writes to `target`
+    // (see the verdict below), so count both.
+    let stdoutBytes = 0;
     let stderrTail = [];
     const progress = {};
     let stderrBuffer = '';
@@ -123,7 +125,7 @@ export async function runTemplateTest({ template, stream, container = null, dura
       try { child.kill('SIGTERM'); } catch { /* gone */ }
     }, limitMs);
 
-    child.stdout.on('data', (chunk) => { bytesOut += chunk.length; });
+    child.stdout.on('data', (chunk) => { stdoutBytes += chunk.length; });
     child.stderr.on('data', (chunk) => {
       stderrBuffer += chunk.toString();
       const lines = stderrBuffer.split('\n');
@@ -146,7 +148,7 @@ export async function runTemplateTest({ template, stream, container = null, dura
       try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
       resolve({
         ok: false, error: errorText(err), exitCode: null,
-        durationMs: Date.now() - startedAt, bytesOut, stderr: stderrTail.join('\n'),
+        durationMs: Date.now() - startedAt, bytesOut: stdoutBytes, stdoutBytes, fileBytes: 0, stderr: stderrTail.join('\n'),
         progress, command, templateId, outputType, target: null, timedOut: false,
       });
     });
@@ -154,21 +156,26 @@ export async function runTemplateTest({ template, stream, container = null, dura
     child.on('close', (code, signal) => {
       clearTimeout(timer);
       const durationMs = Date.now() - startedAt;
-      // Cleanup the test output file — we only need the bytesOut / progress
-      // stats for the verdict, not the file itself.
+      // What did the command actually produce? The test writes to a *file*
+      // (never a pipe), so measuring stdout alone answered "no output
+      // produced" for every template that writes <output> — which is the form
+      // the editor recommends. Stat the file before cleaning it up.
+      let fileBytes = 0;
+      try { fileBytes = fs.statSync(target).size; } catch { /* nothing reached disk */ }
       try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      const bytesOut = stdoutBytes + fileBytes;
       // "ok" = ffmpeg produced bytes within the test window without an error
       // pattern in the stderr. exitCode 0 is a clean finish, SIGTERM is the
       // timer firing (still a positive signal — the pipeline ran).
       const sawError = stderrTail.some((l) => /\b(error|failed|invalid|unable|cannot|denied|not found|impossible|could not|invalid data|broken pipe)\b/i.test(l));
       const ok = bytesOut > 0 && !sawError && (code === 0 || signal === 'SIGTERM' || signal === 'SIGINT');
       log.info('relay', `template test done`, {
-        templateId, outputType, stream: stream.id, ok, bytesOut, exitCode: code, signal,
+        templateId, outputType, stream: stream.id, ok, bytesOut, fileBytes, stdoutBytes, exitCode: code, signal,
         elapsedMs: durationMs, timedOut,
       });
       resolve({
         ok,
-        exitCode: code, signal, durationMs, bytesOut,
+        exitCode: code, signal, durationMs, bytesOut, fileBytes, stdoutBytes,
         stderr: stderrTail.join('\n'),
         progress: { ...progress, lastProgressAt: lastProgressAt || null },
         command, templateId, outputType, target, timedOut,
@@ -451,6 +458,13 @@ export async function ensureSession(stream, opts = {}) {
     log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || container} URL asked for ${expectedFormat} — players can mis-detect the stream`, {
       stream: stream.id, templateId: template?.templateId || '', template: template?.name || '',
     });
+  }
+
+  // "Subtitles never show on the box" is otherwise indistinguishable from "the
+  // receiver ignores them": say up front whether this session muxes the
+  // attached subtitle at all, and if not, why.
+  for (const note of subtitleSessionNotes(effectiveProfile, wantsHls ? 'hls' : container, args)) {
+    log.warn('relay', note, { stream: stream.id, output: outputType || container, title: stream.title });
   }
 
   const command = argsToCommand(args);

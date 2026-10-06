@@ -71,19 +71,49 @@ function signatureFor(url, referer) {
   return createHmac('sha256', signingKey).update(`${url}\n${referer}`).digest('base64url');
 }
 
-/** Build a signed relative URL; callers cannot turn this endpoint into an open proxy. */
-export function posterProxyUrl(poster, referer = '') {
-  const refererUrl = httpUrl(referer);
-  let imageUrl = httpUrl(poster);
-  if (!imageUrl && refererUrl) {
-    try { imageUrl = httpUrl(new URL(String(poster), refererUrl).href); } catch { /* invalid relative URL */ }
+/**
+ * Recover the durable remote artwork reference from either a provider URL or a
+ * same-origin proxy URL previously handed to the browser. Proxy signatures are
+ * intentionally process-local; persisting `/api/poster?...&sig=...` made every
+ * Playlist metadata poster turn into the blue fallback after an app restart.
+ * We therefore persist the remote URL + referer and sign a fresh browser URL on
+ * every API response.
+ */
+export function posterSource(poster, referer = '') {
+  const value = String(poster || '').trim();
+  let embedded = null;
+  try {
+    const parsed = new URL(value, 'http://vu-movie.invalid');
+    if (parsed.pathname === '/api/poster') {
+      embedded = {
+        url: parsed.searchParams.get('url') || '',
+        referer: parsed.searchParams.get('ref') || '',
+      };
+    }
+  } catch { /* handled as a normal URL below */ }
+
+  const referrerUrl = httpUrl(embedded?.referer || referer);
+  let imageUrl = httpUrl(embedded?.url || value);
+  if (!imageUrl && referrerUrl) {
+    try { imageUrl = httpUrl(new URL(embedded?.url || value, referrerUrl).href); } catch { /* invalid relative URL */ }
   }
   if (!imageUrl) return null;
-  const ref = refererUrl?.href || '';
-  const url = imageUrl.href;
-  const signature = signatureFor(url, ref);
-  const params = new URLSearchParams({ url, ref, sig: signature });
+  return { url: imageUrl.href, referer: referrerUrl?.href || '' };
+}
+
+/** Build a signed relative URL; callers cannot turn this endpoint into an open proxy. */
+export function posterProxyUrl(poster, referer = '') {
+  const source = posterSource(poster, referer);
+  if (!source) return null;
+  const signature = signatureFor(source.url, source.referer);
+  const params = new URLSearchParams({ url: source.url, ref: source.referer, sig: signature });
   return `/api/poster?${params.toString()}`;
+}
+
+/** Re-sign artwork read from storage, including records made by older builds. */
+export function publicPosterUrl(poster, referer = '') {
+  const source = posterSource(poster, referer);
+  return source ? posterProxyUrl(source.url, source.referer) : '';
 }
 
 function signatureIsValid(url, referer, signature) {
