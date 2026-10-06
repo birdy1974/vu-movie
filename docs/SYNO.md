@@ -111,7 +111,8 @@ GPU but the driver is wrong — try `LIBVA_DRIVER_NAME=i965`.
 | Concurrent transcodes | realistically **1** at 1080p, or 2 at 720p if you accept dropped frames |
 | Headless Chromium | keep `BROWSER_CONCURRENCY=1` (~300 MB, one core while a page is scraping) |
 
-Practical defaults in `.env`: `DEFAULT_RESOLUTION=1080`, `DEFAULT_VIDEO_BITRATE=2500`.
+Practical settings in `.env` for this box: `DEFAULT_RESOLUTION=1080`, `DEFAULT_VIDEO_BITRATE=2500`
+(the built-in default is `8000`; the measured jobs below use 2.5 Mbit and still look right).
 4K HEVC sources are decoded in hardware and encoded to 1080p H.264 in real time —
 that is the realistic sweet spot. Anything asking for HEVC *output* is a CPU job
 (hours, not minutes) and the UI marks it as such.

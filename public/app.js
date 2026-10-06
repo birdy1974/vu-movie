@@ -1920,7 +1920,7 @@ const SETTINGS_LABELS = {
   'enigma2.password': ['Password', 'Stored in /config/vumovie.json; shown masked after a reload.'],
   'enigma2.bouquetName': ['Bouquet name', 'Name the playlist gets in the receiver bouquet list.'],
   'enigma2.rootDir': ['Root directory', 'Folder on the box for the bouquet and the subtitle files.'],
-  'enigma2.serviceType': ['Service type', 'Enigma2 service type, 1 = non-TS (4097 = stream), 1 = DVB.'],
+  'enigma2.serviceType': ['Service type', 'Enigma2 service type for the bouquet entries: 4097 = GStreamer (non-TS stream, the default), 1 = DVB.'],
   'enigma2.ftpEnabled': ['FTP upload', 'Upload the bouquet and subtitles over FTP instead of HTTP.'],
   'enigma2.ftpPort': ['FTP port', '21 by default.'],
   'enigma2.autoPush': ['Auto push', 'Push the bouquet after every playlist change.'],

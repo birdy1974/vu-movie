@@ -1,6 +1,7 @@
 {
   "_comment": "Example of /config/vumovie.json. Copy to config/vumovie.json (or set CONFIG_FILE) and edit. Environment variables always win over this file. Every option is a NESTED object — write \"scraper\": { \"flaresolverrUrl\": \"…\" }, never a flat \"scraper.flaresolverrUrl\" key: JSON has no dotted paths, so the flat spelling is ignored (the app now says so in the log instead of staying quiet). Saving from the Settings page rewrites this file in the correct shape.",
   "app": {
+    "host": "0.0.0.0",
     "port": 8080,
     "baseUrl": "",
     "logLevel": "info",
@@ -14,6 +15,7 @@
     "waitForDbMs": 60000
   },
   "transcode": {
+    "_comment": "videoBitrate/audioBitrate/audioChannels/fps below are the practical DS918+ values from docs/SYNO.md; the built-in defaults are 8000/192/6/25 and the Settings page writes whatever you pick there.",
     "mode": "auto",
     "alwaysTranscode": false,
     "maxConcurrent": 1,
@@ -34,7 +36,11 @@
     "upstreamSegmentChunkBytes": 97280,
     "upstreamParallel": 4,
     "upstreamCacheMb": 64,
-    "upstreamRequestTimeoutMs": 30000
+    "upstreamRequestTimeoutMs": 30000,
+    "encoderFallback": "libx264 -preset veryfast -crf 22",
+    "maxClientBacklog": 12582912,
+    "ffmpegTemplates": [],
+    "defaultFfmpegTemplateId": ""
   },
   "subtitles": {
     "languages": [
@@ -100,6 +106,28 @@
     "proxyUrl": "",
     "noProxy": "localhost,127.0.0.1,::1",
     "movieboxExtraHosts": [],
-    "movieboxBrowserFallback": true
+    "movieboxBrowserFallback": true,
+    "movieboxTransport": "auto",
+    "flaresolverrTimeoutMs": 30000,
+    "sessionDir": "/config/sessions",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+  },
+  "storage": {
+    "downloads": "/config/downloads",
+    "tmp": "/tmp/vumovie",
+    "cacheBudgetMb": 2048
+  },
+  "playlist": {
+    "_comment": "The app maintains token and items itself; name/xtreamUsername are safe to edit (or set PLAYLIST_NAME / XTREAM_USERNAME).",
+    "name": "vu-movie",
+    "token": "",
+    "xtreamUsername": "vumovie",
+    "xtreamPassword": "",
+    "items": []
+  },
+  "sources": {
+    "dir": "/config/sources",
+    "enabled": [],
+    "disabled": []
   }
 }
