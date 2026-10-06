@@ -2,9 +2,16 @@
  * vu-movie — subtitle providers and registry.
  *
  * Per your decision (D4) the default set is:
- *   keyless : OpenSubtitles.org (legacy XML-RPC), Podnapisi, TVsubtitles
+ *   keyless : OpenSubtitles.org (legacy XML-RPC), Podnapisi, TVsubtitles, TVsubs.net
  *   API key : OpenSubtitles.com, SubDL            → enabled as soon as you paste a key
+ *   account : Addic7ed                            → enabled as soon as credentials are set
  *   custom  : URL templates you add yourself in the UI (any source you like)
+ *
+ * Of the six sites in requirements.md, JustSubtitles.com has NO dedicated
+ * provider: its search and downloads run entirely in page JavaScript against a
+ * Cloudflare-fronted API (api.justsubtitles.com), so there are no server-side
+ * endpoints a scraper could call. Cover it with a custom template if you have
+ * an endpoint, or use one of the providers below.
  *
  * Every provider reports a *state* (ok / needs-key / needs-credentials / broken) so
  * a dead source never looks like "no subtitles exist for this movie".
@@ -14,7 +21,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { request } from '../scrapers/http.js';
+import { request, CookieJar } from '../scrapers/http.js';
 import {
   decodeSubtitle, cleanSrt, vttToSrt, applyOffset, countCues, scoreResult, normaliseLang,
   extractSubtitleFromBuffer, isZip, isRar,
@@ -506,7 +513,281 @@ class Tvsubtitles extends Provider {
   }
 }
 
-/* ---------------- 6. user-defined template providers ---------------- */
+/* ---------------- 6. Addic7ed (series, free account) ---------------- */
+
+/**
+ * Addic7ed language ids as they appear in the `/updated/<lang>/<file>/<n>`
+ * download links. Only ids verified against live pages are mapped; anything
+ * else falls back to the language name in the row itself.
+ */
+const ADDIC7ED_LANG_BY_ID = { 1: 'en', 8: 'fr', 17: 'nl', 18: 'sv' };
+
+/** Language names the site uses, longer names first so "Portuguese (Brazilian)" wins. */
+const ADDIC7ED_LANGUAGE_NAMES = [
+  ['Portuguese (Brazilian)', 'pt'],
+  ['English', 'en'], ['Dutch', 'nl'], ['French', 'fr'], ['German', 'de'],
+  ['Spanish', 'es'], ['Italian', 'it'], ['Russian', 'ru'], ['Swedish', 'sv'],
+  ['Polish', 'pl'], ['Greek', 'el'], ['Arabic', 'ar'], ['Turkish', 'tr'],
+  ['Hungarian', 'hu'], ['Romanian', 'ro'], ['Portuguese', 'pt'],
+  ['Catala', 'ca'], ['Euskera', 'eu'], ['Galician', 'gl'], ['Persian', 'fa'],
+  ['Czech', 'cs'],
+];
+
+function stripHtml(text) {
+  return decodeEntities(String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim());
+}
+
+/**
+ * Pure: parse the season table of an Addic7ed show page (what search.php
+ * redirects to) into subtitle rows.
+ *
+ * Every `<tr>` of the table carries: season + episode (first two cells and the
+ * /serie/<Show>/<s>/<e>/ link), the episode title, the language name, the
+ * release/version and a `/updated/<langId>/<fileId>/<n>` download link.
+ * Returns `[{ season, episode, title, language, release, url }]`.
+ */
+export function parseAddic7edRows(html) {
+  const rows = [];
+  for (const tr of String(html || '').split(/<tr[\s>]/i).slice(1)) {
+    const dl = /href="(?:https?:\/\/[^"/]+)?\/(updated|original)\/(\d+)\/(\d+)\/(\d+)"/i.exec(tr);
+    if (!dl) continue;
+    const url = `https://www.addic7ed.com/${dl[1].toLowerCase()}/${dl[2]}/${dl[3]}/${dl[4]}`;
+    const epLink = /href="(?:[^"]*\/)?serie\/[^"]*?\/(\d+)\/(\d+)\//i.exec(tr);
+    const cells = tr.split(/<\/?td[^>]*>/i).map(stripHtml).filter((c) => c && !/^&nbsp;?$/.test(c));
+    const season = epLink ? Number(epLink[1]) : Number(cells[0]) || null;
+    const episode = epLink ? Number(epLink[2]) : Number(cells[1]) || null;
+    const title = cells[2] || '';
+    // Language: the first known language name in the row, else the id in the link.
+    let language = ADDIC7ED_LANG_BY_ID[Number(dl[2])] || null;
+    for (const [name, code] of ADDIC7ED_LANGUAGE_NAMES) {
+      if (cells.some((c) => c === name) || tr.includes(`>${name}<`)) { language = code; break; }
+    }
+    // Release: the cell right after the language cell, unless it is a status word.
+    let release = '';
+    const langIdx = cells.findIndex((c) => ADDIC7ED_LANGUAGE_NAMES.some(([name]) => name === c));
+    if (langIdx >= 0 && cells[langIdx + 1] && !/^(completed|incomplete)$/i.test(cells[langIdx + 1])) {
+      release = cells[langIdx + 1];
+    }
+    rows.push({ season, episode, title, language, release, url });
+  }
+  return rows;
+}
+
+class Addic7ed extends Provider {
+  constructor() {
+    super('addic7ed', 'Addic7ed', {
+      kind: 'scrape', needs: ['addic7ed'],
+      note: 'Series only. Uses your free Addic7ed account (ADDIC7ED_USER / ADDIC7ED_PASS); anonymous downloads are throttled to almost nothing.',
+    });
+    this.jar = new CookieJar('addic7ed');
+    this.loggedIn = false;
+  }
+
+  /** POST the configured credentials once; anonymous is fine for searching. */
+  async login() {
+    if (this.loggedIn) return true;
+    const creds = getConfig().subtitles.credentials;
+    if (!creds.addic7edUser || !creds.addic7edPass) return false;
+    const form = new URLSearchParams({ username: creds.addic7edUser, password: creds.addic7edPass });
+    const res = await request('https://www.addic7ed.com/login.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://www.addic7ed.com/login.php' },
+      body: form.toString(),
+      jar: this.jar, allowFailure: true, retries: 0, timeoutMs: 25000,
+    });
+    // A logged-in page swaps the Login link for Logout; a failure shows the form again.
+    this.loggedIn = res.ok && /logout\.php|href="\/logout/i.test(res.text || '');
+    this.jar.save();
+    log.info('subtitles', `addic7ed login ${this.loggedIn ? 'ok' : 'failed — continuing anonymously'}`);
+    return this.loggedIn;
+  }
+
+  async search(ctx) {
+    if (ctx.kind !== 'series') return [];
+    await this.login();
+    const season = Number(ctx.season || 1);
+    const episode = Number(ctx.episode || 1);
+    const langs = (ctx.languages || ['nl', 'en']).map(normaliseLang);
+
+    const res = await request(`https://www.addic7ed.com/search.php?search=${encodeURIComponent(ctx.title)}&submit=Search`, {
+      jar: this.jar, allowFailure: true, retries: 1, timeoutMs: 25000,
+      headers: { Referer: 'https://www.addic7ed.com/' },
+    });
+    if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
+
+    // search.php redirects straight to /show/<id> on a hit; otherwise it lists
+    // candidate shows and we pick the best label match.
+    let html = res.text || '';
+    if (!/\/show\/\d+/.test(res.url || '')) {
+      const links = [...html.matchAll(/href="(\/show\/\d+)"[^>]*>([\s\S]*?)<\/a>/g)]
+        .map((m) => ({ url: m[1], label: stripHtml(m[2]) }));
+      if (!links.length) {
+        this.setState(false, 'no show match — Addic7ed may have changed its page layout');
+        return [];
+      }
+      const wanted = String(ctx.title).toLowerCase();
+      const pick = links.find((l) => l.label.toLowerCase().includes(wanted)) || links[0];
+      const page = await request(`https://www.addic7ed.com${pick.url}`, {
+        jar: this.jar, allowFailure: true, retries: 1, timeoutMs: 25000,
+        headers: { Referer: 'https://www.addic7ed.com/' },
+      });
+      if (!page.ok) throw new Error(page.error || `HTTP ${page.status}`);
+      html = page.text || '';
+    }
+
+    const rows = parseAddic7edRows(html)
+      .filter((r) => r.season === season && r.episode === episode && r.language && langs.includes(r.language))
+      .map((r) => ({
+        providerId: this.id,
+        language: r.language,
+        title: r.title || ctx.title,
+        release: r.release || `${ctx.title} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`,
+        downloads: 0,
+        id: r.url,
+        url: r.url,
+        referer: `https://www.addic7ed.com${(/\/show\/\d+/.exec(res.url) || [])[0] || ''}`,
+        format: 'srt',
+        episodeMatch: true,
+      }));
+    this.setState(rows.length > 0, rows.length ? `${rows.length} hits` : `nothing for S${season}E${episode} in ${langs.join('/')} — check the account quota`);
+    return rows;
+  }
+
+  async download(result) {
+    await this.login();
+    const res = await request(result.url, {
+      binary: true, jar: this.jar, retries: 0, timeoutMs: 30000,
+      headers: { Referer: result.referer || 'https://www.addic7ed.com/' },
+    });
+    const buffer = res.buffer;
+    // Over the daily quota Addic7ed answers with an HTML error page instead of a file.
+    if (!buffer?.length || buffer.subarray(0, 32).toString('latin1').trimStart().startsWith('<')) {
+      throw new Error('Addic7ed refused the download (daily limit reached or layout change)');
+    }
+    return { buffer, filename: `${result.release}.${result.language}.srt` };
+  }
+}
+
+/* ---------------- 7. TVsubs.net (keyless, series) ---------------- */
+
+/**
+ * Pure: pick the episode/lang links out of a tvsubs.net season page.
+ * Returns `{ episodes: Map(episodeNumber → epId), langs: Map(epId → [lang,…]) }`.
+ */
+export function parseTvsubsSeason(html) {
+  const text = String(html || '');
+  const episodes = new Map();
+  // "01. <a href="/episode-107732.html">…title…" — the number and the plain
+  // episode anchor sit a few characters apart. The lookbehind keeps digit runs
+  // inside other ids ("subtitle-289726.html") from posing as episode numbers.
+  for (const m of text.matchAll(/(?<![\d.])(\d{1,3})\.[\s\S]{0,160}?href="(?:[^"]*\/)?episode-(\d+)\.html"/g)) {
+    const num = Number(m[1]);
+    if (num >= 1 && !episodes.has(num)) episodes.set(num, m[2]);
+  }
+  const langs = new Map();
+  for (const m of text.matchAll(/href="(?:[^"]*\/)?episode-(\d+)-([a-z]{2})\.html"/g)) {
+    if (!langs.has(m[1])) langs.set(m[1], []);
+    const list = langs.get(m[1]);
+    if (!list.includes(m[2])) list.push(m[2]);
+  }
+  return { episodes, langs };
+}
+
+/** Pure: list the subtitle entries of a tvsubs.net episode-language page. */
+export function parseTvsubsEpisode(html) {
+  const entries = [];
+  for (const m of String(html || '').matchAll(/<a[^>]+href="(?:[^"]*\/)?subtitle-(\d+)\.html"[^>]*>([\s\S]*?)<\/a>/g)) {
+    const release = stripHtml(m[2]);
+    if (!release) continue;
+    entries.push({ id: m[1], release });
+  }
+  return entries;
+}
+
+class Tvsubs extends Provider {
+  constructor() {
+    super('tvsubs', 'TVsubs.net', {
+      kind: 'scrape', languages: ['nl', 'en'],
+      note: 'Series only. Keyless; a different catalogue than TVsubtitles.net. Files arrive as ZIP archives.',
+    });
+  }
+
+  async search(ctx) {
+    if (ctx.kind !== 'series') return [];
+    const season = Number(ctx.season || 1);
+    const episode = Number(ctx.episode || 1);
+    const langs = (ctx.languages || ['nl', 'en']).map(normaliseLang);
+
+    // 1. find the show — search.php lists candidates with /tvshow-<id>-<n>.html links.
+    const found = await request(`https://www.tvsubs.net/search.php?q=${encodeURIComponent(ctx.title)}`, { allowFailure: true, retries: 1, timeoutMs: 25000 });
+    if (!found.ok) throw new Error(found.error || `HTTP ${found.status}`);
+    const shows = [...(found.text || '').matchAll(/href="[^"]*\/tvshow-(\d+)-\d+\.html"[^>]*>([\s\S]*?)<\/a>/g)]
+      .map((m) => ({ id: m[1], label: stripHtml(m[2]) }));
+    if (!shows.length) {
+      this.setState(false, 'no show match — TVsubs.net may have changed its page layout');
+      return [];
+    }
+    const wanted = String(ctx.title).toLowerCase();
+    const show = shows.find((s) => s.label.toLowerCase() === wanted)
+      || shows.find((s) => s.label.toLowerCase().includes(wanted))
+      || shows[0];
+
+    // 2. season page: /tvshow-<id>-<season>.html (the second number IS the season).
+    const seasonPage = await request(`https://www.tvsubs.net/tvshow-${show.id}-${season}.html`, { allowFailure: true, retries: 1, timeoutMs: 25000 });
+    if (!seasonPage.ok) throw new Error(seasonPage.error || `HTTP ${seasonPage.status}`);
+    const { episodes, langs: episodeLangs } = parseTvsubsSeason(seasonPage.text);
+    const epId = episodes.get(episode);
+    if (!epId) {
+      this.setState(false, `episode S${season}E${episode} not listed`);
+      return [];
+    }
+
+    // 3. one page per (episode, language): /episode-<epId>-<lang>.html
+    const results = [];
+    for (const lang of episodeLangs.get(epId) || []) {
+      if (!langs.includes(lang)) continue;
+      const epPage = await request(`https://www.tvsubs.net/episode-${epId}-${lang}.html`, { allowFailure: true, retries: 1, timeoutMs: 25000 });
+      if (!epPage.ok) continue;
+      for (const entry of parseTvsubsEpisode(epPage.text)) {
+        results.push({
+          providerId: this.id,
+          language: lang,
+          title: ctx.title,
+          release: entry.release,
+          downloads: 0,
+          id: entry.id,
+          url: `https://www.tvsubs.net/subtitle-${entry.id}.html`,
+          format: 'srt',
+          episodeMatch: true,
+        });
+      }
+    }
+    this.setState(results.length > 0, `${results.length} hits`);
+    return results;
+  }
+
+  async download(result) {
+    // /download-<id>.html serves the packed subtitle directly; if the site
+    // answers with an HTML page instead, take the first archive link from it.
+    const res = await request(`https://www.tvsubs.net/download-${result.id}.html`, {
+      binary: true, retries: 1, timeoutMs: 25000,
+      headers: { Referer: result.url },
+    });
+    let buffer = res.buffer;
+    if (buffer?.length && buffer.subarray(0, 32).toString('latin1').trimStart().startsWith('<')) {
+      const html = buffer.toString('utf8');
+      const link = /href="([^"]+\.(?:zip|rar|srt))"/i.exec(html) || /href="([^"]*download[^"]*)"/i.exec(html);
+      if (!link) throw new Error('TVsubs.net download page had no file link — layout may have changed');
+      const target = new URL(link[1], `https://www.tvsubs.net/download-${result.id}.html`).toString();
+      const file = await request(target, { binary: true, retries: 1, timeoutMs: 25000, headers: { Referer: result.url } });
+      buffer = file.buffer;
+    }
+    if (!buffer?.length) throw new Error('TVsubs.net sent an empty download');
+    return { buffer, filename: `${result.release}.${result.language}.zip` };
+  }
+}
+
+/* ---------------- 8. user-defined template providers ---------------- */
 
 export class CustomProvider extends Provider {
   constructor(config) {
@@ -605,6 +886,8 @@ const providers = [
   new OpenSubtitlesCom(),
   new Podnapisi(),
   new Tvsubtitles(),
+  new Addic7ed(),
+  new Tvsubs(),
 ];
 
 export function listProviders() {
@@ -727,4 +1010,7 @@ export async function autoFetch(target, { offsetMs = 0 } = {}) {
   return { ...fetched, result: best, alternatives: results.slice(1, 10) };
 }
 
-export default { listProviders, searchSubtitles, fetchSubtitle, storeSubtitle, autoFetch, testProvider, getProvider, parseXmlRpc, CustomProvider };
+export default {
+  listProviders, searchSubtitles, fetchSubtitle, storeSubtitle, autoFetch, testProvider,
+  getProvider, parseXmlRpc, CustomProvider, parseAddic7edRows, parseTvsubsSeason, parseTvsubsEpisode,
+};

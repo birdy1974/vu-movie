@@ -128,10 +128,17 @@ permissions, Container Manager project import, firewall, where the data lives).
 |---|---|---|
 | OpenSubtitles.org | XML-RPC, hash matching | no |
 | Podnapisi | scrape | no |
-| TVsubtitles.net | scrape | no |
+| TVsubtitles.net | scrape (series only) | no |
+| TVsubs.net | scrape (series only), ZIP archives | no |
 | SubDL | REST API | free key, 2000 req/day |
 | OpenSubtitles.com | REST API | free key, 5–20 downloads/day |
+| Addic7ed | scrape (series only) | free account (`ADDIC7ED_USER`/`ADDIC7ED_PASS`) — anonymous downloads are throttled to nothing |
 | *your own* | template (URL + regex), added in the UI | — |
+
+Of the six sites in the requirements, **JustSubtitles.com has no dedicated
+provider**: its search and downloads run entirely in page JavaScript against a
+Cloudflare-fronted API, so there is no server-side endpoint to scrape. Use a
+custom template if you have one, or any of the providers above.
 
 Search, preview the cues, **shift the timing** (+/− ms), download the `.srt`, or
 push it to the receiver (`/media/hdd/movie/vumovie`, configurable) so the Duo2
@@ -463,7 +470,7 @@ src/core/       log, config, db+repo, job queue, media (ffmpeg probing + VAAPI),
 src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox client,
                 failure diagnostics (DNS/egress/TLS verdicts)
 src/streams/    stream store (tokens/URLs), relay (ffmpeg sessions), downloads, M3U
-src/subtitles/  5 providers + custom templates, SRT/VTT/encoding tools, receiver push
+src/subtitles/  7 providers + custom templates, SRT/VTT/encoding tools, receiver push
 src/enigma2/    bouquet builder + atomic FTP writes; OpenWebif reload/verification
 src/http/       REST API + server (static UI, playable /s, /dl, /hls, /watch)
 public/         the entire UI (no build step): index.html, app.js, style.css
