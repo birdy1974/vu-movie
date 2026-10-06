@@ -41,6 +41,11 @@ const VMPlaylist = (() => {
       urls: data.urls || null,
       templates: data.templates || [],
       defaultTemplateId: data.defaultTemplateId || '',
+      // The server reports whether playlist changes reach the config file. They
+      // always apply to the running process; on a read-only /config mount they
+      // do not survive a restart, which the tab says out loud instead of
+      // pretending the save worked.
+      writable: data.storage?.writable !== false,
       loaded: true,
     };
     if (force) state.playlist.loadedAt = Date.now();
@@ -56,10 +61,23 @@ const VMPlaylist = (() => {
 
   /* ---------------- mutations ---------------- */
 
+  /** Warn once when a change was applied but could not be written to the config file. */
+  let persistWarned = false;
+  function notePersisted(data) {
+    if (data?.storage) state.playlist.writable = data.storage.writable !== false;
+    if (data?.persisted === false && !persistWarned) {
+      persistWarned = true;
+      toast('The config file is not writable here — playlist changes are kept in memory and are lost when the container restarts', 'warn', 10000);
+      renderTab();
+    }
+    return data;
+  }
+
   async function addToPlaylist(streamIds, { silent = false } = {}) {
     const list = (Array.isArray(streamIds) ? streamIds : [streamIds]).filter(Boolean);
     if (!list.length) return null;
     const data = await api('/api/playlist/items', { method: 'POST', body: { streamIds: list }, silent });
+    notePersisted(data);
     state.playlist.items = data.items || state.playlist.items;
     if (!silent) toast(`${data.added || 0} item(s) added to the playlist`, 'ok');
     return data;
@@ -67,6 +85,7 @@ const VMPlaylist = (() => {
 
   async function patchItem(streamId, patch) {
     const data = await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'PATCH', body: patch, silent: true });
+    notePersisted(data);
     state.playlist.items = data.items || state.playlist.items;
     renderTab();
     renderAddPicker();
@@ -74,9 +93,9 @@ const VMPlaylist = (() => {
   }
 
   async function assignTemplate(streamId, templateId) {
-    await api(`/api/playlist/items/${encodeURIComponent(streamId)}/template`, {
+    notePersisted(await api(`/api/playlist/items/${encodeURIComponent(streamId)}/template`, {
       method: 'POST', body: { templateId }, silent: true,
-    });
+    }));
     await refresh();
     const label = templateId ? (templates().find((tpl) => tpl.id === templateId)?.name || templateId) : 'guided profile builder';
     toast(`FFmpeg template → ${label}`, 'ok', 4000);
@@ -85,7 +104,7 @@ const VMPlaylist = (() => {
   async function removeItem(streamId) {
     const item = itemFor(streamId);
     if (!window.confirm(`Remove “${item?.title || streamId}” from the playlist?\n\nThe stream itself stays in the library and can be added again.`)) return;
-    await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'DELETE' });
+    notePersisted(await api(`/api/playlist/items/${encodeURIComponent(streamId)}`, { method: 'DELETE' }));
     await refresh();
     toast('Removed from the playlist', 'info', 4000);
   }
@@ -99,7 +118,7 @@ const VMPlaylist = (() => {
   }
 
   async function reorder(streamIds) {
-    const data = await api('/api/playlist', { method: 'PUT', body: { streamIds }, silent: true });
+    const data = notePersisted(await api('/api/playlist', { method: 'PUT', body: { streamIds }, silent: true }));
     state.playlist.items = data.items || state.playlist.items;
     renderTab();
   }
@@ -202,9 +221,14 @@ const VMPlaylist = (() => {
       summaryEl.textContent = `${summary.enabled ?? 0} of ${summary.total ?? list.length} enabled · ${summary.withTemplate ?? 0} with template · ${summary.withSubtitle ?? 0} with subtitle`;
     }
     const hint = $('#list-hint');
-    if (hint) hint.textContent = state.playlist.defaultTemplateId
-      ? `Items without their own template use the default: ${templates().find((t) => t.id === state.playlist.defaultTemplateId)?.name || state.playlist.defaultTemplateId}`
-      : 'No default template set — items without one use the guided profile builder.';
+    if (hint) {
+      const base = state.playlist.defaultTemplateId
+        ? `Items without their own template use the default: ${templates().find((t) => t.id === state.playlist.defaultTemplateId)?.name || state.playlist.defaultTemplateId}`
+        : 'No default template set — items without one use the guided profile builder.';
+      hint.textContent = state.playlist.writable === false
+        ? `${base} ⚠ the config file is not writable, so changes live in memory and are lost on restart (mount /config read-write to keep them).`
+        : base;
+    }
     const openStreamBtn = $('#btn-list-open-stream');
     if (openStreamBtn) openStreamBtn.disabled = !list.length;
 
@@ -448,12 +472,34 @@ const VMPlaylist = (() => {
     }
   }
 
+  /**
+   * Turn a MediaSource/mpegts.js failure into something an operator can act on.
+   *
+   * The common case is not a codec problem at all: the relay had nothing to
+   * send (the upstream mirror was dead, the link expired, or the container has
+   * no usable ffmpeg), and Chromium reports that as
+   * "DEMUXER_ERROR_COULD_NOT_OPEN: MediaSource endOfStream before demuxer
+   * initialization completes", which says nothing about the actual cause.
+   */
+  function explainPlaybackFailure(reason) {
+    const text = String(reason || '');
+    if (/endOfStream before demuxer|COULD_NOT_OPEN|src not supported|MEDIA_ERR_SRC_NOT_SUPPORTED/i.test(text)) {
+      return 'the relay sent no playable video — the source did not start (dead mirror, expired link, or ffmpeg unavailable). The Logs tab shows the ffmpeg error';
+    }
+    if (/media_source|MediaSource.*not supported/i.test(text)) {
+      return 'this browser has no Media Source Extensions support';
+    }
+    return text || 'unknown playback error';
+  }
+
   function startPlayback({ stream, urls, video, statusEl }) {
     if (!video) return null;
     let player = null;
     let stopped = false;
+    let failed = false;
     const fallback = (message) => {
       if (stopped) return;
+      failed = true;
       statusEl.className = 'note warn';
       statusEl.innerHTML = `${escapeHtml(message)}<br>
         <span class="mut">Stream URL: <code>${escapeHtml(urls.ts || '')}</code></span>`;
@@ -482,11 +528,14 @@ const VMPlaylist = (() => {
         player.attachMediaElement(video);
         player.on(window.mpegts.Events.ERROR, (type, detail, info) => {
           const reason = info?.msg || info?.message || detail || type || 'unknown playback error';
-          fallback(`Web preview failed: ${reason}. The source codec may not be supported by this browser.`);
+          fallback(`Web preview failed: ${explainPlaybackFailure(reason)}. “open in VLC” always plays the same URL.`);
         });
         player.load();
         player.play().catch(() => {
-          if (!stopped) statusEl.textContent = 'ready — press Play to start';
+          // Autoplay is blocked (or the source never starts): only offer
+          // "press Play" when nothing has failed — an error message must not be
+          // overwritten by this hint a moment later.
+          if (!stopped && !failed) statusEl.textContent = 'ready — press Play to start';
         });
       } catch (error) {
         fallback(`Could not start the browser transmuxer: ${error.message}`);
@@ -498,7 +547,7 @@ const VMPlaylist = (() => {
       video.src = nativeUrl;
       video.addEventListener('error', () => fallback('This browser cannot play the relay natively and MPEG-TS transmuxing is unavailable.'), { once: true });
       video.play().catch(() => {
-        if (!stopped) statusEl.textContent = 'ready — press Play to start';
+        if (!stopped && !failed) statusEl.textContent = 'ready — press Play to start';
       });
     }
 

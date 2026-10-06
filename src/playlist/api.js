@@ -47,6 +47,17 @@ function baseUrlFrom(req) {
 }
 
 /**
+ * Whether a playlist change really reached the config file. A read-only
+ * /config mount (or a sandbox without one) still applies every change to the
+ * running process, it just does not survive a restart — the UI says so instead
+ * of pretending the save worked.
+ */
+const storageMeta = () => {
+  const writable = playlist.configWritableNow();
+  return { persisted: writable, storage: { writable } };
+};
+
+/**
  * Every URL the Stream tab hands out. The public ones carry the playlist token
  * and sit outside the /api password (VLC, the VU+ and IPTV apps cannot log in);
  * the /api ones are for the browser UI itself.
@@ -148,6 +159,7 @@ router.get('/', wrap(async (req, res) => {
     outputTypes: OUTPUT_TYPES,
     outputLabels: OUTPUT_LABELS,
     urls: outputUrls(baseUrl),
+    ...storageMeta(),
   });
 }));
 
@@ -163,7 +175,7 @@ router.put('/', wrap(async (req, res) => {
     log.info('playlist', `playlist items saved`, { items: body.items.length });
   }
   const baseUrl = baseUrlFrom(req);
-  res.json({ ok: true, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)) });
+  res.json({ ok: true, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
 }));
 
 router.post('/items', wrap(async (req, res) => {
@@ -171,7 +183,7 @@ router.post('/items', wrap(async (req, res) => {
   const { added } = await playlist.addItems(streamIds, { enabled: req.body?.enabled !== false });
   log.info('playlist', `added ${added} stream(s) to the playlist`);
   const baseUrl = baseUrlFrom(req);
-  res.json({ ok: true, added, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)) });
+  res.json({ ok: true, added, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
 }));
 
 router.patch('/items/:id', wrap(async (req, res) => {
@@ -182,14 +194,14 @@ router.patch('/items/:id', wrap(async (req, res) => {
   const baseUrl = baseUrlFrom(req);
   const all = (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl));
   const updated = all.find((entry) => entry.streamId === item.streamId) || null;
-  res.json({ ok: true, item: updated, items: all });
+  res.json({ ok: true, item: updated, items: all, ...storageMeta() });
 }));
 
 router.delete('/items/:id', wrap(async (req, res) => {
   const result = await playlist.removeItem(req.params.id);
   log.info('playlist', `item ${req.params.id} removed from the playlist`);
   const baseUrl = baseUrlFrom(req);
-  res.json({ ok: true, removed: result.removed, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)) });
+  res.json({ ok: true, removed: result.removed, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
 }));
 
 /** Assign one of the saved FFmpeg templates (empty id = guided profile builder). */
@@ -197,7 +209,7 @@ router.post('/items/:id/template', wrap(async (req, res) => {
   const stream = await playlist.assignTemplate(req.params.id, req.body?.templateId, { outputType: req.body?.outputType || '' });
   const baseUrl = baseUrlFrom(req);
   const all = (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl));
-  res.json({ ok: true, streamId: stream.id, items: all });
+  res.json({ ok: true, streamId: stream.id, items: all, ...storageMeta() });
 }));
 
 /** Attach a subtitle: a provider result, or the contents of a local .srt file. */

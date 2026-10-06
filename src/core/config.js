@@ -13,7 +13,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { log, logError } from './log.js';
+import { log, logError, errorText } from './log.js';
 
 const CONFIG_FILE = process.env.CONFIG_FILE || '/config/vumovie.json';
 const CONFIG_DIR = path.dirname(CONFIG_FILE);
@@ -402,6 +402,9 @@ export function coerceConfigValues(node, defaults = DEFAULTS) {
   return out;
 }
 
+/** True once a config write failed, so the repeats are logged at debug level. */
+let saveFailureLogged = false;
+
 /** Populated by loadConfig(); exported as a live binding via getConfig(). */
 let current = structuredClone(DEFAULTS);
 
@@ -524,8 +527,14 @@ export function saveConfig(patch) {
     fs.writeFileSync(tmp, JSON.stringify(stripSecretsForDisk(next), null, 2));
     fs.renameSync(tmp, CONFIG_FILE);
     log.info('config', `saved ${CONFIG_FILE}`, { bytes: fs.statSync(CONFIG_FILE).size });
+    saveFailureLogged = false;
   } catch (err) {
-    logError('config', `could not save ${CONFIG_FILE}`, err);
+    // A config file that cannot be written fails on *every* write — a read-only
+    // volume, or a container started without one. The first failure is worth an
+    // error (with the stack, so the mount shows up in a report); the repeats are
+    // noise, and every caller already reports the consequence itself.
+    if (saveFailureLogged) log.debug('config', `could not save ${CONFIG_FILE} (the file is still not writable)`, { error: errorText(err) });
+    else { saveFailureLogged = true; logError('config', `could not save ${CONFIG_FILE}`, err); }
     throw err;
   }
   return next;
@@ -583,6 +592,7 @@ export function ensureDirs() {
     path.dirname(CONFIG_FILE),
     current.sources.dir,
   ];
+  const failed = [];
   for (const dir of dirs) {
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -591,7 +601,16 @@ export function ensureDirs() {
       // /downloads and /config are usually volumes; a failure here is worth an error
       // but not a crash — the app can still serve already-known streams.
       logError('config', `could not create directory ${dir}`, err);
+      failed.push({ dir, err });
     }
+  }
+  // One summary line, because five stacked EACCES errors at boot hide what they
+  // actually mean: the mounted volume is missing or read-only, so settings, the
+  // playlist and the hardware cache will not survive a restart. Everything else
+  // (searching, the UI, streaming) keeps working.
+  if (failed.length) {
+    log.warn('config', `${failed.length} director${failed.length === 1 ? 'y' : 'ies'} could not be created — the app keeps running, but settings and the playlist are memory-only for this run`,
+      { dirs: failed.map((entry) => entry.dir).join(', '), cause: errorText(failed[0].err) });
   }
 }
 

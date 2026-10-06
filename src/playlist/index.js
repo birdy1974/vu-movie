@@ -26,7 +26,7 @@
 
 import crypto from 'node:crypto';
 import { getConfig, saveConfig } from '../core/config.js';
-import { log } from '../core/log.js';
+import { log, errorText } from '../core/log.js';
 import { normaliseProfile } from '../core/media.js';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -37,6 +37,52 @@ import * as enigma2 from '../enigma2/index.js';
 const MAX_ITEMS = 300;
 
 const text = (value, fallback = '') => (value === undefined || value === null ? fallback : String(value));
+
+/* ------------------------------------------------------------------ *
+ * persistence
+ *
+ * The playlist (order, flags, token) lives in the config file, which is a
+ * mounted volume on the NAS. That file is not always writable: a read-only
+ * mount, a container started without the volume, or a throwaway environment
+ * like the sandbox this repository is previewed in. A failed *write* must
+ * never fail a *request* — `GET /api/playlist` used to answer 500 with
+ * "EACCES: mkdir '/config'", which left the whole Playlist tab (and with it
+ * the preview player, the bouquet and the public outputs) empty.
+ *
+ * So the writes below are best effort: the change is applied in memory
+ * (saveConfig() already updates the running config before it touches the
+ * disk), the process keeps behaving consistently until it stops, and the
+ * operator is told once that nothing was persisted.
+ * ------------------------------------------------------------------ */
+
+/** Token generated for this run when the config file cannot be written. */
+let memoryToken = '';
+/** False as soon as one config write failed; reported to the UI by /api/playlist. */
+let configWritable = true;
+let persistFailureLogged = false;
+
+/**
+ * Persist a playlist patch, tolerating a config file that cannot be written.
+ * Returns true when the change really reached the disk.
+ */
+function persistPlaylist(patch, description) {
+  try {
+    saveConfig({ playlist: patch });
+    configWritable = true;
+    return true;
+  } catch (err) {
+    configWritable = false;
+    if (!persistFailureLogged) {
+      persistFailureLogged = true;
+      log.warn('playlist', `the config file is not writable — ${description} is kept in memory for this run only`,
+        { error: errorText(err) });
+    }
+    return false;
+  }
+}
+
+/** Whether the last playlist write reached the config file (the UI shows a hint when it did not). */
+export function configWritableNow() { return configWritable; }
 
 /** One playlist entry, coerced into the shape the rest of the app expects. */
 function normaliseItem(entry = {}) {
@@ -64,19 +110,25 @@ export function name() {
 /**
  * The unguessable handle in every public output URL (/pl/<token>/…). Created on
  * first use and stored in the config, so an URL handed to the VU+ or to an IPTV
- * app keeps working across restarts.
+ * app keeps working across restarts. When the config file cannot be written the
+ * token is still generated and reused for the lifetime of the process, so those
+ * URLs work for this run instead of the endpoint failing.
  */
 export function token() {
   const existing = text(getConfig().playlist?.token).trim();
   if (existing) return existing;
+  if (memoryToken) return memoryToken;
   const created = crypto.randomBytes(12).toString('base64url');
-  saveConfig({ playlist: { token: created } });
-  log.info('playlist', 'generated the playlist token for the public output URLs');
+  memoryToken = created;
+  const stored = persistPlaylist({ token: created }, 'the playlist token');
+  log.info('playlist', stored
+    ? 'generated the playlist token for the public output URLs'
+    : 'generated the playlist token for this run (it could not be written to the config file)');
   return created;
 }
 
 export function tokenMatches(candidate) {
-  const expected = text(getConfig().playlist?.token).trim();
+  const expected = text(getConfig().playlist?.token).trim() || memoryToken;
   if (!expected || !candidate) return false;
   const a = Buffer.from(String(candidate));
   const b = Buffer.from(expected);
@@ -94,7 +146,7 @@ export function saveItems(items = []) {
     next.push(item);
     if (next.length >= MAX_ITEMS) break;
   }
-  saveConfig({ playlist: { items: next } });
+  persistPlaylist({ items: next }, 'the playlist order and flags');
   return next;
 }
 
@@ -391,4 +443,5 @@ export async function summary() {
 export default {
   name, token, tokenMatches, saveItems, sync, entries, enabledStreams, addItems, removeItem,
   updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, playlistText, bouquet, summary,
+  configWritableNow,
 };
