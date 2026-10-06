@@ -35,6 +35,7 @@ import {
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
 } from './upstream.js';
+import { decideWebProfile, describeWebDecisions } from './web-preview.js';
 
 /**
  * Run an FFmpeg template (or built profile) for a short window against the
@@ -421,35 +422,73 @@ function cleanupHlsDir(session) {
 /**
  * Build (or reuse) a session for a stream.
  * @param {object} stream  record from streams/store
- * @param {object} [opts]  { profile: overrides, container }
+ * @param {object} [opts]  { profile: overrides, container, outputType, web: { videoCodecs, audioCodecs } }
+ *
+ * The `web` opt (set by the HTTP layer when the request came from the browser
+ * preview) makes this a **preview session**: its own `outputType: 'web'`, no
+ * subtitles, no item template, and a container/codec choice derived from what
+ * the browser said it can play (see streams/web-preview.js).
+ *
+ * A session is a pipe that is already running, so it cannot be re-encoded for a
+ * different client: a preview asked for while a VLC session is alive gets its
+ * own session. That is the price of "the preview must never show subtitles",
+ * and the idle stop closes both again when nobody is watching.
  */
 export async function ensureSession(stream, opts = {}) {
+  const web = opts.web ? { ...opts.web } : null;
   const existing = sessions.get(stream.id);
   if (existing && existing.alive) {
-    log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size, outputType: existing.outputType });
-    return existing;
+    if (existing.web === Boolean(web)) {
+      log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size, outputType: existing.outputType });
+      return existing;
+    }
+    log.info('relay', `starting a separate ${web ? 'web preview' : 'player'} session for stream ${stream.id} (the running ${existing.outputType || 'default'} session cannot change its output)`, {
+      existingOutput: existing.outputType || '', existingClients: existing.clients.size,
+    });
+    stopSession(stream.id, web ? 'replaced by web preview' : 'replaced by a non-preview output');
   }
 
   const cfg = getConfig();
-  const outputType = opts.outputType || '';
+  const outputType = web ? 'web' : (opts.outputType || '');
   const container = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
   let profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
 
-  // Apply the per-output FFmpeg template selection: stream output override →
-  // stream default → global output default → global default. An empty result
-  // falls through to the guided profile builder (i.e. no template is used).
-  const template = resolveOutputTemplateForSession(profileInput, outputType);
-  if (template) {
-    profileInput = {
-      ...profileInput,
-      container: template.container || profileInput.container,
-      ffmpegTemplate: template.command,
-      ffmpegTemplateId: template.templateId || '',
-      ffmpegTemplateName: template.name || '',
-    };
-    log.debug('relay', `using template for output "${outputType || 'default'}"`, {
-      templateId: template.templateId, name: template.name, source: template.source,
+  // The browser preview is not the receiver: the item's template is dropped and
+  // the guided builder decides, because the template was written for VLC/the
+  // VU+ (DVB subtitles, HEVC, AC-3 — none of which the MSE player can take).
+  // What the browser CAN take comes from its own codec report; without a probe
+  // the safe path is H.264 + AAC.
+  let webDecisions = null;
+  let template = null;
+  if (web) {
+    const decision = decideWebProfile({
+      probe: stream.upstream?.probe || null,
+      videoCodecs: web.videoCodecs || [],
+      audioCodecs: web.audioCodecs || [],
+      reported: web.reported !== false,
     });
+    webDecisions = decision.decisions;
+    profileInput = { ...profileInput, ...decision.profile };
+    log.info('relay', `web preview profile for stream ${stream.id}: ${describeWebDecisions(webDecisions)}`, {
+      reasons: webDecisions.reasons, video: webDecisions.video, audio: webDecisions.audio,
+    });
+  } else {
+    // Apply the per-output FFmpeg template selection: stream output override →
+    // stream default → global output default → global default. An empty result
+    // falls through to the guided profile builder (i.e. no template is used).
+    template = resolveOutputTemplateForSession(profileInput, outputType);
+    if (template) {
+      profileInput = {
+        ...profileInput,
+        container: template.container || profileInput.container,
+        ffmpegTemplate: template.command,
+        ffmpegTemplateId: template.templateId || '',
+        ffmpegTemplateName: template.name || '',
+      };
+      log.debug('relay', `using template for output "${outputType || 'default'}"`, {
+        templateId: template.templateId, name: template.name, source: template.source,
+      });
+    }
   }
 
   const profile = normaliseProfile(profileInput, stream.upstream?.probe || null);
@@ -512,7 +551,10 @@ export async function ensureSession(stream, opts = {}) {
   // attached subtitle at all, and if not, why. The notes must describe the
   // container ffmpeg REALLY writes (a Matroska template bound to the .ts slot
   // still muxes the text sidecar) — not the container the URL promised.
+  // A web preview is the one case where dropping subtitles is deliberate, not a
+  // surprise: the decision line above already states it.
   for (const note of subtitleSessionNotes(effectiveProfile, actualFormat || (wantsHls ? 'hls' : container), args)) {
+    if (web) { log.debug('relay', note, { stream: stream.id, output: 'web' }); continue; }
     log.warn('relay', note, { stream: stream.id, output: outputType || container, title: stream.title });
   }
 
@@ -526,6 +568,11 @@ export async function ensureSession(stream, opts = {}) {
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     encoder: profile.ffmpegTemplate ? 'custom template' : profile.transcode ? (hw.available && profile.encoder === 'vaapi' ? 'h264_vaapi' : profile.encoder || 'libx264') : 'copy',
     outputType,
+    // A preview session: subtitle-free, template-free, codecs chosen from the
+    // browser's own report. Marked so a player session can never be reused for
+    // a browser (and the other way around).
+    web: Boolean(web),
+    webDecisions,
     templateId: profile.ffmpegTemplateId || '',
     templateSource: template?.source || '',
     profile: effectiveProfile,
@@ -854,6 +901,10 @@ export function publicSession(session) {
     mode: session.mode,
     encoder: session.encoder,
     outputType: session.outputType || '',
+    web: Boolean(session.web),
+    // Why the preview got its particular codecs/subtitle drop — shown in the
+    // preview modal and in `GET /api/streams/:id`.
+    webDecisions: session.web ? (session.webDecisions || null) : null,
     templateId: session.templateId || '',
     templateSource: session.templateSource || '',
     clients: session.clients.size,

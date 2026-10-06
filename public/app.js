@@ -241,8 +241,10 @@ function renderSessions(sessions) {
   state.sessions = sessions;
   const host = $('#dash-sessions');
   if (host) {
+    // A preview runs as its own session next to a VLC one (a running pipe
+    // cannot change its output), so the row has to say which is which.
     host.innerHTML = sessions.length
-      ? sessions.map((s) => `<div class="kv"><span>${escapeHtml(s.streamId)} <span class="mut">${escapeHtml(s.mode || '')}/${escapeHtml(s.encoder || '')}</span></span>
+      ? sessions.map((s) => `<div class="kv"><span>${escapeHtml(s.streamId)} <span class="mut">${escapeHtml(s.mode || '')}/${escapeHtml(s.encoder || '')}</span>${s.web ? ` ${tag(OUTPUT_LABELS.web || 'web preview', 'alt')}` : ''}</span>
           <span>${s.clients} client(s) · ${s.bytesOut ? fmtBytes(s.bytesOut) : '0'} ${s.stats?.speed ? `· ${escapeHtml(s.stats.speed)}` : ''}</span></div>`).join('')
       : '<div class="meta">none</div>';
   }
@@ -1610,6 +1612,7 @@ function wireSubtitles() {
 
 const STREAM_URL_LABELS = [
   ['ts', 'VLC / any player (.ts)'],
+  ['web', 'Web preview (no subtitles)'],
   ['mkv', 'VLC / any player (.mkv)'],
   ['hls', 'Playlist (.m3u8)'],
   ['playlist', 'Playlist (.m3u)'],

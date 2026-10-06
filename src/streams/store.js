@@ -177,6 +177,12 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
       : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
     download: `${base}/dl/${token}/${slug}.${ext}`,
     watch: `${base}/watch/${token}`,
+    // The URL that tells the relay "this is the browser preview": subtitle-free,
+    // no item template, codecs picked from what the browser can play (see
+    // streams/web-preview.js). Kept as a path suffix instead of a query because
+    // the mpegts.js fallback (a plain <video src>) and the mini-player both
+    // pass it around unchanged.
+    web: `${base}/s/${token}/${slug}.ts.web`,
     // The bouquet service-ref encodes the URL with `encodeE2Url`, which
     // strips query strings — the receiver cannot reach a URL with
     // `?enigma2=1`. We use a `.ts.enigma2` path suffix that survives the
@@ -204,6 +210,10 @@ export function outputTypeForPath(reqPath) {
   // that do pass headers/queries through (e.g. direct test calls).
   if (name.endsWith('/direct')) return 'direct';
   if (name.endsWith('.ts.enigma2') || name.endsWith('/enigma2.ts')) return 'enigma2';
+  // Browser preview (mpegts.js / MSE). Like the Enigma2 suffix, this is a path
+  // segment so the URL survives clients that drop query strings; the browser
+  // player therefore cannot accidentally be served the VLC template's output.
+  if (name.endsWith('.ts.web') || name.endsWith('/web.ts')) return 'web';
   if (name.endsWith('.m3u8')) return 'm3u8';
   if (name.endsWith('.m3u')) return 'm3u';
   if (name.endsWith('.mkv')) return 'vlcMkv';

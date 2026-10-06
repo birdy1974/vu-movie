@@ -280,6 +280,55 @@ writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
 the query string when it builds the service reference — a 720p H.264 template
 bound to the `enigma2` slot is what actually runs on the Duo2.
 
+The **browser preview is an eighth output** (`web`, URL `/s/{token}/{slug}.ts.web`).
+It is the one slot no template can be assigned to — see below.
+
+#### The web preview (the browser player)
+
+The ▶ **preview** button in the Playlist tab (and the `/watch/{token}` page) does
+not play an FFmpeg template's output. The player is
+[mpegts.js](https://github.com/xqq/mpegts.js): it transmuxes MPEG-TS into
+fragmented MP4 and feeds that to Media Source Extensions, so what can be played
+is decided by **the browser in front of the stream** — not by VLC, not by the
+Duo2, and not by the template the item carries.
+
+Before playback starts the page asks its own browser what it can decode
+(`MediaSource.isTypeSupported` over H.264/HEVC/AV1/VP9 and
+AAC/AC-3/E-AC-3/Opus/MP3) and hands that report to the relay as a query string —
+a query, because a plain `<video src>` fallback can carry it too:
+
+```
+/s/{token}/{slug}.ts.web?codecs=1&vcodecs=avc1,hvc1&acodecs=mp4a,ac-3
+```
+
+The relay answers with a session that
+
+* **drops every subtitle** — no sidecar `.srt`, no source track, no
+  `-c:s dvbsub`: the command always carries `-sn -dn`. A text track cannot be
+  muxed into TS at all, a DVB bitmap track makes the browser transmuxer fail, and
+  the preview player has no subtitle UI;
+* **ignores the item's and the global templates** for every other slot (they are
+  written for the receiver — DVB subtitles, HEVC, AC-3). The guided profile
+  builder runs instead, so the item's resolution cap and bitrates still apply;
+* **copies what the browser can play and re-encodes the rest**: H.264 video plus
+  a supported audio track is a plain remux (no CPU at all), anything else becomes
+  H.264 + AAC (VAAPI when the NAS has it, libx264 otherwise). HEVC/AV1/VP9 always
+  transcode, even in a browser whose MediaSource claims support, because
+  mpegts.js only transmuxes H.264 reliably.
+
+The modal prints the verdict under the video — `playing — web preview: transcode
+hevc → h264 + transcode eac3 → aac, subtitles dropped (… support)` — together
+with the exact preview URL, so a surprise transcode is explained in the player
+instead of in the log. `GET /api/streams/{id}` returns the same as
+`session.webDecisions` (`{ copy, reported, video: { source, family, supported,
+action }, audio: { … }, subtitles: 'dropped', reasons }`).
+
+Subtitles therefore never show in the web preview, by design, and the relay says
+so once per session (`web preview profile for stream …: … subtitles dropped`).
+The `.ts`/`.mkv` URLs are unaffected: the same modal's **open in VLC** plays the
+`.ts` URL with the item's template and its subtitle track, and *Watch in browser*
+in the URLs panel shows the preview URL for a bug report.
+
 #### Building the command from fields
 
 The template editor is not just a text area: it carries the same structured

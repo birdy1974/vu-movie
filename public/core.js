@@ -340,6 +340,7 @@ const OUTPUT_LABELS = {
   enigma2: 'Enigma2 / Duo2',
   direct: 'Direct upstream link (302)',
   download: 'Download to NAS',
+  web: 'Web preview (no subtitles)',
 };
 const OUTPUT_TYPES = ['vlcTs', 'vlcMkv', 'm3u8', 'm3u', 'enigma2', 'direct', 'download'];
 

@@ -71,7 +71,7 @@ function fetchMock(url, options = {}) {
 /* ---------------- load the real page ---------------- */
 
 let html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-for (const file of ['core.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
+for (const file of ['core.js', 'web-codecs.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
   const code = fs.readFileSync(path.join(ROOT, file), 'utf8').replace(/<\/script/gi, '<\\/script');
   html = html.replace(`<script src="/${file}"></script>`, () => `<script>${code}</script>`);
 }

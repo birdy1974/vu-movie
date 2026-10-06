@@ -26,7 +26,7 @@ const ROOT = path.resolve(import.meta.dirname, '..', 'public');
 /* ---------------- fixtures + mocked API ---------------- */
 
 const items = [
-  { streamId: 's1', enabled: true, templateId: '', title: 'Dune: Part Two', year: 2024, kind: 'movie', sourceId: 'cinejoy', quality: '1080p', hasTemplate: false, urls: { ts: 'http://h/pl/a.ts' }, order: 0 },
+  { streamId: 's1', enabled: true, templateId: '', title: 'Dune: Part Two', year: 2024, kind: 'movie', sourceId: 'cinejoy', quality: '1080p', hasTemplate: false, urls: { ts: 'http://h/pl/a.ts', web: 'http://h/pl/a.ts.web', watch: 'http://h/watch/tok1' }, order: 0 },
   { streamId: 's2', enabled: true, templateId: '', title: 'Alien: Romulus', year: 2024, kind: 'movie', sourceId: 'cinevo', quality: '720p', hasTemplate: false, urls: { ts: 'http://h/pl/b.ts' }, order: 1 },
   { streamId: 's3', enabled: false, templateId: '', title: 'Old Smurfs', year: 1981, kind: 'series', sourceId: 'redflix', quality: '480p', hasTemplate: false, urls: { ts: 'http://h/pl/c.ts' }, order: 2 },
 ];
@@ -75,7 +75,31 @@ function fetchMock(url, options = {}) {
       storage: { writable: true },
     });
   }
-  if (u.startsWith('/api/streams')) return json({ ok: true, streams: [], stream: { title: 'x' } });
+  if (u.startsWith('/api/streams')) {
+    // The preview modal reads GET /api/streams/:id twice: once for the URLs it
+    // hands to mpegts.js, once after playback starts for the relay's web
+    // decision (copy vs transcode, subtitles dropped).
+    return json({
+      ok: true,
+      streams: [],
+      stream: { id: 's1', title: 'Dune: Part Two', year: 2024, kind: 'movie', enabled: true },
+      urls: {
+        ts: 'http://h/pl/a.ts', web: 'http://h/pl/a.ts.web', raw: 'http://h/pl/a.raw.ts',
+        mkv: 'http://h/pl/a.mkv', hls: 'http://h/pl/a.m3u8', playlist: 'http://h/pl/a.m3u',
+        download: 'http://h/dl/a.ts', watch: 'http://h/watch/tok1', forBox: 'http://h/pl/a.ts.enigma2',
+      },
+      session: {
+        id: 's1-web', streamId: 's1', outputType: 'web', web: true, clients: 1, mode: 'copy', encoder: 'copy',
+        webDecisions: {
+          copy: true,
+          video: { source: 'h264', family: 'avc1', remuxSafe: true, supported: true, action: 'copy', target: null },
+          audio: { source: 'aac', family: 'mp4a', supported: true, action: 'copy', target: null },
+          subtitles: 'dropped',
+          reasons: ['subtitles are dropped for the web player'],
+        },
+      },
+    });
+  }
   if (u.startsWith('/api/health')) return json({ ok: true, version: '1.0.0', uptimeSec: 1, ffmpeg: { ok: true, version: '6.0' }, hwaccel: { available: false, reason: 'test' }, postgres: false, enigma2: { configured: false } });
   if (u.startsWith('/api/config')) return json({ ok: true, config: { app: {}, transcode: {}, subtitles: {}, enigma2: {}, scraper: {}, storage: {} } });
   void method;
@@ -83,7 +107,7 @@ function fetchMock(url, options = {}) {
 }
 
 let html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-for (const file of ['core.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
+for (const file of ['core.js', 'web-codecs.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
   const code = fs.readFileSync(path.join(ROOT, file), 'utf8').replace(/<\/script/gi, '<\\/script');
   html = html.replace(`<script src="/${file}"></script>`, () => `<script>${code}</script>`);
 }
@@ -96,7 +120,15 @@ const dom = new JSDOM(html, {
   beforeParse(window) {
     window.fetch = fetchMock;
     window.EventSource = class { constructor() { this.readyState = 0; } addEventListener() {} close() {} };
-    window.mpegts = { Events: { ERROR: 'error' }, isSupported: () => true, createPlayer: () => ({ attachMediaElement() {}, on() {}, load() {}, play() { return Promise.resolve(); }, pause() {}, unload() {}, detachMediaElement() {}, destroy() {} }) };
+    window.mpegtsPlayerUrls = [];
+    window.mpegts = {
+      Events: { ERROR: 'error' },
+      isSupported: () => true,
+      createPlayer: (config) => {
+        window.mpegtsPlayerUrls.push(config.url);
+        return { attachMediaElement() {}, on() {}, load() {}, play() { return Promise.resolve(); }, pause() {}, unload() {}, detachMediaElement() {}, destroy() {} };
+      },
+    };
     window.addEventListener('error', (e) => errors.push(String(e.error || e.message)));
     window.addEventListener('unhandledrejection', (e) => errors.push(`unhandled: ${e.reason}`));
   },
@@ -146,6 +178,23 @@ $$('#playlist-items [data-pl-check]')[1].click();
 await tick(80);
 check('the per-row ⚡ checks only that row', checkCalls.length === 4 && checkCalls[3].join() === 's2', JSON.stringify(checkCalls));
 check('the other rows keep their state', /working 1920×1080/.test($$('#playlist-items [data-pl-row]')[0].innerHTML));
+
+/* the preview web player: subtitle-free, codec-reported URL */
+$$('#playlist-items [data-pl-play]')[0].click();
+await tick(120);
+check('the preview modal opens with a <video>', Boolean($('#player-video')));
+check('the modal says the preview drops the subtitles', /without subtitles/i.test(doc.body.innerHTML));
+const playerUrl = win.mpegtsPlayerUrls[0] || '';
+check('mpegts.js is handed the .ts.web URL, not the VLC .ts', playerUrl.includes('/a.ts.web?') && !/a\.ts\?/.test(playerUrl), playerUrl);
+check('the URL reports the browser codec probe to the relay', /codecs=1/.test(playerUrl) && /vcodecs=/.test(playerUrl) && /acodecs=/.test(playerUrl), playerUrl);
+check('the preview URL is shown for debugging', ($('#player-weburl')?.textContent || '').includes('.ts.web?'));
+await tick(60);
+const video = $('#player-video');
+video.dispatchEvent(new win.Event('playing'));
+await tick(40);
+const statusText = $('#player-status')?.textContent || '';
+check('the status line explains the relay decision (subtitles dropped)', /playing — web preview: copy h264 \+ copy aac, subtitles dropped/.test(statusText), statusText);
+check('#player-status is the live status element', Boolean(statusText));
 
 console.log(errors.length ? `\nJS errors:\n${errors.join('\n')}` : '\nno page errors');
 const failed = results.filter((line) => line.startsWith('FAIL')).length;

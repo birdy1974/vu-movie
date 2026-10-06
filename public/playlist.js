@@ -640,11 +640,13 @@ const VMPlaylist = (() => {
             <div id="player-status" class="meta" style="margin-top:8px">connecting…</div>
             <div class="row" style="margin-top:8px">
               <button class="btn sm" data-player-vlc>▶ open in VLC</button>
-              <button class="btn sm ghost" data-player-copy>copy stream URL</button>
+              <button class="btn sm ghost" data-player-copy>copy VLC URL</button>
               <button class="btn sm ghost" data-player-newtab>open /watch page ↗</button>
               <button class="btn sm ghost" data-player-sub>▤ subtitle</button>
             </div>
-            <div class="meta" style="margin-top:8px">The web player transmuxes the MPEG-TS relay in your browser. If the source uses a browser-unsupported codec such as HEVC, use VLC or assign an H.264/AAC transcode template.</div>
+            <div class="meta" style="margin-top:8px">The web player transmuxes the MPEG-TS relay in <b>this browser</b>: it reports which codecs it can decode, and the relay builds the preview from that — <b>without subtitles</b> and ignoring the item’s FFmpeg template (that one is written for VLC/the VU+). HEVC or AC-3 sources are transcoded to H.264/AAC on the fly; a source the browser cannot decode at all still plays in VLC.</div>
+            <details class="meta" style="margin-top:6px"><summary style="cursor:pointer">preview URL</summary>
+              <div class="mono" id="player-weburl" style="word-break:break-all;margin-top:4px"></div></details>
           </div>`,
         onMount: (root) => {
           const video = $('#player-video', root);
@@ -686,27 +688,48 @@ const VMPlaylist = (() => {
     let player = null;
     let stopped = false;
     let failed = false;
+    // The preview URL carries this browser's codec report; the relay answers it
+    // with a subtitle-free, browser-compatible session (see /web-codecs.js).
+    // The guard keeps a stale cached page working: without the probe the relay
+    // gets no report and transcodes to H.264/AAC, which is the safe path.
+    const webUrl = (window.VMWebCodecs?.previewUrl || ((url) => url))(urls.web || urls.ts);
+    const webUrlEl = $('#player-weburl');
+    if (webUrlEl) webUrlEl.textContent = webUrl;
+    // The relay's decision (copy vs transcode, which codec) is only known after
+    // the session exists, so it is fetched once for the status line.
+    const note = { web: '' };
     const fallback = (message) => {
       if (stopped) return;
       failed = true;
       statusEl.className = 'note warn';
       statusEl.innerHTML = `${escapeHtml(message)}<br>
-        <span class="mut">Stream URL: <code>${escapeHtml(urls.ts || '')}</code></span>`;
+        <span class="mut">Preview URL: <code>${escapeHtml(webUrl)}</code> · VLC URL (keeps subtitles): <code>${escapeHtml(urls.ts || '')}</code></span>`;
     };
     const markPlaying = () => {
       if (stopped) return;
       statusEl.className = 'meta ok-text';
-      statusEl.textContent = 'playing';
+      statusEl.textContent = note.web ? `playing — ${note.web}` : 'playing';
     };
     video.addEventListener('playing', markPlaying);
     statusEl.innerHTML = '<span class="spin"></span> starting the MPEG-TS relay and buffering…';
 
-    if (window.mpegts?.isSupported?.() && urls.ts) {
+    // Fetch once the session exists and show what the relay decided. A failure
+    // here is silent on purpose: the status line is a nicety, the video is the
+    // product.
+    api(`/api/streams/${encodeURIComponent(stream.id)}`, { silent: true })
+      .then((res) => {
+        if (stopped || !res?.session?.web) return;
+        note.web = window.VMWebCodecs?.describeDecisions?.(res.session.webDecisions) || '';
+        if (note.web && statusEl.classList.contains('ok-text')) markPlaying();
+      })
+      .catch(() => {});
+
+    if (window.mpegts?.isSupported?.() && webUrl) {
       try {
         player = window.mpegts.createPlayer({
           type: 'mpegts',
           isLive: true,
-          url: urls.ts,
+          url: webUrl,
         }, {
           enableWorker: true,
           lazyLoad: false,
@@ -730,10 +753,11 @@ const VMPlaylist = (() => {
         fallback(`Could not start the browser transmuxer: ${error.message}`);
       }
     } else {
-      // Safari can play some relay/container combinations natively. Keep this as
-      // a fallback for browsers without MediaSource/mpegts.js.
-      const nativeUrl = urls.raw || urls.ts;
-      video.src = nativeUrl;
+      // Safari can play some relay/container combinations natively (it demuxes
+      // MPEG-TS). Keep this as a fallback for browsers without
+      // MediaSource/mpegts.js — the same preview URL, so the relay still drops
+      // the subtitles and picks a codec the browser reported.
+      video.src = webUrl || urls.raw || urls.ts;
       video.addEventListener('error', () => fallback('This browser cannot play the relay natively and MPEG-TS transmuxing is unavailable.'), { once: true });
       video.play().catch(() => {
         if (!stopped && !failed) statusEl.textContent = 'ready — press Play to start';

@@ -126,6 +126,10 @@ const OUTPUT_LABELS = {
   enigma2: 'Enigma2 / Duo2',
   direct: 'Direct upstream link (302)',
   download: 'Download to NAS',
+  // Not in OUTPUT_TYPES on purpose: the browser preview session is built by the
+  // app (no subtitles, codecs from the browser's own report), never from an
+  // operator template. The label only names it in the sessions list.
+  web: 'Web preview (no subtitles)',
 };
 export { OUTPUT_TYPES, OUTPUT_LABELS };
 

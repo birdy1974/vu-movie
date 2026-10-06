@@ -149,6 +149,20 @@ export function createApp() {
     const isEnigma2 = pathOutputType === 'enigma2' || queryIsEnigma2;
     const outputType = isEnigma2 ? 'enigma2' : baseOutputType;
 
+    // The browser preview (`{slug}.ts.web`, plus `?web=1` for the mini player's
+    // fallback) is its own output slot: no subtitles, no per-item template, and
+    // codecs chosen from what the browser reported it can play. The codec query
+    // parameters are the report — `codecs=1` marks it as present, because an
+    // empty list would otherwise look like "the browser supports nothing", and
+    // a plain <video src> fallback (no parameters at all) must fall back to the
+    // safe H.264/AAC transcode rather than to a blind remux.
+    const isWeb = pathOutputType === 'web' || String(req.query.web || '') === '1';
+    const webOpts = isWeb ? {
+      reported: String(req.query.codecs || '') === '1',
+      videoCodecs: req.query.vcodecs || '',
+      audioCodecs: req.query.acodecs || '',
+    } : null;
+
     // direct redirect (hybrid mode from decision D2) — zero load on the NAS.
     // Only valid for sources that need no request headers: a 302 cannot carry
     // the signed Cookie/Referer that MovieBox and friends demand, so those URLs
@@ -194,20 +208,22 @@ export function createApp() {
       return res.send(csv);
     }
 
-    // `.ts.enigma2` lands here with `ext === 'enigma2'`. Treat it as a `.ts`
-    // mpegts request — only the outputType differs.
-    const effectiveExt = (ext === 'enigma2' || pathOutputType === 'enigma2') ? 'ts' : ext;
+    // `.ts.enigma2` lands here with `ext === 'enigma2'`, `.ts.web` with
+    // `ext === 'web'`. Both are mpegts requests — only the outputType differs.
+    const effectiveExt = (ext === 'enigma2' || ext === 'web' || pathOutputType === 'enigma2' || isWeb) ? 'ts' : ext;
     if (!['ts', 'mkv', 'mp4', 'mpegts', 'matroska'].includes(effectiveExt)) {
       log.warn('http', 'unsupported stream extension requested', { ext, name: req.params.name });
       return res.status(400).send(`vu-movie: unsupported extension ".${ext}" (use .ts, .mkv, .m3u8 or .m3u)`);
     }
 
-    const container = effectiveExt === 'mkv' || effectiveExt === 'matroska' ? 'matroska' : 'mpegts';
+    // A preview never muxes Matroska: the player is an MSE transmuxer and the
+    // web-preview profile pins mpegts anyway.
+    const container = isWeb ? 'mpegts' : (effectiveExt === 'mkv' || effectiveExt === 'matroska' ? 'matroska' : 'mpegts');
     // Bounded wait so a slow GPU self-test cannot hold a playback request open.
     const hw = await hardware({ waitMs: 15000 });
     let session;
     try {
-      session = await relay.ensureSession(stream, { container, outputType });
+      session = await relay.ensureSession(stream, { container, outputType: isWeb ? 'web' : outputType, web: webOpts });
     } catch (err) {
       logError('http', 'could not start the stream session', err, { stream: stream.id });
       return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
@@ -272,18 +288,21 @@ export function createApp() {
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
     const tsUrlJson = JSON.stringify(urls.ts).replace(/</g, '\\u003c');
-    const rawUrlJson = JSON.stringify(urls.raw).replace(/</g, '\\u003c');
+    const webUrlJson = JSON.stringify(urls.web).replace(/</g, '\\u003c');
     res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
 <title>${escapeHtml(stream.title)} — vu-movie</title>
 <style>body{background:#0b0f16;color:#e6edf7;font:14px system-ui;margin:0;padding:24px}
 video{width:100%;max-width:1100px;background:#000;border-radius:12px}#status{color:#94a3b8;margin:10px 0}
 a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px}</style>
-<script src="/vendor/mpegts.js"></script></head>
+<script src="/vendor/mpegts.js"></script><script src="/web-codecs.js"></script></head>
 <body><h1>${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}</h1>
 <video id="video" controls autoplay playsinline></video><div id="status">starting the MPEG-TS relay…</div>
-<p>Stream link: <code>${escapeHtml(urls.ts)}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>
-<script>(()=>{const video=document.getElementById('video');const status=document.getElementById('status');const ts=${tsUrlJson};let failed=false;
-if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.createPlayer({type:'mpegts',isLive:true,url:ts},{enableWorker:true,lazyLoad:false,liveBufferLatencyChasing:true});player.attachMediaElement(video);player.on(window.mpegts.Events.ERROR,(type,detail,info)=>{failed=true;const reason=String((info&&info.msg)||detail||type||'');status.textContent='Playback failed: '+(/endOfStream before demuxer|COULD_NOT_OPEN|not supported/i.test(reason)?'the relay sent no playable video — the source did not start (dead mirror, expired link, or ffmpeg unavailable)':reason)+'. Try VLC or an H.264/AAC template.'});player.load();player.play().catch(()=>{if(!failed)status.textContent='ready — press Play to start'});video.addEventListener('playing',()=>{status.textContent='playing'},{once:true});window.addEventListener('beforeunload',()=>{try{player.destroy()}catch{}})}else{video.src=${rawUrlJson};status.textContent='native browser playback fallback';video.play().catch(()=>{})}})();</script>
+<p>Preview link (no subtitles, browser codecs): <code id="weburl"></code><br>
+VLC link (keeps subtitles): <code>${escapeHtml(urls.ts)}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>
+<script>(()=>{const video=document.getElementById('video');const status=document.getElementById('status');
+const web=window.VMWebCodecs?VMWebCodecs.previewUrl(${webUrlJson}):${webUrlJson};
+document.getElementById('weburl').textContent=web;let failed=false;
+if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.createPlayer({type:'mpegts',isLive:true,url:web},{enableWorker:true,lazyLoad:false,liveBufferLatencyChasing:true});player.attachMediaElement(video);player.on(window.mpegts.Events.ERROR,(type,detail,info)=>{failed=true;const reason=String((info&&info.msg)||detail||type||'');status.textContent='Playback failed: '+(/endOfStream before demuxer|COULD_NOT_OPEN|not supported/i.test(reason)?'the relay sent no playable video — the source did not start (dead mirror, expired link, or ffmpeg unavailable)':reason)+'. Try VLC — it keeps the subtitles too.'});player.load();player.play().catch(()=>{if(!failed)status.textContent='ready — press Play to start'});video.addEventListener('playing',()=>{status.textContent='playing'},{once:true});window.addEventListener('beforeunload',()=>{try{player.destroy()}catch{}})}else{video.src=web;status.textContent='native browser playback fallback (no subtitles)';video.play().catch(()=>{})}})();</script>
 </body></html>`);
   });
 
