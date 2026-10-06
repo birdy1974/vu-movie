@@ -466,6 +466,10 @@ body[data-page="mobile"] .btn{padding:7px 11px}
 .app.nav-mini .side:hover .brand,.app.nav-mini .side:focus-within .brand{flex-direction:row;justify-content:flex-start;padding:4px 6px 14px;gap:10px}
 .app.nav-mini .side:hover .nav button,.app.nav-mini .side:focus-within .nav button{justify-content:flex-start;padding:9px 11px}
 
+/* ---- the Mobile tab: the title shares its row with the fold-all button ---- */
+#p-mobile h1{display:flex;align-items:center;gap:8px}
+#p-mobile h1>*:first-child{flex:1;min-width:0}
+
 /* ---- collapsible panes (the fold button in a card header) ---- */
 .foldbtn{all:unset;cursor:pointer;flex-shrink:0;width:26px;height:22px;display:inline-grid;place-items:center;
   border:1px solid var(--line);border-radius:7px;color:var(--mut);font-size:11px;line-height:1}

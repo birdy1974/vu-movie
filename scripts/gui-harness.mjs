@@ -150,7 +150,7 @@ for (const file of ['core.js', 'playlist.js', 'ffmpeg-editor.js', 'app.js']) {
 }
 
 const dom = new JSDOM(html, {
-  url: 'http://127.0.0.1:8080/#dash',
+  url: 'http://127.0.0.1:8080/',
   runScripts: 'dangerously',
   pretendToBeVisual: true,
   beforeParse(window) {
@@ -192,6 +192,24 @@ const check = (label, condition, extra = '') => {
 
 await tick(150);
 
+/* ---------------- 0. the site opens on the Mobile tab ---------------- */
+
+check('startup lands on the Mobile tab', !$('#p-mobile')?.classList.contains('hide') && $('#p-dash')?.classList.contains('hide'),
+  `mobile=${$('#p-mobile')?.className} dash=${$('#p-dash')?.className}`);
+check('the nav highlights Mobile', $('[data-p="mobile"]')?.classList.contains('on') === true && !$('[data-p="dash"]')?.classList.contains('on'));
+check('body[data-page] is mobile (phone-sized CSS applies)', document.body.dataset.page === 'mobile', document.body.dataset.page);
+const foldBodies = $$('#p-mobile [data-fold-body]');
+check('all five Mobile panes start collapsed', foldBodies.length === 5 && foldBodies.every((b) => b.classList.contains('hide')),
+  foldBodies.map((b) => `${b.dataset.foldBody}:${b.classList.contains('hide') ? 'folded' : 'open'}`).join(' '));
+const foldAll = $('#btn-mob-fold');
+check('the Mobile title has a fold-all button that offers “expand all”', /expand all/.test(foldAll?.textContent || ''), foldAll?.textContent?.trim());
+foldAll?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(30);
+check('it opens every pane in one tap', foldBodies.every((b) => !b.classList.contains('hide')) && /collapse all/.test(foldAll.textContent));
+foldAll.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(30);
+check('and closes them again', foldBodies.every((b) => b.classList.contains('hide')) && /expand all/.test(foldAll.textContent));
+
 /* ---------------- 1. sidebar rail + pin ---------------- */
 
 const app = $('.app');
@@ -211,12 +229,14 @@ check('unpin returns to the rail', app.classList.contains('nav-mini'));
 const folds = $$('.foldbtn[data-fold]');
 check('5 mobile fold buttons', folds.length === 5, folds.map((f) => f.dataset.fold).join(','));
 const mobSearchBody = $('[data-fold-body="mob-search"]');
+// The panes start folded, so the first tap opens and the second closes.
 folds[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-check('folding hides the pane body', mobSearchBody.classList.contains('hide'));
-check('fold state persists', JSON.parse(window.localStorage.getItem('vu-movie.folded') || '{}')['mob-search'] === true,
-  String(window.localStorage.getItem('vu-movie.folded')));
+check('opening a pane shows its body', !mobSearchBody.classList.contains('hide'));
+check('a folded pane is remembered under the current key',
+  JSON.parse(window.localStorage.getItem('vu-movie.folded.v2') || '{}')['mob-search'] === false,
+  String(window.localStorage.getItem('vu-movie.folded.v2')));
 folds[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-check('unfolding shows it again', !mobSearchBody.classList.contains('hide'));
+check('closing it hides the pane again', mobSearchBody.classList.contains('hide'));
 
 /* ---------------- 3. mobile playlist template beside the title ---------------- */
 
