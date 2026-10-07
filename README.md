@@ -119,6 +119,11 @@ permissions, Container Manager project import, firewall, where the data lives).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
+* Every result card (Search and Mobile) has a **▶ preview** button: it races the
+  title's providers, takes the best playable format of the first one that answers
+  (S1E1 for a series), and plays it in the preview web player — without adding
+  anything to the playlist. The backing stream is ephemeral: deleted when the
+  player closes, swept after 60 minutes if the browser is closed mid-preview.
 * **Series get a season/episode picker.** Below the selected title, one card per
   season offers every episode as a checkbox (with per-season and
   all-seasons toggles); the season list comes from MovieBox when the title has

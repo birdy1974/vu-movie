@@ -897,6 +897,10 @@ function renderResults() {
       e.stopPropagation();
       selectGroup(group);
     });
+    card.querySelector('[data-preview-group]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      previewGroup(group, e.currentTarget);
+    });
   });
 }
 
@@ -931,6 +935,119 @@ function resultGroupMarkup(group) {
       <button class="btn sm pri" data-open-formats>formats &amp; metadata</button>
     </div>
   </article>`;
+}
+
+/* ---------------- search-result preview (ephemeral stream + web player) ----------------
+ *
+ * The ▶ preview button on a result card resolves the title's providers in a
+ * race, takes the best playable format of the first provider that answers
+ * with one, and plays it in the preview web player — without touching the
+ * playlist. The backing stream is ephemeral (never listed, no subtitle or
+ * bouquet chores) and is deleted when the player modal closes.
+ */
+
+/** First episode of the first listed season — what a series preview plays. */
+async function previewSeriesEpisode(group) {
+  try {
+    const params = new URLSearchParams({ title: group.title || '' });
+    if (group.year) params.set('year', String(group.year));
+    const data = await api(`/api/find/series?${params}`, { silent: true });
+    const seasons = Array.isArray(data.seasons) ? data.seasons : [];
+    const first = seasons.map((entry) => ({
+      season: Number(entry.season),
+      episode: (entry.episodes || []).map((ep) => Number(ep.episode)).filter((n) => n > 0).sort((a, b) => a - b)[0],
+    })).filter((entry) => entry.season > 0 && entry.episode).sort((a, b) => a.season - b.season)[0];
+    if (first) return { season: first.season, episode: first.episode };
+  } catch { /* fall through to S1E1 */ }
+  return { season: 1, episode: 1 };
+}
+
+async function previewGroup(group, button = null) {
+  if (!group?.entries?.length) return;
+  const label = button?.innerHTML;
+  if (button) { button.disabled = true; button.innerHTML = '<span class="spin"></span> resolving…'; }
+  try {
+    const isSeries = (group.kind || 'movie') === 'series';
+    const picked = isSeries ? await previewSeriesEpisode(group) : { season: 0, episode: 0 };
+    const { season, episode } = picked;
+    // Providers race: the first playable format wins and the rest are
+    // aborted, so one slow/dead site never holds the preview hostage.
+    const controller = new AbortController();
+    let winner = null;
+    const errors = [];
+    const heightOf = (candidate) => seriesQualityHeight(seriesQualityKey(candidate));
+    await Promise.all(group.entries.map(async (entry) => {
+      if (controller.signal.aborted || winner) return;
+      try {
+        const data = await api('/api/find/resolve', {
+          method: 'POST', silent: true, signal: controller.signal,
+          body: {
+            url: entry.url,
+            sourceId: entry.sourceId,
+            title: entry.title || group.title,
+            year: entry.year || group.year || null,
+            kind: entry.kind || group.kind || 'movie',
+            season, episode,
+            probe: true,
+            useBrowser: entry.sourceId !== 'moviebox',
+          },
+        });
+        if (controller.signal.aborted || winner) return;
+        const playable = expandCandidateQualities(data.candidates || [])
+          .filter((candidate) => candidate.ok !== false)
+          .sort((a, b) => heightOf(b) - heightOf(a));
+        if (playable.length && !winner) {
+          winner = { ...playable[0], sourceId: playable[0].sourceId || entry.sourceId, _entry: entry };
+          controller.abort();
+        } else if (data.error) {
+          errors.push(`${sourceName(entry.sourceId)}: ${data.error}`);
+        }
+      } catch (error) {
+        if (error?.name !== 'AbortError') errors.push(`${sourceName(entry.sourceId)}: ${error.message}`);
+      }
+    }));
+    if (!winner) {
+      toast(errors.length ? `Nothing playable to preview — ${errors[0]}` : 'Nothing playable to preview', 'warn');
+      return;
+    }
+    const entry = winner._entry || {};
+    const data = await api('/api/streams', {
+      method: 'POST',
+      silent: true,
+      body: {
+        title: isSeries && season && episode ? `${group.title} ${seriesLabel(season, episode)}` : group.title,
+        year: entry.year || group.year || null,
+        kind: entry.kind || group.kind || 'movie',
+        poster: group.poster || entry.poster || '',
+        description: entry.description || '',
+        sourceId: winner.sourceId || entry.sourceId || '',
+        candidate: {
+          url: winner.url,
+          quality: winner.quality,
+          label: winner.label,
+          sourceId: winner.sourceId || entry.sourceId,
+          kind: winner.kind,
+          headers: winner.headers,
+          variants: winner.variants,
+          probe: winner.probe,
+        },
+        season: isSeries ? season : null,
+        episode: isSeries ? episode : null,
+        ephemeral: true,
+      },
+    });
+    const streamId = data.stream?.id;
+    if (!streamId) throw new Error('preview stream was not created');
+    await VMPlaylist.openPlayer(streamId, {
+      onClose: () => {
+        api(`/api/streams/${encodeURIComponent(streamId)}`, { method: 'DELETE', silent: true }).catch(() => {});
+      },
+    });
+  } catch (error) {
+    if (error?.name !== 'AbortError') toast(`Preview failed: ${error.message}`, 'err');
+  } finally {
+    if (button) { button.disabled = false; button.innerHTML = label; }
+  }
 }
 
 function updateResultsViewButtons() {
@@ -3473,6 +3590,12 @@ async function initMobile() {
     if (metaBtn) {
       const group = state.mobile.results.find((c) => c.key === metaBtn.dataset.mobMeta);
       if (group) openSearchMetadata(group);
+      return;
+    }
+    const previewBtn = event.target.closest('[data-mob-preview]');
+    if (previewBtn) {
+      const group = state.mobile.results.find((c) => c.key === previewBtn.dataset.mobPreview);
+      if (group) previewGroup(group, previewBtn);
       return;
     }
     // A provider chip: only that provider's formats. The row itself: all of them.

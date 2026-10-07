@@ -21,7 +21,7 @@ import { startServer } from './http/server.js';
 import relay from './streams/relay.js';
 import browser from './scrapers/browser.js';
 import { loadSources } from './scrapers/registry.js';
-import { startPlaylistMaintenance, stopPlaylistMaintenance } from './playlist/maintenance.js';
+import { startPlaylistMaintenance, stopPlaylistMaintenance, startEphemeralSweep, stopEphemeralSweep } from './playlist/maintenance.js';
 
 process.env.APP_VERSION = process.env.APP_VERSION || '1.0.0';
 

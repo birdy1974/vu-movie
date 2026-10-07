@@ -711,14 +711,18 @@ router.post('/streams', wrap(async (req, res) => {
   // Search results carry a short-lived signed /api/poster URL. Persist its
   // durable remote source instead, then issue a new proxy URL when reading.
   const artwork = posterSource(body.poster);
+  // `ephemeral` backs the ▶ preview button on search results: a playable
+  // stream that is never listed (no playlist row, no .m3u, no bouquet) and is
+  // deleted when the preview closes, so it gets no subtitle or bouquet chores.
+  const ephemeral = body.ephemeral === true;
   const stream = await store.createStream({
     title: body.title, year: body.year, kind: body.kind || 'movie', poster: artwork?.url || null,
     posterReferer: artwork?.referer || '',
     description: body.description, sourceId: body.sourceId, candidate: body.candidate,
     profile: body.profile || {}, subtitleId: body.subtitleId || null,
-    season: body.season || null, episode: body.episode || null,
+    season: body.season || null, episode: body.episode || null, ephemeral,
   });
-  const subtitleResult = body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
+  const subtitleResult = !ephemeral && body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
   let subtitleError = null;
   if (subtitleResult) {
     try {
@@ -735,7 +739,7 @@ router.post('/streams', wrap(async (req, res) => {
     }
   }
   res.json({ ok: true, stream: publicStreamRecord(stream), urls: store.urlsFor(stream, baseUrlFrom(req)), ...(subtitleError ? { subtitleError } : {}) });
-  afterStreamCreated(stream, baseUrlFrom(req), { skipSubtitleSearch: Boolean(subtitleResult) });
+  if (!ephemeral) afterStreamCreated(stream, baseUrlFrom(req), { skipSubtitleSearch: Boolean(subtitleResult) });
 }));
 
 /**

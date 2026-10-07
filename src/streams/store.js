@@ -16,6 +16,14 @@ import { normaliseProfile } from '../core/media.js';
 const shortId = () => crypto.randomBytes(5).toString('hex');
 const token = () => crypto.randomBytes(12).toString('base64url');
 
+/**
+ * How long a preview (ephemeral) stream survives without being watched.
+ * Ephemeral streams back the ▶ preview button on search results: they are
+ * deleted when the preview modal closes, and this TTL is the backstop for
+ * previews abandoned by closing the browser (see sweepEphemeralStreams).
+ */
+export const EPHEMERAL_TTL_MINUTES = 60;
+
 /** Create (and persist) a stream record from a resolved candidate. */
 export async function createStream({
   id: existingId = null, token: existingToken = null,
@@ -23,13 +31,15 @@ export async function createStream({
   playlist_name: existingPlaylistName = null, subtitle_id: existingSubtitleId = null,
   payload: existingPayload = null, source_id: existingSourceId = null,
   title, year = null, kind = 'movie', poster = null, posterReferer = '', description = null, sourceId = null,
-  candidate, profile = {}, subtitleId = null, season = null, episode = null,
+  candidate, profile = {}, subtitleId = null, season = null, episode = null, ephemeral = false,
 }) {
   const cfg = getConfig();
   const now = new Date();
   const expires = existingExpiresAt !== undefined
     ? existingExpiresAt
-    : cfg.app.tokenTtlMinutes > 0 ? new Date(now.getTime() + cfg.app.tokenTtlMinutes * 60000) : null;
+    : ephemeral
+      ? new Date(now.getTime() + EPHEMERAL_TTL_MINUTES * 60000)
+      : cfg.app.tokenTtlMinutes > 0 ? new Date(now.getTime() + cfg.app.tokenTtlMinutes * 60000) : null;
 
   let profileInput = { ...(profile || {}) };
   if (!existingId && !Object.hasOwn(profileInput, 'ffmpegTemplate') && !Object.hasOwn(profileInput, 'ffmpegTemplateId')) {
@@ -56,6 +66,16 @@ export async function createStream({
     }
   }
   const normalised = normaliseProfile(profileInput, candidate?.probe || null);
+  // The ephemeral flag lives in payload.meta so previews need no schema
+  // migration; a re-save that carries an existing payload keeps the flag.
+  let payload = existingPayload || {
+    sourceId: candidate?.sourceId || null,
+    meta: {
+      ...(candidate?.meta || {}),
+      ...(posterReferer ? { posterReferer } : {}),
+    },
+  };
+  if (ephemeral) payload = { ...(payload || {}), meta: { ...(payload?.meta || {}), ephemeral: true } };
   const record = {
     id: existingId || shortId(),
     token: existingToken || token(),
@@ -82,13 +102,7 @@ export async function createStream({
     playlist_name: existingPlaylistName || `${title || 'vu-movie'}${year ? ` (${year})` : ''}`,
     created_at: existingCreatedAt || now.toISOString(),
     expires_at: expires ? (expires instanceof Date ? expires.toISOString() : expires) : null,
-    payload: existingPayload || {
-      sourceId: candidate?.sourceId || null,
-      meta: {
-        ...(candidate?.meta || {}),
-        ...(posterReferer ? { posterReferer } : {}),
-      },
-    },
+    payload,
     updated_at: now.toISOString(),
   };
 
@@ -112,7 +126,10 @@ export async function getStream(idOrToken) {
 
 export async function listStreams() {
   const rows = await repo.listStreams(200);
-  return rows.map((r) => ({
+  // Ephemeral preview streams are playable via getStream()/the relay but never
+  // listed: the playlist, the .m3u outputs and the Enigma2 bouquet only ever
+  // see deliberate additions.
+  return rows.filter((r) => r?.payload?.meta?.ephemeral !== true).map((r) => ({
     id: r.id,
     token: r.token,
     title: r.title,
@@ -136,6 +153,18 @@ export async function listStreams() {
 export async function removeStream(id) {
   await repo.deleteStream(id);
   log.info('streams', `deleted stream ${id}`);
+}
+
+/**
+ * Delete ephemeral preview streams whose TTL has passed. Previews are deleted
+ * when the player modal closes; this sweep only catches the ones abandoned by
+ * closing the browser (or a crashed tab) mid-preview.
+ */
+export async function sweepEphemeralStreams(now = new Date()) {
+  const cutoff = now instanceof Date ? now.toISOString() : String(now);
+  const removed = await repo.deleteEphemeralStreamsBefore(cutoff);
+  if (removed > 0) log.info('streams', `swept ${removed} expired preview stream(s)`);
+  return { removed };
 }
 
 /**
@@ -256,4 +285,4 @@ export function slugify(text) {
     .slice(0, 70) || 'stream';
 }
 
-export default { createStream, getStream, listStreams, removeStream, urlsFor, slugify };
+export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, EPHEMERAL_TTL_MINUTES };
