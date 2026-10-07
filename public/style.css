@@ -125,6 +125,56 @@ pre{background:#080c13;border:1px solid var(--line);border-radius:10px;padding:1
 .selected-episodes select{width:100%;padding:7px 9px}
 .episode-status{grid-column:1/-1}
 @media(max-width:600px){.selected-episodes{grid-template-columns:1fr 1fr}}
+
+/* ---- series picker: season cards + episode pills (Selected title pane) ---- */
+.series-picker{margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+.series-picker-head{display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12.5px}
+.series-picker-head b{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut)}
+.season-cards{display:flex;flex-direction:column;gap:8px;max-height:320px;overflow:auto;padding-right:2px}
+.season-card{border:1px solid var(--line);border-radius:10px;background:var(--bg2);overflow:hidden}
+.season-card-head{display:flex;align-items:center;gap:8px;padding:7px 9px}
+.season-check{display:flex;align-items:center;gap:7px;margin:0;color:var(--fg);font-size:12.5px;cursor:pointer;flex:1;min-width:0}
+.season-check input{flex-shrink:0}
+.season-card-head .mut{font-size:11px}
+.season-card-head .btn{flex-shrink:0}
+.episode-pills{display:flex;flex-wrap:wrap;gap:5px;padding:0 9px 9px}
+.ep-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border:1px solid var(--line);
+  border-radius:999px;background:var(--card);color:var(--mut);font-size:11px;cursor:pointer;user-select:none}
+.ep-pill input{position:absolute;opacity:0;width:0;height:0}
+.ep-pill:hover{border-color:var(--acc);color:var(--fg)}
+.ep-pill.on{border-color:var(--acc);background:rgba(14,165,233,.13);color:#fff}
+.ep-pill.loaded{box-shadow:inset 0 -2px 0 rgba(52,211,153,.55)}
+.ep-pill.busy{box-shadow:inset 0 -2px 0 rgba(56,189,248,.55)}
+.series-manual{display:grid;grid-template-columns:110px 1fr auto;gap:8px;align-items:end;margin-top:8px}
+.series-manual .field{margin:0}
+.series-picker-actions{margin-top:8px}
+.series-picker .episode-status{margin-top:6px}
+@media(max-width:600px){.series-manual{grid-template-columns:1fr 1fr}.series-manual .btn{grid-column:1/-1}}
+@media(max-width:600px){
+  /* The same season cards + matrix render on the Mobile tab: give the matrix
+     table its own horizontal scroll and make pills/card heads touch-friendly. */
+  .quality-matrix table{display:block;overflow-x:auto}
+  .quality-matrix th,.quality-matrix td{white-space:nowrap}
+  .season-card-head{flex-wrap:wrap}
+  .season-check{flex:1 1 100%}
+  .ep-pill{padding:5px 12px;font-size:12px}
+}
+
+/* ---- series Formats area: quality matrix + episode groups ---- */
+.quality-matrix{border:1px solid var(--line);border-radius:11px;overflow:hidden;margin-bottom:10px;background:var(--bg2)}
+.quality-matrix .cardhead{padding:8px 12px}
+.quality-matrix table{font-size:12px}
+.quality-matrix th,.quality-matrix td{padding:7px 10px}
+.episode-groups{display:flex;flex-direction:column;gap:8px}
+.ep-group{border:1px solid var(--line);border-radius:11px;background:var(--bg2);overflow:hidden}
+.ep-group summary{cursor:pointer;padding:9px 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;list-style:none}
+.ep-group summary::-webkit-details-marker{display:none}
+.ep-group summary:hover{background:rgba(255,255,255,.02)}
+.ep-group summary b{font-size:13px}
+.ep-group-body{padding:0 12px 12px;border-top:1px solid var(--line)}
+.ep-group-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:9px 0}
+.ep-candidates{display:flex;flex-direction:column;gap:8px}
+.ep-candidates .cand{margin-bottom:0}
 .selected-release{font-size:11px}
 .selected-url{margin-top:5px;overflow-wrap:anywhere;white-space:normal;font-size:10.5px}
 .moviecard-list{padding:7px 10px}
@@ -198,10 +248,9 @@ button.provider-choice:focus-visible{outline:2px solid var(--acc);outline-offset
 .chip.on{border-color:var(--acc);color:#fff}
 .chip-count{font-size:9px;color:var(--mut);font-weight:700}
 .source-chip-option{display:inline-flex;align-items:center;gap:3px}
-.source-search-open{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:999px;border:1px solid var(--line);
+.source-home-open{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:999px;border:1px solid var(--line);
   background:var(--bg2);color:var(--acc);font-size:12px;line-height:1;transition:.15s}
-.source-search-open:hover,.source-search-open:focus-visible{border-color:var(--acc);background:rgba(56,189,248,.12);text-decoration:none}
-.source-search-open.home{color:var(--mut)}
+.source-home-open:hover,.source-home-open:focus-visible{border-color:var(--acc);background:rgba(56,189,248,.12);text-decoration:none}
 .output-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:6px}
 .output-grid label.row{all:unset;cursor:pointer;padding:7px 10px;border-radius:9px;border:1px solid var(--line);
   background:var(--bg2);color:var(--fg);font-size:12.5px;display:flex;gap:8px;align-items:center}

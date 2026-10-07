@@ -210,7 +210,7 @@ test('source links are available on Search, Mobile and Dashboard, with unsafe UR
   assert.doesNotMatch(browse, /data-source-group="flixer"/, 'unverified Flixer domains must render as separate entries');
 });
 
-test('Search and Mobile source chips open reliable title routes and fall back safely when they are not verified', () => {
+test('Search and Mobile source chips link to the source homepage, never a title search', () => {
   const sources = [
     { id: 'vidbox', name: 'Vidbox', home: 'https://vidbox.vc/', enabled: true, search: { kind: 'browser', url: 'https://vidbox.vc/search?q={query}' } },
     { id: 'netmovie', name: 'NetMovie', home: 'https://pc.netmovie.site/', enabled: true, search: { kind: 'browser', url: 'https://pc.netmovie.site/?q={query}', openMode: 'home' } },
@@ -221,13 +221,15 @@ test('Search and Mobile source chips open reliable title routes and fall back sa
   app.run(`state.sources = ${JSON.stringify(sources)}; state.selectedSources = ['vidbox']; state.mobile.selectedSources = ['vidbox']; $('#q').value = 'Dune: Part Two'; $('#mob-q').value = 'Dune: Part Two'; renderSourceChips(); renderMobSourceChips();`);
   for (const selector of ['#source-chips', '#mob-source-chips']) {
     const html = app.el(selector).innerHTML;
-    assert.match(html, /href="https:\/\/vidbox\.vc\/search\?q=Dune%3A%20Part%20Two"/);
-    assert.match(html, /aria-label="Search Vidbox for/);
-    assert.match(html, /href="https:\/\/pc\.netmovie\.site\//, 'unreliable query routes fall back to the homepage');
+    assert.match(html, /href="https:\/\/vidbox\.vc\/"/);
+    assert.match(html, /aria-label="Open Vidbox homepage"/);
+    assert.match(html, /href="https:\/\/pc\.netmovie\.site\/"/);
     assert.match(html, /href="https:\/\/overlook\.cx\/lobby"/, 'API search URLs are not exposed as browser pages');
     assert.doesNotMatch(html, /javascript:/, 'unsafe source routes are never rendered as links');
+    assert.doesNotMatch(html, /Dune/, 'the typed query must not leak into source links');
   }
-  assert.equal(app.run(`sourceSearchEntry(${JSON.stringify(sources[1])}, 'Runner').mode`), 'home');
+  assert.match(app.run(`sourceHomeOpenLink(${JSON.stringify(sources[1])})`), /href="https:\/\/pc\.netmovie\.site\/"/);
+  assert.equal(app.run(`sourceHomeOpenLink(${JSON.stringify(sources[3])})`), '');
 });
 
 test('the discovery popup feeds selected titles into desktop and Mobile search', async () => {

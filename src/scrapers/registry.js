@@ -710,6 +710,10 @@ export async function resolveTarget(input) {
           // through an undefined function and silently ignored every recipe.
           mediaPatterns: source?.mediaPatterns || null,
           timeoutMs: getConfig().scraper.resolveTimeoutMs,
+          // Series: the sniffer best-effort clicks the season/episode controls
+          // on the detail page before capturing media (logged in episodeSelect).
+          season: selectedSeason || 0,
+          episode: selectedEpisode || 0,
           signal,
         });
       } catch (err) {
@@ -719,6 +723,9 @@ export async function resolveTarget(input) {
         logError('scraper', 'headless browser could not run — continuing without the sniffer', err, { url: truncate(url, 120) });
       }
       timeline.browser = Date.now() - t0;
+      if (sniff.episodeSelect?.notes?.length) {
+        notes.push(`Episode select: ${sniff.episodeSelect.notes.join('; ')}`);
+      }
       if (!sniff.ok && (sniff.error || sniff.note)) {
         notes.push(`Browser ${sniff.note || 'scrape failed'}${sniff.error ? ` (${sniff.error})` : ''}`);
       }
@@ -803,9 +810,23 @@ export async function resolveTarget(input) {
     candidates.push(...(ext.providers || []));
   }
 
+  // Tag every candidate with the requested S/E so the series picker can group
+  // per-episode resolves without guessing. Candidates that already carry
+  // their own (MovieBox resource rows) keep it.
+  for (const candidate of candidates) {
+    if (candidate.season == null) candidate.season = selectedSeason || null;
+    if (candidate.episode == null) candidate.episode = selectedEpisode || null;
+    candidate.meta = {
+      ...(candidate.meta || {}),
+      season: candidate.meta?.season ?? candidate.season,
+      episode: candidate.meta?.episode ?? candidate.episode,
+    };
+  }
+
   const unique = dedupeCandidates(candidates);
   log.info('scraper', `resolve finished: ${unique.length} unique candidate(s)`, {
     timeline, sources: [...new Set(unique.map((c) => c.sourceId))].join(','),
+    ...(selectedSeason || selectedEpisode ? { season: selectedSeason, episode: selectedEpisode } : {}),
   });
 
   let error = unique.length ? null : ['no playable stream found', ...notes].join(' — ');

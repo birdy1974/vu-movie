@@ -602,7 +602,37 @@ router.get('/find/details', wrap(async (req, res) => {
       }
     }
     if (request.signal.aborted) return;
-    res.json({ ok: true, subjectId, details, seasons, seasonError });
+    res.json({
+      ok: true, subjectId, details, seasons, seasonError,
+      // Normalized copy for the series picker (same shape as /find/series).
+      normalizedSeasons: seasons ? moviebox.normalizeSeasonInfo(seasons) : [],
+    });
+  } finally {
+    request.dispose();
+  }
+}));
+
+/**
+ * Series season/episode discovery for the Selected-title picker.
+ *
+ * Auto chain (see src/scrapers/series.js): MovieBox season-info when a
+ * subjectId is known (or findable by title) → TMDB season list → none (the
+ * UI falls back to manual season/episode numbers).
+ */
+router.get('/find/series', wrap(async (req, res) => {
+  const request = requestAbortSignal(req, res);
+  try {
+    const { getSeriesSeasons } = await import('../scrapers/series.js');
+    const outcome = await getSeriesSeasons({
+      subjectId: req.query.subjectId ? String(req.query.subjectId) : null,
+      title: req.query.title ? String(req.query.title) : '',
+      year: req.query.year ? Number(req.query.year) : null,
+      tmdbId: req.query.tmdbId ? String(req.query.tmdbId) : null,
+      imdbId: req.query.imdbId ? String(req.query.imdbId) : null,
+      signal: request.signal,
+    });
+    if (request.signal.aborted) return;
+    res.json({ ok: true, ...outcome });
   } finally {
     request.dispose();
   }
@@ -629,6 +659,8 @@ router.post('/find/resolve', wrap(async (req, res) => {
     });
     res.json({
       ok: candidates.length > 0,
+      season: Number(req.body?.season) || 0,
+      episode: Number(req.body?.episode) || 0,
       candidates: candidates.map((c, i) => ({
         index: i,
         url: c.url,
@@ -638,6 +670,10 @@ router.post('/find/resolve', wrap(async (req, res) => {
         kind: c.kind,
         ok: c.ok,
         error: c.error || null,
+        // The requested S/E, echoed so the series picker can group candidates
+        // per episode without guessing which resolve they came from.
+        season: Number(c.season ?? c.meta?.season ?? req.body?.season) || null,
+        episode: Number(c.episode ?? c.meta?.episode ?? req.body?.episode) || null,
         probe: c.probe ? {
           container: c.probe.container, durationSec: c.probe.durationSec, bitrate: c.probe.bitrate,
           video: c.probe.video, audio: c.probe.audio, subtitles: c.probe.subtitles,
@@ -675,14 +711,18 @@ router.post('/streams', wrap(async (req, res) => {
   // Search results carry a short-lived signed /api/poster URL. Persist its
   // durable remote source instead, then issue a new proxy URL when reading.
   const artwork = posterSource(body.poster);
+  // `ephemeral` backs the ▶ preview button on search results: a playable
+  // stream that is never listed (no playlist row, no .m3u, no bouquet) and is
+  // deleted when the preview closes, so it gets no subtitle or bouquet chores.
+  const ephemeral = body.ephemeral === true;
   const stream = await store.createStream({
     title: body.title, year: body.year, kind: body.kind || 'movie', poster: artwork?.url || null,
     posterReferer: artwork?.referer || '',
     description: body.description, sourceId: body.sourceId, candidate: body.candidate,
     profile: body.profile || {}, subtitleId: body.subtitleId || null,
-    season: body.season || null, episode: body.episode || null,
+    season: body.season || null, episode: body.episode || null, ephemeral,
   });
-  const subtitleResult = body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
+  const subtitleResult = !ephemeral && body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
   let subtitleError = null;
   if (subtitleResult) {
     try {
@@ -699,7 +739,7 @@ router.post('/streams', wrap(async (req, res) => {
     }
   }
   res.json({ ok: true, stream: publicStreamRecord(stream), urls: store.urlsFor(stream, baseUrlFrom(req)), ...(subtitleError ? { subtitleError } : {}) });
-  afterStreamCreated(stream, baseUrlFrom(req), { skipSubtitleSearch: Boolean(subtitleResult) });
+  if (!ephemeral) afterStreamCreated(stream, baseUrlFrom(req), { skipSubtitleSearch: Boolean(subtitleResult) });
 }));
 
 /**

@@ -722,7 +722,13 @@ const VMPlaylist = (() => {
    * in MediaSource, locally in the browser. Safari/native playback remains the
    * fallback, and VLC is always offered for a codec the browser cannot decode.
    */
-  async function openPlayer(streamId) {
+  /**
+   * `onClose` runs when the player modal closes (or is replaced by another
+   * modal). The search-result preview uses it to delete its ephemeral stream;
+   * playlist playback passes nothing.
+   */
+  async function openPlayer(streamId, { onClose = null } = {}) {
+    const notifyClosed = () => { try { onClose?.(); } catch { /* best-effort preview cleanup */ } };
     openModal({
       title: 'Preview web player',
       className: 'wide',
@@ -777,10 +783,14 @@ const VMPlaylist = (() => {
           return () => {
             try { if (iframe) iframe.src = 'about:blank'; } catch {}
             try { cleanup?.(); } catch {}
+            notifyClosed();
           };
         },
       });
     } catch (error) {
+      // The player never started, so there is no modal cleanup to run later —
+      // release the preview stream right away instead of waiting for the TTL.
+      notifyClosed();
       if (status) status.textContent = `could not load the stream: ${error.message}`;
     }
   }

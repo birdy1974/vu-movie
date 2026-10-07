@@ -3,6 +3,7 @@ import { getConfig } from '../core/config.js';
 import { log, errorText } from '../core/log.js';
 import * as playlist from './index.js';
 import { ensureStreamReady } from '../streams/recovery.js';
+import { sweepEphemeralStreams } from '../streams/store.js';
 
 const DEFAULT_INTERVAL_MINUTES = 360;
 const MIN_INTERVAL_MINUTES = 15;
@@ -179,10 +180,50 @@ export function getPlaylistMaintenanceStatus() {
   };
 }
 
+/* ---------------- expired preview (ephemeral stream) sweep ---------------- */
+
+const EPHEMERAL_SWEEP_INTERVAL_MS = 15 * 60_000;
+
+const ephemeralSweep = { timer: null, running: false };
+
+async function runEphemeralSweepOnce(reason) {
+  if (ephemeralSweep.running) return;
+  ephemeralSweep.running = true;
+  try {
+    await sweepEphemeralStreams();
+  } catch (error) {
+    log.warn('streams', 'expired preview sweep failed', { error: errorText(error), reason });
+  } finally {
+    ephemeralSweep.running = false;
+  }
+}
+
+/**
+ * Previews delete their stream when the player modal closes; this timer is the
+ * backstop for previews abandoned by closing the browser mid-preview. It also
+ * runs once at startup so a restart clears anything left behind.
+ */
+export function startEphemeralSweep({ intervalMs = EPHEMERAL_SWEEP_INTERVAL_MS } = {}) {
+  stopEphemeralSweep();
+  runEphemeralSweepOnce('startup').catch(() => {});
+  ephemeralSweep.timer = setInterval(() => {
+    runEphemeralSweepOnce('scheduled').catch(() => {});
+  }, Math.max(60_000, intervalMs));
+  ephemeralSweep.timer.unref?.();
+  return { running: true, intervalMs: Math.max(60_000, intervalMs) };
+}
+
+export function stopEphemeralSweep() {
+  if (ephemeralSweep.timer) clearInterval(ephemeralSweep.timer);
+  ephemeralSweep.timer = null;
+}
+
 export default {
   runPlaylistAutoCheck,
   startPlaylistMaintenance,
   reconfigurePlaylistMaintenance,
   stopPlaylistMaintenance,
   getPlaylistMaintenanceStatus,
+  startEphemeralSweep,
+  stopEphemeralSweep,
 };

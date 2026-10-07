@@ -298,6 +298,29 @@ export const repo = {
     if (pool) await query('delete from streams where id = $1 or token = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
   },
 
+  /** Delete ephemeral preview streams whose TTL passed (ISO cutoff). Returns the removed count. */
+  async deleteEphemeralStreamsBefore(cutoffIso) {
+    let removed = 0;
+    for (const [key, rec] of mem.streams) {
+      if (rec?.payload?.meta?.ephemeral === true && rec.expires_at && String(rec.expires_at) <= cutoffIso) {
+        mem.streams.delete(key);
+        removed += 1;
+      }
+    }
+    if (pool) {
+      const res = await query(
+        `delete from streams
+          where payload->'meta'->>'ephemeral' = 'true'
+            and expires_at is not null and expires_at <= $1::timestamptz`,
+        [cutoffIso],
+      ).catch((err) => { logError('db', 'deleteEphemeralStreamsBefore failed', err); return null; });
+      // In postgres mode the memory map mirrors the table, so the SQL row
+      // count is the truth and the memory loop above just kept the mirror.
+      if (res) return res.rowCount || 0;
+    }
+    return removed;
+  },
+
   /* ---------------- append-only playlist-addition history ---------------- */
   async recordPlaylistAdditions(events = []) {
     const rows = (Array.isArray(events) ? events : [events]).filter((event) => event?.eventId && event?.streamId && event?.title)

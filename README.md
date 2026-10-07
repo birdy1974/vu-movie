@@ -79,8 +79,8 @@ permissions, Container Manager project import, firewall, where the data lives).
   entries because an exact shared redirect destination could not be verified.
   The source selector is available on Mobile and Search; direct site links are
   also in Mobile, Search → Open a source and Dashboard. A small external-link
-  control beside each Search/Mobile source chip opens that source's title-search
-  route when it is dependable, otherwise the safe homepage. Custom recipes can
+  control beside each Search/Mobile source chip opens that source's homepage.
+  Custom recipes can
   be added in Settings → Sources. **MovieBox** uses its own signed REST client (the
   same protocol the [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
   see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a
@@ -119,6 +119,23 @@ permissions, Container Manager project import, firewall, where the data lives).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
+* Every result card (Search and Mobile) has a **▶ preview** button: it races the
+  title's providers, takes the best playable format of the first one that answers
+  (S1E1 for a series), and plays it in the preview web player — without adding
+  anything to the playlist. The backing stream is ephemeral: deleted when the
+  player closes, swept after 60 minutes if the browser is closed mid-preview.
+* **Series get a season/episode picker.** Below the selected title, one card per
+  season offers every episode as a checkbox (with per-season and
+  all-seasons toggles); the season list comes from MovieBox when the title has
+  it, else from TMDB (needs the key below), else from manual season/episode
+  numbers. Formats resolve **on demand per episode** — expanding an episode
+  group fetches it, “load selected” fetches the ticked ones — and a
+  **quality-coverage matrix** combines everything loaded into one row per
+  quality (episodes covered, providers, bulk “add all in 1080p”). Movies keep
+  the flat format list. The Mobile tab shows the same season cards, matrix and
+  episode groups for a series (with its provider-scope chips). Played episodes
+  are added as `Title S01E02` items with their season/episode stored on the
+  stream (bouquet separators included).
 * **Discover titles** opens a Trending now / Top 10 / For you popup on Search
   and Mobile. Picking a title runs the normal source search. The first two lists
   use TMDB; For you uses every playlist-add event as its recommendation signal,

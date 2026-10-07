@@ -1607,8 +1607,71 @@ export function resetBackoff() {
   lastError = null;
 }
 
+/**
+ * Normalize a `/subject-api/season-info` payload to the picker's shape:
+ * [{ season, name, episodeCount, episodes: [{ episode, name }] }].
+ *
+ * The endpoint's envelope changed across app versions (array vs. { seasons },
+ * { list }, or a { "1": [...] } map; season keys named season/seasonNumber/se
+ * and episode keys episode/episodeNumber/ep), so every spelling is accepted
+ * and anything unparseable is dropped rather than throwing.
+ */
+export function normalizeSeasonInfo(payload) {
+  const raw = payload?.data ?? payload;
+  let entries = [];
+  if (Array.isArray(raw)) entries = raw;
+  else if (Array.isArray(raw?.seasons)) entries = raw.seasons;
+  else if (Array.isArray(raw?.list)) entries = raw.list;
+  else if (Array.isArray(raw?.items)) entries = raw.items;
+  else if (raw && typeof raw === 'object') {
+    const numericKeys = Object.keys(raw).filter((key) => /^\d+$/.test(key));
+    if (numericKeys.length) {
+      entries = numericKeys.map((key) => ({ season: Number(key), episodes: raw[key] }));
+    }
+  }
+  const seasons = [];
+  for (const entry of entries) {
+    const season = Number(entry?.season ?? entry?.seasonNumber ?? entry?.se ?? entry?.season_number);
+    if (!Number.isFinite(season) || season < 0) continue;
+    const rawEpisodes = entry?.episodes ?? entry?.items ?? entry?.list ?? entry;
+    let episodes = [];
+    if (Array.isArray(rawEpisodes)) {
+      episodes = rawEpisodes
+        .map((item) => {
+          if (item == null) return null;
+          if (typeof item === 'number' || typeof item === 'string') {
+            const episode = Number(item);
+            return Number.isFinite(episode) && episode > 0 ? { episode, name: `Episode ${episode}` } : null;
+          }
+          const episode = Number(item?.episode ?? item?.episodeNumber ?? item?.ep ?? item?.episode_number);
+          if (!Number.isFinite(episode) || episode <= 0) return null;
+          return { episode, name: item?.name || item?.title || `Episode ${episode}` };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.episode - b.episode);
+    } else {
+      const count = Number(entry?.episodeCount ?? entry?.episode_count ?? entry?.epCount ?? entry?.count ?? 0);
+      if (Number.isFinite(count) && count > 0) {
+        episodes = Array.from({ length: Math.min(count, 500) }, (_, i) => ({
+          episode: i + 1, name: `Episode ${i + 1}`,
+        }));
+      }
+    }
+    if (!episodes.length) continue;
+    const seen = new Set();
+    const deduped = episodes.filter((e) => (seen.has(e.episode) ? false : (seen.add(e.episode), true)));
+    seasons.push({
+      season,
+      name: entry?.name || `Season ${season}`,
+      episodeCount: deduped.length,
+      episodes: deduped,
+    });
+  }
+  return seasons.sort((a, b) => a.season - b.season);
+}
+
 export default {
-  search, detail, seasonInfo, playInfo, resources, captions, findStreamsByTitle,
+  search, detail, seasonInfo, normalizeSeasonInfo, playInfo, resources, captions, findStreamsByTitle,
   releasesFromPlayInfo, releasesFromResources, status, resetBackoff, resetIdentity,
   classifyFetchError, parseJwtClaims, sessionIsValid, HOST_POOL, getHostPool,
   h5Search, h5StreamsFor, mapH5SearchResults, releasesFromH5Streams, h5ClientToken,
