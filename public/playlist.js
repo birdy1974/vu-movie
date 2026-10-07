@@ -534,6 +534,62 @@ const VMPlaylist = (() => {
 
   /* ---------------- metadata popup ---------------- */
 
+  async function fetchEnrichedForStream(stream) {
+    try {
+      const params = new URLSearchParams({
+        title: stream.title || '',
+        year: stream.year ? String(stream.year) : '',
+        type: stream.kind || 'movie',
+      });
+      const meta = stream.payload?.meta || {};
+      if (meta.imdbId) params.set('imdbId', meta.imdbId);
+      if (meta.tmdbId) params.set('tmdbId', meta.tmdbId);
+      const data = await api(`/api/metadata/tmdb?${params}`, { silent: true });
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function tmdbMarkup(enriched) {
+    if (!enriched) return '<div class="meta">No TMDB/OMDB data — configure API key in Settings → Metadata.</div>';
+    const tmdb = enriched.tmdb;
+    const omdb = enriched.omdb;
+    const hasAny = tmdb || omdb;
+    if (!hasAny) {
+      const err = (enriched.errors||[]).map(er=>`${er.source}: ${er.error}`).join('; ') || 'No results from TMDB/OMDB';
+      return `<div class="meta">TMDB/OMDB: ${escapeHtml(err)} — check API key in Settings → Metadata.</div>`;
+    }
+    const rows = [];
+    if (tmdb) {
+      rows.push(`<div class="kv"><span>TMDB title</span><span>${escapeHtml(tmdb.title||'—')}${tmdb.year?` (${tmdb.year})`:''}</span></div>`);
+      if (tmdb.originalTitle && tmdb.originalTitle !== tmdb.title) rows.push(`<div class="kv"><span>Original title</span><span>${escapeHtml(tmdb.originalTitle)}</span></div>`);
+      if (tmdb.tagline) rows.push(`<div class="kv"><span>Tagline</span><span>${escapeHtml(tmdb.tagline)}</span></div>`);
+      if (tmdb.overview) rows.push(`<div class="kv"><span>Plot (TMDB)</span><span>${escapeHtml(tmdb.overview)}</span></div>`);
+      if (tmdb.genres?.length) rows.push(`<div class="kv"><span>Genres (TMDB)</span><span>${escapeHtml(tmdb.genres.join(', '))}</span></div>`);
+      if (tmdb.rating) rows.push(`<div class="kv"><span>TMDB rating</span><span>★ ${tmdb.rating} (${tmdb.votes||0} votes)</span></div>`);
+      if (tmdb.runtime) rows.push(`<div class="kv"><span>Runtime (TMDB)</span><span>${tmdb.runtime} min</span></div>`);
+      if (tmdb.director?.length) rows.push(`<div class="kv"><span>Director (TMDB)</span><span>${escapeHtml(tmdb.director.join(', '))}</span></div>`);
+      if (tmdb.cast?.length) rows.push(`<div class="kv"><span>Cast (TMDB)</span><span>${escapeHtml(tmdb.cast.slice(0,5).map(c=>c.name).join(', '))}</span></div>`);
+      if (tmdb.releaseDate) rows.push(`<div class="kv"><span>Released (TMDB)</span><span>${escapeHtml(tmdb.releaseDate)}</span></div>`);
+    }
+    if (omdb) {
+      if (omdb.plot && (!tmdb || !tmdb.overview)) rows.push(`<div class="kv"><span>Plot (OMDB)</span><span>${escapeHtml(omdb.plot)}</span></div>`);
+      if (omdb.imdbRating) rows.push(`<div class="kv"><span>IMDb rating</span><span>★ ${omdb.imdbRating} (${omdb.imdbVotes||''})</span></div>`);
+      if (omdb.metascore && omdb.metascore !== 'N/A') rows.push(`<div class="kv"><span>Metascore</span><span>${escapeHtml(omdb.metascore)}</span></div>`);
+      if (omdb.rated) rows.push(`<div class="kv"><span>Rated</span><span>${escapeHtml(omdb.rated)}</span></div>`);
+      if (omdb.awards && omdb.awards !== 'N/A') rows.push(`<div class="kv"><span>Awards</span><span>${escapeHtml(omdb.awards)}</span></div>`);
+      if (omdb.actors?.length) rows.push(`<div class="kv"><span>Actors (OMDB)</span><span>${escapeHtml(omdb.actors.join(', '))}</span></div>`);
+      if (omdb.director?.length) rows.push(`<div class="kv"><span>Director (OMDB)</span><span>${escapeHtml(omdb.director.join(', '))}</span></div>`);
+    }
+    const links = [];
+    if (tmdb?.tmdbUrl) links.push(`<a href="${escapeHtml(tmdb.tmdbUrl)}" target="_blank" rel="noreferrer">TMDB ↗</a>`);
+    if (tmdb?.imdbUrl || omdb?.imdbUrl) links.push(`<a href="${escapeHtml(tmdb?.imdbUrl||omdb?.imdbUrl)}" target="_blank" rel="noreferrer">IMDb ↗</a>`);
+    if (enriched.imdbId) links.push(`<a href="https://www.imdb.com/title/${escapeHtml(enriched.imdbId)}/" target="_blank" rel="noreferrer">IMDb (${escapeHtml(enriched.imdbId)}) ↗</a>`);
+    if (links.length) rows.push(`<div class="kv"><span>Links</span><span>${links.join(' · ')}</span></div>`);
+    return `<div class="meta-table">${rows.join('')}</div>`;
+  }
+
   async function openMetadata(streamId) {
     openModal({
       title: 'Metadata',
@@ -593,6 +649,7 @@ const VMPlaylist = (() => {
               </div>
             </div>
           </div>
+          <div id="tmdb-section" class="card" style="margin-top:14px"><h3 style="margin:0 0 8px">TMDB / IMDb metadata <span class="tip" tabindex="0" role="note" aria-label="About TMDB" data-tip="Rich info from themoviedb.org and omdbapi.com — configure API keys in Settings → Metadata.">i</span></h3><div class="meta"><span class="spin"></span> loading TMDB/IMDb…</div></div>
           <h3 style="margin-top:14px">Stream metadata</h3>
           <div class="meta-table">${rows.map(([key, value]) => `<div class="kv"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('')}</div>
           <h3 style="margin-top:14px">Output URLs</h3>
@@ -603,6 +660,19 @@ const VMPlaylist = (() => {
           $('[data-meta-play]', root)?.addEventListener('click', () => openPlayer(stream.id));
           $('[data-meta-sub]', root)?.addEventListener('click', () => openSubtitlePicker(stream.id));
           $('[data-meta-copy-json]', root)?.addEventListener('click', () => copyText(json));
+          // Load TMDB async
+          fetchEnrichedForStream(stream).then((enriched) => {
+            const host = root.querySelector('#tmdb-section');
+            if (!host) return;
+            if (!enriched) {
+              host.innerHTML = `<h3 style="margin:0 0 8px">TMDB / IMDb metadata</h3><div class="meta">TMDB not configured — add API key in Settings → Metadata (free at themoviedb.org).</div>`;
+              return;
+            }
+            host.innerHTML = `<h3 style="margin:0 0 8px">TMDB / IMDb metadata ${enriched.sources?.length?`<span class="tag ok">${escapeHtml(enriched.sources.join(', '))}</span>`:''}</h3>${tmdbMarkup(enriched)}`;
+          }).catch(() => {
+            const host = root.querySelector('#tmdb-section');
+            if (host) host.innerHTML = `<h3>TMDB / IMDb metadata</h3><div class="meta">Could not load TMDB/IMDb — check API key.</div>`;
+          });
         },
       });
     } catch (error) {

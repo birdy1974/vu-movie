@@ -35,6 +35,7 @@ import * as subs from '../subtitles/index.js';
 import * as enigma2 from '../enigma2/index.js';
 import { fetchPosterImage, posterProxyUrl, posterSource, publicPosterUrl } from './poster-proxy.js';
 import { pushSubtitleToReceiver } from '../subtitles/push.js';
+import * as metadata from '../metadata/index.js';
 
 const router = express.Router();
 const startedAt = Date.now();
@@ -1204,5 +1205,43 @@ router.post('/jobs/:id/cancel', wrap(async (req, res) => {
 /* ---------- moviebox helper (search is part of /find/search) ---------- */
 
 router.get('/moviebox/status', wrap(async (req, res) => res.json({ ok: true, status: moviebox.status() })));
+
+/* ---------- metadata (TMDB / OMDB) ---------- */
+
+router.get('/metadata/status', wrap(async (req, res) => {
+  const cfg = getConfig();
+  res.json({
+    ok: true,
+    tmdb: { configured: Boolean(cfg.metadata?.tmdbApiKey), language: cfg.metadata?.language || 'en-US' },
+    omdb: { configured: Boolean(cfg.metadata?.omdbApiKey) },
+    any: metadata.isAnyConfigured(),
+  });
+}));
+
+router.get('/metadata/tmdb', wrap(async (req, res) => {
+  const { title, year, type, imdbId, tmdbId } = req.query;
+  if (!title && !imdbId && !tmdbId) return res.status(400).json({ ok: false, error: 'title, imdbId or tmdbId required' });
+  const data = await metadata.enrichMetadata({
+    title: title ? String(title) : '',
+    year: year ? Number(year) : null,
+    type: type ? String(type) : 'movie',
+    imdbId: imdbId ? String(imdbId) : null,
+    tmdbId: tmdbId ? String(tmdbId) : null,
+  });
+  res.json({ ok: true, ...data });
+}));
+
+router.post('/metadata/enrich', wrap(async (req, res) => {
+  const { title, year, type, imdbId, tmdbId } = req.body || {};
+  if (!title && !imdbId && !tmdbId) return res.status(400).json({ ok: false, error: 'title, imdbId or tmdbId required' });
+  const data = await metadata.enrichMetadata({
+    title: title ? String(title) : '',
+    year: year ? Number(year) : null,
+    type: type ? String(type) : 'movie',
+    imdbId: imdbId ? String(imdbId) : null,
+    tmdbId: tmdbId ? String(tmdbId) : null,
+  });
+  res.json({ ok: true, ...data });
+}));
 
 export default router;

@@ -628,6 +628,14 @@ function renderResults() {
       if (event.target.closest('a,button')) return;
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
     });
+    card.querySelector('[data-open-meta]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSearchMetadata(group);
+    });
+    card.querySelector('[data-open-formats]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectGroup(group);
+    });
   });
 }
 
@@ -658,6 +666,7 @@ function resultGroupMarkup(group) {
     </div>
     <div class="result-actions">
       <span class="tag info">${group.entries.length} format(s)</span>
+      <button class="btn sm ghost" data-open-meta title="show TMDB/IMDb metadata">ⓘ meta</button>
       <button class="btn sm pri" data-open-formats>formats &amp; metadata</button>
     </div>
   </article>`;
@@ -747,6 +756,123 @@ function metadataRows(group) {
   const description = group.entries.map((entry) => entry.description).find(Boolean);
   return { rows, description };
 }
+
+async function fetchEnrichedSearch(group) {
+  try {
+    const params = new URLSearchParams({
+      title: group.title || '',
+      year: group.year ? String(group.year) : '',
+      type: group.kind || 'movie',
+    });
+    // Try to use imdb/tmdb id if present in entries
+    const meta = group.entries.find(e=>e.imdbId||e.tmdbId) || {};
+    if (meta.imdbId) params.set('imdbId', meta.imdbId);
+    if (meta.tmdbId) params.set('tmdbId', meta.tmdbId);
+    const data = await api(`/api/metadata/tmdb?${params}`, { silent: true });
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+function enrichedToRows(enriched) {
+  if (!enriched) return [];
+  const rows = [];
+  const tmdb = enriched.tmdb;
+  const omdb = enriched.omdb;
+  if (tmdb) {
+    if (tmdb.overview) rows.push(['Plot (TMDB)', tmdb.overview]);
+    if (tmdb.tagline) rows.push(['Tagline', tmdb.tagline]);
+    if (tmdb.genres?.length) rows.push(['Genres (TMDB)', tmdb.genres.join(', ')]);
+    if (tmdb.rating) rows.push(['TMDB rating', `★ ${tmdb.rating} (${tmdb.votes||0} votes)`]);
+    if (tmdb.runtime) rows.push(['Runtime (TMDB)', `${tmdb.runtime} min`]);
+    if (tmdb.director?.length) rows.push(['Director (TMDB)', tmdb.director.join(', ')]);
+    if (tmdb.cast?.length) rows.push(['Cast (TMDB)', tmdb.cast.slice(0,8).map(c=>c.name).join(', ')]);
+    if (tmdb.releaseDate) rows.push(['Released (TMDB)', tmdb.releaseDate]);
+    if (tmdb.status) rows.push(['Status (TMDB)', tmdb.status]);
+  }
+  if (omdb) {
+    if (omdb.imdbRating) rows.push(['IMDb rating', `★ ${omdb.imdbRating} (${omdb.imdbVotes||''})`]);
+    if (omdb.metascore && omdb.metascore !== 'N/A') rows.push(['Metascore', omdb.metascore]);
+    if (omdb.rated) rows.push(['Rated', omdb.rated]);
+    if (omdb.awards && omdb.awards !== 'N/A') rows.push(['Awards', omdb.awards]);
+    if (omdb.director?.length) rows.push(['Director (OMDB)', omdb.director.join(', ')]);
+    if (omdb.actors?.length) rows.push(['Actors (OMDB)', omdb.actors.join(', ')]);
+  }
+  if (tmdb?.tmdbUrl || omdb?.imdbUrl || enriched.imdbId) {
+    const links = [];
+    if (tmdb?.tmdbUrl) links.push(`TMDB: ${tmdb.tmdbUrl}`);
+    if (tmdb?.imdbUrl || omdb?.imdbUrl) links.push(`IMDb: ${tmdb?.imdbUrl||omdb?.imdbUrl}`);
+    if (enriched.imdbId) links.push(`IMDb ID: ${enriched.imdbId}`);
+    rows.push(['Links', links.join(' · ')]);
+  }
+  return rows;
+}
+
+function tmdbLinksMarkup(enriched) {
+  if (!enriched) return '';
+  const tmdb = enriched.tmdb;
+  const omdb = enriched.omdb;
+  const links = [];
+  if (tmdb?.tmdbUrl) links.push(`<a href="${escapeHtml(tmdb.tmdbUrl)}" target="_blank" rel="noreferrer">TMDB ↗</a>`);
+  if (tmdb?.imdbUrl || omdb?.imdbUrl) links.push(`<a href="${escapeHtml(tmdb?.imdbUrl||omdb?.imdbUrl)}" target="_blank" rel="noreferrer">IMDb ↗</a>`);
+  if (enriched.imdbId) links.push(`<a href="https://www.imdb.com/title/${escapeHtml(enriched.imdbId)}/" target="_blank" rel="noreferrer">IMDb (${escapeHtml(enriched.imdbId)}) ↗</a>`);
+  if (tmdb?.backdrop) links.push(`<a href="${escapeHtml(tmdb.backdrop)}" target="_blank" rel="noreferrer">backdrop ↗</a>`);
+  return links.length ? `<div class="row" style="margin-top:8px">${links.join(' · ')}</div>` : '';
+}
+
+async function openSearchMetadata(group) {
+  const title = group.title || 'Metadata';
+  openModal({
+    title: `${title}${group.year ? ` (${group.year})` : ''} — metadata`,
+    className: 'wide',
+    body: `<div class="meta"><span class="spin"></span> loading TMDB/IMDb…</div>`,
+  });
+  try {
+    const enriched = await fetchEnrichedSearch(group);
+    if (!enriched || (!enriched.tmdb && !enriched.omdb)) {
+      const errMsg = (enriched?.errors||[]).map(e=>`${e.source}: ${e.error}`).join('; ') || 'No TMDB/OMDB results — configure API keys in Settings → Metadata.';
+      openModal({
+        title: `${title} — metadata`,
+        className: 'wide',
+        body: `<div class="meta">${escapeHtml(errMsg)}</div>
+          <div class="meta-table">${metadataRows(group).rows.map(([k,v])=>`<div class="kv"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('')}</div>
+          ${group.entries[0]?.description ? `<p>${escapeHtml(group.entries[0].description)}</p>` : ''}`,
+      });
+      return;
+    }
+    const baseRows = metadataRows(group).rows;
+    const extraRows = enrichedToRows(enriched);
+    const allRows = [...baseRows, ...extraRows];
+    const desc = enriched.tmdb?.overview || enriched.omdb?.plot || group.entries.map(e=>e.description).find(Boolean) || '';
+    const poster = enriched.tmdb?.poster || group.poster || '';
+    openModal({
+      title: `${enriched.tmdb?.title || group.title}${enriched.tmdb?.year || group.year ? ` (${enriched.tmdb?.year||group.year})` : ''}`,
+      className: 'wide',
+      body: `
+        <div class="meta-flex">
+          ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:120px;max-height:180px;object-fit:cover;border-radius:8px" onerror="this.remove()">` : ''}
+          <div style="flex:1;min-width:240px">
+            ${desc ? `<p>${escapeHtml(desc)}</p>` : '<p class="mut">No description.</p>'}
+            ${tmdbLinksMarkup(enriched)}
+            <div class="row" style="margin-top:8px">
+              <span class="tag ok">${escapeHtml((enriched.sources||[]).join(', ')||'metadata')}</span>
+              ${enriched.tmdb?.rating ? `<span class="tag info">★ ${enriched.tmdb.rating}</span>` : ''}
+              ${enriched.omdb?.imdbRating ? `<span class="tag info">IMDb ${enriched.omdb.imdbRating}</span>` : ''}
+            </div>
+          </div>
+        </div>
+        <h3 style="margin-top:14px">Combined metadata</h3>
+        <div class="meta-table">${allRows.map(([k,v])=>`<div class="kv"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('')}</div>
+        ${enriched.tmdb?.cast?.length ? `<h3 style="margin-top:14px">Cast (TMDB)</h3><div class="meta-table">${enriched.tmdb.cast.slice(0,10).map(c=>`<div class="kv"><span>${escapeHtml(c.name)}</span><span>${escapeHtml(c.character||'')}</span></div>`).join('')}</div>` : ''}
+        <details style="margin-top:14px"><summary class="sub" style="cursor:pointer">Raw enriched JSON</summary><pre style="max-height:320px">${escapeHtml(JSON.stringify(enriched, null, 2))}</pre></details>
+      `,
+    });
+  } catch (error) {
+    openModal({ title: 'Metadata', body: `<div class="note err">${escapeHtml(error.message)}</div>` });
+  }
+}
+
 
 /**
  * HLS resolvers return one master candidate with its renditions in `variants`.
@@ -893,6 +1019,23 @@ async function selectGroup(group, { sourceId = '' } = {}) {
   if (table) {
     table.classList.remove('hide');
     table.innerHTML = rows.map(([key, value]) => `<div class="meta-row"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('');
+    // Async enrich with TMDB/IMDb — does not block format resolving
+    fetchEnrichedSearch(full).then((enriched) => {
+      if (!enriched || (!enriched.tmdb && !enriched.omdb)) return;
+      const extra = enrichedToRows(enriched);
+      if (!extra.length) return;
+      const current = table.innerHTML;
+      const extraHtml = extra.map(([k,v])=>`<div class="meta-row"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('');
+      table.innerHTML = current + extraHtml;
+      if (enriched.tmdb?.overview && details) {
+        details.textContent = enriched.tmdb.overview;
+        details.classList.remove('hide');
+      }
+      // Add links row
+      const linksEl = document.createElement('div');
+      linksEl.innerHTML = tmdbLinksMarkup(enriched);
+      if (linksEl.firstChild) table.appendChild(linksEl.firstChild);
+    }).catch(()=>{});
   }
   renderSelectionProviders(full, sourceId);
   const selectionNote = $('#sel-note');
@@ -912,10 +1055,15 @@ function renderSelectionActions() {
   if (!host) return;
   host.innerHTML = `
     <button class="btn sm" id="btn-sel-formats">↻ resolve formats</button>
+    <button class="btn sm ghost" id="btn-sel-meta">ⓘ metadata (TMDB/IMDb)</button>
     <button class="btn sm ghost" id="btn-sel-subs">▭ matching subtitles</button>
     <button class="btn sm ghost" id="btn-sel-playlist">☰ open playlist</button>
     <span class="mut" id="sel-format-note"></span>`;
   $('#btn-sel-formats').addEventListener('click', () => loadFormats({ announce: true }));
+  $('#btn-sel-meta').addEventListener('click', () => {
+    const sel = state.selection;
+    if (sel) openSearchMetadata({ title: sel.title, year: sel.year, kind: sel.kind, entries: sel.entries, poster: sel.poster });
+  });
   $('#btn-sel-subs').addEventListener('click', () => openSelectionSubtitles());
   $('#btn-sel-playlist').addEventListener('click', () => go('list'));
 }
@@ -2097,6 +2245,12 @@ const SETTINGS_SECTIONS = [
     ],
   },
   {
+    key: 'metadata', title: 'Metadata',
+    fields: [
+      ['tmdbApiKey', 'password'], ['omdbApiKey', 'password'], ['language', 'text'],
+    ],
+  },
+  {
     key: 'enigma2', title: 'Enigma2',
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
@@ -2130,6 +2284,7 @@ const SETTINGS_SECTIONS = [
 const SETTINGS_NOTES = {
   transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
+  metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
   storage: 'Folders inside the container, and how much disk the cache may use.',
@@ -2158,6 +2313,10 @@ const SETTINGS_LABELS = {
   'subtitles.pushToReceiver': ['Push to receiver', 'Upload the chosen subtitle to the Enigma2 box as well.'],
   'subtitles.receiverDir': ['Receiver directory', 'Folder on the box that receives the .srt files.'],
   'subtitles.disabledProviders': ['Disabled providers', 'Provider ids to skip, comma separated (see the Subtitles tab).'],
+
+  'metadata.tmdbApiKey': ['TMDB API key', 'From https://www.themoviedb.org/settings/api — v3 key, free. Enables rich metadata in search and playlist.'],
+  'metadata.omdbApiKey': ['OMDB API key', 'From https://www.omdbapi.com/apikey.aspx — optional, adds IMDb ratings.'],
+  'metadata.language': ['Metadata language', 'e.g. en-US, nl-NL, de-DE for TMDB results.'],
 
   'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
   'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
