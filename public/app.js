@@ -271,34 +271,17 @@ function sourceHomeEntries(source) {
   });
 }
 
-function sourceSearchEntry(source, query) {
-  const fallback = sourceHomeEntries(source)[0]?.href || '';
-  const value = String(query || '').trim();
-  const search = source?.search || {};
-  // API endpoints and the recipes that were observed to ignore or fail query
-  // routes open their public home page instead of exposing JSON or a dead page.
-  const canSearch = search.openMode !== 'home'
-    && (search.kind !== 'api' || Boolean(search.openUrl))
-    && Boolean(value);
-  const template = search.openUrl || (search.kind === 'api' ? '' : search.url || '');
-  if (canSearch && /\{(?:query|q)\}/i.test(template)) {
-    const href = String(template).replace(/\{(?:query|q)\}/gi, encodeURIComponent(value));
-    try {
-      const url = new URL(href, fallback || source?.home || undefined);
-      if (['http:', 'https:'].includes(url.protocol) && url.hostname) {
-        return { href: url.href, mode: 'query', title: `Search ${source.name} for “${value}”` };
-      }
-    } catch { /* fall back to the known-safe source homepage */ }
-  }
-  return fallback ? { href: fallback, mode: 'home', title: `Open ${source?.name || 'source'} homepage` } : null;
-}
-
-function sourceSearchOpenLink(source, query) {
-  const entry = sourceSearchEntry(source, query);
+/**
+ * The ↗ beside a source chip always opens the source's own website (primary
+ * homepage) — never a title search for whatever is in the search box.
+ * Unsafe/non-http homepages render no link at all.
+ */
+function sourceHomeOpenLink(source) {
+  const entry = sourceHomeEntries(source)[0];
   if (!entry) return '';
-  return `<a class="source-search-open ${entry.mode === 'home' ? 'home' : ''}" data-open-mode="${entry.mode}"
-    href="${escapeHtml(entry.href)}" target="_blank" rel="noopener noreferrer"
-    aria-label="${escapeHtml(entry.title)}" title="${escapeHtml(entry.title)}">↗</a>`;
+  const title = `Open ${source?.name || 'source'} homepage`;
+  return `<a class="source-home-open" href="${escapeHtml(entry.href)}" target="_blank" rel="noopener noreferrer"
+    aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">↗</a>`;
 }
 
 function sourceLinkButtons(source, className = 'source-open-link') {
@@ -407,7 +390,6 @@ async function loadSources() {
 function renderSourceChips() {
   const host = $('#source-chips');
   if (!host) return;
-  const query = $('#q')?.value || '';
   host.innerHTML = state.sources.map((source) => {
     const domains = sourceHomeEntries(source).map((entry) => entry.label).join(', ');
     const details = [source.notes, domains ? `Domains: ${domains}` : ''].filter(Boolean).join(' — ');
@@ -415,7 +397,7 @@ function renderSourceChips() {
       <span class="chip ${state.selectedSources.includes(source.id) ? 'on' : ''}" data-id="${escapeHtml(source.id)}" role="button" tabindex="0"
         title="${escapeHtml(details || source.name)}${source.health?.ok === false ? ' — failing' : ''}">
         ${escapeHtml(source.name)}${source.mirrors?.length ? ` <small class="chip-count">+${source.mirrors.length}</small>` : ''}${source.health?.ok === false ? ' ⚠' : ''}</span>
-      ${sourceSearchOpenLink(source, query)}
+      ${sourceHomeOpenLink(source)}
     </span>`;
   }).join('') || '<span class="meta">no sources configured</span>';
   const count = $('#sources-count');
@@ -2370,7 +2352,6 @@ function wireFind() {
   $$('#find-tabs button').forEach((button) => button.addEventListener('click', () => setFindTab(button.dataset.t)));
   $('#btn-search')?.addEventListener('click', doSearch);
   $('#btn-search-discover')?.addEventListener('click', () => openDiscoveryModal('find'));
-  $('#q')?.addEventListener('input', renderSourceChips);
   $('#q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') doSearch(); });
   $('#btn-sources-all')?.addEventListener('click', () => { state.selectedSources = state.sources.map((source) => source.id); renderSourceChips(); saveSearchState(); });
   $('#btn-sources-none')?.addEventListener('click', () => { state.selectedSources = []; renderSourceChips(); saveSearchState(); });
@@ -3550,7 +3531,6 @@ async function initMobile() {
   renderMobileSourceLinks();
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
   $('#btn-mob-discover')?.addEventListener('click', () => openDiscoveryModal('mobile'));
-  $('#mob-q')?.addEventListener('input', renderMobSourceChips);
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
   $('#mob-sources')?.addEventListener('change', () => {
     const v = $('#mob-sources')?.value;
@@ -3774,13 +3754,12 @@ function renderMobSourceChips() {
     if (count) count.textContent = '';
     return;
   }
-  const query = $('#mob-q')?.value || '';
   host.innerHTML = sources.map((s) => {
     const domains = sourceHomeEntries(s).map((entry) => entry.label).join(', ');
     const details = [s.notes, domains ? `Domains: ${domains}` : ''].filter(Boolean).join(' — ');
     return `<span class="source-chip-option">
       <span class="chip ${selected.includes(s.id) ? 'on' : ''}" data-id="${escapeHtml(s.id)}" role="button" tabindex="0" title="${escapeHtml(details || s.name)}">${escapeHtml(s.name)}${s.mirrors?.length ? ` <small class="chip-count">+${s.mirrors.length}</small>` : ''}</span>
-      ${sourceSearchOpenLink(s, query)}
+      ${sourceHomeOpenLink(s)}
     </span>`;
   }).join('');
   if (count) count.textContent = `${selected.length}/${sources.length} selected`;

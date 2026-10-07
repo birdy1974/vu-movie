@@ -79,8 +79,8 @@ permissions, Container Manager project import, firewall, where the data lives).
   entries because an exact shared redirect destination could not be verified.
   The source selector is available on Mobile and Search; direct site links are
   also in Mobile, Search → Open a source and Dashboard. A small external-link
-  control beside each Search/Mobile source chip opens that source's title-search
-  route when it is dependable, otherwise the safe homepage. Custom recipes can
+  control beside each Search/Mobile source chip opens that source's homepage.
+  Custom recipes can
   be added in Settings → Sources. **MovieBox** uses its own signed REST client (the
   same protocol the [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
   see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a

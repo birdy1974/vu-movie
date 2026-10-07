@@ -248,10 +248,9 @@ button.provider-choice:focus-visible{outline:2px solid var(--acc);outline-offset
 .chip.on{border-color:var(--acc);color:#fff}
 .chip-count{font-size:9px;color:var(--mut);font-weight:700}
 .source-chip-option{display:inline-flex;align-items:center;gap:3px}
-.source-search-open{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:999px;border:1px solid var(--line);
+.source-home-open{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:999px;border:1px solid var(--line);
   background:var(--bg2);color:var(--acc);font-size:12px;line-height:1;transition:.15s}
-.source-search-open:hover,.source-search-open:focus-visible{border-color:var(--acc);background:rgba(56,189,248,.12);text-decoration:none}
-.source-search-open.home{color:var(--mut)}
+.source-home-open:hover,.source-home-open:focus-visible{border-color:var(--acc);background:rgba(56,189,248,.12);text-decoration:none}
 .output-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:6px}
 .output-grid label.row{all:unset;cursor:pointer;padding:7px 10px;border-radius:9px;border:1px solid var(--line);
   background:var(--bg2);color:var(--fg);font-size:12.5px;display:flex;gap:8px;align-items:center}
