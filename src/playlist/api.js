@@ -8,9 +8,11 @@
  * library and the subtitle providers.
  *
  *   GET    /api/playlist              items (stream + urls) + every output URL
+ *   GET    /api/playlist/history      append-only title additions for recommendations
  *   PUT    /api/playlist              reorder (`streamIds`) and/or replace items
  *   POST   /api/playlist/items        add streams by id
- *   POST   /api/playlist/check        “are these upstreams still working?” (ffprobe)
+ *   POST   /api/playlist/check        check upstreams and automatically refresh inactive ones
+ *   GET    /api/playlist/check/schedule  scheduled availability-check status
  *   PATCH  /api/playlist/items/:id    enable/disable, assign template, language
  *   DELETE /api/playlist/items/:id    remove from the playlist
  *   POST   /api/playlist/items/:id/template   assign a saved FFmpeg template
@@ -31,7 +33,9 @@ import * as enigma2 from '../enigma2/index.js';
 import { publicPosterUrl } from '../http/poster-proxy.js';
 import { OUTPUT_LABELS, OUTPUT_TYPES, requestAbortSignal } from '../http/api.js';
 import * as playlist from './index.js';
-import { checkStreams } from './check.js';
+import { checkStreams, summariseCheck, BROKEN_STATES } from './check.js';
+import { ensureStreamReady } from '../streams/recovery.js';
+import { getPlaylistMaintenanceStatus } from './maintenance.js';
 
 /**
  * How many upstreams are probed at once by POST /api/playlist/check when the
@@ -172,9 +176,19 @@ router.get('/', wrap(async (req, res) => {
     defaultTemplateId: getConfig().transcode.defaultFfmpegTemplateId || '',
     outputTypes: OUTPUT_TYPES,
     outputLabels: OUTPUT_LABELS,
+    maintenance: getPlaylistMaintenanceStatus(),
     urls: outputUrls(baseUrl),
     ...storageMeta(),
   });
+}));
+
+router.get('/history', wrap(async (_req, res) => {
+  const history = await playlist.additionHistory();
+  res.json({ ok: true, count: history.length, history });
+}));
+
+router.get('/check/schedule', wrap(async (_req, res) => {
+  res.json({ ok: true, schedule: getPlaylistMaintenanceStatus() });
 }));
 
 /** Reorder and/or replace the list. `streamIds` alone is the drag-and-drop case. */
@@ -237,11 +251,45 @@ router.post('/check', wrap(async (req, res) => {
     const unknown = wanted
       ? wanted.filter((id) => !list.some((entry) => String(entry.stream.id) === id))
       : [];
-    const { results, summary } = await checkStreams(targets, { signal: request.signal, concurrency });
+    const checkStartedAt = Date.now();
+    const checked = await checkStreams(targets, { signal: request.signal, concurrency });
     if (request.signal.aborted) return;
+    let results = checked.results;
+    const configAutoRepair = getConfig().playlist?.autoRepairEnabled !== false;
+    const autoRepair = body.autoRepair === undefined ? configAutoRepair : body.autoRepair === true;
+    if (autoRepair) {
+      const entriesById = new Map(chosen.map((entry) => [String(entry.stream.id), entry]));
+      const repairIndexes = results.map((result, index) => ({ result, index }))
+        .filter(({ result }) => BROKEN_STATES.includes(result.state) || result.state === 'skipped');
+      let nextRepair = 0;
+      await Promise.all(Array.from({ length: Math.min(concurrency, repairIndexes.length) }, async () => {
+        while (true) {
+          const task = repairIndexes[nextRepair++];
+          if (!task || request.signal.aborted) return;
+          const entry = entriesById.get(String(task.result.streamId));
+          if (!entry) continue;
+          const outcome = await ensureStreamReady(entry.stream, {
+            reason: 'manual-playlist-check',
+            autoRepair: true,
+            initialCheck: task.result,
+            signal: request.signal,
+          });
+          if (request.signal.aborted) return;
+          results[task.index] = outcome.result
+            ? { ...outcome.result, streamId: task.result.streamId, title: task.result.title, repaired: outcome.repaired === true }
+            : { ...task.result, repairError: outcome.error || 'automatic refresh failed' };
+        }
+      }));
+      if (request.signal.aborted) return;
+    }
+    const summary = summariseCheck(results, {
+      ms: Date.now() - checkStartedAt,
+      checkedAt: checked.summary.checkedAt,
+      probing: checked.summary.probing,
+    });
     res.json({
       ok: true,
-      summary: { ...summary, concurrency, requested: wanted ? wanted.length : list.length },
+      summary: { ...summary, concurrency, requested: wanted ? wanted.length : list.length, autoRepair },
       results: wanted
         ? [...results].sort((a, b) => wanted.indexOf(String(a.streamId)) - wanted.indexOf(String(b.streamId)))
         : results,
@@ -318,8 +366,10 @@ router.delete('/items/:id/subtitle', wrap(async (req, res) => {
 router.post('/items/:id/session', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const session = await relay.ensureSession(stream, { profile: {}, container: req.body?.container });
-  res.json({ ok: true, session: relay.publicSession(session) });
+  const ready = await ensureStreamReady(stream, { reason: 'playlist-session-start' });
+  if (!ready.ok) return res.status(503).json({ ok: false, error: ready.error || ready.result?.error || 'upstream is not available', check: ready.result });
+  const session = await relay.ensureSession(ready.stream, { profile: {}, container: req.body?.container });
+  res.json({ ok: true, session: relay.publicSession(session), ...(ready.repaired ? { repaired: true, sourceId: ready.stream.source_id } : {}) });
 }));
 
 router.delete('/items/:id/session', wrap(async (req, res) => {
@@ -330,13 +380,15 @@ router.delete('/items/:id/session', wrap(async (req, res) => {
 router.post('/items/:id/download', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const job = exporter.startDownload(stream, {
+  const ready = await ensureStreamReady(stream, { reason: 'playlist-download-start' });
+  if (!ready.ok) return res.status(503).json({ ok: false, error: ready.error || ready.result?.error || 'upstream is not available', check: ready.result });
+  const job = exporter.startDownload(ready.stream, {
     profile: req.body?.profile || {},
     container: req.body?.container,
     filename: req.body?.filename || null,
   });
   const full = findJob(job.id) || job;
-  res.json({ ok: true, job: full });
+  res.json({ ok: true, job: full, ...(ready.repaired ? { repaired: true, sourceId: ready.stream.source_id } : {}) });
 }));
 
 /** The playlist as a plain .m3u file (download button in the UI). */

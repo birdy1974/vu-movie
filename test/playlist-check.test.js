@@ -196,7 +196,7 @@ test('POST /api/playlist/check answers per item, without a network', async () =>
     const res = await fetch(`${base}/api/playlist/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ streamIds: [noUrl.id, expired.id, 'does-not-exist'] }),
+      body: JSON.stringify({ streamIds: [noUrl.id, expired.id, 'does-not-exist'], autoRepair: false }),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -214,7 +214,7 @@ test('POST /api/playlist/check answers per item, without a network', async () =>
 
     // A single-id request is what the UI sends per row.
     const one = await (await fetch(`${base}/api/playlist/check`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ streamIds: [expired.id] }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ streamIds: [expired.id], autoRepair: false }),
     })).json();
     assert.equal(one.results.length, 1);
     assert.equal(one.results[0].title, 'Expired Smurfs');

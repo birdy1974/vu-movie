@@ -83,6 +83,12 @@ export function loadSources({ force = false } = {}) {
       id: site.id,
       name: site.name || site.id,
       home: site.home || '',
+      mirrors: Array.isArray(site.mirrors)
+        ? site.mirrors.map((mirror) => (typeof mirror === 'string'
+          ? { name: '', url: mirror }
+          : { name: String(mirror?.name || ''), url: String(mirror?.url || mirror?.home || '') }))
+          .filter((mirror) => mirror.url)
+        : [],
       enabled: site.enabled !== false,
       kind: site.kind || 'browser',
       notes: site.notes || '',

@@ -10,15 +10,38 @@ import assert from 'node:assert/strict';
 import { resolveTarget, listSources, matchSourceByUrl, getSource } from '../src/scrapers/registry.js';
 import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates } from '../src/scrapers/registry.js';
 
-test('the seven requested sites are loaded from the recipe file', () => {
+test('the built-in catalog includes the requested URLs and keeps unverified Flixer domains separate', () => {
   const sources = listSources();
   const ids = sources.map((s) => s.id);
-  assert.ok(sources.length >= 7, `only ${sources.length} sources: ${ids.join(', ')}`);
-  assert.ok(ids.includes('moviebox') === false || true); // MovieBox is queried separately, not a site recipe
-  for (const host of ['overlook.cx', 'cinevo.nl', 'cinejoy.pk', 'flixhub.studio', 'redflix.club', '1flex.org', 'cinezo.st']) {
-    assert.ok(sources.some((s) => s.match?.includes(host)), `no recipe for ${host} (have: ${ids.join(', ')})`);
+  assert.ok(sources.length >= 18, `only ${sources.length} sources: ${ids.join(', ')}`);
+  assert.ok(!ids.includes('moviebox'), 'MovieBox is queried separately, not a site recipe');
+  for (const host of [
+    'overlook.cx', 'cinevo.nl', 'cinejoy.pk', 'flixhub.studio', 'redflix.club', '1flex.org', 'cinezo.st',
+    'flixer.gd', 'vidbox.vc', 'nunflix.cx', 'flixer.su', 'moviewiser.com', 'purehd.cc',
+    'fmovieshd.one', 'filmween.net', 'pc.netmovie.site', 'www.1tube.org', 'nippleflix.org',
+  ]) {
+    assert.ok(matchSourceByUrl(`https://${host}/`), `no recipe for ${host} (have: ${ids.join(', ')})`);
   }
   assert.ok(sources.every((s) => s.enabled === true && s.home && s.search?.url && s.resolve), 'every recipe needs home/search/resolve');
+
+  const flixerGd = getSource('flixer-gd');
+  const flixerSu = getSource('flixer-su');
+  assert.ok(flixerGd && flixerSu, 'both Flixer domains should have a recipe');
+  assert.notEqual(flixerGd.id, flixerSu.id, 'do not merge domains without an exact shared redirect destination');
+  assert.deepEqual(flixerGd.mirrors, []);
+  assert.deepEqual(flixerSu.mirrors, []);
+  assert.equal(matchSourceByUrl('https://flixer.gd/search?q=Runner')?.id, 'flixer-gd');
+  assert.equal(matchSourceByUrl('https://flixer.su/search?q=Runner')?.id, 'flixer-su');
+  for (const id of ['overlook', 'nunflix', 'moviewiser', 'filmween', 'netmovie', 'nippleflix']) {
+    assert.equal(getSource(id)?.search?.openMode, 'home', `${id} should use its safe homepage for direct-open links`);
+  }
+  assert.equal(getSource('vidbox')?.search?.openMode, undefined, 'confirmed search routes stay query-specific');
+});
+
+test('confirmed path-style search recipes remain configured', () => {
+  assert.equal(getSource('purehd')?.search?.url, 'https://purehd.cc/search/{query}');
+  assert.equal(getSource('fmovieshd')?.search?.url, 'https://fmovieshd.one/search/{query}');
+  assert.equal(getSource('1tube')?.search?.url, 'https://www.1tube.org/search?q={query}');
 });
 
 test('a pasted page URL is matched to its recipe', () => {

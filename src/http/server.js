@@ -25,6 +25,7 @@ import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath,
 import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
+import { ensureStreamReady } from '../streams/recovery.js';
 import * as exporter from '../streams/export.js';
 import { upstreamProxyMiddleware } from '../streams/upstream.js';
 import apiRouter from './api.js';
@@ -41,6 +42,16 @@ async function streamByToken(token) {
   const stream = await store.getStream(token);
   if (!stream) log.warn('http', 'unknown stream token requested', { token: truncate(token, 20) });
   return stream;
+}
+
+/** Verify/refresh the upstream before ffmpeg, a redirect or a download starts. */
+async function prepareStreamForPlayback(stream, res, reason = 'stream-start') {
+  const ready = await ensureStreamReady(stream, { reason });
+  if (ready.ok) return ready.stream;
+  const detail = ready.error || ready.result?.repairError || ready.result?.error || 'the upstream did not answer';
+  log.warn('http', `playback blocked because "${stream.title}" is unavailable`, { streamId: stream.id, reason, error: detail });
+  if (!res.destroyed) res.status(503).type('text/plain').send(`vu-movie: "${stream.title || 'stream'}" is unavailable; automatic refresh failed: ${detail}`);
+  return null;
 }
 
 function extensionOf(reqPath) {
@@ -131,7 +142,7 @@ export function createApp() {
   /* ---------------- playable endpoints ---------------- */
 
   app.get('/s/:token/:name', async (req, res) => {
-    const stream = await streamByToken(req.params.token);
+    let stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const ext = extensionOf(req.params.name);
 
@@ -168,6 +179,8 @@ export function createApp() {
     // the signed Cookie/Referer that MovieBox and friends demand, so those URLs
     // are refused with an explanation instead of sending VLC into a 403.
     if (ext === 'direct' || req.path.endsWith('/direct')) {
+      stream = await prepareStreamForPlayback(stream, res, 'direct-playback-start');
+      if (!stream) return;
       if (!store.directPlaybackAvailable(stream)) {
         log.warn('http', 'direct redirect refused — the source needs request headers', { stream: stream.id });
         return res.status(409).json({
@@ -184,6 +197,8 @@ export function createApp() {
     if (ext === 'm3u' || ext === 'm3u8') {
       const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
       if (ext === 'm3u8' && (stream.profile?.container === 'hls')) {
+        stream = await prepareStreamForPlayback(stream, res, 'hls-playback-start');
+        if (!stream) return;
         const session = await relay.ensureSession(stream, { container: 'hls', outputType: outputType || 'm3u8' });
         if (session.kind === 'hls') {
           log.info('http', 'client asked for the HLS playlist', { stream: stream.id });
@@ -219,6 +234,8 @@ export function createApp() {
     // A preview never muxes Matroska: the player is an MSE transmuxer and the
     // web-preview profile pins mpegts anyway.
     const container = isWeb ? 'mpegts' : (effectiveExt === 'mkv' || effectiveExt === 'matroska' ? 'matroska' : 'mpegts');
+    stream = await prepareStreamForPlayback(stream, res, 'media-playback-start');
+    if (!stream) return;
     // Bounded wait so a slow GPU self-test cannot hold a playback request open.
     const hw = await hardware({ waitMs: 15000 });
     let session;
@@ -247,8 +264,10 @@ export function createApp() {
   /* ---------------- download endpoint (attachment, single client) ---------------- */
 
   app.get('/dl/:token/:name', async (req, res) => {
-    const stream = await streamByToken(req.params.token);
+    let stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
+    stream = await prepareStreamForPlayback(stream, res, 'download-start');
+    if (!stream) return;
     const ext = extensionOf(req.params.name);
     const container = ext === 'mkv' ? 'matroska' : 'mpegts';
     const hw = await hardware({ waitMs: 15000 });

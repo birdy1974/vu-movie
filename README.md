@@ -71,10 +71,18 @@ permissions, Container Manager project import, firewall, where the data lives).
 ### Search & scrape
 * One search box that fans out over the enabled sources, plus a **paste-URL** mode
   for a page or player URL.
-* Source list (editable in Settings → Sources): `overlook.cx`, `cinevo.nl`,
-  `cinejoy.pk`, `flixhub.studio`, `redflix.club`, `1flex.org`, `cinezo.st` — and
-  **MovieBox** through its own signed REST client (the same protocol the
-  [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
+* Built-in browser recipes for `overlook.cx`, `cinevo.nl`, `cinejoy.pk`,
+  `flixhub.studio`, `redflix.club`, `1flex.org`, `cinezo.st`, `flixer.gd`,
+  `flixer.su`, `vidbox.vc`, `nunflix.cx`, `moviewiser.com`, `purehd.cc`,
+  `fmovieshd.one`, `filmween.net`, `pc.netmovie.site`, `1tube.org` and
+  `nippleflix.org` (18 recipes total). Flixer.gd and Flixer.su remain separate
+  entries because an exact shared redirect destination could not be verified.
+  The source selector is available on Mobile and Search; direct site links are
+  also in Mobile, Search → Open a source and Dashboard. A small external-link
+  control beside each Search/Mobile source chip opens that source's title-search
+  route when it is dependable, otherwise the safe homepage. Custom recipes can
+  be added in Settings → Sources. **MovieBox** uses its own signed REST client (the
+  same protocol the [MovieBox-TUI](https://github.com/mesamirh/MovieBox-TUI) reference client speaks;
   see [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for a
   line-by-line comparison of how both apps select a title versus how they fetch and
   play it). When the `api*.aoneroom.com` edge is filtered and no host answers at
@@ -111,6 +119,11 @@ permissions, Container Manager project import, firewall, where the data lives).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
+* **Discover titles** opens a Trending now / Top 10 / For you popup on Search
+  and Mobile. Picking a title runs the normal source search. The first two lists
+  use TMDB; For you uses every playlist-add event as its recommendation signal,
+  retaining removed/deleted titles and never consulting playback history. Add a
+  free TMDB API key in **Settings → Metadata** to enable the lists.
 
 ### One stream for VLC
 * `http://<nas>:8080/s/<token>/<title>.ts` — a single continuous MPEG-TS.
@@ -216,19 +229,23 @@ page instead of from guesswork.
 ### Operations
 * **Jobs** for every long action, with progress, logs and a cancel button
   (cancelling kills the underlying Chromium/ffmpeg process).
-* **“Check streams” on the Playlist tab** answers the question a playlist can't:
-  is anything in it still playing? Every item's upstream URL is probed with
-  ffprobe — the same proof the Search tab runs before offering a format — and
-  each row gets a verdict: **working** (with what was found: container, codec,
-  resolution, duration), **not working**, **token expired** (the stream's own
-  upstream-token TTL passed) or **unverified** (probing is switched off in
-  Settings or ffprobe is missing). The line next to the button summarises the
-  run (`3/5 working · 2 not working: …`), broken rows are outlined red, a single
-  row can be re-checked with its own ⚡ button, and a check never changes,
-  disables or deletes anything. API: `POST /api/playlist/check`
-  `{ "streamIds": ["…"] }` (omit it for the whole list) → `{ results: [{ streamId,
-  state, error, probeMs, probe }], summary, unknown }`
-  with `state` ∈ `working | dead | expired | unverified | skipped`.
+* **Playlist availability and recovery:** the Playlist tab's **Check streams**
+  action probes each upstream with ffprobe and reports **working**, **not
+  working**, **token expired**, **unverified** or **skipped**. Broken/expired
+  items are automatically re-resolved: vu-movie searches the current provider
+  first, then other enabled providers for the same title/year/type. A successful
+  candidate replaces the saved upstream URL, headers and probe in place; the
+  stable stream id/token and every existing output URL remain unchanged. Rows
+  identify auto-refreshed items and update their source/quality. The scheduled
+  check runs every six hours by default (first pass shortly after startup), and
+  playback, download and relay-session starts perform an availability check
+  before using an upstream. If recovery fails, playback returns an actionable
+  503 instead of starting ffmpeg against a known-dead link. Set **Settings →
+  Playlist availability** or `PLAYLIST_AUTO_CHECK`,
+  `PLAYLIST_CHECK_INTERVAL_MINUTES` (15–10080) and `PLAYLIST_AUTO_REPAIR` to
+  adjust it. API: `POST /api/playlist/check` accepts optional
+  `{ "streamIds": ["…"], "autoRepair": false }`; omit `streamIds` to check the
+  whole list. `GET /api/playlist/check/schedule` reports schedule state.
 * **Live log view** in the UI (`/api/events`, SSE) with level/component filters —
   made for "why is this film not playing" debugging.
 * **Detailed, levelled, component-tagged logging** in the container log too

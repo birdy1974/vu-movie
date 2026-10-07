@@ -282,6 +282,14 @@ export const DEFAULTS = {
   playlist: {
     name: process.env.PLAYLIST_NAME || 'vu-movie',
     items: [],
+    /** Streams deliberately removed stay out until explicitly added again. */
+    removedStreamIds: [],
+    /** Append-only title snapshots used for recommendations (never watch history). */
+    additionHistory: [],
+    /** Periodically probe every playlist item and refresh broken upstreams. */
+    autoCheckEnabled: String(process.env.PLAYLIST_AUTO_CHECK || 'true').toLowerCase() !== 'false',
+    autoCheckIntervalMinutes: Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES || 360),
+    autoRepairEnabled: String(process.env.PLAYLIST_AUTO_REPAIR || 'true').toLowerCase() !== 'false',
     token: '',
     /** Username/password an Xtream Codes client sends (empty = token only). */
     xtreamUsername: process.env.XTREAM_USERNAME || 'vumovie',
@@ -440,6 +448,9 @@ function envOverrides() {
   if (process.env.LOG_LEVEL) set('app.logLevel', process.env.LOG_LEVEL);
   if (process.env.APP_USERNAME) set('app.username', process.env.APP_USERNAME);
   if (process.env.APP_PASSWORD) set('app.password', process.env.APP_PASSWORD);
+  if (process.env.PLAYLIST_AUTO_CHECK !== undefined) set('playlist.autoCheckEnabled', String(process.env.PLAYLIST_AUTO_CHECK).toLowerCase() !== 'false');
+  if (process.env.PLAYLIST_CHECK_INTERVAL_MINUTES !== undefined) set('playlist.autoCheckIntervalMinutes', Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES));
+  if (process.env.PLAYLIST_AUTO_REPAIR !== undefined) set('playlist.autoRepairEnabled', String(process.env.PLAYLIST_AUTO_REPAIR).toLowerCase() !== 'false');
   if (process.env.DATABASE_URL) set('db.url', process.env.DATABASE_URL);
   if (process.env.DOWNLOADS_DIR) set('storage.downloads', process.env.DOWNLOADS_DIR);
   if (process.env.TMP_DIR) set('storage.tmp', process.env.TMP_DIR);
@@ -575,7 +586,11 @@ const SECRET_PATHS = [
 
 /** Returns a copy with passwords/keys masked, for the UI. */
 export function publicConfig() {
-  const clone = structuredClone(current);
+  // These playlist internals are intentionally exposed only by the dedicated
+  // playlist APIs: additionHistory can grow without bound and removed ids are
+  // implementation state, neither belongs in Settings responses or boot logs.
+  const { additionHistory: _additionHistory, removedStreamIds: _removedStreamIds, ...publicPlaylist } = current.playlist || {};
+  const clone = structuredClone({ ...current, playlist: publicPlaylist });
   // Custom commands can contain credentials or private origin details. They are
   // served only by /api/ffmpeg/templates to the template editor, never the
   // general settings/health config response.

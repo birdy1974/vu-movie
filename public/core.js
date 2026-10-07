@@ -375,7 +375,7 @@ const state = {
   defaultFfmpegTemplateId: '',
   ffmpegDefaults: {},
   /* playlist.js fills these */
-  playlist: { items: [], available: [], urls: null, summary: null, templates: [], loaded: false },
+  playlist: { items: [], available: [], urls: null, summary: null, templates: [], maintenance: null, loaded: false },
   /* ffmpeg-editor.js fills these */
   editors: {},
 };
