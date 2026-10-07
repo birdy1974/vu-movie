@@ -127,8 +127,10 @@ permissions, Container Manager project import, firewall, where the data lives).
   group fetches it, “load selected” fetches the ticked ones — and a
   **quality-coverage matrix** combines everything loaded into one row per
   quality (episodes covered, providers, bulk “add all in 1080p”). Movies keep
-  the flat format list. Played episodes are added as `Title S01E02` items with
-  their season/episode stored on the stream (bouquet separators included).
+  the flat format list. The Mobile tab shows the same season cards, matrix and
+  episode groups for a series (with its provider-scope chips). Played episodes
+  are added as `Title S01E02` items with their season/episode stored on the
+  stream (bouquet separators included).
 * **Discover titles** opens a Trending now / Top 10 / For you popup on Search
   and Mobile. Picking a title runs the normal source search. The first two lists
   use TMDB; For you uses every playlist-add event as its recommendation signal,

@@ -1579,10 +1579,13 @@ function seriesQualityKey(candidate) {
   return 'source';
 }
 
-/** Aggregate the loaded episodes into quality-first rows (coverage matrix). */
-function seriesMatrixRows() {
+/**
+ * Aggregate loaded episodes into quality-first rows (coverage matrix).
+ * Defaults to the Search tab's loaded episodes; the Mobile tab passes its own.
+ */
+function seriesMatrixRows(loaded = seriesLoadedEpisodes()) {
   const rows = new Map();
-  for (const entry of seriesLoadedEpisodes()) {
+  for (const entry of loaded) {
     const seen = new Set();
     for (const candidate of entry.candidates || []) {
       const quality = seriesQualityKey(candidate);
@@ -1762,27 +1765,35 @@ function renderSeriesPicker() {
     ? `${sourceLabel} · ${series.seasons.length} season(s)`
     : sourceLabel;
   $('#sel-series-manual')?.classList.toggle('hide', series.source !== 'none' && series.source !== 'manual');
-  host.innerHTML = series.seasons.map((entry) => {
-    const groups = (entry.episodes || []).map((ep) => series.episodes.get(seriesKey(entry.season, ep.episode))).filter(Boolean);
-    const selected = groups.filter((group) => group.selected).length;
-    const collapsed = series.collapsed.has(entry.season);
-    return `<div class="season-card" data-season-card="${entry.season}">
-      <div class="season-card-head">
-        <label class="season-check"><input type="checkbox" data-season-check="${entry.season}"${selected && selected === groups.length ? ' checked' : ''} aria-label="select all of season ${entry.season}"> <b>${escapeHtml(entry.name || `Season ${entry.season}`)}</b></label>
-        <span class="mut">${selected}/${groups.length}</span>
-        <button type="button" class="btn sm ghost" data-season-all="${entry.season}">all</button>
-        <button type="button" class="btn sm ghost" data-season-none="${entry.season}">none</button>
-        <button type="button" class="foldbtn" data-season-toggle="${entry.season}" aria-expanded="${collapsed ? 'false' : 'true'}" title="${collapsed ? 'show' : 'hide'} episodes">${collapsed ? '▸' : '▾'}</button>
-      </div>
-      <div class="episode-pills${collapsed ? ' hide' : ''}">
-        ${groups.map((group) => `<label class="ep-pill${group.selected ? ' on' : ''}${group.status === 'done' ? ' loaded' : ''}${group.status === 'loading' ? ' busy' : ''}" title="${escapeHtml(group.name || `Episode ${group.episode}`)}${group.status === 'done' ? ` — ${(group.candidates || []).length} format(s) loaded` : ''}">
-          <input type="checkbox" data-ep-check="${group.season}:${group.episode}"${group.selected ? ' checked' : ''}>
-          <span>E${String(group.episode).padStart(2, '0')}</span>
-        </label>`).join('') || '<span class="meta">no episodes listed</span>'}
-      </div>
-    </div>`;
-  }).join('') || '<div class="meta">No seasons listed.</div>';
+  host.innerHTML = series.seasons.map((entry) => seasonCardMarkup(series, entry)).join('') || '<div class="meta">No seasons listed.</div>';
   updateSeriesSummary();
+}
+
+/**
+ * One season card with its episode pills — shared by the Search tab and the
+ * Mobile tab so both pickers are literally the same cards. The data attributes
+ * are identical on both tabs on purpose: the listeners live on different
+ * containers (#sel-seasons vs #mob-formats), so there is no cross-talk.
+ */
+function seasonCardMarkup(series, entry) {
+  const groups = (entry.episodes || []).map((ep) => series.episodes.get(seriesKey(entry.season, ep.episode))).filter(Boolean);
+  const selected = groups.filter((group) => group.selected).length;
+  const collapsed = series.collapsed.has(entry.season);
+  return `<div class="season-card" data-season-card="${entry.season}">
+    <div class="season-card-head">
+      <label class="season-check"><input type="checkbox" data-season-check="${entry.season}"${selected && selected === groups.length ? ' checked' : ''} aria-label="select all of season ${entry.season}"> <b>${escapeHtml(entry.name || `Season ${entry.season}`)}</b></label>
+      <span class="mut">${selected}/${groups.length}</span>
+      <button type="button" class="btn sm ghost" data-season-all="${entry.season}">all</button>
+      <button type="button" class="btn sm ghost" data-season-none="${entry.season}">none</button>
+      <button type="button" class="foldbtn" data-season-toggle="${entry.season}" aria-expanded="${collapsed ? 'false' : 'true'}" title="${collapsed ? 'show' : 'hide'} episodes">${collapsed ? '▸' : '▾'}</button>
+    </div>
+    <div class="episode-pills${collapsed ? ' hide' : ''}">
+      ${groups.map((group) => `<label class="ep-pill${group.selected ? ' on' : ''}${group.status === 'done' ? ' loaded' : ''}${group.status === 'loading' ? ' busy' : ''}" title="${escapeHtml(group.name || `Episode ${group.episode}`)}${group.status === 'done' ? ` — ${(group.candidates || []).length} format(s) loaded` : ''}">
+        <input type="checkbox" data-ep-check="${group.season}:${group.episode}"${group.selected ? ' checked' : ''}>
+        <span>E${String(group.episode).padStart(2, '0')}</span>
+      </label>`).join('') || '<span class="meta">no episodes listed</span>'}
+    </div>
+  </div>`;
 }
 
 function updateSeriesSummary() {
@@ -1994,7 +2005,7 @@ function seriesMatrixMarkup(rows, totalSelected, loadedCount) {
   </div>`;
 }
 
-function seriesEpisodeGroupMarkup(group) {
+function seriesEpisodeGroupMarkup(group, providerCount = null) {
   const key = seriesKey(group.season, group.episode);
   const label = seriesLabel(group.season, group.episode);
   const status = group.status === 'loading'
@@ -2007,7 +2018,10 @@ function seriesEpisodeGroupMarkup(group) {
   const title = group.name && group.name !== `Episode ${group.episode}` ? ` — ${escapeHtml(group.name)}` : '';
   let body = '';
   if (group.status === 'loading') {
-    body = `<div class="meta"><span class="spin"></span> resolving ${(state.selection?.entries || []).length} provider(s)…</div>`;
+    // Desktop passes nothing (the Search selection owns the count); the Mobile
+    // tab passes its own scoped entry count explicitly.
+    const count = providerCount ?? (state.selection?.entries || []).length;
+    body = `<div class="meta"><span class="spin"></span> resolving ${count} provider(s)…</div>`;
   } else if (group.status === 'done' && (group.candidates || []).length) {
     body = `<div class="ep-group-actions">
         <button type="button" class="btn sm pri" data-series-add-best="${key}">+ add best (${escapeHtml(seriesQualityKey((group.candidates || []).find((c) => c.ok !== false) || group.candidates[0]))})</button>
@@ -3480,9 +3494,100 @@ async function initMobile() {
       mobileSelect(state.mobile.group, { sourceId: scope.dataset.mscopeProvider || '' });
       return;
     }
+    // Series picker: same data attributes as the Search tab's picker, scoped
+    // here to the Mobile tab's own formats container.
+    const seriesQuality = event.target.closest('[data-series-add-quality]');
+    if (seriesQuality) {
+      mobAddQuality(seriesQuality.dataset.seriesAddQuality, seriesQuality);
+      return;
+    }
+    const seriesBest = event.target.closest('[data-series-add-best]');
+    if (seriesBest) {
+      const [season, episode] = String(seriesBest.dataset.seriesAddBest).split(':').map(Number);
+      mobAddEpisodeBest(season, episode, seriesBest);
+      return;
+    }
+    const seriesAdd = event.target.closest('[data-series-add]');
+    if (seriesAdd) {
+      const [season, episode, index] = String(seriesAdd.dataset.seriesAdd).split(':');
+      const group = state.mobile.series?.episodes.get(seriesKey(season, episode));
+      const candidate = group?.candidates?.[Number(index)];
+      if (candidate) mobAddSeriesCandidate(candidate, Number(season), Number(episode), seriesAdd);
+      return;
+    }
+    const seriesLoad = event.target.closest('[data-series-load]');
+    if (seriesLoad) {
+      const [season, episode] = String(seriesLoad.dataset.seriesLoad).split(':').map(Number);
+      const group = state.mobile.series?.episodes.get(seriesKey(season, episode));
+      if (group) group.open = true;
+      mobLoadSeriesEpisode(season, episode);
+      return;
+    }
+    const seriesReload = event.target.closest('[data-series-reload]');
+    if (seriesReload) {
+      const [season, episode] = String(seriesReload.dataset.seriesReload).split(':').map(Number);
+      mobLoadSeriesEpisode(season, episode, { force: true });
+      return;
+    }
+    const seasonAll = event.target.closest('[data-season-all]');
+    if (seasonAll) { mobSetSeasonSelection(seasonAll.dataset.seasonAll, true); return; }
+    const seasonNone = event.target.closest('[data-season-none]');
+    if (seasonNone) { mobSetSeasonSelection(seasonNone.dataset.seasonNone, false); return; }
+    const seasonToggle = event.target.closest('[data-season-toggle]');
+    if (seasonToggle) {
+      const season = Number(seasonToggle.dataset.seasonToggle);
+      if (state.mobile.series?.collapsed.has(season)) state.mobile.series.collapsed.delete(season);
+      else state.mobile.series?.collapsed.add(season);
+      mobRenderSeriesPicker();
+      return;
+    }
+    if (event.target.closest('#mob-series-all')) { mobSetAllSeasons(true); return; }
+    if (event.target.closest('#mob-series-clear')) { mobSetAllSeasons(false); return; }
+    if (event.target.closest('#mob-series-load')) { mobLoadSelectedEpisodes({ announce: true }); return; }
+    if (event.target.closest('#mob-manual-add')) { mobAddManualEpisodes(); return; }
+    const probe = event.target.closest('[data-probe-url]');
+    if (probe && probe.dataset.probeUrl) { probeUrl(probe.dataset.probeUrl); return; }
     const add = event.target.closest('[data-madd]');
     if (!add) return;
     mobileAdd(Number(add.dataset.madd));
+  });
+  $('#mob-formats')?.addEventListener('change', (event) => {
+    const series = state.mobile.series;
+    if (!series) return;
+    const seasonCheck = event.target.closest('[data-season-check]');
+    if (seasonCheck) {
+      mobSetSeasonSelection(seasonCheck.dataset.seasonCheck, seasonCheck.checked);
+      return;
+    }
+    const epCheck = event.target.closest('[data-ep-check]');
+    if (epCheck) {
+      const [season, episode] = String(epCheck.dataset.epCheck).split(':').map(Number);
+      const group = series.episodes.get(seriesKey(season, episode));
+      if (group) {
+        group.selected = epCheck.checked;
+        if (!epCheck.checked && group.status === 'loading') group.controller?.abort();
+        if (!epCheck.checked) { group.status = 'idle'; group.candidates = []; group.error = null; }
+      }
+      mobRenderSeriesPicker();
+      mobRenderSeriesCandidates();
+    }
+  });
+  // Expanding an episode group resolves it on demand (first open only).
+  $('#mob-formats')?.addEventListener('toggle', (event) => {
+    const details = event.target?.closest?.('[data-ep-group]');
+    if (!details || !details.open) return;
+    const [season, episode] = String(details.dataset.epGroup).split(':').map(Number);
+    const entry = state.mobile.series?.episodes.get(seriesKey(season, episode));
+    if (entry) entry.open = true;
+    if (entry && entry.status !== 'done' && entry.status !== 'loading') {
+      mobLoadSeriesEpisode(season, episode);
+    }
+  }, true);
+  $('#mob-formats')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && event.target?.id === 'mob-manual-episodes') {
+      event.preventDefault();
+      mobAddManualEpisodes();
+    }
   });
   $('#btn-mob-refresh')?.addEventListener('click', () => VMPlaylist.refresh().then(refreshMobile));
   $('#mob-list')?.addEventListener('change', (event) => {
@@ -3576,10 +3681,12 @@ function mobileHint(text) {
  * half a minute must not look like it answered with the old titles.
  */
 function beginMobileSearch(query) {
+  mobAbortSeriesLoads();
   state.mobile.results = [];
   state.mobile.group = null;
   state.mobile.activeSource = '';
   state.mobile.candidates = [];
+  state.mobile.series = null;
   const host = $('#mob-results');
   if (host) host.innerHTML = `<div class="meta">searching “${escapeHtml(query)}”…</div>`;
   const formats = $('#mob-formats');
@@ -3636,8 +3743,15 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
   const full = state.mobile.results.find((candidate) => candidate.key === group.key) || group;
   const entries = sourceId ? full.entries.filter((entry) => entry.sourceId === sourceId) : full.entries;
   if (!entries.length) { mobileHint(`no ${sourceName(sourceId)} format`); return; }
+  mobAbortSeriesLoads();
   state.mobile.group = full;
   state.mobile.activeSource = sourceId || '';
+  state.mobile.series = null;
+  if (full.kind === 'series') {
+    renderMobSeriesSkeleton(full, sourceId);
+    mobLoadSeriesSeasons();
+    return;
+  }
   const host = $('#mob-formats');
   host.innerHTML = `<div class="meta">resolving ${entries.length} provider(s)${sourceId ? ` from ${escapeHtml(sourceName(sourceId))}` : ''}…</div>`;
   const collected = [];
@@ -3665,6 +3779,10 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
       </button>`;
     }).join('') || '<div class="meta">no playable formats</div>'}`;
   host.innerHTML = baseHtml;
+  fillMobileEnriched(host, full);
+}
+
+function fillMobileEnriched(host, full) {
   // Enrich async
   fetchEnrichedSearch(full).then((enriched)=>{
     const eh = host.querySelector('#mob-enriched');
@@ -3713,6 +3831,467 @@ async function mobileAdd(index) {
   } catch (error) {
     toast(error.message, 'err');
   }
+}
+
+/* ---------------- mobile series picker (same cards as the Search tab) ----------------
+ *
+ * A series selected on the Mobile tab gets the same picker as the Search tab:
+ * one card per season with episode pills above the formats, then the
+ * quality-first matrix plus one collapsible per-episode group resolved on
+ * demand when expanded. The card/group/matrix markup is shared
+ * (seasonCardMarkup / seriesMatrixMarkup / seriesEpisodeGroupMarkup); only the
+ * state (state.mobile.series) and the add path (mobile group instead of the
+ * Search selection) are mobile-specific.
+ */
+
+function mobAbortSeriesLoads() {
+  const series = state.mobile.series;
+  if (!series) return;
+  for (const group of series.episodes.values()) {
+    try { group.controller?.abort(); } catch { /* already settled */ }
+    if (group.status === 'loading') group.status = 'idle';
+  }
+  series.loadingAll = false;
+  series.seq = (series.seq || 0) + 1;
+}
+
+/** Provider entries for the mobile series loads, honoring the scope chips. */
+function mobSeriesEntries() {
+  const group = state.mobile.group;
+  if (!group) return [];
+  const scope = state.mobile.activeSource || '';
+  return scope
+    ? (group.entries || []).filter((entry) => entry.sourceId === scope)
+    : (group.entries || []);
+}
+
+function mobSeriesEpisodeKey() {
+  const group = state.mobile.group;
+  return `${group?.key || ''}|${state.mobile.activeSource || ''}`;
+}
+
+function mobSeriesSelectedEpisodes() {
+  const series = state.mobile.series;
+  if (!series) return [];
+  return [...series.episodes.values()]
+    .filter((group) => group.selected)
+    .sort((a, b) => a.season - b.season || a.episode - b.episode);
+}
+
+function mobSeriesLoadedEpisodes() {
+  return mobSeriesSelectedEpisodes().filter((group) => group.status === 'done' && (group.candidates || []).length);
+}
+
+function renderMobSeriesSkeleton(full, sourceId) {
+  const host = $('#mob-formats');
+  const providerCount = new Set((full.entries || []).map((entry) => entry.sourceId)).size;
+  host.innerHTML = `
+    <div class="mob-head"><b>${escapeHtml(titleText(full))}</b>
+      <span class="meta">${escapeHtml(full.kind)} · ${sourceId ? `formats from ${escapeHtml(sourceName(sourceId))} only` : `formats from all ${providerCount} provider(s)`} · tick episodes below, expand one to load it</span></div>
+    <div id="mob-enriched" class="meta" style="margin:6px 0">loading TMDB/IMDb…</div>
+    ${providerCount > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(full, { activeSource: sourceId, attr: 'data-mscope-provider', all: true })}</div>` : ''}
+    <div class="series-picker">
+      <div class="series-picker-head"><b>Seasons &amp; episodes</b><span class="mut" id="mob-series-source"></span></div>
+      <div id="mob-seasons" class="season-cards"><div class="meta"><span class="spin"></span> loading seasons…</div></div>
+      <div id="mob-series-manual" class="series-manual hide">
+        <div class="field"><label for="mob-manual-season">Season</label><input id="mob-manual-season" type="number" min="0" value="1"></div>
+        <div class="field"><label for="mob-manual-episodes">Episodes (e.g. 1-8)</label><input id="mob-manual-episodes" placeholder="1-8"></div>
+        <button type="button" class="btn sm pri" id="mob-manual-add">add</button>
+      </div>
+      <div class="row series-picker-actions">
+        <button type="button" class="btn sm ghost" id="mob-series-all">✓ all</button>
+        <button type="button" class="btn sm ghost" id="mob-series-clear">✕ clear</button>
+        <button type="button" class="btn sm pri" id="mob-series-load">⤓ load selected</button>
+        <span class="mut" id="mob-series-summary"></span>
+      </div>
+      <div id="mob-series-status" class="meta episode-status" role="status" aria-live="polite"></div>
+    </div>
+    <div id="mob-series-formats"></div>`;
+  fillMobileEnriched(host, full);
+}
+
+async function mobLoadSeriesSeasons() {
+  const full = state.mobile.group;
+  if (!full || full.kind !== 'series') return;
+  const subjectEntry = (full.entries || []).find((entry) => entry.movieboxSubjectId);
+  const series = newSeriesState({ key: full.key, movieboxSubjectId: subjectEntry?.movieboxSubjectId || null });
+  state.mobile.series = series;
+  const seq = ++series.seq;
+  mobRenderSeriesCandidates();
+  try {
+    const params = new URLSearchParams({ title: full.title || '' });
+    if (full.year) params.set('year', String(full.year));
+    if (series.subjectId) params.set('subjectId', series.subjectId);
+    const meta = (full.entries || []).find((entry) => entry.imdbId || entry.tmdbId) || {};
+    if (meta.tmdbId) params.set('tmdbId', meta.tmdbId);
+    if (meta.imdbId) params.set('imdbId', meta.imdbId);
+    const data = await api(`/api/find/series?${params}`, { silent: true });
+    if (state.mobile.series !== series || seq !== series.seq) return;
+    series.source = data.source || 'none';
+    series.seasons = Array.isArray(data.seasons) ? data.seasons : [];
+    series.subjectId = data.subjectId || series.subjectId;
+    series.tmdbId = data.tmdbId || null;
+    series.errors = Array.isArray(data.errors) ? data.errors : [];
+    if (!series.seasons.length) {
+      mobRenderSeriesManual();
+      return;
+    }
+    // Default: first season, all episodes selected — the first episode group
+    // auto-loads so the formats area is not empty.
+    const firstSeason = series.seasons[0];
+    for (const entry of series.seasons) {
+      for (const ep of entry.episodes || []) {
+        series.episodes.set(seriesKey(entry.season, ep.episode), {
+          season: entry.season,
+          episode: ep.episode,
+          name: ep.name || '',
+          airDate: ep.airDate || null,
+          selected: entry.season === firstSeason.season,
+          status: 'idle',
+          candidates: [],
+          error: null,
+          controller: null,
+          open: entry.season === firstSeason.season && ep.episode === (entry.episodes[0]?.episode ?? 1),
+        });
+      }
+    }
+    mobRenderSeriesPicker();
+    mobRenderSeriesCandidates();
+    const first = mobSeriesSelectedEpisodes()[0];
+    if (first) mobLoadSeriesEpisode(first.season, first.episode);
+  } catch (error) {
+    if (state.mobile.series !== series) return;
+    series.source = 'none';
+    series.errors = [{ source: 'series', error: error.message }];
+    mobRenderSeriesManual();
+  }
+}
+
+/** No season source answered: manual season/episode number inputs. */
+function mobRenderSeriesManual() {
+  const series = state.mobile.series;
+  $('#mob-series-source').textContent = 'manual entry';
+  const host = $('#mob-seasons');
+  if (host) {
+    const reasons = (series?.errors || []).map((entry) => `${entry.source}: ${entry.error}`).join(' · ');
+    host.innerHTML = `<div class="meta">No season list available${reasons ? ` — ${escapeHtml(reasons)}` : ''}. Add episodes by hand:</div>`;
+  }
+  $('#mob-series-manual')?.classList.remove('hide');
+  mobUpdateSeriesSummary();
+  mobRenderSeriesCandidates();
+}
+
+function mobAddManualEpisodes() {
+  const series = state.mobile.series;
+  if (!series) return;
+  const season = Number($('#mob-manual-season')?.value) || 0;
+  const episodes = parseEpisodeList($('#mob-manual-episodes')?.value);
+  if (!season || !episodes.length) {
+    toast('Enter a season and at least one episode (e.g. 1-8)', 'warn');
+    return;
+  }
+  if (!series.seasons.some((entry) => entry.season === season)) {
+    series.seasons.push({ season, name: `Season ${season}`, episodeCount: 0, episodes: [] });
+    series.seasons.sort((a, b) => a.season - b.season);
+  }
+  const seasonEntry = series.seasons.find((entry) => entry.season === season);
+  for (const episode of episodes) {
+    const key = seriesKey(season, episode);
+    if (!series.episodes.has(key)) {
+      series.episodes.set(key, {
+        season, episode, name: '', airDate: null,
+        selected: true, status: 'idle', candidates: [], error: null, controller: null, open: false,
+      });
+    } else {
+      series.episodes.get(key).selected = true;
+    }
+    if (!seasonEntry.episodes.some((item) => item.episode === episode)) {
+      seasonEntry.episodes.push({ episode, name: `Episode ${episode}` });
+      seasonEntry.episodes.sort((a, b) => a.episode - b.episode);
+    }
+  }
+  if (series.source === 'none') series.source = 'manual';
+  $('#mob-manual-episodes').value = '';
+  mobRenderSeriesPicker();
+  mobRenderSeriesCandidates();
+  mobUpdateSeriesSummary();
+}
+
+function mobRenderSeriesPicker() {
+  const series = state.mobile.series;
+  const host = $('#mob-seasons');
+  if (!series || !host) return;
+  const sourceLabel = {
+    moviebox: 'MovieBox', tmdb: 'TMDB', manual: 'manual', loading: '…', none: 'manual entry',
+  }[series.source] || series.source;
+  $('#mob-series-source').textContent = series.seasons.length
+    ? `${sourceLabel} · ${series.seasons.length} season(s)`
+    : sourceLabel;
+  $('#mob-series-manual')?.classList.toggle('hide', series.source !== 'none' && series.source !== 'manual');
+  host.innerHTML = series.seasons.map((entry) => seasonCardMarkup(series, entry)).join('') || '<div class="meta">No seasons listed.</div>';
+  mobUpdateSeriesSummary();
+}
+
+function mobUpdateSeriesSummary() {
+  const series = state.mobile.series;
+  const host = $('#mob-series-summary');
+  if (!host) return;
+  if (!series) { host.textContent = ''; return; }
+  const selected = mobSeriesSelectedEpisodes();
+  const loaded = selected.filter((group) => group.status === 'done').length;
+  const loading = selected.filter((group) => group.status === 'loading').length;
+  host.textContent = selected.length
+    ? `${selected.length} episode(s) selected · ${loaded} loaded${loading ? ` · ${loading} loading` : ''}`
+    : 'nothing selected';
+}
+
+function mobSetSeasonSelection(season, selected) {
+  const series = state.mobile.series;
+  if (!series) return;
+  for (const group of series.episodes.values()) {
+    if (group.season === Number(season)) group.selected = selected;
+  }
+  mobRenderSeriesPicker();
+  mobRenderSeriesCandidates();
+}
+
+function mobSetAllSeasons(selected) {
+  const series = state.mobile.series;
+  if (!series) return;
+  for (const group of series.episodes.values()) group.selected = selected;
+  mobRenderSeriesPicker();
+  mobRenderSeriesCandidates();
+}
+
+/**
+ * Resolve one S/E across the mobile result's (scoped) provider entries.
+ * Cached: a loaded episode is not re-resolved unless `force`. Renders
+ * progressively — each provider's answer appears as soon as it arrives.
+ */
+async function mobLoadSeriesEpisode(season, episode, { force = false } = {}) {
+  const group = state.mobile.group;
+  const series = state.mobile.series;
+  if (!group || !series) return;
+  const key = seriesKey(season, episode);
+  const ep = series.episodes.get(key);
+  if (!ep || !ep.selected) return;
+  if (ep.status === 'loading') return;
+  if (ep.status === 'done' && !force && ep.scopeKey === mobSeriesEpisodeKey()) {
+    mobRenderSeriesCandidates();
+    return;
+  }
+  ep.controller?.abort();
+  const controller = new AbortController();
+  ep.controller = controller;
+  ep.status = 'loading';
+  ep.error = null;
+  ep.candidates = [];
+  ep.scopeKey = mobSeriesEpisodeKey();
+  mobRenderSeriesCandidates();
+  mobUpdateSeriesSummary();
+  const status = $('#mob-series-status');
+  const entries = mobSeriesEntries();
+  const collected = [];
+  const errors = [];
+  let finished = 0;
+  const render = () => {
+    if (state.mobile.series !== series || ep.controller !== controller) return;
+    ep.candidates = expandCandidateQualities(collected);
+    mobRenderSeriesCandidates();
+    const playable = ep.candidates.filter((candidate) => candidate.ok !== false).length;
+    if (status) {
+      status.textContent = finished < entries.length
+        ? `${seriesLabel(season, episode)}: resolving ${finished}/${entries.length} provider(s) · ${playable} format(s) ready…`
+        : `${seriesLabel(season, episode)}: ${playable}/${ep.candidates.length} playable`;
+    }
+  };
+  await Promise.all(entries.map(async (entry) => {
+    if (controller.signal.aborted) return;
+    try {
+      const data = await api('/api/find/resolve', {
+        method: 'POST',
+        silent: true,
+        signal: controller.signal,
+        body: {
+          url: entry.url,
+          sourceId: entry.sourceId,
+          title: entry.title || group.title,
+          year: entry.year || group.year || null,
+          kind: entry.kind || group.kind || 'series',
+          season, episode,
+          probe: true,
+          useBrowser: entry.sourceId !== 'moviebox',
+        },
+      });
+      if (controller.signal.aborted) return;
+      for (const candidate of data.candidates || []) {
+        collected.push({
+          ...candidate,
+          season, episode,
+          sourceId: candidate.sourceId || entry.sourceId,
+          _entry: entry,
+        });
+      }
+      if (data.error) errors.push(data.error);
+    } catch (error) {
+      if (error?.name !== 'AbortError') errors.push(`${sourceName(entry.sourceId)}: ${error.message}`);
+    } finally {
+      finished += 1;
+      render();
+    }
+  }));
+  if (state.mobile.series !== series || ep.controller !== controller) return;
+  ep.status = errors.length && !collected.length ? 'error' : 'done';
+  ep.error = ep.status === 'error' ? errors[0] : (errors.length ? `${errors.length} provider(s) failed` : null);
+  ep.candidates = expandCandidateQualities(collected);
+  ep.controller = null;
+  mobRenderSeriesCandidates();
+  mobUpdateSeriesSummary();
+}
+
+/** Resolve every selected episode with a small concurrency (browser sniffs are slow). */
+async function mobLoadSelectedEpisodes({ announce = false, force = false } = {}) {
+  const series = state.mobile.series;
+  if (!series) return;
+  const queue = mobSeriesSelectedEpisodes().filter((group) =>
+    force || (group.status !== 'done' && group.status !== 'loading'));
+  if (!queue.length) {
+    if (announce) toast('Every selected episode is already loaded', 'info', 3000);
+    return;
+  }
+  if (queue.length > 25) {
+    toast(`Loading ${queue.length} episodes — each browser-source episode costs a full page sniff`, 'warn', 8000);
+  }
+  series.loadingAll = true;
+  mobUpdateSeriesSummary();
+  let index = 0;
+  const workers = Array.from({ length: Math.min(SERIES_LOAD_CONCURRENCY, queue.length) }, async () => {
+    while (index < queue.length && state.mobile.series === series && series.loadingAll) {
+      const next = queue[index++];
+      await mobLoadSeriesEpisode(next.season, next.episode, { force });
+    }
+  });
+  await Promise.all(workers);
+  if (state.mobile.series !== series) return;
+  series.loadingAll = false;
+  mobUpdateSeriesSummary();
+  if (announce) {
+    const loaded = mobSeriesLoadedEpisodes().length;
+    toast(loaded ? `${loaded} episode(s) loaded` : 'No episode formats resolved', loaded ? 'ok' : 'warn');
+  }
+}
+
+/** Mobile formats area for a series: quality matrix + per-episode groups. */
+function mobRenderSeriesCandidates() {
+  const series = state.mobile.series;
+  const group = state.mobile.group;
+  const host = $('#mob-series-formats');
+  if (!host) return;
+  if (!group || group.kind !== 'series' || !series) return;
+  const selected = mobSeriesSelectedEpisodes();
+  if (series.source === 'loading') {
+    host.innerHTML = '<div class="meta"><span class="spin"></span> loading seasons…</div>';
+    return;
+  }
+  if (!selected.length) {
+    host.innerHTML = '<div class="meta">Tick episodes above — each one resolves on demand when expanded.</div>';
+    return;
+  }
+  const rows = seriesMatrixRows(mobSeriesLoadedEpisodes());
+  const loadedCount = mobSeriesLoadedEpisodes().length;
+  host.innerHTML = `
+    ${rows.length ? seriesMatrixMarkup(rows, selected.length, loadedCount) : `<div class="meta">No episode loaded yet — expand one below or press “load selected”. ${selected.length} episode(s) selected.</div>`}
+    <div class="episode-groups">
+      ${selected.map((ep) => seriesEpisodeGroupMarkup(ep, mobSeriesEntries().length)).join('')}
+    </div>`;
+}
+
+/** Mobile counterpart of addCandidateToPlaylist: adds from the mobile group. */
+async function mobAddSeriesCandidate(candidate, season, episode, button = null) {
+  const group = state.mobile.group;
+  if (!candidate || !group) return null;
+  const entry = candidate._entry || {};
+  if (button) button.disabled = true;
+  try {
+    const se = Number(season ?? candidate.season) || null;
+    const ep = Number(episode ?? candidate.episode) || null;
+    const data = await api('/api/streams', {
+      method: 'POST',
+      body: {
+        title: se && ep ? `${group.title} ${seriesLabel(se, ep)}` : group.title,
+        year: entry.year || group.year || null,
+        kind: entry.kind || group.kind || 'series',
+        poster: group.poster || entry.poster || '',
+        description: entry.description || '',
+        sourceId: candidate.sourceId || entry.sourceId || '',
+        candidate: {
+          url: candidate.url,
+          quality: candidate.quality,
+          label: candidate.label,
+          sourceId: candidate.sourceId || entry.sourceId,
+          kind: candidate.kind,
+          headers: candidate.headers,
+          variants: candidate.variants,
+          probe: candidate.probe,
+        },
+        season: se,
+        episode: ep,
+      },
+    });
+    await VMPlaylist.refresh({ render: false });
+    refreshMobile();
+    toast(`Added “${data.stream.title}” to the playlist`, 'ok');
+    if (button) button.textContent = '✓ added';
+    return data.stream;
+  } catch (error) {
+    toast(error.message, 'err');
+    if (button) button.disabled = false;
+    return null;
+  }
+}
+
+/** Add the single best playable candidate of one mobile episode. */
+async function mobAddEpisodeBest(season, episode, button = null) {
+  const series = state.mobile.series;
+  const group = series?.episodes.get(seriesKey(season, episode));
+  if (!group?.candidates?.length) return;
+  const best = [...group.candidates]
+    .filter((c) => c.ok !== false)
+    .sort((a, b) => seriesQualityHeight(seriesQualityKey(b)) - seriesQualityHeight(seriesQualityKey(a)))[0]
+    || group.candidates[0];
+  if (button) button.disabled = true;
+  try {
+    await mobAddSeriesCandidate(best, season, episode, button);
+  } finally {
+    mobRenderSeriesCandidates();
+  }
+}
+
+/** Bulk add: one playlist item per episode for the given quality row. */
+async function mobAddQuality(quality, button = null) {
+  const series = state.mobile.series;
+  if (!series) return;
+  const rows = seriesMatrixRows(mobSeriesLoadedEpisodes());
+  const row = rows.find((candidate) => candidate.quality === quality);
+  if (!row) return;
+  if (button) button.disabled = true;
+  toast(`Adding ${row.episodes.length} episode(s) in ${quality}…`, 'info', 4000);
+  let added = 0;
+  let failed = 0;
+  try {
+    for (const { season, episode } of row.episodes) {
+      const group = series.episodes.get(seriesKey(season, episode));
+      const candidate = (group?.candidates || []).find((c) => seriesQualityKey(c) === quality && c.ok !== false)
+        || (group?.candidates || []).find((c) => seriesQualityKey(c) === quality);
+      if (!candidate) { failed += 1; continue; }
+      const stream = await mobAddSeriesCandidate(candidate, season, episode);
+      if (stream) added += 1; else failed += 1;
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+  toast(added ? `Added ${added} episode(s) in ${quality}${failed ? ` (${failed} failed)` : ''}` : `Nothing added in ${quality}`, added ? 'ok' : 'warn');
+  mobRenderSeriesCandidates();
 }
 
 function refreshMobile() {

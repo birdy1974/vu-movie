@@ -150,6 +150,15 @@ pre{background:#080c13;border:1px solid var(--line);border-radius:10px;padding:1
 .series-picker-actions{margin-top:8px}
 .series-picker .episode-status{margin-top:6px}
 @media(max-width:600px){.series-manual{grid-template-columns:1fr 1fr}.series-manual .btn{grid-column:1/-1}}
+@media(max-width:600px){
+  /* The same season cards + matrix render on the Mobile tab: give the matrix
+     table its own horizontal scroll and make pills/card heads touch-friendly. */
+  .quality-matrix table{display:block;overflow-x:auto}
+  .quality-matrix th,.quality-matrix td{white-space:nowrap}
+  .season-card-head{flex-wrap:wrap}
+  .season-check{flex:1 1 100%}
+  .ep-pill{padding:5px 12px;font-size:12px}
+}
 
 /* ---- series Formats area: quality matrix + episode groups ---- */
 .quality-matrix{border:1px solid var(--line);border-radius:11px;overflow:hidden;margin-bottom:10px;background:var(--bg2)}
