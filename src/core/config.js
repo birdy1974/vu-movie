@@ -242,6 +242,11 @@ export const DEFAULTS = {
     customProviders: [],
     disabledProviders: [],
   },
+  metadata: {
+    tmdbApiKey: process.env.TMDB_API_KEY || '',
+    omdbApiKey: process.env.OMDB_API_KEY || '',
+    language: process.env.METADATA_LANGUAGE || 'en-US',
+  },
   enigma2: {
     host: process.env.ENIGMA2_HOST || '',
     port: Number(process.env.ENIGMA2_PORT || 80),

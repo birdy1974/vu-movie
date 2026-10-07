@@ -628,6 +628,14 @@ function renderResults() {
       if (event.target.closest('a,button')) return;
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
     });
+    card.querySelector('[data-open-meta]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSearchMetadata(group);
+    });
+    card.querySelector('[data-open-formats]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectGroup(group);
+    });
   });
 }
 
@@ -658,6 +666,7 @@ function resultGroupMarkup(group) {
     </div>
     <div class="result-actions">
       <span class="tag info">${group.entries.length} format(s)</span>
+      <button class="btn sm ghost" data-open-meta title="show TMDB/IMDb metadata">ⓘ meta</button>
       <button class="btn sm pri" data-open-formats>formats &amp; metadata</button>
     </div>
   </article>`;
@@ -747,6 +756,123 @@ function metadataRows(group) {
   const description = group.entries.map((entry) => entry.description).find(Boolean);
   return { rows, description };
 }
+
+async function fetchEnrichedSearch(group) {
+  try {
+    const params = new URLSearchParams({
+      title: group.title || '',
+      year: group.year ? String(group.year) : '',
+      type: group.kind || 'movie',
+    });
+    // Try to use imdb/tmdb id if present in entries
+    const meta = group.entries.find(e=>e.imdbId||e.tmdbId) || {};
+    if (meta.imdbId) params.set('imdbId', meta.imdbId);
+    if (meta.tmdbId) params.set('tmdbId', meta.tmdbId);
+    const data = await api(`/api/metadata/tmdb?${params}`, { silent: true });
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+function enrichedToRows(enriched) {
+  if (!enriched) return [];
+  const rows = [];
+  const tmdb = enriched.tmdb;
+  const omdb = enriched.omdb;
+  if (tmdb) {
+    if (tmdb.overview) rows.push(['Plot (TMDB)', tmdb.overview]);
+    if (tmdb.tagline) rows.push(['Tagline', tmdb.tagline]);
+    if (tmdb.genres?.length) rows.push(['Genres (TMDB)', tmdb.genres.join(', ')]);
+    if (tmdb.rating) rows.push(['TMDB rating', `★ ${tmdb.rating} (${tmdb.votes||0} votes)`]);
+    if (tmdb.runtime) rows.push(['Runtime (TMDB)', `${tmdb.runtime} min`]);
+    if (tmdb.director?.length) rows.push(['Director (TMDB)', tmdb.director.join(', ')]);
+    if (tmdb.cast?.length) rows.push(['Cast (TMDB)', tmdb.cast.slice(0,8).map(c=>c.name).join(', ')]);
+    if (tmdb.releaseDate) rows.push(['Released (TMDB)', tmdb.releaseDate]);
+    if (tmdb.status) rows.push(['Status (TMDB)', tmdb.status]);
+  }
+  if (omdb) {
+    if (omdb.imdbRating) rows.push(['IMDb rating', `★ ${omdb.imdbRating} (${omdb.imdbVotes||''})`]);
+    if (omdb.metascore && omdb.metascore !== 'N/A') rows.push(['Metascore', omdb.metascore]);
+    if (omdb.rated) rows.push(['Rated', omdb.rated]);
+    if (omdb.awards && omdb.awards !== 'N/A') rows.push(['Awards', omdb.awards]);
+    if (omdb.director?.length) rows.push(['Director (OMDB)', omdb.director.join(', ')]);
+    if (omdb.actors?.length) rows.push(['Actors (OMDB)', omdb.actors.join(', ')]);
+  }
+  if (tmdb?.tmdbUrl || omdb?.imdbUrl || enriched.imdbId) {
+    const links = [];
+    if (tmdb?.tmdbUrl) links.push(`TMDB: ${tmdb.tmdbUrl}`);
+    if (tmdb?.imdbUrl || omdb?.imdbUrl) links.push(`IMDb: ${tmdb?.imdbUrl||omdb?.imdbUrl}`);
+    if (enriched.imdbId) links.push(`IMDb ID: ${enriched.imdbId}`);
+    rows.push(['Links', links.join(' · ')]);
+  }
+  return rows;
+}
+
+function tmdbLinksMarkup(enriched) {
+  if (!enriched) return '';
+  const tmdb = enriched.tmdb;
+  const omdb = enriched.omdb;
+  const links = [];
+  if (tmdb?.tmdbUrl) links.push(`<a href="${escapeHtml(tmdb.tmdbUrl)}" target="_blank" rel="noreferrer">TMDB ↗</a>`);
+  if (tmdb?.imdbUrl || omdb?.imdbUrl) links.push(`<a href="${escapeHtml(tmdb?.imdbUrl||omdb?.imdbUrl)}" target="_blank" rel="noreferrer">IMDb ↗</a>`);
+  if (enriched.imdbId) links.push(`<a href="https://www.imdb.com/title/${escapeHtml(enriched.imdbId)}/" target="_blank" rel="noreferrer">IMDb (${escapeHtml(enriched.imdbId)}) ↗</a>`);
+  if (tmdb?.backdrop) links.push(`<a href="${escapeHtml(tmdb.backdrop)}" target="_blank" rel="noreferrer">backdrop ↗</a>`);
+  return links.length ? `<div class="row" style="margin-top:8px">${links.join(' · ')}</div>` : '';
+}
+
+async function openSearchMetadata(group) {
+  const title = group.title || 'Metadata';
+  openModal({
+    title: `${title}${group.year ? ` (${group.year})` : ''} — metadata`,
+    className: 'wide',
+    body: `<div class="meta"><span class="spin"></span> loading TMDB/IMDb…</div>`,
+  });
+  try {
+    const enriched = await fetchEnrichedSearch(group);
+    if (!enriched || (!enriched.tmdb && !enriched.omdb)) {
+      const errMsg = (enriched?.errors||[]).map(e=>`${e.source}: ${e.error}`).join('; ') || 'No TMDB/OMDB results — configure API keys in Settings → Metadata.';
+      openModal({
+        title: `${title} — metadata`,
+        className: 'wide',
+        body: `<div class="meta">${escapeHtml(errMsg)}</div>
+          <div class="meta-table">${metadataRows(group).rows.map(([k,v])=>`<div class="kv"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('')}</div>
+          ${group.entries[0]?.description ? `<p>${escapeHtml(group.entries[0].description)}</p>` : ''}`,
+      });
+      return;
+    }
+    const baseRows = metadataRows(group).rows;
+    const extraRows = enrichedToRows(enriched);
+    const allRows = [...baseRows, ...extraRows];
+    const desc = enriched.tmdb?.overview || enriched.omdb?.plot || group.entries.map(e=>e.description).find(Boolean) || '';
+    const poster = enriched.tmdb?.poster || group.poster || '';
+    openModal({
+      title: `${enriched.tmdb?.title || group.title}${enriched.tmdb?.year || group.year ? ` (${enriched.tmdb?.year||group.year})` : ''}`,
+      className: 'wide',
+      body: `
+        <div class="meta-flex">
+          ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:120px;max-height:180px;object-fit:cover;border-radius:8px" onerror="this.remove()">` : ''}
+          <div style="flex:1;min-width:240px">
+            ${desc ? `<p>${escapeHtml(desc)}</p>` : '<p class="mut">No description.</p>'}
+            ${tmdbLinksMarkup(enriched)}
+            <div class="row" style="margin-top:8px">
+              <span class="tag ok">${escapeHtml((enriched.sources||[]).join(', ')||'metadata')}</span>
+              ${enriched.tmdb?.rating ? `<span class="tag info">★ ${enriched.tmdb.rating}</span>` : ''}
+              ${enriched.omdb?.imdbRating ? `<span class="tag info">IMDb ${enriched.omdb.imdbRating}</span>` : ''}
+            </div>
+          </div>
+        </div>
+        <h3 style="margin-top:14px">Combined metadata</h3>
+        <div class="meta-table">${allRows.map(([k,v])=>`<div class="kv"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('')}</div>
+        ${enriched.tmdb?.cast?.length ? `<h3 style="margin-top:14px">Cast (TMDB)</h3><div class="meta-table">${enriched.tmdb.cast.slice(0,10).map(c=>`<div class="kv"><span>${escapeHtml(c.name)}</span><span>${escapeHtml(c.character||'')}</span></div>`).join('')}</div>` : ''}
+        <details style="margin-top:14px"><summary class="sub" style="cursor:pointer">Raw enriched JSON</summary><pre style="max-height:320px">${escapeHtml(JSON.stringify(enriched, null, 2))}</pre></details>
+      `,
+    });
+  } catch (error) {
+    openModal({ title: 'Metadata', body: `<div class="note err">${escapeHtml(error.message)}</div>` });
+  }
+}
+
 
 /**
  * HLS resolvers return one master candidate with its renditions in `variants`.
@@ -893,6 +1019,23 @@ async function selectGroup(group, { sourceId = '' } = {}) {
   if (table) {
     table.classList.remove('hide');
     table.innerHTML = rows.map(([key, value]) => `<div class="meta-row"><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`).join('');
+    // Async enrich with TMDB/IMDb — does not block format resolving
+    fetchEnrichedSearch(full).then((enriched) => {
+      if (!enriched || (!enriched.tmdb && !enriched.omdb)) return;
+      const extra = enrichedToRows(enriched);
+      if (!extra.length) return;
+      const current = table.innerHTML;
+      const extraHtml = extra.map(([k,v])=>`<div class="meta-row"><span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span></div>`).join('');
+      table.innerHTML = current + extraHtml;
+      if (enriched.tmdb?.overview && details) {
+        details.textContent = enriched.tmdb.overview;
+        details.classList.remove('hide');
+      }
+      // Add links row
+      const linksEl = document.createElement('div');
+      linksEl.innerHTML = tmdbLinksMarkup(enriched);
+      if (linksEl.firstChild) table.appendChild(linksEl.firstChild);
+    }).catch(()=>{});
   }
   renderSelectionProviders(full, sourceId);
   const selectionNote = $('#sel-note');
@@ -912,10 +1055,15 @@ function renderSelectionActions() {
   if (!host) return;
   host.innerHTML = `
     <button class="btn sm" id="btn-sel-formats">↻ resolve formats</button>
+    <button class="btn sm ghost" id="btn-sel-meta">ⓘ metadata (TMDB/IMDb)</button>
     <button class="btn sm ghost" id="btn-sel-subs">▭ matching subtitles</button>
     <button class="btn sm ghost" id="btn-sel-playlist">☰ open playlist</button>
     <span class="mut" id="sel-format-note"></span>`;
   $('#btn-sel-formats').addEventListener('click', () => loadFormats({ announce: true }));
+  $('#btn-sel-meta').addEventListener('click', () => {
+    const sel = state.selection;
+    if (sel) openSearchMetadata({ title: sel.title, year: sel.year, kind: sel.kind, entries: sel.entries, poster: sel.poster });
+  });
   $('#btn-sel-subs').addEventListener('click', () => openSelectionSubtitles());
   $('#btn-sel-playlist').addEventListener('click', () => go('list'));
 }
@@ -1652,14 +1800,23 @@ function renderStreamUrls() {
       ${item.enabled ? tag('in the outputs', 'ok') : tag('disabled — not in the outputs', 'warn')}
       <span class="mut">${item.session ? `${item.session.clients || 0} player(s) connected` : 'no relay session running'}</span>
     </div>
-    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => `
+    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => {
+      const url = urls[key] || '';
+      const canOpen = Boolean(url);
+      const isWatch = key === 'watch';
+      const isVlcLike = ['ts','mkv','forBox','hls','playlist','web'].includes(key);
+      const openLabel = isWatch ? 'open ↗' : 'VLC';
+      const openAttr = isWatch ? `data-open-url="${escapeHtml(url)}"` : `data-vlc-url="${escapeHtml(url)}"`;
+      return `
       <div class="field" style="margin:0">
         <label>${escapeHtml(label)}</label>
         <div class="row">
-          <input type="text" class="mono" readonly value="${escapeHtml(urls[key] || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
-          <button type="button" class="btn sm" data-copy-url="${escapeHtml(urls[key] || '')}"${urls[key] ? '' : ' disabled'}>copy</button>
+          <input type="text" class="mono" readonly value="${escapeHtml(url)}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
+          <button type="button" class="btn sm" data-copy-url="${escapeHtml(url)}"${canOpen ? '' : ' disabled'}>copy</button>
+          ${canOpen ? `<button type="button" class="btn sm ghost" ${openAttr} title="${isWatch ? 'open watch page' : 'open in VLC / player'}">${openLabel}</button>` : ''}
         </div>
-      </div>`).join('')}</div>
+      </div>`;
+    }).join('')}</div>
     ${urls.directNote ? `<div class="note mut" style="margin:8px 0 0">Direct upstream link ${escapeHtml(urls.directNote)}.</div>` : ''}`;
   $$('#st-urls input[readonly]').forEach((input) => input.addEventListener('click', () => input.select()));
   const note = $('#st-url-note');
@@ -1731,8 +1888,20 @@ function initStream() {
     URL.revokeObjectURL(link.href);
   });
   $('#st-outputs')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-copy]');
-    if (button) copyText(button.dataset.copy);
+    const copyBtn = event.target.closest('[data-copy]');
+    if (copyBtn) { copyText(copyBtn.dataset.copy); return; }
+    const vlcPl = event.target.closest('[data-vlc-pl]');
+    if (vlcPl?.dataset.vlcPl) {
+      const u = vlcPl.dataset.vlcPl;
+      try {
+        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        window.location.href = vlc;
+        setTimeout(() => toast(`VLC playlist: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
+      } catch {
+        window.open(u, '_blank');
+      }
+      return;
+    }
   });
   $('#st-items')?.addEventListener('click', (event) => {
     const copyButton = event.target.closest('[data-copy-item]');
@@ -1749,8 +1918,24 @@ function initStream() {
     copyText(lines.join('\n'));
   });
   $('#st-urls')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-copy-url]');
-    if (button?.dataset.copyUrl) copyText(button.dataset.copyUrl);
+    const copyBtn = event.target.closest('[data-copy-url]');
+    if (copyBtn?.dataset.copyUrl) { copyText(copyBtn.dataset.copyUrl); return; }
+    const openBtn = event.target.closest('[data-open-url]');
+    if (openBtn?.dataset.openUrl) { window.open(openBtn.dataset.openUrl, '_blank'); return; }
+    const vlcBtn = event.target.closest('[data-vlc-url]');
+    if (vlcBtn?.dataset.vlcUrl) {
+      const u = vlcBtn.dataset.vlcUrl;
+      // Try VLC protocol, fallback to opening URL
+      try {
+        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        window.location.href = vlc;
+        // Also copy to clipboard as hint
+        setTimeout(() => toast(`VLC URL: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
+      } catch {
+        window.open(u, '_blank');
+      }
+      return;
+    }
   });
   $('#btn-st-vlc')?.addEventListener('click', () => streamUrlAction('vlc'));
   $('#btn-st-session-start')?.addEventListener('click', () => streamUrlAction('start'));
@@ -1774,21 +1959,23 @@ async function refreshStream(announce = false) {
   $('#st-meta').innerHTML = `${escapeHtml(state.playlist.name || 'vu-movie')} · ${summary.enabled}/${summary.total} item(s) enabled · ${escapeHtml(state.playlist.items.filter((item) => item.hasTemplate).length)} with an FFmpeg template`;
   const xtream = urls.xtream || {};
   const entries = [
-    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true },
-    { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player', url: urls.m3u },
-    { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata', url: urls.m3uPlus },
-    { name: 'VLC playlist', hint: 'the same list, VLC preset', url: urls.vlc },
-    { name: 'Kodi playlist', hint: 'Kodi preset (.m3u)', url: urls.kodi },
-    { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json },
-    { name: 'Xtream Codes', hint: `player_api.php · user ${xtream.username || '—'}`, url: xtream.playerApi, kind: 'xtream', xtream },
-    { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet },
+    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true, vlc: false },
+    { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player (all enabled playlist items)', url: urls.m3u, kind: 'm3u', vlc: true },
+    { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata (all enabled)', url: urls.m3uPlus, kind: 'm3u', vlc: true },
+    { name: 'VLC playlist', hint: 'VLC preset — complete playlist (all streams defined in Playlist tab, enabled only)', url: urls.vlc, kind: 'm3u', vlc: true, isCompleteVlc: true },
+    { name: 'Kodi playlist', hint: 'Kodi preset (.m3u) — complete playlist', url: urls.kodi, kind: 'm3u', vlc: true },
+    { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json, kind: 'json', vlc: false },
+    { name: 'Xtream Codes', hint: `player_api.php · user ${xtream.username || '—'}`, url: xtream.playerApi, kind: 'xtream', xtream, vlc: false },
+    { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet, kind: 'bouquet', vlc: false },
   ];
   $('#st-outputs').innerHTML = entries.map((entry) => `
-    <div class="card">
+    <div class="card" ${entry.isCompleteVlc ? 'style="border-color:var(--acc);box-shadow:0 0 0 1px rgba(56,189,248,.25)"' : ''}>
       <div class="spread">
-        <div><h3 style="margin:0">${escapeHtml(entry.name)}</h3><div class="meta">${escapeHtml(entry.hint || '')}</div></div>
+        <div><h3 style="margin:0">${escapeHtml(entry.name)}${entry.isCompleteVlc ? ' <span class="tag info">complete playlist</span>' : ''}</h3><div class="meta">${escapeHtml(entry.hint || '')}</div></div>
         <div class="row" style="gap:6px">
           ${entry.kind === 'link' ? `<a class="btn sm" href="${escapeHtml(entry.url || '')}" target="_blank" rel="noreferrer">open ↗</a>` : ''}
+          ${entry.vlc ? `<button class="btn sm" data-vlc-pl="${escapeHtml(entry.url || '')}" title="open in VLC">▶ VLC</button>` : ''}
+          ${entry.kind === 'm3u' ? `<a class="btn sm ghost" href="${escapeHtml(entry.url || '')}" target="_blank" rel="noreferrer">open ↗</a>` : ''}
           <button class="btn sm ghost" data-copy="${escapeHtml(entry.url || '')}">copy</button>
         </div>
       </div>
@@ -2058,6 +2245,12 @@ const SETTINGS_SECTIONS = [
     ],
   },
   {
+    key: 'metadata', title: 'Metadata',
+    fields: [
+      ['tmdbApiKey', 'password'], ['omdbApiKey', 'password'], ['language', 'text'],
+    ],
+  },
+  {
     key: 'enigma2', title: 'Enigma2',
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
@@ -2091,6 +2284,7 @@ const SETTINGS_SECTIONS = [
 const SETTINGS_NOTES = {
   transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
+  metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
   storage: 'Folders inside the container, and how much disk the cache may use.',
@@ -2119,6 +2313,10 @@ const SETTINGS_LABELS = {
   'subtitles.pushToReceiver': ['Push to receiver', 'Upload the chosen subtitle to the Enigma2 box as well.'],
   'subtitles.receiverDir': ['Receiver directory', 'Folder on the box that receives the .srt files.'],
   'subtitles.disabledProviders': ['Disabled providers', 'Provider ids to skip, comma separated (see the Subtitles tab).'],
+
+  'metadata.tmdbApiKey': ['TMDB API key', 'From https://www.themoviedb.org/settings/api — v3 key, free. Enables rich metadata in search and playlist.'],
+  'metadata.omdbApiKey': ['OMDB API key', 'From https://www.omdbapi.com/apikey.aspx — optional, adds IMDb ratings.'],
+  'metadata.language': ['Metadata language', 'e.g. en-US, nl-NL, de-DE for TMDB results.'],
 
   'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
   'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
@@ -2278,9 +2476,60 @@ function wireSettings() {
 
 async function initMobile() {
   await VMPlaylist.load().catch(() => {});
+  // Mobile source selection — mirrors desktop but lives in state.mobile.selectedSources
+  if (!Array.isArray(state.mobile.selectedSources)) state.mobile.selectedSources = [];
+  try {
+    const { sources } = await api('/api/sources', { silent: true });
+    if (sources?.length) {
+      state.sources = sources;
+      if (!state.mobile.selectedSources.length) {
+        state.mobile.selectedSources = sources.filter((s) => s.enabled).map((s) => s.id);
+      }
+      renderMobSourceChips();
+    }
+  } catch {}
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
+  $('#mob-sources')?.addEventListener('change', () => {
+    const v = $('#mob-sources')?.value;
+    if (v === 'all') {
+      state.mobile.selectedSources = state.sources.map((s) => s.id);
+    } else if (v === 'enabled') {
+      state.mobile.selectedSources = state.sources.filter((s) => s.enabled).map((s) => s.id);
+    }
+    // custom keeps current selection
+    renderMobSourceChips();
+  });
+  $('#mob-source-chips')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('.chip');
+    if (!chip || !chip.dataset.id) return;
+    const id = chip.dataset.id;
+    const cur = state.mobile.selectedSources || [];
+    state.mobile.selectedSources = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+    // If user manually toggles, mark select as custom
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'custom';
+    renderMobSourceChips();
+  });
+  $('#btn-mob-sources-all')?.addEventListener('click', () => {
+    state.mobile.selectedSources = state.sources.map((s) => s.id);
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'all';
+    renderMobSourceChips();
+  });
+  $('#btn-mob-sources-enabled')?.addEventListener('click', () => {
+    state.mobile.selectedSources = state.sources.filter((s) => s.enabled).map((s) => s.id);
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'enabled';
+    renderMobSourceChips();
+  });
   $('#mob-results')?.addEventListener('click', (event) => {
+    const metaBtn = event.target.closest('[data-mob-meta]');
+    if (metaBtn) {
+      const group = state.mobile.results.find((c) => c.key === metaBtn.dataset.mobMeta);
+      if (group) openSearchMetadata(group);
+      return;
+    }
     // A provider chip: only that provider's formats. The row itself: all of them.
     const provider = event.target.closest('[data-mprovider]');
     if (provider) {
@@ -2309,6 +2558,19 @@ async function initMobile() {
     const select = event.target.closest('[data-mtpl]');
     if (!select) return;
     VMPlaylist.assignTemplate(select.dataset.mtpl, select.value).then(() => refreshMobile());
+  });
+  $('#mob-list')?.addEventListener('click', (event) => {
+    const play = event.target.closest('[data-mob-play]');
+    if (play) {
+      const url = play.dataset.mobPlay;
+      if (url) window.open(url, '_blank');
+      return;
+    }
+    const rem = event.target.closest('[data-mob-remove]');
+    if (rem) {
+      VMPlaylist.removeItem(rem.dataset.mobRemove).then(() => refreshMobile());
+      return;
+    }
   });
   $('#btn-mob-sub-search')?.addEventListener('click', mobileSubtitleSearch);
   $('#mob-subs')?.addEventListener('click', (event) => {
@@ -2342,6 +2604,28 @@ async function initMobile() {
   $('#btn-mob-copy-url')?.addEventListener('click', () => copyText(state.playlist.urls?.page || ''));
 }
 
+function renderMobSourceChips() {
+  const host = $('#mob-source-chips');
+  const count = $('#mob-sources-count');
+  if (!host) return;
+  const sources = state.sources || [];
+  const selected = state.mobile.selectedSources || [];
+  if (!sources.length) {
+    host.innerHTML = '<span class="meta">no sources</span>';
+    if (count) count.textContent = '';
+    return;
+  }
+  host.innerHTML = sources.map((s) => `<span class="chip ${selected.includes(s.id) ? 'on' : ''}" data-id="${escapeHtml(s.id)}" role="button" tabindex="0" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>`).join('');
+  if (count) count.textContent = `${selected.length}/${sources.length} selected`;
+  // Sync the quick select
+  const sel = $('#mob-sources');
+  if (sel) {
+    if (selected.length === sources.length) sel.value = 'all';
+    else if (selected.length === sources.filter((x) => x.enabled).length && selected.every((id) => sources.find((x) => x.id === id)?.enabled)) sel.value = 'enabled';
+    else sel.value = 'custom';
+  }
+}
+
 function mobileHint(text) {
   const hint = $('#mob-search-hint');
   if (hint) hint.textContent = text;
@@ -2370,18 +2654,33 @@ async function mobileSearch() {
   beginMobileSearch(q);
   const params = new URLSearchParams({ q, moviebox: 'true' });
   if ($('#mob-type')?.value) params.set('type', $('#mob-type').value);
-  if ($('#mob-sources')?.value === 'enabled') params.set('sources', state.sources.filter((source) => source.enabled).map((source) => source.id).join(','));
+  const selSources = state.mobile.selectedSources || [];
+  if (selSources.length && selSources.length !== (state.sources||[]).length) {
+    params.set('sources', selSources.join(','));
+  } else if (!selSources.length) {
+    // No sources selected -> fallback to enabled
+    const enabled = (state.sources||[]).filter((s) => s.enabled).map((s) => s.id);
+    if (enabled.length) params.set('sources', enabled.join(','));
+  }
   try {
     const data = await api(`/api/find/search?${params}`, { silent: true });
     state.mobile.results = buildGroups(data.results || []).slice(0, 12);
     const host = $('#mob-results');
     host.innerHTML = state.mobile.results.length ? state.mobile.results.map((group) => {
       const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
+      const poster = group.poster || group.entries.find((e) => e.poster)?.poster || '';
       return `<div class="mob-result-wrap" data-mgroup="${escapeHtml(group.key)}">
-        <button class="mob-result">
-          <span class="mob-title">${escapeHtml(titleText(group))}</span>
-          <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
-        </button>
+        <div class="row" style="gap:6px;align-items:flex-start">
+          <button class="mob-result" style="flex-direction:row;align-items:flex-start;gap:10px;flex:1">
+            ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:54px;height:81px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:54px;height:81px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
+            <span style="display:flex;flex-direction:column;gap:2px;min-width:0;text-align:left">
+              <span class="mob-title">${escapeHtml(titleText(group))}</span>
+              <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
+              <span class="meta" style="white-space:normal">${providers.map((id) => escapeHtml(sourceName(id))).join(', ')}</span>
+            </span>
+          </button>
+          <button class="btn sm ghost" data-mob-meta="${escapeHtml(group.key)}" title="TMDB/IMDb metadata" style="flex-shrink:0">ⓘ</button>
+        </div>
         ${providers.length > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(group, { attr: 'data-mprovider' })}</div>` : ''}
       </div>`;
     }).join('') : '<div class="meta">nothing found</div>';
@@ -2414,9 +2713,10 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
   }
   state.mobile.candidates = expandCandidateQualities(collected);
   const providerCount = new Set(full.entries.map((entry) => entry.sourceId)).size;
-  host.innerHTML = `
+  const baseHtml = `
     <div class="mob-head"><b>${escapeHtml(titleText(full))}</b>
       <span class="meta">${escapeHtml(full.kind)} · ${sourceId ? `formats from ${escapeHtml(sourceName(sourceId))} only` : `formats from all ${providerCount} provider(s)`} · pick a quality to add it to the playlist</span></div>
+    <div id="mob-enriched" class="meta" style="margin:6px 0">loading TMDB/IMDb…</div>
     ${providerCount > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(full, { activeSource: sourceId, attr: 'data-mscope-provider', all: true })}</div>` : ''}
     ${state.mobile.candidates.filter((candidate) => candidate.ok !== false).map((candidate) => {
       const index = state.mobile.candidates.indexOf(candidate);
@@ -2425,6 +2725,29 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
         <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video ? ` · ${escapeHtml(` ${candidate.probe.video.width}×${candidate.probe.video.height}`)}` : ''}</span>
       </button>`;
     }).join('') || '<div class="meta">no playable formats</div>'}`;
+  host.innerHTML = baseHtml;
+  // Enrich async
+  fetchEnrichedSearch(full).then((enriched)=>{
+    const eh = host.querySelector('#mob-enriched');
+    if (!eh) return;
+    if (!enriched || (!enriched.tmdb && !enriched.omdb)) {
+      eh.textContent = 'No TMDB/IMDb — add API key in Settings → Metadata';
+      return;
+    }
+    const tmdb = enriched.tmdb;
+    const omdb = enriched.omdb;
+    const parts = [];
+    if (tmdb?.overview) parts.push(`<div style="margin:4px 0">${escapeHtml(tmdb.overview.slice(0,280))}${tmdb.overview.length>280?'…':''}</div>`);
+    if (tmdb?.genres?.length) parts.push(`<div class="meta">Genres: ${escapeHtml(tmdb.genres.join(', '))}</div>`);
+    if (tmdb?.rating) parts.push(`<div class="meta">TMDB ★ ${tmdb.rating} (${tmdb.votes||0})</div>`);
+    if (omdb?.imdbRating) parts.push(`<div class="meta">IMDb ★ ${omdb.imdbRating}</div>`);
+    if (tmdb?.director?.length) parts.push(`<div class="meta">Director: ${escapeHtml(tmdb.director.join(', '))}</div>`);
+    const links = [];
+    if (tmdb?.tmdbUrl) links.push(`<a href="${escapeHtml(tmdb.tmdbUrl)}" target="_blank" rel="noreferrer">TMDB ↗</a>`);
+    if (tmdb?.imdbUrl||omdb?.imdbUrl) links.push(`<a href="${escapeHtml(tmdb?.imdbUrl||omdb?.imdbUrl)}" target="_blank" rel="noreferrer">IMDb ↗</a>`);
+    if (links.length) parts.push(`<div class="row" style="gap:6px;margin-top:4px">${links.join(' · ')}</div>`);
+    eh.innerHTML = parts.join('') || 'No extra metadata';
+  }).catch(()=>{ const eh=host.querySelector('#mob-enriched'); if(eh) eh.textContent='TMDB/IMDb failed'; });
 }
 
 async function mobileAdd(index) {
@@ -2462,17 +2785,27 @@ function refreshMobile() {
   if (!items.length) {
     host.innerHTML = '<div class="meta">the playlist is empty — search above and pick a format</div>';
   } else {
-    host.innerHTML = items.map((item) => `
-      <div class="mob-item">
+    host.innerHTML = items.map((item) => {
+      const poster = item.poster || '';
+      const watchUrl = item.urls?.watch || '';
+      const tsUrl = item.urls?.ts || '';
+      return `
+      <div class="mob-item" style="gap:10px">
+        ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:48px;height:72px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:48px;height:72px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
         <div class="mob-item-main">
           <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
-          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''}</div>
+          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'}</div>
+          <div class="row" style="margin-top:6px;gap:6px">
+            <button class="btn sm pri" data-mob-play="${escapeHtml(watchUrl || tsUrl)}" title="stream on your mobile">▶ stream</button>
+            <button class="btn sm ghost" data-mob-remove="${escapeHtml(item.streamId)}" title="remove from playlist">⊖</button>
+          </div>
         </div>
         <select class="mob-tpl" data-mtpl="${escapeHtml(item.streamId)}" aria-label="FFmpeg template for ${escapeHtml(item.title)}" title="FFmpeg template">
           <option value="">guided builder</option>
           ${VMPlaylist.templates().map((tpl) => `<option value="${escapeHtml(tpl.id)}"${(item.templateId || item.profileTemplateId) === tpl.id ? ' selected' : ''}>${escapeHtml(tpl.name)}</option>`).join('')}
         </select>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
   const select = $('#mob-sub-item');
   if (select) {
@@ -2589,10 +2922,23 @@ function wireFolds() {
     const fallback = button.getAttribute('aria-expanded') === 'false';
     const saved = stored[button.dataset.fold];
     setFold(button, typeof saved === 'boolean' ? saved : fallback, false);
-    button.addEventListener('click', () => {
+    const toggle = () => {
       const body = $(`[data-fold-body="${button.dataset.fold}"]`);
       if (body) setFold(button, !body.classList.contains('hide'));
+    };
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggle();
     });
+    const head = button.closest('.cardhead');
+    if (head) {
+      head.style.cursor = 'pointer';
+      head.addEventListener('click', (e) => {
+        if (e.target.closest('.tip')) return;
+        if (e.target.closest('.foldbtn')) return;
+        toggle();
+      });
+    }
   });
   $('#btn-mob-fold')?.addEventListener('click', () => {
     const buttons = mobileFoldButtons();

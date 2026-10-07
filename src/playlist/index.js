@@ -193,17 +193,16 @@ export async function sync({ persist = true } = {}) {
     seen.add(item.streamId);
     items.push(item);
   }
-  // listStreams() is newest-first; append oldest-first so the playlist starts in
-  // the order the streams were created.
-  const added = streams.filter((s) => !seen.has(String(s.id))).reverse().map((s) => normaliseItem({ streamId: s.id }));
-  items.push(...added);
-  const changed = dropped.length || added.length || items.length !== current.length;
+  // listStreams() is newest-first; new movies go on top, not bottom.
+  const added = streams.filter((s) => !seen.has(String(s.id))).map((s) => normaliseItem({ streamId: s.id }));
+  const nextItems = [...added, ...items];
+  const changed = dropped.length || added.length || nextItems.length !== current.length;
   if (changed) {
     if (dropped.length) log.info('playlist', `${dropped.length} item(s) removed — the stream no longer exists`, { streamIds: dropped.slice(0, 10) });
-    if (added.length) log.info('playlist', `${added.length} new stream(s) appended to the playlist`);
-    if (persist) return saveItems(items);
+    if (added.length) log.info('playlist', `${added.length} new stream(s) added on top of the playlist`);
+    if (persist) return saveItems(nextItems);
   }
-  return items;
+  return changed ? nextItems : items;
 }
 
 /** Resolve every item against the stream store, in playlist order. */
@@ -230,22 +229,23 @@ export async function enabledStreams() {
   return list.filter((entry) => entry.enabled).map((entry) => entry.stream);
 }
 
-/** Add streams (idempotent; existing items keep their flags and position). */
+/** Add streams (idempotent; existing items keep their flags and position, new ones on top). */
 export async function addItems(streamIds = [], { enabled = true } = {}) {
   const wanted = (Array.isArray(streamIds) ? streamIds : [streamIds]).map((id) => text(id).trim()).filter(Boolean);
   const items = await sync();
   const known = new Set(items.map((item) => item.streamId));
-  let added = 0;
+  const newOnes = [];
   for (const streamId of wanted) {
     const stream = await store.getStream(streamId);
     if (!stream) throw Object.assign(new Error(`stream "${streamId}" not found`), { status: 404 });
     if (known.has(streamId)) continue;
-    items.push(normaliseItem({ streamId, enabled }));
+    newOnes.push(normaliseItem({ streamId, enabled }));
     known.add(streamId);
-    added += 1;
   }
-  if (added) saveItems(items);
-  return { items, added };
+  const added = newOnes.length;
+  const nextItems = [...newOnes, ...items];
+  if (added) saveItems(nextItems);
+  return { items: added ? nextItems : items, added };
 }
 
 /** Remove one item (the stream itself stays in the library). */
@@ -519,7 +519,7 @@ export async function bouquet(baseUrl, { serviceType = null } = {}) {
     title: stream.title,
     year: stream.year,
     url: store.urlsFor(stream, baseUrl).forBox,
-    description: `${stream.title}${stream.year ? ` (${stream.year})` : ''} — ${stream.upstream?.quality || 'source'}`,
+    description: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
     subtitle: stream.profile?.subtitlePath ? (stream.profile.subtitleLanguage || '').slice(0, 3) : null,
     season: stream.upstream?.season || null,
     series: stream.title,
