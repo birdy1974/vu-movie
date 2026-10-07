@@ -2524,6 +2524,12 @@ async function initMobile() {
     renderMobSourceChips();
   });
   $('#mob-results')?.addEventListener('click', (event) => {
+    const metaBtn = event.target.closest('[data-mob-meta]');
+    if (metaBtn) {
+      const group = state.mobile.results.find((c) => c.key === metaBtn.dataset.mobMeta);
+      if (group) openSearchMetadata(group);
+      return;
+    }
     // A provider chip: only that provider's formats. The row itself: all of them.
     const provider = event.target.closest('[data-mprovider]');
     if (provider) {
@@ -2664,14 +2670,17 @@ async function mobileSearch() {
       const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
       const poster = group.poster || group.entries.find((e) => e.poster)?.poster || '';
       return `<div class="mob-result-wrap" data-mgroup="${escapeHtml(group.key)}">
-        <button class="mob-result" style="flex-direction:row;align-items:flex-start;gap:10px">
-          ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:54px;height:81px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:54px;height:81px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
-          <span style="display:flex;flex-direction:column;gap:2px;min-width:0;text-align:left">
-            <span class="mob-title">${escapeHtml(titleText(group))}</span>
-            <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
-            <span class="meta" style="white-space:normal">${providers.map((id) => escapeHtml(sourceName(id))).join(', ')}</span>
-          </span>
-        </button>
+        <div class="row" style="gap:6px;align-items:flex-start">
+          <button class="mob-result" style="flex-direction:row;align-items:flex-start;gap:10px;flex:1">
+            ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:54px;height:81px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:54px;height:81px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
+            <span style="display:flex;flex-direction:column;gap:2px;min-width:0;text-align:left">
+              <span class="mob-title">${escapeHtml(titleText(group))}</span>
+              <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
+              <span class="meta" style="white-space:normal">${providers.map((id) => escapeHtml(sourceName(id))).join(', ')}</span>
+            </span>
+          </button>
+          <button class="btn sm ghost" data-mob-meta="${escapeHtml(group.key)}" title="TMDB/IMDb metadata" style="flex-shrink:0">ⓘ</button>
+        </div>
         ${providers.length > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(group, { attr: 'data-mprovider' })}</div>` : ''}
       </div>`;
     }).join('') : '<div class="meta">nothing found</div>';
@@ -2704,9 +2713,10 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
   }
   state.mobile.candidates = expandCandidateQualities(collected);
   const providerCount = new Set(full.entries.map((entry) => entry.sourceId)).size;
-  host.innerHTML = `
+  const baseHtml = `
     <div class="mob-head"><b>${escapeHtml(titleText(full))}</b>
       <span class="meta">${escapeHtml(full.kind)} · ${sourceId ? `formats from ${escapeHtml(sourceName(sourceId))} only` : `formats from all ${providerCount} provider(s)`} · pick a quality to add it to the playlist</span></div>
+    <div id="mob-enriched" class="meta" style="margin:6px 0">loading TMDB/IMDb…</div>
     ${providerCount > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(full, { activeSource: sourceId, attr: 'data-mscope-provider', all: true })}</div>` : ''}
     ${state.mobile.candidates.filter((candidate) => candidate.ok !== false).map((candidate) => {
       const index = state.mobile.candidates.indexOf(candidate);
@@ -2715,6 +2725,29 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
         <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video ? ` · ${escapeHtml(` ${candidate.probe.video.width}×${candidate.probe.video.height}`)}` : ''}</span>
       </button>`;
     }).join('') || '<div class="meta">no playable formats</div>'}`;
+  host.innerHTML = baseHtml;
+  // Enrich async
+  fetchEnrichedSearch(full).then((enriched)=>{
+    const eh = host.querySelector('#mob-enriched');
+    if (!eh) return;
+    if (!enriched || (!enriched.tmdb && !enriched.omdb)) {
+      eh.textContent = 'No TMDB/IMDb — add API key in Settings → Metadata';
+      return;
+    }
+    const tmdb = enriched.tmdb;
+    const omdb = enriched.omdb;
+    const parts = [];
+    if (tmdb?.overview) parts.push(`<div style="margin:4px 0">${escapeHtml(tmdb.overview.slice(0,280))}${tmdb.overview.length>280?'…':''}</div>`);
+    if (tmdb?.genres?.length) parts.push(`<div class="meta">Genres: ${escapeHtml(tmdb.genres.join(', '))}</div>`);
+    if (tmdb?.rating) parts.push(`<div class="meta">TMDB ★ ${tmdb.rating} (${tmdb.votes||0})</div>`);
+    if (omdb?.imdbRating) parts.push(`<div class="meta">IMDb ★ ${omdb.imdbRating}</div>`);
+    if (tmdb?.director?.length) parts.push(`<div class="meta">Director: ${escapeHtml(tmdb.director.join(', '))}</div>`);
+    const links = [];
+    if (tmdb?.tmdbUrl) links.push(`<a href="${escapeHtml(tmdb.tmdbUrl)}" target="_blank" rel="noreferrer">TMDB ↗</a>`);
+    if (tmdb?.imdbUrl||omdb?.imdbUrl) links.push(`<a href="${escapeHtml(tmdb?.imdbUrl||omdb?.imdbUrl)}" target="_blank" rel="noreferrer">IMDb ↗</a>`);
+    if (links.length) parts.push(`<div class="row" style="gap:6px;margin-top:4px">${links.join(' · ')}</div>`);
+    eh.innerHTML = parts.join('') || 'No extra metadata';
+  }).catch(()=>{ const eh=host.querySelector('#mob-enriched'); if(eh) eh.textContent='TMDB/IMDb failed'; });
 }
 
 async function mobileAdd(index) {
