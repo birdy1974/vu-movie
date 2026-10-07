@@ -519,7 +519,7 @@ export async function bouquet(baseUrl, { serviceType = null } = {}) {
     title: stream.title,
     year: stream.year,
     url: store.urlsFor(stream, baseUrl).forBox,
-    description: `${stream.title}${stream.year ? ` (${stream.year})` : ''} — ${stream.upstream?.quality || 'source'}`,
+    description: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
     subtitle: stream.profile?.subtitlePath ? (stream.profile.subtitleLanguage || '').slice(0, 3) : null,
     season: stream.upstream?.season || null,
     series: stream.title,
