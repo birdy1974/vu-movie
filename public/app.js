@@ -10,9 +10,8 @@
  *   app.js           Mobile, Dashboard, Search, Subtitles, Stream, Logs,
  *                    Settings, navigation, health polling and bootstrap
  *
- * The backend is untouched (see the task: "keep the core code as it is"): every
- * request below goes to an endpoint that already exists in src/http/api.js,
- * src/playlist/api.js or src/playlist/ffmpeg-run.js.
+ * Source recipes and their home/mirror links arrive through the existing
+ * /api/sources endpoint; GUI state and rendering stay in this plain script.
  */
 'use strict';
 
@@ -230,7 +229,7 @@ async function loadHealth() {
     renderSessions(h.streamSessions || []);
     const healthById = Object.fromEntries((h.sources || []).map((source) => [source.id, source.health]));
     state.sources.forEach((source) => { source.health = healthById[source.id] || source.health; });
-    if (!$('#dash-sources')?.dataset.loaded) renderSourceHealth();
+    if (currentPage === 'dash' && state.sources.length) renderSourceHealth();
   } catch (error) {
     const cards = $('#dash-cards');
     if (cards) cards.innerHTML = `<div class="card"><h3>Backend unreachable</h3><div class="meta">${escapeHtml(error.message)}</div></div>`;
@@ -251,14 +250,80 @@ function renderSessions(sessions) {
   if ($('#st-monitor') && !$('#p-stream')?.classList.contains('hide')) renderStreamMonitor();
 }
 
+function sourceHomeEntries(source) {
+  const mirrors = Array.isArray(source?.mirrors) ? source.mirrors : [];
+  const candidates = [{ name: source?.name || '', url: source?.home || '' }, ...mirrors.map((mirror) => (
+    typeof mirror === 'string' ? { name: '', url: mirror } : mirror || {}
+  ))];
+  const seen = new Set();
+  return candidates.flatMap((candidate) => {
+    try {
+      const url = new URL(String(candidate.url || candidate.home || ''));
+      if (!['http:', 'https:'].includes(url.protocol)) return [];
+      const href = url.href;
+      const key = href.replace(/\/$/, '').toLowerCase();
+      if (!url.hostname || seen.has(key)) return [];
+      seen.add(key);
+      return [{ href, label: url.hostname.replace(/^www\./i, ''), name: candidate.name || url.hostname }];
+    } catch { return []; }
+  });
+}
+
+function sourceSearchEntry(source, query) {
+  const fallback = sourceHomeEntries(source)[0]?.href || '';
+  const value = String(query || '').trim();
+  const search = source?.search || {};
+  // API endpoints and the recipes that were observed to ignore or fail query
+  // routes open their public home page instead of exposing JSON or a dead page.
+  const canSearch = search.openMode !== 'home'
+    && (search.kind !== 'api' || Boolean(search.openUrl))
+    && Boolean(value);
+  const template = search.openUrl || (search.kind === 'api' ? '' : search.url || '');
+  if (canSearch && /\{(?:query|q)\}/i.test(template)) {
+    const href = String(template).replace(/\{(?:query|q)\}/gi, encodeURIComponent(value));
+    try {
+      const url = new URL(href, fallback || source?.home || undefined);
+      if (['http:', 'https:'].includes(url.protocol) && url.hostname) {
+        return { href: url.href, mode: 'query', title: `Search ${source.name} for “${value}”` };
+      }
+    } catch { /* fall back to the known-safe source homepage */ }
+  }
+  return fallback ? { href: fallback, mode: 'home', title: `Open ${source?.name || 'source'} homepage` } : null;
+}
+
+function sourceSearchOpenLink(source, query) {
+  const entry = sourceSearchEntry(source, query);
+  if (!entry) return '';
+  return `<a class="source-search-open ${entry.mode === 'home' ? 'home' : ''}" data-open-mode="${entry.mode}"
+    href="${escapeHtml(entry.href)}" target="_blank" rel="noopener noreferrer"
+    aria-label="${escapeHtml(entry.title)}" title="${escapeHtml(entry.title)}">↗</a>`;
+}
+
+function sourceLinkButtons(source, className = 'source-open-link') {
+  return sourceHomeEntries(source).map((entry) => `<a class="btn sm ghost ${className}" href="${escapeHtml(entry.href)}" target="_blank" rel="noopener noreferrer"
+    aria-label="Open ${escapeHtml(source.name)} at ${escapeHtml(entry.label)}" title="${escapeHtml(entry.href)}">${escapeHtml(entry.label)} ↗</a>`).join('');
+}
+
+function sourceDirectoryMarkup(source) {
+  const entries = sourceHomeEntries(source);
+  return `<div class="source-directory-group" data-source-group="${escapeHtml(source.id)}">
+    <div class="source-directory-heading"${source.notes ? ` title="${escapeHtml(source.notes)}"` : ''}>
+      <span>${escapeHtml(source.name)}</span>${entries.length > 1 ? `<span class="source-directory-count">${entries.length} domains</span>` : ''}
+    </div>
+    <div class="source-directory-links">${sourceLinkButtons(source, 'source-directory-link') || '<span class="meta">no homepage URL</span>'}</div>
+  </div>`;
+}
+
 function renderSourceHealth() {
   const host = $('#dash-sources');
   if (host) {
     host.innerHTML = state.sources.map((source) => `
       <div class="srcrow">
-        <div><b>${escapeHtml(source.name)}</b> <span class="mut" style="font-size:11px">${escapeHtml(source.kind || '')}</span></div>
-        <div>${source.health?.ok === true ? tag(source.health.message || 'ok', 'ok') : source.health?.checks ? tag(source.health.message || 'failing', 'err') : tag('unused')}
-          ${source.home ? `<a href="${escapeHtml(source.home)}" target="_blank" rel="noreferrer">open ↗</a>` : ''}</div>
+        <div class="srcrow-info"><b>${escapeHtml(source.name)}</b> <span class="mut" style="font-size:11px">${escapeHtml(source.kind || '')}</span></div>
+        <div class="srcrow-actions">
+          <span>${source.health?.ok === true ? tag(source.health.message || 'ok', 'ok') : source.health?.checks ? tag(source.health.message || 'failing', 'err') : tag('unused')}</span>
+          <div class="source-health-links">${sourceLinkButtons(source, 'source-health-link')}</div>
+        </div>
       </div>`).join('') || '<div class="meta">no sources</div>';
   }
   if (host) host.dataset.loaded = '1';
@@ -308,24 +373,207 @@ async function loadStreams() {
  * search — sources, grouped results, metadata + formats
  * ====================================================================== */
 
+const LEGACY_BUILTIN_SOURCE_IDS = ['overlook', 'cinevo', 'cinejoy', 'flixhub', 'redflix', 'flex1', 'cinezo'];
+
 async function loadSources() {
-  const { sources } = await api('/api/sources');
+  const { sources = [] } = await api('/api/sources');
   state.sources = sources;
-  if (!state.selectedSources.length) state.selectedSources = sources.filter((source) => source.enabled).map((source) => source.id);
+  const currentIds = sources.map((source) => source.id);
+  const enabledIds = sources.filter((source) => source.enabled).map((source) => source.id);
+  if (!state.selectedSources.length) {
+    state.selectedSources = enabledIds;
+  } else {
+    const savedCatalog = Array.isArray(ui.search.sourceIds) ? ui.search.sourceIds : null;
+    const wasSelectAll = savedCatalog?.length
+      ? savedCatalog.every((id) => state.selectedSources.includes(id))
+        && state.selectedSources.every((id) => savedCatalog.includes(id))
+      : LEGACY_BUILTIN_SOURCE_IDS.every((id) => state.selectedSources.includes(id));
+    const selected = state.selectedSources.filter((id) => currentIds.includes(id));
+    // An old v2 preference with every original built-in selected means “all”;
+    // include newly installed sources without overriding a saved custom subset.
+    state.selectedSources = wasSelectAll
+      ? [...new Set([...selected, ...enabledIds])]
+      : [...new Set(selected)];
+  }
+  ui.search.sourceIds = currentIds;
   renderSourceChips();
   renderSourceHealth();
+  renderBrowseLinks();
+  renderMobileSourceLinks();
 }
 
 function renderSourceChips() {
   const host = $('#source-chips');
   if (!host) return;
-  host.innerHTML = state.sources.map((source) => `
-    <span class="chip ${state.selectedSources.includes(source.id) ? 'on' : ''}" data-id="${escapeHtml(source.id)}" role="button" tabindex="0"
-      title="${escapeHtml(source.name)}${source.health?.ok === false ? ' — failing' : ''}">
-      ${escapeHtml(source.name)}${source.health?.ok === false ? ' ⚠' : ''}</span>`).join('')
-    || '<span class="meta">no sources configured</span>';
+  const query = $('#q')?.value || '';
+  host.innerHTML = state.sources.map((source) => {
+    const domains = sourceHomeEntries(source).map((entry) => entry.label).join(', ');
+    const details = [source.notes, domains ? `Domains: ${domains}` : ''].filter(Boolean).join(' — ');
+    return `<span class="source-chip-option">
+      <span class="chip ${state.selectedSources.includes(source.id) ? 'on' : ''}" data-id="${escapeHtml(source.id)}" role="button" tabindex="0"
+        title="${escapeHtml(details || source.name)}${source.health?.ok === false ? ' — failing' : ''}">
+        ${escapeHtml(source.name)}${source.mirrors?.length ? ` <small class="chip-count">+${source.mirrors.length}</small>` : ''}${source.health?.ok === false ? ' ⚠' : ''}</span>
+      ${sourceSearchOpenLink(source, query)}
+    </span>`;
+  }).join('') || '<span class="meta">no sources configured</span>';
   const count = $('#sources-count');
-  if (count) count.textContent = `${state.selectedSources.length}/${state.sources.length} enabled`;
+  if (count) count.textContent = `${state.selectedSources.length}/${state.sources.length} selected`;
+}
+
+function safeImageUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return ['https:', 'http:'].includes(url.protocol) ? url.href : '';
+  } catch { return ''; }
+}
+
+function discoveryCardMarkup(item, list) {
+  const title = String(item.title || '').trim();
+  if (!title) return '';
+  const posterUrl = safeImageUrl(item.poster);
+  const kind = item.type === 'series' ? 'series' : 'movie';
+  const year = Number(item.year) || '';
+  const details = [kind === 'series' ? 'Series' : 'Movie', year || ''].filter(Boolean).join(' · ');
+  const rating = Number(item.rating) > 0 ? `★ ${Number(item.rating).toFixed(1)}` : '';
+  const reason = list === 'for-you' && Number(item.matches) > 0
+    ? `Matches ${item.matches} added title${item.matches === 1 ? '' : 's'}`
+    : '';
+  const overview = String(item.overview || '').trim();
+  return `<button type="button" class="discovery-card" data-discovery-pick data-title="${escapeHtml(title)}"
+      data-kind="${kind}" data-year="${year}" aria-label="Search for ${escapeHtml(title)}">
+    ${posterUrl ? `<img class="discovery-poster" src="${escapeHtml(posterUrl)}" alt="" loading="lazy">` : '<span class="discovery-poster placeholder" aria-hidden="true">🎬</span>'}
+    <span class="discovery-copy">
+      <b>${escapeHtml(title)}</b>
+      <span class="meta">${escapeHtml(details)}${rating ? ` · ${escapeHtml(rating)}` : ''}</span>
+      ${reason ? `<span class="discovery-reason">${escapeHtml(reason)}</span>` : ''}
+      ${overview ? `<span class="discovery-overview">${escapeHtml(overview)}</span>` : ''}
+    </span>
+    <span class="discovery-select" aria-hidden="true">Search ↗</span>
+  </button>`;
+}
+
+function openDiscoveryModal(target = 'find') {
+  const bodyMarkup = `<p class="meta discovery-intro">Choose a title to run it through the existing source search. “For you” uses the complete playlist-addition history, including removed or deleted items — never playback history.</p>
+    <div class="tabs discovery-tabs" role="tablist" aria-label="Title lists">
+      <button type="button" class="on" data-discovery-list="trending" aria-pressed="true">Trending now</button>
+      <button type="button" data-discovery-list="top10" aria-pressed="false">Top 10</button>
+      <button type="button" data-discovery-list="for-you" aria-pressed="false">For you</button>
+    </div>
+    <div class="discovery-controls">
+      <label class="discovery-filter">Titles<select id="discovery-type"><option value="all">Movies + series</option><option value="movie">Movies</option><option value="series">Series</option></select></label>
+      <label class="discovery-filter" id="discovery-window-filter">Trending<select id="discovery-window"><option value="week">This week</option><option value="day">Today</option></select></label>
+      <button type="button" class="btn sm ghost" id="discovery-refresh">↻ Refresh</button>
+    </div>
+    <div id="discovery-summary" class="meta" role="status" aria-live="polite">Loading titles…</div>
+    <div id="discovery-results" class="discovery-grid"><div class="meta">Loading…</div></div>`;
+  openModal({
+    title: 'Discover titles',
+    body: bodyMarkup,
+    className: 'wide discovery-modal',
+    onMount: (body) => mountDiscoveryModal(body, target),
+  });
+}
+
+function mountDiscoveryModal(body, target) {
+  if (!body) return null;
+  let list = 'trending';
+  let type = 'all';
+  let window = 'week';
+  let sequence = 0;
+  let controller = null;
+  const summary = $('#discovery-summary', body);
+  const results = $('#discovery-results', body);
+  const typeSelect = $('#discovery-type', body);
+  const windowSelect = $('#discovery-window', body);
+  const windowFilter = $('#discovery-window-filter', body);
+
+  const renderState = () => {
+    $$('[data-discovery-list]', body).forEach((button) => {
+      const active = button.dataset.discoveryList === list;
+      button.classList.toggle('on', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    if (windowFilter) windowFilter.classList.toggle('hide', list !== 'trending');
+  };
+
+  const showError = (error) => {
+    const message = String(error?.message || 'Could not load this list');
+    if (/TMDB API key is not configured/i.test(message)) {
+      if (summary) summary.innerHTML = 'Add a TMDB API key in Settings → Metadata to load this list. <button type="button" class="btn sm ghost" data-discovery-settings>Open Settings</button>';
+    } else if (summary) summary.textContent = message;
+    if (results) results.innerHTML = '<div class="meta">No titles loaded.</div>';
+  };
+
+  const load = async () => {
+    controller?.abort();
+    controller = new AbortController();
+    const current = ++sequence;
+    if (summary) summary.textContent = 'Loading titles…';
+    if (results) results.innerHTML = '<div class="meta"><span class="spin"></span> Loading…</div>';
+    const params = new URLSearchParams({ type });
+    if (list === 'trending') params.set('window', window);
+    params.set('limit', list === 'top10' ? '10' : '20');
+    try {
+      const data = await api(`/api/discovery/${list}?${params}`, { silent: true, signal: controller.signal });
+      if (current !== sequence) return;
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (list === 'for-you') {
+        if (summary) {
+          const additions = Number(data.historyCount) || 0;
+          const unique = Number(data.uniqueHistoryTitles) || 0;
+          summary.textContent = additions
+            ? `Based on ${type === 'all' ? 'all ' : ''}${additions} playlist additions${type === 'all' ? '' : ` matching the ${type === 'movie' ? 'movies' : 'series'} filter`} (${unique} distinct titles; removed/deleted titles are retained). No watch history is used.${data.partialFailures ? ` ${data.partialFailures} TMDB lookup(s) unavailable.` : ''}`
+            : type === 'all'
+              ? 'No playlist additions yet. Add a title to the playlist to build recommendations; later removals and deletions will stay in the history.'
+              : `No ${type === 'movie' ? 'movie' : 'series'} additions match this filter. Switch to Movies + series to see all playlist additions.`;
+        }
+      } else if (summary) {
+        summary.textContent = list === 'trending'
+          ? `TMDB trending ${window === 'day' ? 'today' : 'this week'} · ${items.length} titles`
+          : `TMDB top-rated titles · ${items.length} titles`;
+      }
+      if (results) {
+        results.innerHTML = items.length
+          ? items.map((item) => discoveryCardMarkup(item, list)).filter(Boolean).join('')
+          : `<div class="meta">${list === 'for-you' && Number(data.historyCount) === 0 ? 'Your playlist-addition history is empty for this filter.' : 'No titles in this list right now.'}</div>`;
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError' || current !== sequence) return;
+      showError(error);
+    }
+  };
+
+  $$('[data-discovery-list]', body).forEach((button) => button.addEventListener('click', () => {
+    list = button.dataset.discoveryList;
+    renderState();
+    load();
+  }));
+  typeSelect?.addEventListener('change', () => { type = typeSelect.value; load(); });
+  windowSelect?.addEventListener('change', () => { window = windowSelect.value; load(); });
+  $('#discovery-refresh', body)?.addEventListener('click', load);
+  body.addEventListener('click', (event) => {
+    const settings = event.target.closest('[data-discovery-settings]');
+    if (settings) { closeModal(); go('set'); return; }
+    const choice = event.target.closest('[data-discovery-pick]');
+    if (!choice) return;
+    const title = choice.dataset.title || '';
+    if (target === 'mobile') {
+      if ($('#mob-q')) $('#mob-q').value = title;
+      if ($('#mob-type')) $('#mob-type').value = choice.dataset.kind === 'series' ? 'series' : 'movie';
+      renderMobSourceChips();
+      closeModal();
+      mobileSearch();
+    } else {
+      if ($('#q')) $('#q').value = title;
+      if ($('#q-type')) $('#q-type').value = choice.dataset.kind === 'series' ? 'series' : 'movie';
+      renderSourceChips();
+      closeModal();
+      doSearch();
+    }
+  });
+  renderState();
+  load();
+  return () => { sequence += 1; controller?.abort(); };
 }
 
 function initFind() {
@@ -351,6 +599,7 @@ function initFind() {
 
 function saveSearchState() {
   ui.search.sources = state.selectedSources;
+  ui.search.sourceIds = state.sources.map((source) => source.id);
   writeStoredText(SEARCH_STATE_KEY, JSON.stringify(ui.search));
 }
 
@@ -364,8 +613,18 @@ function setFindTab(tab, persist = true) {
 
 function renderBrowseLinks() {
   const host = $('#browse-links');
+  if (host) {
+    host.innerHTML = state.sources.map(sourceDirectoryMarkup).join('')
+      || '<div class="meta">no sources configured</div>';
+  }
+  renderMobileSourceLinks();
+}
+
+function renderMobileSourceLinks() {
+  const host = $('#mob-source-links');
   if (!host) return;
-  host.innerHTML = state.sources.map((source) => `<a class="btn sm ghost" href="${escapeHtml(source.home)}" target="_blank" rel="noreferrer">${escapeHtml(source.name)} ↗</a>`).join('');
+  host.innerHTML = state.sources.map(sourceDirectoryMarkup).join('')
+    || '<div class="meta">no sources configured</div>';
 }
 
 /**
@@ -1404,6 +1663,8 @@ async function doResolveFromUrl() {
 function wireFind() {
   $$('#find-tabs button').forEach((button) => button.addEventListener('click', () => setFindTab(button.dataset.t)));
   $('#btn-search')?.addEventListener('click', doSearch);
+  $('#btn-search-discover')?.addEventListener('click', () => openDiscoveryModal('find'));
+  $('#q')?.addEventListener('input', renderSourceChips);
   $('#q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') doSearch(); });
   $('#btn-sources-all')?.addEventListener('click', () => { state.selectedSources = state.sources.map((source) => source.id); renderSourceChips(); saveSearchState(); });
   $('#btn-sources-none')?.addEventListener('click', () => { state.selectedSources = []; renderSourceChips(); saveSearchState(); });
@@ -2251,6 +2512,12 @@ const SETTINGS_SECTIONS = [
     ],
   },
   {
+    key: 'playlist', title: 'Playlist availability',
+    fields: [
+      ['autoCheckEnabled', 'bool'], ['autoCheckIntervalMinutes', 'number'], ['autoRepairEnabled', 'bool'],
+    ],
+  },
+  {
     key: 'enigma2', title: 'Enigma2',
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
@@ -2285,6 +2552,7 @@ const SETTINGS_NOTES = {
   transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
   metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
+  playlist: 'Scheduled stream health checks and automatic recovery. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
   storage: 'Folders inside the container, and how much disk the cache may use.',
@@ -2317,6 +2585,10 @@ const SETTINGS_LABELS = {
   'metadata.tmdbApiKey': ['TMDB API key', 'From https://www.themoviedb.org/settings/api — v3 key, free. Enables rich metadata in search and playlist.'],
   'metadata.omdbApiKey': ['OMDB API key', 'From https://www.omdbapi.com/apikey.aspx — optional, adds IMDb ratings.'],
   'metadata.language': ['Metadata language', 'e.g. en-US, nl-NL, de-DE for TMDB results.'],
+
+  'playlist.autoCheckEnabled': ['Scheduled checks', 'Check every stream in the Playlist after startup and repeat on the interval below.'],
+  'playlist.autoCheckIntervalMinutes': ['Check interval (min)', '15–10080 minutes; default is every 6 hours. The first scheduled check starts shortly after boot.'],
+  'playlist.autoRepairEnabled': ['Auto-refresh inactive streams', 'When a check fails, resolve the same title on its current provider first, then try other enabled providers. The stream token and output URLs stay the same.'],
 
   'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
   'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
@@ -2381,7 +2653,8 @@ async function loadSettings() {
             return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" value="${escapeHtml(list.join(', '))}" placeholder="comma separated"></div>`;
           }
           const inputType = type === 'password' ? 'password' : type === 'number' ? 'number' : 'text';
-          return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}" value="${escapeHtml(value ?? '')}"></div>`;
+          const constraints = section.key === 'playlist' && key === 'autoCheckIntervalMinutes' ? ' min="15" max="10080" step="15"' : '';
+          return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}"${constraints} value="${escapeHtml(value ?? '')}"></div>`;
         }).join('')}
         </div>
       </div>`).join('');
@@ -2488,7 +2761,10 @@ async function initMobile() {
       renderMobSourceChips();
     }
   } catch {}
+  renderMobileSourceLinks();
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
+  $('#btn-mob-discover')?.addEventListener('click', () => openDiscoveryModal('mobile'));
+  $('#mob-q')?.addEventListener('input', renderMobSourceChips);
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
   $('#mob-sources')?.addEventListener('change', () => {
     const v = $('#mob-sources')?.value;
@@ -2615,7 +2891,15 @@ function renderMobSourceChips() {
     if (count) count.textContent = '';
     return;
   }
-  host.innerHTML = sources.map((s) => `<span class="chip ${selected.includes(s.id) ? 'on' : ''}" data-id="${escapeHtml(s.id)}" role="button" tabindex="0" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>`).join('');
+  const query = $('#mob-q')?.value || '';
+  host.innerHTML = sources.map((s) => {
+    const domains = sourceHomeEntries(s).map((entry) => entry.label).join(', ');
+    const details = [s.notes, domains ? `Domains: ${domains}` : ''].filter(Boolean).join(' — ');
+    return `<span class="source-chip-option">
+      <span class="chip ${selected.includes(s.id) ? 'on' : ''}" data-id="${escapeHtml(s.id)}" role="button" tabindex="0" title="${escapeHtml(details || s.name)}">${escapeHtml(s.name)}${s.mirrors?.length ? ` <small class="chip-count">+${s.mirrors.length}</small>` : ''}</span>
+      ${sourceSearchOpenLink(s, query)}
+    </span>`;
+  }).join('');
   if (count) count.textContent = `${selected.length}/${sources.length} selected`;
   // Sync the quick select
   const sel = $('#mob-sources');

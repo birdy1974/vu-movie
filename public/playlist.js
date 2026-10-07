@@ -40,6 +40,7 @@ const VMPlaylist = (() => {
       summary: data.summary || null,
       urls: data.urls || null,
       templates: data.templates || [],
+      maintenance: data.maintenance || null,
       defaultTemplateId: data.defaultTemplateId || '',
       // The server reports whether playlist changes reach the config file. They
       // always apply to the running process; on a read-only /config mount they
@@ -201,7 +202,7 @@ const VMPlaylist = (() => {
     const probe = probeLine(health);
     if (health.state === 'working') {
       const ms = health.probeMs ? ` (${Math.round(health.probeMs / 1000)} s)` : '';
-      return tag(`working${probe}${ms}`, 'ok');
+      return tag(`${health.repaired ? 'refreshed' : 'working'}${probe}${ms}`, 'ok');
     }
     if (health.state === 'dead') return tag('not working', 'err');
     if (health.state === 'expired') return tag('token expired', 'err');
@@ -222,10 +223,19 @@ const VMPlaylist = (() => {
         probe.subtitleTracks ? `${probe.subtitleTracks} subtitle track(s)` : '',
       ].filter(Boolean).join(' · ')
       : '';
-    if (health.state === 'working') return `checked${health.at ? ` ${fmtTime(health.at)}` : ''}${found ? ` — ${found}` : ''}`;
-    if (health.state === 'unverified') return `not proven: ${health.error || 'probing is switched off in Settings or ffprobe is missing'}`;
-    if (health.state === 'skipped') return health.error || 'no upstream URL stored for this stream';
-    return `${health.error || 'the upstream URL did not answer'}${health.at ? ` (checked ${fmtTime(health.at)})` : ''}`;
+    if (health.state === 'working') {
+      const refreshed = health.repaired
+        ? ` · automatically refreshed${health.sourceChanged ? ` from ${health.previousSourceId || 'the old provider'} to ${health.sourceId || 'a new provider'}` : ''}`
+        : '';
+      return `checked${health.at ? ` ${fmtTime(health.at)}` : ''}${found ? ` — ${found}` : ''}${refreshed}`;
+    }
+    if (health.state === 'unverified') {
+      const detail = health.error || 'probing is switched off in Settings or ffprobe is missing';
+      return `${health.repaired ? 'automatically refreshed, but not proven' : 'not proven'}: ${detail}`;
+    }
+    const detail = [health.error || (health.state === 'skipped' ? 'no upstream URL stored for this stream' : 'the upstream URL did not answer'),
+      health.repairError ? `automatic refresh failed: ${health.repairError}` : ''].filter(Boolean).join(' · ');
+    return `${detail}${health.at ? ` (checked ${fmtTime(health.at)})` : ''}`;
   }
 
   /** The row's health cell — replaced in place while a check is running. */
@@ -273,15 +283,34 @@ const VMPlaylist = (() => {
     }
     const broken = health.filter((result) => ['dead', 'expired'].includes(result.state));
     const working = health.filter((result) => result.state === 'working').length;
+    const repaired = health.filter((result) => result.repaired).length;
     const unknown = health.filter((result) => ['unverified', 'skipped'].includes(result.state)).length;
     const parts = [`${working}/${health.length} working`];
+    if (repaired) parts.push(`${repaired} auto-refreshed`);
     if (broken.length) {
-      const names = broken.slice(0, 3).map((result) => `${result.title || result.streamId} (${result.error || result.state})`);
+      const names = broken.slice(0, 3).map((result) => `${result.title || result.streamId} (${result.repairError || result.error || result.state})`);
       parts.push(`${broken.length} not working: ${names.join('; ')}${broken.length > 3 ? ` +${broken.length - 3} more` : ''}`);
     }
     if (unknown) parts.push(`${unknown} unverified`);
     note.textContent = parts.join(' · ');
     note.classList.toggle('has-broken', broken.length > 0);
+  }
+
+  function renderCheckSchedule() {
+    const note = $('#list-check-schedule');
+    if (!note) return;
+    const schedule = state.playlist.maintenance;
+    if (!schedule) { note.textContent = ''; return; }
+    if (!schedule.enabled) {
+      note.textContent = 'Automatic Playlist checks are off; streams are still checked before playback starts.';
+      return;
+    }
+    const last = schedule.lastSummary
+      ? ` · last: ${schedule.lastSummary.checked} checked, ${schedule.lastSummary.repaired || 0} refreshed`
+      : '';
+    note.textContent = schedule.running
+      ? `Automatic Playlist check is running${last}`
+      : `Automatic check every ${schedule.intervalMinutes} min${schedule.nextRunAt ? ` · next ${fmtTime(schedule.nextRunAt)}` : ''}${last}`;
   }
 
   /**
@@ -340,15 +369,17 @@ const VMPlaylist = (() => {
     state.playlist.checkingIds = new Set();
     renderCheckNote();
     const health = list.map((item) => healthOf(item.streamId)).filter(Boolean);
+    const refreshedCount = health.filter((result) => result.repaired).length;
+    if (refreshedCount) await refresh();
     const broken = health.filter((result) => ['dead', 'expired'].includes(result.state));
     if (broken.length) {
-      toast(`${broken.length} of ${health.length} stream(s) are not working: ${broken.slice(0, 3).map((result) => result.title || result.streamId).join(', ')}`, 'err', 12000);
-    } else if (health.some((result) => result.state === 'unverified')) {
-      toast('Checked — probing is off or ffprobe is missing, so the streams are unverified', 'warn', 9000);
+      toast(`${refreshedCount ? `${refreshedCount} refreshed; ` : ''}${broken.length} of ${health.length} stream(s) are still not working: ${broken.slice(0, 3).map((result) => result.title || result.streamId).join(', ')}`, 'err', 12000);
+    } else if (health.some((result) => ['unverified', 'skipped'].includes(result.state))) {
+      toast(`${refreshedCount ? `${refreshedCount} stream(s) refreshed. ` : ''}Checked — some streams could not be verified or have no usable upstream URL`, 'warn', 9000);
     } else if (requestFailures) {
       toast(`${requestFailures} check(s) could not reach the server`, 'err');
     } else {
-      toast(`All ${health.length} stream(s) answered`, 'ok');
+      toast(refreshedCount ? `${refreshedCount} stream(s) refreshed; all ${health.length} answered` : `All ${health.length} stream(s) answered`, 'ok');
     }
     return { health };
   }
@@ -419,6 +450,7 @@ const VMPlaylist = (() => {
     const openStreamBtn = $('#btn-list-open-stream');
     if (openStreamBtn) openStreamBtn.disabled = !list.length;
     renderCheckNote();
+    renderCheckSchedule();
 
     if (!list.length) {
       host.innerHTML = '<div class="card"><div class="meta">The playlist is empty. Search a title on the Search tab and pick a format, or use “add a stream” above.</div></div>';

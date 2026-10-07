@@ -65,8 +65,15 @@
             <span class="mut" id="mob-sources-count"></span>
           </div>
         </div>
+        <details class="mob-source-directory">
+          <summary>Open a source</summary>
+          <p class="meta">Browse a site, copy a title or player URL, then use Search → Paste URL to scrape it.</p>
+          <div id="mob-source-links" class="source-directory-grid"><span class="meta">loading sources…</span></div>
+          <a class="source-directory-search" href="#find">Go to Search →</a>
+        </details>
         <div class="row">
           <button class="btn pri grow" id="btn-mob-search">⌕ Search</button>
+          <button type="button" class="btn ghost" id="btn-mob-discover">✦ Discover</button>
           <span class="mut" id="mob-search-hint"></span>
         </div>
         <div id="mob-results" class="mob-results"><div class="meta">Search a title, then tap it to see the available formats.</div></div>
@@ -135,7 +142,7 @@
           <div id="dash-jobs"><div class="meta" style="padding:14px">loading…</div></div>
         </div>
         <div class="card">
-          <h2>Sources <span class="tip" tabindex="0" role="note" aria-label="About the sources" data-tip="Sites the app can scrape. The dot shows the last health check; the switches enable or disable a site for searches.">i</span></h2>
+          <h2>Sources <span class="tip" tabindex="0" role="note" aria-label="About the sources" data-tip="Sites the app can scrape. The dot shows the last search health check. Click a domain to open it; the Search and Mobile source pickers choose which sites to query.">i</span></h2>
           <div id="dash-sources"><div class="meta">loading…</div></div>
           <h2 style="margin-top:14px">Live sessions</h2>
           <div id="dash-sessions"><div class="meta">none</div></div>
@@ -175,6 +182,7 @@
           </div>
           <div class="row">
             <button class="btn pri" id="btn-search">⌕ Search</button>
+            <button type="button" class="btn ghost" id="btn-search-discover">✦ Trending / Top 10</button>
             <label class="row" style="gap:6px;margin:0;color:var(--fg)"><input type="checkbox" id="q-moviebox" checked> include MovieBox</label>
             <span class="mut" id="find-hint"></span>
           </div>
@@ -201,8 +209,8 @@
         </div>
 
         <div id="tab-browse" class="hide">
-          <p class="sub" style="margin:6px 0 10px">Open a source and paste the player URL in the “Paste URL” tab. <span class="tip" tabindex="0" role="note" aria-label="About browsing sources" data-tip="Open a source, find your title, copy the URL from the address bar and paste it in the “Paste URL” tab.">i</span></p>
-          <div class="row" id="browse-links"></div>
+          <p class="sub" style="margin:6px 0 10px">Open a source and paste its title or player URL in the “Paste URL” tab. Each card is one source; confirmed mirrors stay together with a link for each domain. <span class="tip" tabindex="0" role="note" aria-label="About browsing sources" data-tip="Open a source, find your title, copy the URL from the address bar and paste it in the “Paste URL” tab. Flixer.gd and Flixer.su look alike, but remain separate until an exact shared redirect destination is confirmed.">i</span></p>
+          <div id="browse-links" class="source-directory-grid"><span class="meta">loading sources…</span></div>
         </div>
       </div>
 
@@ -359,7 +367,7 @@
 
     <!-- ============ PLAYLIST ============ -->
     <section id="p-list" class="hide">
-      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue. “Check streams” probes the upstream URL behind every item and marks the dead ones instead of leaving you to find out in VLC.">i</span></h1>
+      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue. “Check streams” probes each upstream and can refresh inactive links without changing the stream token. Checks also run on a schedule and before playback starts.">i</span></h1>
       <div class="card">
         <div class="spread">
           <div class="row">
@@ -369,8 +377,9 @@
           <div class="row">
             <button class="btn sm ghost" id="btn-list-enable-all">✓ enable all</button>
             <button class="btn sm ghost" id="btn-list-disable-all">✕ disable all</button>
-            <button class="btn sm" id="btn-list-check" title="probe every upstream URL in the playlist with ffprobe">⚡ check streams <span class="tip" tabindex="0" role="note" aria-label="About checking streams" data-tip="Probes every item's upstream URL with ffprobe — the same proof the Search tab runs before offering a format. Each row shows working / dead / token expired / unverified, with the reason in its tooltip; the line next to the button summarises the result. Nothing is changed or removed by a check.">i</span></button>
+            <button class="btn sm" id="btn-list-check" title="check and automatically refresh inactive upstream URLs">⚡ check streams <span class="tip" tabindex="0" role="note" aria-label="About checking streams" data-tip="Checks each item's upstream URL. If it is inactive, vu-movie searches the same provider first and then other enabled providers for the same title, and updates the upstream while keeping the stream token and playlist URL stable. Automatic checks also run on the configured schedule and before playback starts.">i</span></button>
             <span class="mut" id="list-check-note" role="status" aria-live="polite"></span>
+            <span class="mut" id="list-check-schedule" role="status" aria-live="polite"></span>
             <button class="btn sm ghost" id="btn-list-refresh">⟳ refresh</button>
           </div>
         </div>

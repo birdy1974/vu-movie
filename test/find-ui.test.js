@@ -66,6 +66,8 @@ function makeDom() {
     if (!elements.has(selector)) elements.set(selector, makeElement(selector));
     return elements.get(selector);
   };
+  const modalRoot = elementFor('#modal-root');
+  modalRoot.querySelector = (selector) => selector === '.modal' ? elementFor('.modal') : null;
   const document = {
     // `loading` (plus a no-op addEventListener) keeps bootstrap() from running:
     // the test drives the panel itself.
@@ -151,6 +153,17 @@ const SOURCES = [
   { id: 'cinevo', name: 'Cinevo', home: 'https://cinevo.nl', enabled: true },
 ];
 
+const SOURCE_DIRECTORY_FIXTURE = [
+  {
+    id: 'sample-mirror-group', name: 'Example source', home: 'https://source.example/', enabled: true,
+    mirrors: [{ name: 'Example mirror', url: 'https://mirror.example/' }],
+  },
+  { id: 'flixer-gd', name: 'Flixer.gd', home: 'https://flixer.gd/', enabled: true },
+  { id: 'flixer-su', name: 'Flixer.su', home: 'https://flixer.su/', enabled: true },
+  { id: 'vidbox', name: 'Vidbox', home: 'https://vidbox.vc/home', enabled: true },
+  { id: 'unsafe-test', name: 'Unsafe', home: 'javascript:alert(1)', enabled: true },
+];
+
 const SMURFS = [
   { title: 'The Smurfs', year: 2025, kind: 'movie', url: 'https://cinejoy.pk/movie/smurfs-2025', sourceId: 'cinejoy' },
   { title: 'The Smurfs', year: 2025, kind: 'movie', url: 'https://redflix.club/play?id=936108', sourceId: 'redflix' },
@@ -174,6 +187,96 @@ function standardFetch({ search = () => json({ ok: true, results: [], providerEr
     return json({ ok: true });
   };
 }
+
+test('source links are available on Search, Mobile and Dashboard, with unsafe URLs omitted', () => {
+  const app = loadApp();
+  app.run(`state.sources = ${JSON.stringify(SOURCE_DIRECTORY_FIXTURE)}; renderBrowseLinks(); renderSourceHealth(); renderMobSourceChips();`);
+
+  for (const selector of ['#browse-links', '#mob-source-links', '#dash-sources']) {
+    const html = app.el(selector).innerHTML;
+    assert.match(html, /https:\/\/source\.example\//, `${selector} should link to the primary domain`);
+    assert.match(html, /https:\/\/mirror\.example\//, `${selector} should link to the confirmed mirror`);
+    assert.match(html, /https:\/\/flixer\.gd\//, `${selector} should link to Flixer.gd`);
+    assert.match(html, /https:\/\/flixer\.su\//, `${selector} should link to Flixer.su`);
+    assert.match(html, /rel="noopener noreferrer"/);
+    assert.doesNotMatch(html, /javascript:/, 'non-http homepage schemes must not become links');
+  }
+  const browse = app.el('#browse-links').innerHTML;
+  assert.match(browse, /data-source-group="sample-mirror-group"/);
+  assert.match(browse, /source\.example/);
+  assert.match(browse, /mirror\.example/);
+  assert.match(browse, /data-source-group="flixer-gd"/);
+  assert.match(browse, /data-source-group="flixer-su"/);
+  assert.doesNotMatch(browse, /data-source-group="flixer"/, 'unverified Flixer domains must render as separate entries');
+});
+
+test('Search and Mobile source chips open reliable title routes and fall back safely when they are not verified', () => {
+  const sources = [
+    { id: 'vidbox', name: 'Vidbox', home: 'https://vidbox.vc/', enabled: true, search: { kind: 'browser', url: 'https://vidbox.vc/search?q={query}' } },
+    { id: 'netmovie', name: 'NetMovie', home: 'https://pc.netmovie.site/', enabled: true, search: { kind: 'browser', url: 'https://pc.netmovie.site/?q={query}', openMode: 'home' } },
+    { id: 'overlook', name: 'Overlook', home: 'https://overlook.cx/lobby', enabled: true, search: { kind: 'api', url: 'https://overlook.cx/api/search?q={query}' } },
+    { id: 'unsafe', name: 'Unsafe', home: 'javascript:alert(1)', enabled: true, search: { kind: 'browser', url: 'javascript:alert({query})' } },
+  ];
+  const app = loadApp();
+  app.run(`state.sources = ${JSON.stringify(sources)}; state.selectedSources = ['vidbox']; state.mobile.selectedSources = ['vidbox']; $('#q').value = 'Dune: Part Two'; $('#mob-q').value = 'Dune: Part Two'; renderSourceChips(); renderMobSourceChips();`);
+  for (const selector of ['#source-chips', '#mob-source-chips']) {
+    const html = app.el(selector).innerHTML;
+    assert.match(html, /href="https:\/\/vidbox\.vc\/search\?q=Dune%3A%20Part%20Two"/);
+    assert.match(html, /aria-label="Search Vidbox for/);
+    assert.match(html, /href="https:\/\/pc\.netmovie\.site\//, 'unreliable query routes fall back to the homepage');
+    assert.match(html, /href="https:\/\/overlook\.cx\/lobby"/, 'API search URLs are not exposed as browser pages');
+    assert.doesNotMatch(html, /javascript:/, 'unsafe source routes are never rendered as links');
+  }
+  assert.equal(app.run(`sourceSearchEntry(${JSON.stringify(sources[1])}, 'Runner').mode`), 'home');
+});
+
+test('the discovery popup feeds selected titles into desktop and Mobile search', async () => {
+  const app = loadApp({ onFetch: standardFetch() });
+  app.run("openDiscoveryModal('find')");
+  const markup = app.el('#modal-body').innerHTML;
+  assert.match(markup, /Trending now/);
+  assert.match(markup, /Top 10/);
+  assert.match(markup, /For you/);
+  assert.match(markup, /never playback history/);
+  const desktopChoice = {
+    dataset: { title: 'Arrival', kind: 'series', year: '2022' },
+    closest: (selector) => selector === '[data-discovery-pick]' ? desktopChoice : null,
+  };
+  fire(app.el('#modal-body'), 'click', desktopChoice);
+  await tick();
+  assert.equal(app.el('#q').value, 'Arrival');
+  assert.equal(app.el('#q-type').value, 'series');
+  assert.ok(app.calls.some((call) => call.url.startsWith('/api/find/search') && call.url.includes('q=Arrival')));
+
+  const mobile = loadApp({ onFetch: standardFetch() });
+  mobile.run("openDiscoveryModal('mobile')");
+  const mobileChoice = {
+    dataset: { title: 'Dune: Part Two', kind: 'movie', year: '2024' },
+    closest: (selector) => selector === '[data-discovery-pick]' ? mobileChoice : null,
+  };
+  fire(mobile.el('#modal-body'), 'click', mobileChoice);
+  await tick();
+  assert.equal(mobile.el('#mob-q').value, 'Dune: Part Two');
+  assert.equal(mobile.el('#mob-type').value, 'movie');
+  assert.ok(mobile.calls.some((call) => call.url.startsWith('/api/find/search') && call.url.includes('Dune%3A+Part+Two')));
+});
+
+test('legacy select-all preferences include newly installed sources without expanding a custom subset', async () => {
+  const previousIds = ['overlook', 'cinevo', 'cinejoy', 'flixhub', 'redflix', 'flex1', 'cinezo'];
+  const sources = [...previousIds, 'flixer-gd', 'flixer-su', 'vidbox'].map((id) => ({
+    id, name: id, home: `https://${id}.example/`, enabled: true,
+  }));
+  const app = loadApp({ onFetch: (request) => request.url.startsWith('/api/sources')
+    ? json({ ok: true, sources })
+    : json({ ok: true }) });
+  app.run(`state.selectedSources = ${JSON.stringify(previousIds)}; ui.search.sources = ${JSON.stringify(previousIds)};`);
+  await app.run('loadSources()');
+  assert.deepEqual(JSON.parse(app.run('JSON.stringify(state.selectedSources)')), sources.map((source) => source.id));
+
+  app.run(`state.selectedSources = ['cinezo']; ui.search.sourceIds = ${JSON.stringify(sources.map((source) => source.id))};`);
+  await app.run('loadSources()');
+  assert.deepEqual(JSON.parse(app.run('JSON.stringify(state.selectedSources)')), ['cinezo']);
+});
 
 /* ---------------- 1. no stale results ---------------- */
 

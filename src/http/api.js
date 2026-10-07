@@ -36,6 +36,10 @@ import * as enigma2 from '../enigma2/index.js';
 import { fetchPosterImage, posterProxyUrl, posterSource, publicPosterUrl } from './poster-proxy.js';
 import { pushSubtitleToReceiver } from '../subtitles/push.js';
 import * as metadata from '../metadata/index.js';
+import * as discovery from '../metadata/discovery.js';
+import * as playlist from '../playlist/index.js';
+import { reconfigurePlaylistMaintenance } from '../playlist/maintenance.js';
+import { ensureStreamReady } from '../streams/recovery.js';
 
 const router = express.Router();
 const startedAt = Date.now();
@@ -300,6 +304,7 @@ router.put('/config', wrap(async (req, res) => {
   saveConfig(patch);
   if (patch.app?.logLevel) setLogLevel(patch.app.logLevel);
   if (patch.enigma2) enigma2.resetStatusCache();
+  if (patch.playlist) reconfigurePlaylistMaintenance();
   res.json({ ok: true, config: publicConfig(), changed: Object.keys(patch) });
 }));
 
@@ -1003,8 +1008,10 @@ router.get('/streams/:id/session', wrap(async (req, res) => {
 router.post('/streams/:id/session', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const session = await relay.ensureSession(stream, { profile: req.body?.profile || {}, container: req.body?.container });
-  res.json({ ok: true, session: relay.publicSession(session) });
+  const ready = await ensureStreamReady(stream, { reason: 'stream-api-session' });
+  if (!ready.ok) return res.status(503).json({ ok: false, error: ready.error || ready.result?.error || 'upstream is not available', check: ready.result });
+  const session = await relay.ensureSession(ready.stream, { profile: req.body?.profile || {}, container: req.body?.container });
+  res.json({ ok: true, session: relay.publicSession(session), ...(ready.repaired ? { repaired: true, sourceId: ready.stream.source_id } : {}) });
 }));
 
 router.delete('/streams/:id/session', wrap(async (req, res) => {
@@ -1044,12 +1051,14 @@ router.post('/streams/:id/playlist', wrap(async (req, res) => {
 router.post('/streams/:id/download', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-  const job = exporter.startDownload(stream, {
+  const ready = await ensureStreamReady(stream, { reason: 'download-start' });
+  if (!ready.ok) return res.status(503).json({ ok: false, error: ready.error || ready.result?.error || 'upstream is not available', check: ready.result });
+  const job = exporter.startDownload(ready.stream, {
     profile: req.body?.profile || {},
     container: req.body?.container,
     filename: req.body?.filename || null,
   });
-  res.json({ ok: true, job: findJob(job.id) || { id: job.id } });
+  res.json({ ok: true, job: findJob(job.id) || { id: job.id }, ...(ready.repaired ? { repaired: true, sourceId: ready.stream.source_id } : {}) });
 }));
 
 router.get('/downloads', wrap(async (req, res) => {
@@ -1216,6 +1225,43 @@ router.get('/metadata/status', wrap(async (req, res) => {
     omdb: { configured: Boolean(cfg.metadata?.omdbApiKey) },
     any: metadata.isAnyConfigured(),
   });
+}));
+
+router.get('/discovery/:list', wrap(async (req, res) => {
+  const list = String(req.params.list || '').trim().toLowerCase();
+  if (!['trending', 'top10', 'for-you'].includes(list)) {
+    return res.status(404).json({ ok: false, error: 'discovery list must be trending, top10, or for-you' });
+  }
+  const requestedType = String(req.query.type || 'all').trim().toLowerCase();
+  const type = requestedType === 'tv' ? 'series' : requestedType;
+  if (!['all', 'movie', 'series'].includes(type)) {
+    return res.status(422).json({ ok: false, error: 'type must be all, movie, or series' });
+  }
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(50, Math.floor(parsedLimit)) : (list === 'top10' ? 10 : 20);
+  const window = req.query.window === 'day' ? 'day' : 'week';
+  let history = null;
+  if (list === 'for-you') {
+    history = await playlist.additionHistory();
+    // The empty state does not need a TMDB key; it explains where the signal
+    // comes from before the user has added any titles.
+    const relevantHistory = history.some((event) => event?.title
+      && (type === 'all' || (/series|tv|show/i.test(String(event.kind || '')) ? 'series' : 'movie') === type));
+    if (!relevantHistory) {
+      return res.json({ ok: true, list, ...(await discovery.playlistRecommendations(history, { type, limit })) });
+    }
+  }
+  if (!metadata.tmdb.isConfigured()) {
+    return res.status(503).json({
+      ok: false,
+      error: 'TMDB API key is not configured. Add it in Settings → Metadata to load trending, Top 10, and personalized recommendations.',
+    });
+  }
+  let result;
+  if (list === 'trending') result = await discovery.trendingTitles({ type, window, limit });
+  else if (list === 'top10') result = await discovery.topTenTitles({ type, limit });
+  else result = await discovery.playlistRecommendations(history, { type, limit });
+  res.json({ ok: true, list, ...result });
 }));
 
 router.get('/metadata/tmdb', wrap(async (req, res) => {

@@ -346,10 +346,13 @@ await window.App.go('set');
 await tick(150);
 const sectionCards = $$('#settings-grid [data-set-section]').map((c) => c.dataset.setSection);
 if (!sectionCards.length) console.log('DEBUG settings-grid:', $('#settings-grid')?.innerHTML.slice(0, 400));
-check('old settings sections are back', ['transcode', 'subtitles', 'enigma2', 'scraper', 'storage', 'app'].every((k) => sectionCards.includes(k)), sectionCards.join(','));
+check('settings sections include playlist recovery controls', ['transcode', 'subtitles', 'playlist', 'enigma2', 'scraper', 'storage', 'app'].every((k) => sectionCards.includes(k)), sectionCards.join(','));
+check('playlist schedule and auto-repair settings are available', ['autoCheckEnabled', 'autoCheckIntervalMinutes', 'autoRepairEnabled'].every((key) => $(`#set-playlist-${key}`)), 'schedule · interval · auto-refresh');
+const checkInterval = $('#set-playlist-autoCheckIntervalMinutes');
+check('check interval is constrained to 15–10080 minutes', checkInterval?.min === '15' && checkInterval?.max === '10080', `${checkInterval?.min}–${checkInterval?.max}`);
 const setInputs = $$('#settings-grid input,#settings-grid select');
 check('settings fields rendered', setInputs.length >= 40, `${setInputs.length} controls`);
-const rawKeys = /^(mode|resolution|aspect|videoBitrate|audioBitrate|audioChannels|fps|container|alwaysTranscode|hardware|maxConcurrent|device|idleStopSeconds|encoderFallback|realtime|languages|autoSearch|pushToReceiver|receiverDir|disabledProviders|host|port|username|password|bouquetName|rootDir|serviceType|ftpEnabled|ftpPort|autoPush|browserConcurrency|browserIdleSeconds|resolveTimeoutMs|probeCandidates|maxCandidates|flaresolverrUrl|externalExtractorUrl|sessionDir|userAgent|downloads|tmp|cacheBudgetMb|baseUrl|logLevel|tokenTtlMinutes)$/;
+const rawKeys = /^(mode|resolution|aspect|videoBitrate|audioBitrate|audioChannels|fps|container|alwaysTranscode|hardware|maxConcurrent|device|idleStopSeconds|encoderFallback|realtime|languages|autoSearch|pushToReceiver|receiverDir|disabledProviders|host|port|username|password|bouquetName|rootDir|serviceType|ftpEnabled|ftpPort|autoPush|autoCheckEnabled|autoCheckIntervalMinutes|autoRepairEnabled|browserConcurrency|browserIdleSeconds|resolveTimeoutMs|probeCandidates|maxCandidates|flaresolverrUrl|externalExtractorUrl|sessionDir|userAgent|downloads|tmp|cacheBudgetMb|baseUrl|logLevel|tokenTtlMinutes)$/;
 check('field labels are human, not raw keys',
   [...$$('#settings-grid label')].every((l) => !rawKeys.test(l.textContent.replace(/i\s*$/, '').trim())),
   [...$$('#settings-grid label')].map((l) => l.textContent.trim().replace(/\s*i$/, '')).slice(0, 4).join(' | '));

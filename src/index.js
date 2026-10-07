@@ -21,6 +21,7 @@ import { startServer } from './http/server.js';
 import relay from './streams/relay.js';
 import browser from './scrapers/browser.js';
 import { loadSources } from './scrapers/registry.js';
+import { startPlaylistMaintenance, stopPlaylistMaintenance } from './playlist/maintenance.js';
 
 process.env.APP_VERSION = process.env.APP_VERSION || '1.0.0';
 
@@ -111,10 +112,12 @@ async function main() {
     hwaccel: hardwarePending() ? 'detecting…' : (hardwareStatus().available ? 'vaapi' : 'software'),
     url: `http://<nas-ip>:${cfg.app.port}`,
   });
+  startPlaylistMaintenance();
 
   // ---- graceful shutdown ----
   const shutdown = async (signal) => {
     log.info('app', `received ${signal} — shutting down`, { sessions: relay.listSessions().length });
+    stopPlaylistMaintenance();
     server.close(() => log.debug('app', 'http server closed'));
     relay.stopAll('shutdown');
     await browser.closeBrowser('shutdown').catch(() => {});

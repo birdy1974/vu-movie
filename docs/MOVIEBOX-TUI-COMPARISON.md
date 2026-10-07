@@ -47,9 +47,11 @@ even though the manifest is a live DASH MPD, because the manifest is rewritten.
 
 Same as the TUI for MovieBox (`search/v2` → result cards; see `src/scrapers/moviebox.js`
 and `test/moviebox.test.js`, whose fixtures are copied from the reference test-suite), and
-plus a second lane: the seven site recipes in `src/scrapers/builtin-sources.json`
-(overlook.cx, cinevo.nl, cinejoy.pk, flixhub.studio, redflix.club, 1flex.org, cinezo.st).
-That lane works, which is what "the GUI is okay" reflects.
+plus a second lane: the built-in site recipes in `src/scrapers/builtin-sources.json`.
+The catalog now has 18 recipes: the original seven plus Flixer.gd, Flixer.su, Vidbox,
+Nunflix, MovieWiser, PureHD, FMovies HD, Filmween, NetMovie (PC), 1Tube and Nippleflix.
+Flixer.gd and Flixer.su remain independent because an exact shared redirect has not been
+confirmed. That original lane works, which is what "the GUI is okay" reflects.
 
 ### vu-movie — "fetch the selected movie" (the part that fails)
 
@@ -145,7 +147,7 @@ the **request layer**, and that now is:
 | DASH manifest rewriting, `max_height` filtering, segment cache/prefetch, ranged m4s, subtitle-through-proxy | sidecar (`proxy.rs`) | **core now ported**: the in-process upstream proxy (`src/streams/upstream.js`, §4b) rewrites the MPD, pulls every segment in 95 KB ranged sub-requests with per-request retries, caches segments and replays the headers on every request; `max_height`, prefetch and subtitle-serving stay out | ✅ equivalent (core) |
 | DNS: system resolver **with public-resolver fallback** | hickory + Cloudflare/Google/Quad9 | system resolver only; public DNS is used for *diagnosis*, not for scraping | ⚠️ divergence (see below) |
 | TLS: rustls/`webpki-roots` | rustls | Node/OpenSSL (undici) | ⚠️ divergence (see below) |
-| Page sniffing | not implemented (never needed) | Chromium lane for the seven site sources | ➕ extra, not a difference in MovieBox fetching |
+| Page sniffing | not implemented (never needed) | Chromium lane for the 18 built-in site recipes | ➕ extra, not a difference in MovieBox fetching |
 
 The two ⚠️ items are transport, not protocol: Node 22 exposes no supported way to override
 the resolver used by `fetch`/`getaddrinfo` (the reference embeds a Rust resolver for exactly

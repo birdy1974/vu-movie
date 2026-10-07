@@ -30,7 +30,8 @@
         "runtime": "runtime",
         "releaseDate": "release_date",
         "language": "original_language"
-      }
+      },
+      "openMode": "home"
     },
     "resolve": {
       "kind": "browser"
@@ -154,5 +155,230 @@
       "kind": "browser"
     },
     "notes": "Open player API — a native adapter can be added as a fast path (kind:api) once the endpoint shape is confirmed from your network."
+  },
+  {
+    "id": "flixer-gd",
+    "name": "Flixer.gd",
+    "home": "https://flixer.gd/",
+    "enabled": true,
+    "match": [
+      "flixer.gd"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://flixer.gd/search?q={query}",
+      "linkPattern": "/(movie|film|tv|series?|watch)/",
+      "waitMs": 10000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Kept separate from Flixer.su because an exact shared redirect destination has not been confirmed."
+  },
+  {
+    "id": "flixer-su",
+    "name": "Flixer.su",
+    "home": "https://flixer.su/",
+    "enabled": true,
+    "match": [
+      "flixer.su"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://flixer.su/search?q={query}",
+      "linkPattern": "/(movie|film|tv|series?|watch)/",
+      "waitMs": 10000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Kept separate from Flixer.gd because an exact shared redirect destination has not been confirmed."
+  },
+  {
+    "id": "vidbox",
+    "name": "Vidbox",
+    "home": "https://vidbox.vc/home",
+    "enabled": true,
+    "match": [
+      "vidbox.vc"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://vidbox.vc/search?q={query}",
+      "linkPattern": "/(movie|tv|series?)/",
+      "waitMs": 8000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Search result pages use /movie/{id} and /tv/{id} detail links."
+  },
+  {
+    "id": "nunflix",
+    "name": "Nunflix",
+    "home": "https://nunflix.cx/home",
+    "enabled": true,
+    "match": [
+      "nunflix.cx"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://nunflix.cx/browser?q={query}",
+      "linkPattern": "/watch/",
+      "waitMs": 12000,
+      "openMode": "home"
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "The site may show a human-verification interstitial to automated browsers; a direct page URL can still be pasted in Search → Paste URL."
+  },
+  {
+    "id": "moviewiser",
+    "name": "MovieWiser",
+    "home": "https://moviewiser.com/",
+    "enabled": true,
+    "match": [
+      "moviewiser.com"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://moviewiser.com/search?query={query}",
+      "linkPattern": "/us/(movie|tv)/",
+      "waitMs": 8000,
+      "openMode": "home"
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Discovery and streaming-availability catalogue; a title page may link to a legal streaming service rather than contain a video player."
+  },
+  {
+    "id": "purehd",
+    "name": "PureHD",
+    "home": "https://purehd.cc/home",
+    "enabled": true,
+    "match": [
+      "purehd.cc"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://purehd.cc/search/{query}",
+      "linkPattern": "/(movie|tv|tv-show|series?)/",
+      "waitMs": 8000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Search uses the site's /search/{title} route; movie and TV detail pages use /movie/ and /tv/."
+  },
+  {
+    "id": "fmovieshd",
+    "name": "FMovies HD",
+    "home": "https://fmovieshd.one/",
+    "enabled": true,
+    "match": [
+      "fmovieshd.one"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://fmovieshd.one/search/{query}",
+      "linkPattern": "/(movies?|serie|series|tv|watch)/",
+      "waitMs": 8000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Search results use /movies/{slug}/ for films and /serie/{id}/{slug}/ for series."
+  },
+  {
+    "id": "filmween",
+    "name": "Filmween",
+    "home": "https://filmween.net/",
+    "enabled": true,
+    "match": [
+      "filmween.net"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://filmween.net/search?q={query}",
+      "linkPattern": "/(movie|tv|series?)/",
+      "waitMs": 15000,
+      "openMode": "home"
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Filmween's search results hydrate in the page; this recipe waits longer for its movie and TV detail links."
+  },
+  {
+    "id": "netmovie",
+    "name": "NetMovie (PC)",
+    "home": "https://pc.netmovie.site/",
+    "enabled": true,
+    "match": [
+      "pc.netmovie.site"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://pc.netmovie.site/?q={query}",
+      "linkPattern": "/(movie|tv|series|watch|title)/",
+      "waitMs": 8000,
+      "openMode": "home"
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "The PC page links to the NetMovie app for full catalogue access; some titles may require opening the site or pasting a title URL."
+  },
+  {
+    "id": "1tube",
+    "name": "1Tube",
+    "home": "https://www.1tube.org/",
+    "enabled": true,
+    "match": [
+      "1tube.org"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://www.1tube.org/search?q={query}",
+      "linkPattern": "/watch/",
+      "waitMs": 8000
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "Search results use /watch/{id} routes for movies and series."
+  },
+  {
+    "id": "nippleflix",
+    "name": "Nippleflix",
+    "home": "https://nippleflix.org/",
+    "enabled": true,
+    "match": [
+      "nippleflix.org"
+    ],
+    "kind": "browser",
+    "search": {
+      "kind": "browser",
+      "url": "https://nippleflix.org/?q={query}",
+      "linkPattern": "/play\\?id=|/(movie|tv)/",
+      "waitMs": 8000,
+      "openMode": "home"
+    },
+    "resolve": {
+      "kind": "browser"
+    },
+    "notes": "The site currently exposes a homepage catalogue rather than a stable public search route; use Open a source or paste a title/player URL if search returns no match."
   }
 ]

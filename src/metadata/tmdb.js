@@ -10,6 +10,8 @@
  *   /movie/{id}?language=&append_to_response=credits,external_ids,videos
  *   /tv/{id}?language=&append_to_response=credits,external_ids,videos
  *   /find/{imdb_id}?external_source=imdb_id&language=
+ *   /trending/{all|movie|tv}/{day|week}
+ *   /movie|tv/top_rated and /movie|tv/{id}/recommendations
  */
 
 import { getConfig } from '../core/config.js';
@@ -99,6 +101,43 @@ export async function getTMDBDetails({ tmdbId, type = 'movie' } = {}) {
   return normalizeDetails(details, kind);
 }
 
+/** Trending titles, normalized into the same movie/series shape as title search. */
+export async function getTrendingTMDB({ type = 'all', window = 'week', page = 1 } = {}) {
+  const media = type === 'movie' ? 'movie' : type === 'series' || type === 'tv' ? 'tv' : 'all';
+  const timeframe = window === 'day' ? 'day' : 'week';
+  const data = await tmdbFetch(`/trending/${media}/${timeframe}`, { page });
+  return (data.results || []).filter((item) => item.adult !== true).map((item) => {
+    const kind = media === 'all'
+      ? (item.media_type === 'tv' || item.first_air_date ? 'tv' : 'movie')
+      : media;
+    return normalizeSearchResult(item, kind);
+  }).filter((item) => item.title);
+}
+
+/** Top-rated movies, series, or a combined top ten. */
+export async function getTopRatedTMDB({ type = 'all', limit = 10 } = {}) {
+  const media = type === 'movie' ? 'movie' : type === 'series' || type === 'tv' ? 'tv' : 'all';
+  const kinds = media === 'all' ? ['movie', 'tv'] : [media];
+  const pages = await Promise.all(kinds.map(async (kind) => {
+    const data = await tmdbFetch(`/${kind}/top_rated`, { page: 1 });
+    return (data.results || []).filter((item) => item.adult !== true).map((item) => normalizeSearchResult(item, kind));
+  }));
+  const minVotes = media === 'all' ? 100 : 50;
+  const items = pages.flat().filter((item) => Number(item.votes || 0) >= minVotes);
+  items.sort((a, b) => Number(b.rating || 0) - Number(a.rating || 0) || Number(b.votes || 0) - Number(a.votes || 0));
+  const count = Math.max(1, Math.min(50, Number(limit) || 10));
+  return items.slice(0, count);
+}
+
+/** TMDB's per-title recommendations, used as seeds for playlist-based suggestions. */
+export async function getTMDBRecommendations({ tmdbId, type = 'movie' } = {}) {
+  if (!tmdbId) throw new Error('tmdbId required');
+  const kind = type === 'series' || type === 'tv' ? 'tv' : 'movie';
+  const data = await tmdbFetch(`/${kind}/${encodeURIComponent(String(tmdbId))}/recommendations`, { page: 1 });
+  return (data.results || []).filter((item) => item.adult !== true)
+    .map((item) => normalizeSearchResult(item, kind)).filter((item) => item.title);
+}
+
 function normalizeSearchResult(item, kind) {
   const title = item.title || item.name || item.original_title || item.original_name || '';
   const year = (item.release_date || item.first_air_date || '').slice(0, 4) || null;
@@ -176,4 +215,11 @@ export function isConfigured() {
   return Boolean(apiKey());
 }
 
-export default { searchTMDB, getTMDBDetails, isConfigured };
+export default {
+  searchTMDB,
+  getTMDBDetails,
+  getTrendingTMDB,
+  getTopRatedTMDB,
+  getTMDBRecommendations,
+  isConfigured,
+};

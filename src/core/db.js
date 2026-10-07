@@ -44,6 +44,7 @@ let pgModule = null;
 const mem = {
   streams: new Map(),
   titles: new Map(),
+  playlistAdditions: new Map(),
   cache: new Map(),
   settings: new Map(),
 };
@@ -295,6 +296,77 @@ export const repo = {
       if (key === id || rec.id === id || rec.token === id) mem.streams.delete(key);
     }
     if (pool) await query('delete from streams where id = $1 or token = $1', [id]).catch((err) => logError('db', 'deleteStream failed', err));
+  },
+
+  /* ---------------- append-only playlist-addition history ---------------- */
+  async recordPlaylistAdditions(events = []) {
+    const rows = (Array.isArray(events) ? events : [events]).filter((event) => event?.eventId && event?.streamId && event?.title)
+      .map((event) => ({
+        eventId: String(event.eventId),
+        streamId: String(event.streamId),
+        title: String(event.title),
+        year: Number(event.year) || null,
+        kind: event.kind === 'series' ? 'series' : 'movie',
+        poster: event.poster ? String(event.poster) : null,
+        description: event.description ? String(event.description) : null,
+        sourceId: event.sourceId ? String(event.sourceId) : null,
+        tmdbId: event.tmdbId ? String(event.tmdbId) : null,
+        imdbId: event.imdbId ? String(event.imdbId) : null,
+        genres: Array.isArray(event.genres) ? event.genres.map(String) : [],
+        addedAt: event.addedAt || nowIso(),
+      }));
+    if (!rows.length) return 0;
+
+    for (const row of rows) mem.playlistAdditions.set(row.eventId, row);
+    if (pool) {
+      // PostgreSQL allows 65,535 bind parameters. Small batches keep a config
+      // history backfill safe even after years of playlist additions.
+      for (let start = 0; start < rows.length; start += 400) {
+        const batch = rows.slice(start, start + 400);
+        const params = [];
+        const values = batch.map((row, index) => {
+          const offset = index * 12;
+          params.push(
+            row.eventId, row.streamId, row.title, row.year, row.kind, row.poster,
+            row.description, row.sourceId, row.tmdbId, row.imdbId,
+            JSON.stringify(row.genres), row.addedAt,
+          );
+          return `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11}::jsonb,$${offset + 12})`;
+        });
+        await query(
+          `insert into playlist_additions (event_id, stream_id, title, year, kind, poster, description, source_id, tmdb_id, imdb_id, genres, added_at)
+           values ${values.join(',')}
+           on conflict (event_id) do nothing`,
+          params,
+        ).catch((err) => logError('db', 'recordPlaylistAdditions failed — kept in memory/config only', err));
+      }
+    }
+    return rows.length;
+  },
+
+  async listPlaylistAdditions() {
+    const persisted = [];
+    if (pool) {
+      const res = await query('select * from playlist_additions order by added_at asc, event_id asc').catch(() => null);
+      if (res) {
+        persisted.push(...res.rows.map((row) => ({
+          eventId: row.event_id,
+          streamId: row.stream_id,
+          title: row.title,
+          year: row.year,
+          kind: row.kind,
+          poster: row.poster,
+          description: row.description,
+          sourceId: row.source_id,
+          tmdbId: row.tmdb_id,
+          imdbId: row.imdb_id,
+          genres: parseJson(row.genres, []),
+          addedAt: row.added_at instanceof Date ? row.added_at.toISOString() : row.added_at,
+        })));
+      }
+    }
+    const byId = new Map([...persisted, ...mem.playlistAdditions.values()].map((event) => [event.eventId, event]));
+    return [...byId.values()].sort((a, b) => String(a.addedAt).localeCompare(String(b.addedAt)));
   },
 
   /* ---------------- titles / metadata ---------------- */

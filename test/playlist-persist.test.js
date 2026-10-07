@@ -37,8 +37,8 @@ test('the playlist token is created once and stays valid without a writable conf
   assert.equal(playlist.tokenMatches(''), false);
 });
 
-test('playlist writes apply in memory and never throw', () => {
-  const items = playlist.saveItems([{ streamId: 'abc123', enabled: false, templateId: 'tpl-a' }]);
+test('playlist writes apply in memory and never throw', async () => {
+  const items = await playlist.saveItems([{ streamId: 'abc123', enabled: false, templateId: 'tpl-a' }]);
   assert.equal(items.length, 1);
   assert.deepEqual(
     { streamId: items[0].streamId, enabled: items[0].enabled, templateId: items[0].templateId },

@@ -14,6 +14,23 @@ https://flixhub.studio/home
 https://redflix.club/
 https://www.1flex.org/
 https://cinezo.st/
+https://flixer.gd/
+https://vidbox.vc/home
+https://nunflix.cx/home
+https://flixer.su/
+https://moviewiser.com/
+https://purehd.cc/home
+https://fmovieshd.one/
+https://filmween.net/
+https://pc.netmovie.site/
+https://www.1tube.org/
+https://nippleflix.org/
+
+Keep Flixer.gd and Flixer.su as separate source entries unless URL checking confirms they redirect to exactly the same webpage.
+
+Discovery requirements: Search and Mobile source chips should open a source-specific title-search route when reliable and otherwise its homepage. Add a Trending now / Top 10 popup whose selected title enters the existing title-search flow. Personalized recommendations must be based on every playlist addition, remain available after playlist removal or stream deletion, and must not use actual watched/playback history. The optional Postgres setup should preserve the same append-only history; config-backed persistence is the no-Postgres fallback.
+
+Playlist availability requirements: periodically check streams in the Playlist and attempt automatic recovery when an upstream is inactive. Resolve the same title on its current provider first, then try other enabled providers; replace the stored upstream while preserving the stable stream token and output URLs. Before starting playback, a relay session, or a download, check availability and attempt recovery if needed. Scheduled checking and automatic recovery must be configurable.
 
 transcoding functionality:
 video resolution should be preferable 1080p, but 720p is acceptable. in case of higher resolution from the original stream, the original stream should be transcode (decoding and encoding) by synology nas ds918+ making use of the hardware transcoding.

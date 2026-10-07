@@ -14,10 +14,12 @@
  *
  *   playlist.items = [{ streamId, enabled, templateId, subtitleLanguage, addedAt }]
  *
- * Reconciliation is intentionally forgiving: a stream that is not in the list
- * yet (created from the Search tab, or by a version that had no playlist) is
- * appended the first time the list is read, and an item whose stream was
- * deleted disappears. Nothing has to be "registered" by hand.
+ * Reconciliation is intentionally forgiving: a new stream that is not in the
+ * list yet is appended the first time the list is read, while an item the user
+ * deliberately removed stays available without being re-added automatically.
+ * A deleted stream disappears from the live list, but its append-only title
+ * snapshot remains in recommendation history. Nothing has to be registered by
+ * hand, and suggestions never consult playback/watch events.
  *
  * Everything else in this file only *reads* the existing core modules
  * (streams/store.js, streams/export.js, enigma2, subtitles) — the scraping,
@@ -27,6 +29,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { getConfig, saveConfig } from '../core/config.js';
+import { repo } from '../core/db.js';
 import { log, errorText } from '../core/log.js';
 import { normaliseProfile } from '../core/media.js';
 import { uploadSubtitleToReceiver } from '../subtitles/push.js';
@@ -81,6 +84,8 @@ let memoryToken = '';
 /** False as soon as one config write failed; reported to the UI by /api/playlist. */
 let configWritable = true;
 let persistFailureLogged = false;
+let saveItemsQueue = Promise.resolve();
+let historyBackfillComplete = false;
 
 /**
  * Persist a playlist patch, tolerating a config file that cannot be written.
@@ -160,8 +165,51 @@ export function tokenMatches(candidate) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-/** Persist the whole list (order is the caller's order). */
-export function saveItems(items = []) {
+/** Coerce an append-only title snapshot, whether it came from config or Postgres. */
+function normaliseAdditionEvent(event = {}) {
+  const eventId = text(event.eventId || event.event_id).trim();
+  const streamId = text(event.streamId || event.stream_id).trim();
+  const title = text(event.title).trim();
+  if (!eventId || !streamId || !title) return null;
+  const genres = Array.isArray(event.genres) ? [...new Set(event.genres.map((genre) => text(genre).trim()).filter(Boolean))] : [];
+  return {
+    eventId,
+    streamId,
+    title,
+    year: Number(event.year) || null,
+    kind: /series|tv|show/i.test(text(event.kind || event.type)) ? 'series' : 'movie',
+    poster: text(event.poster).trim() || null,
+    description: text(event.description).trim() || null,
+    sourceId: text(event.sourceId || event.source_id).trim() || null,
+    tmdbId: text(event.tmdbId || event.tmdb_id).trim() || null,
+    imdbId: text(event.imdbId || event.imdb_id).trim() || null,
+    genres,
+    addedAt: text(event.addedAt || event.added_at, new Date().toISOString()),
+  };
+}
+
+function additionEventForStream(streamId, stream) {
+  if (!stream) return null;
+  const meta = stream.payload?.meta || stream.meta || {};
+  const event = normaliseAdditionEvent({
+    eventId: crypto.randomUUID(),
+    streamId,
+    title: stream.title || stream.name || 'Untitled',
+    year: stream.year,
+    kind: stream.kind,
+    poster: stream.poster,
+    description: stream.description,
+    sourceId: stream.sourceId || stream.source_id,
+    tmdbId: stream.tmdbId || stream.tmdb_id || meta.tmdbId || meta.tmdb_id,
+    imdbId: stream.imdbId || stream.imdb_id || meta.imdbId || meta.imdb_id,
+    genres: stream.genres || meta.genres,
+    addedAt: new Date().toISOString(),
+  });
+  return event;
+}
+
+async function saveItemsNow(items = [], { streamsById = null } = {}) {
+  const previous = rawItems();
   const next = [];
   const seen = new Set();
   for (const raw of items) {
@@ -171,8 +219,74 @@ export function saveItems(items = []) {
     next.push(item);
     if (next.length >= MAX_ITEMS) break;
   }
-  persistPlaylist({ items: next }, 'the playlist order and flags');
+
+  const previousIds = new Set(previous.map((item) => item.streamId));
+  const nextIds = new Set(next.map((item) => item.streamId));
+  const newlyAdded = next.filter((item) => !previousIds.has(item.streamId));
+  const removedIds = (Array.isArray(getConfig().playlist?.removedStreamIds) ? getConfig().playlist.removedStreamIds : [])
+    .map((id) => text(id).trim()).filter(Boolean);
+  const removed = new Set(removedIds);
+  for (const item of previous) if (!nextIds.has(item.streamId)) removed.add(item.streamId);
+  for (const id of nextIds) removed.delete(id); // an explicit add makes it eligible again
+
+  const additions = [];
+  for (const item of newlyAdded) {
+    const supplied = streamsById instanceof Map ? streamsById.get(item.streamId) : null;
+    const stream = supplied || await store.getStream(item.streamId);
+    const event = additionEventForStream(item.streamId, stream);
+    if (event) additions.push(event);
+  }
+
+  const priorHistory = (Array.isArray(getConfig().playlist?.additionHistory) ? getConfig().playlist.additionHistory : [])
+    .map(normaliseAdditionEvent).filter(Boolean);
+  const historyById = new Map(priorHistory.map((event) => [event.eventId, event]));
+  for (const event of additions) historyById.set(event.eventId, event);
+  const additionHistory = [...historyById.values()];
+
+  // The config is the durable fallback when Postgres is not configured. The
+  // standalone DB table mirrors it when present and deliberately survives a
+  // stream deletion (there is no stream_id foreign key).
+  persistPlaylist({
+    items: next,
+    removedStreamIds: [...removed],
+    additionHistory,
+  }, 'the playlist order and addition history');
+  if (additions.length) await repo.recordPlaylistAdditions(additions);
   return next;
+}
+
+/** Persist the whole list (order is the caller's order); only new ids make history events. */
+export function saveItems(items = [], options = {}) {
+  const snapshot = Array.isArray(items) ? items.map((item) => ({ ...item })) : [];
+  const operation = saveItemsQueue.then(() => saveItemsNow(snapshot, options));
+  saveItemsQueue = operation.catch(() => {});
+  return operation;
+}
+
+/** Full append-only history of playlist additions, merged from config and optional Postgres. */
+export async function additionHistory() {
+  // Reconcile once before reading so a stream auto-added since the last playlist
+  // GET is captured even if the user opens For You first.
+  await sync();
+  const configured = (Array.isArray(getConfig().playlist?.additionHistory) ? getConfig().playlist.additionHistory : [])
+    .map(normaliseAdditionEvent).filter(Boolean);
+  if (!historyBackfillComplete) {
+    historyBackfillComplete = true;
+    if (configured.length) await repo.recordPlaylistAdditions(configured);
+  }
+  const stored = await repo.listPlaylistAdditions();
+  const configuredIds = new Set(configured.map((event) => event.eventId));
+  const byId = new Map();
+  for (const event of stored) byId.set(event.eventId, normaliseAdditionEvent(event));
+  for (const event of configured) byId.set(event.eventId, event);
+  const history = [...byId.values()].filter(Boolean).sort((a, b) => String(a.addedAt).localeCompare(String(b.addedAt)));
+  // If Postgres contains additions that predate the current config file, copy
+  // them into the config fallback once so switching back to memory mode keeps
+  // the same complete history.
+  if (stored.some((event) => !configuredIds.has(event.eventId))) {
+    persistPlaylist({ additionHistory: history }, 'the playlist recommendation history');
+  }
+  return history;
 }
 
 /**
@@ -182,8 +296,10 @@ export function saveItems(items = []) {
  */
 export async function sync({ persist = true } = {}) {
   const streams = await store.listStreams();
-  const available = new Map(streams.map((s) => [String(s.id), s]));
+  const available = new Map(streams.map((stream) => [String(stream.id), stream]));
   const current = rawItems();
+  const manuallyRemoved = new Set((Array.isArray(getConfig().playlist?.removedStreamIds)
+    ? getConfig().playlist.removedStreamIds : []).map((id) => text(id).trim()).filter(Boolean));
   const items = [];
   const seen = new Set();
   const dropped = [];
@@ -193,14 +309,17 @@ export async function sync({ persist = true } = {}) {
     seen.add(item.streamId);
     items.push(item);
   }
-  // listStreams() is newest-first; new movies go on top, not bottom.
-  const added = streams.filter((s) => !seen.has(String(s.id))).map((s) => normaliseItem({ streamId: s.id }));
+  // listStreams() is newest-first; new movies go on top, not bottom. A title
+  // deliberately removed by the user remains in `available` but is not
+  // silently added again on the next GET.
+  const addedStreams = streams.filter((stream) => !seen.has(String(stream.id)) && !manuallyRemoved.has(String(stream.id)));
+  const added = addedStreams.map((stream) => normaliseItem({ streamId: stream.id }));
   const nextItems = [...added, ...items];
   const changed = dropped.length || added.length || nextItems.length !== current.length;
   if (changed) {
     if (dropped.length) log.info('playlist', `${dropped.length} item(s) removed — the stream no longer exists`, { streamIds: dropped.slice(0, 10) });
     if (added.length) log.info('playlist', `${added.length} new stream(s) added on top of the playlist`);
-    if (persist) return saveItems(nextItems);
+    if (persist) return saveItems(nextItems, { streamsById: available });
   }
   return changed ? nextItems : items;
 }
@@ -235,16 +354,18 @@ export async function addItems(streamIds = [], { enabled = true } = {}) {
   const items = await sync();
   const known = new Set(items.map((item) => item.streamId));
   const newOnes = [];
+  const streamsById = new Map();
   for (const streamId of wanted) {
     const stream = await store.getStream(streamId);
     if (!stream) throw Object.assign(new Error(`stream "${streamId}" not found`), { status: 404 });
     if (known.has(streamId)) continue;
     newOnes.push(normaliseItem({ streamId, enabled }));
+    streamsById.set(streamId, stream);
     known.add(streamId);
   }
   const added = newOnes.length;
   const nextItems = [...newOnes, ...items];
-  if (added) saveItems(nextItems);
+  if (added) await saveItems(nextItems, { streamsById });
   return { items: added ? nextItems : items, added };
 }
 
@@ -252,7 +373,7 @@ export async function addItems(streamIds = [], { enabled = true } = {}) {
 export async function removeItem(streamId) {
   const items = await sync();
   const next = items.filter((item) => item.streamId !== String(streamId));
-  saveItems(next);
+  await saveItems(next);
   return { removed: items.length - next.length, items: next };
 }
 
@@ -277,7 +398,7 @@ export async function updateItem(streamId, patch = {}) {
     subtitleLanguage: patch.subtitleLanguage === undefined ? current.subtitleLanguage : text(patch.subtitleLanguage).trim().toLowerCase(),
   };
   items[index] = next;
-  saveItems(items);
+  await saveItems(items);
 
   if (patch.subtitleMode !== undefined) {
     const mode = text(patch.subtitleMode).trim().toLowerCase();
@@ -291,7 +412,7 @@ export async function updateItem(streamId, patch = {}) {
     // push (FTP down, no mount) still leaves the operator's intent recorded.
     next.subtitleMode = mode;
     items[index] = next;
-    saveItems(items);
+    await saveItems(items);
 
     if (MUX_SUBTITLE_MODES.includes(mode)) {
       const before = text(stream.profile?.subtitles, 'none');
@@ -544,7 +665,7 @@ export async function summary() {
 }
 
 export default {
-  name, token, tokenMatches, saveItems, sync, entries, enabledStreams, addItems, removeItem,
+  name, token, tokenMatches, saveItems, sync, entries, enabledStreams, addItems, removeItem, additionHistory,
   updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, pushSubtitle, playlistText, bouquet, summary,
   configWritableNow,
 };

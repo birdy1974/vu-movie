@@ -31,7 +31,7 @@ const REAL_WORLD = {
 fs.writeFileSync(CONFIG, JSON.stringify(REAL_WORLD, null, 2));
 process.env.CONFIG_FILE = CONFIG;
 // Independent of the shell the tests run in …
-for (const name of ['FLARESOLVERR_URL', 'DATABASE_URL', 'LOG_LEVEL', 'DEFAULT_CONTAINER', 'SUBDL_API_KEY']) delete process.env[name];
+for (const name of ['FLARESOLVERR_URL', 'DATABASE_URL', 'LOG_LEVEL', 'DEFAULT_CONTAINER', 'SUBDL_API_KEY', 'PLAYLIST_AUTO_CHECK', 'PLAYLIST_CHECK_INTERVAL_MINUTES', 'PLAYLIST_AUTO_REPAIR']) delete process.env[name];
 // … except this one, which docker-compose always sets (and which used to lose
 // against the config file: the documented precedence is env → file → defaults).
 process.env.FLARESOLVERR_URL = 'http://flaresolverr:8192';
@@ -91,6 +91,9 @@ test('no secret leaks through publicConfig(), whatever shape the file used', () 
   assert.equal(pub.db.url, 'postgres://vu-movie:***@db:5432/vumovie', 'shape is kept, password masked');
   assert.equal(pub.subtitles.keys.subdl, '••••••••');
   assert.equal(pub['db.url'], undefined, 'the flat key is gone, not just masked');
+  config.saveConfig({ playlist: { additionHistory: [{ eventId: 'test', streamId: 'test', title: 'History item' }], removedStreamIds: ['test'] } });
+  assert.equal(config.publicConfig().playlist.additionHistory, undefined, 'unbounded recommendation history is served only by its dedicated endpoint');
+  assert.equal(config.publicConfig().playlist.removedStreamIds, undefined, 'playlist reconciliation internals do not leak into Settings responses');
   // The live config does keep the secret (it has to connect / search) …
   assert.equal(config.getConfig().db.url, 'postgres://vu-movie:vubirdy@db:5432/vumovie');
   // … and a dotted API patch is folded, so it cannot create a flat key at all.
@@ -144,4 +147,23 @@ test('the search render budget has a documented default and is env-overridable',
   const patched = config.saveConfig({ scraper: { searchWaitMs: 20000 } });
   assert.equal(patched.scraper.searchWaitMs, 20000);
   config.saveConfig({ scraper: { searchWaitMs: 12000 } });
+});
+
+test('playlist schedule and recovery settings are known options and environment-overridable', () => {
+  const keys = ['autoCheckEnabled', 'autoCheckIntervalMinutes', 'autoRepairEnabled'];
+  for (const key of keys) assert.ok(config.knownOptionPaths().includes(`playlist.${key}`));
+  process.env.PLAYLIST_AUTO_CHECK = 'false';
+  process.env.PLAYLIST_CHECK_INTERVAL_MINUTES = '45';
+  process.env.PLAYLIST_AUTO_REPAIR = 'false';
+  try {
+    config.loadConfig();
+    assert.equal(config.getConfig().playlist.autoCheckEnabled, false);
+    assert.equal(config.getConfig().playlist.autoCheckIntervalMinutes, 45);
+    assert.equal(config.getConfig().playlist.autoRepairEnabled, false);
+  } finally {
+    delete process.env.PLAYLIST_AUTO_CHECK;
+    delete process.env.PLAYLIST_CHECK_INTERVAL_MINUTES;
+    delete process.env.PLAYLIST_AUTO_REPAIR;
+    config.loadConfig();
+  }
 });
