@@ -547,6 +547,26 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       return result;
     }
 
+    // Series: best-effort season/episode selection on the detail page before
+    // the player is nudged. Generic across templates (season <select>,
+    // data-season/data-episode attributes, "Season N"/"Episode N" controls);
+    // a miss is logged, never fatal — the site's default episode still plays.
+    const requestedSeason = Number(opts.season) || 0;
+    const requestedEpisode = Number(opts.episode) || 0;
+    if (requestedSeason || requestedEpisode) {
+      try {
+        result.episodeSelect = await trySelectEpisode(page, {
+          season: requestedSeason, episode: requestedEpisode,
+        });
+        if (result.episodeSelect?.notes?.length) {
+          log.info('browser', `episode select S${requestedSeason}E${requestedEpisode}: ${result.episodeSelect.notes.join('; ')}`);
+        }
+      } catch (err) {
+        result.episodeSelect = { clickedSeason: false, clickedEpisode: false, notes: [`select failed: ${err.message}`] };
+        log.debug('browser', `episode select S${requestedSeason}E${requestedEpisode} failed (non-fatal)`, { error: err.message });
+      }
+    }
+
     let followedPlayAction = false;
     if (opts.click !== false) followedPlayAction = await nudgePlay(page);
 
@@ -749,6 +769,159 @@ async function nudgePlay(page, aggressive = false) {
     } catch { /* try the next exact action label */ }
   }
   return false;
+}
+
+/**
+ * Best-effort season/episode selection on a series detail page.
+ *
+ * Templates differ per site, so this tries the generic shapes in order and
+ * stops at the first visible match: a season <select>, [data-season]/season
+ * tabs, then [data-episode]/episode buttons/links. Every step is short-timed
+ * and non-fatal — returning what was clicked so the resolve timeline can say
+ * whether SxxExx was actually selected or the site's default episode played.
+ */
+export async function trySelectEpisode(page, { season = 0, episode = 0 } = {}) {
+  const notes = [];
+  let clickedSeason = false;
+  let clickedEpisode = false;
+  const wantedSeason = Number(season) || 0;
+  const wantedEpisode = Number(episode) || 0;
+  if (!wantedSeason && !wantedEpisode) return { clickedSeason, clickedEpisode, notes };
+
+  // 1. Season <select> (flixer clones render one per title).
+  if (wantedSeason) {
+    try {
+      const selects = page.locator('select');
+      const count = await selects.count().catch(() => 0);
+      for (let i = 0; i < Math.min(count, 6) && !clickedSeason; i++) {
+        const select = selects.nth(i);
+        if (!await select.isVisible().catch(() => false)) continue;
+        const options = await select.locator('option').allTextContents().catch(() => []);
+        const matchIndex = options.findIndex((text) => new RegExp(`season\\s*0*${wantedSeason}\\b`, 'i').test(text)
+          || new RegExp(`^\\s*0*${wantedSeason}\\s*$`).test(text));
+        if (matchIndex < 0) continue;
+        const value = await select.locator('option').nth(matchIndex).getAttribute('value').catch(() => null);
+        try {
+          if (value != null) await select.selectOption(value, { timeout: 1500 });
+          else await select.selectOption({ index: matchIndex }, { timeout: 1500 });
+          clickedSeason = true;
+          notes.push(`season <select> → S${wantedSeason}`);
+          await sleep(900);
+        } catch { /* option not selectable — try the clickables below */ }
+      }
+    } catch { /* fall through to clickable season controls */ }
+  }
+
+  // 2. Clickable season controls: [data-season="N"], then "Season N" text.
+  if (wantedSeason && !clickedSeason) {
+    const seasonSelectors = [
+      `[data-season=\"${wantedSeason}\"]`,
+      `[data-season-number=\"${wantedSeason}\"]`,
+      `[data-value=\"${wantedSeason}\"]`,
+    ];
+    for (const selector of seasonSelectors) {
+      try {
+        const control = page.locator(selector).first();
+        if (await control.isVisible().catch(() => false)) {
+          await control.click({ timeout: 1500 });
+          clickedSeason = true;
+          notes.push(`clicked ${selector}`);
+          await sleep(900);
+          break;
+        }
+      } catch { /* try the next shape */ }
+    }
+    if (!clickedSeason) {
+      for (const role of ['button', 'link', 'tab']) {
+        try {
+          const control = page.getByRole(role, { name: new RegExp(`^season\\s*0*${wantedSeason}$`, 'i') }).first();
+          if (await control.isVisible().catch(() => false)) {
+            await control.click({ timeout: 1500 });
+            clickedSeason = true;
+            notes.push(`clicked ${role} “Season ${wantedSeason}”`);
+            await sleep(900);
+            break;
+          }
+        } catch { /* try the next role */ }
+      }
+    }
+  }
+
+  // 3. Episode controls: [data-episode="N"], "Episode N"/"E N", SxxExx links.
+  if (wantedEpisode) {
+    const episodeSelectors = [
+      `[data-episode=\"${wantedEpisode}\"]`,
+      `[data-episode-number=\"${wantedEpisode}\"]`,
+      `[data-ep=\"${wantedEpisode}\"]`,
+    ];
+    for (const selector of episodeSelectors) {
+      try {
+        const control = page.locator(selector).first();
+        if (await control.isVisible().catch(() => false)) {
+          await control.click({ timeout: 1500 });
+          clickedEpisode = true;
+          notes.push(`clicked ${selector}`);
+          await sleep(900);
+          break;
+        }
+      } catch { /* try the next shape */ }
+    }
+    if (!clickedEpisode) {
+      const patterns = [
+        new RegExp(`^episode\\s*0*${wantedEpisode}$`, 'i'),
+        new RegExp(`^e\\s*0*${wantedEpisode}$`, 'i'),
+        new RegExp(`^0*${wantedEpisode}$`),
+      ];
+      for (const pattern of patterns) {
+        for (const role of ['button', 'link']) {
+          try {
+            const control = page.getByRole(role, { name: pattern }).first();
+            if (await control.isVisible().catch(() => false)) {
+              await control.click({ timeout: 1500 });
+              clickedEpisode = true;
+              notes.push(`clicked ${role} matching ${pattern}`);
+              await sleep(900);
+              break;
+            }
+          } catch { /* try the next role/pattern */ }
+        }
+        if (clickedEpisode) break;
+      }
+    }
+    // SxxExx href fallback: /…/s1/e2, ?se=1&ep=2, #episode-2 style deep links.
+    if (!clickedEpisode) {
+      try {
+        const href = await page.evaluate(({ se, ep }) => {
+          const anchors = [...document.querySelectorAll('a[href]')];
+          const padded = (n) => String(n).padStart(2, '0');
+          const matchers = [
+            new RegExp(`s0*${se}[^0-9]*e0*${ep}\\b`, 'i'),
+            new RegExp(`season[^0-9]*0*${se}[^0-9]+episode[^0-9]*0*${ep}\\b`, 'i'),
+            new RegExp(`[?&](?:se|season)=0*${se}\\b[^#]*[?&](?:ep|episode)=0*${ep}\\b`, 'i'),
+          ];
+          for (const matcher of matchers) {
+            const found = anchors.find((a) => matcher.test(a.getAttribute('href') || '') || matcher.test(a.textContent || ''));
+            if (found?.getAttribute('href')) return found.getAttribute('href');
+          }
+          void padded;
+          return null;
+        }, { se: wantedSeason, ep: wantedEpisode }).catch(() => null);
+        if (href && !/^(?:#|javascript:)/i.test(href)) {
+          const target = resolveUrl(page.url(), href);
+          if (target !== page.url()) {
+            await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => {});
+            clickedEpisode = true;
+            notes.push('followed episode deep link');
+            await sleep(900);
+          }
+        }
+      } catch { /* deep-link probe failed — default episode plays */ }
+    }
+  }
+
+  if (wantedSeason && !clickedSeason) notes.push(`no season control matched S${wantedSeason} (default season plays)`);
+  if (wantedEpisode && !clickedEpisode) notes.push(`no episode control matched E${wantedEpisode} (default episode plays)`);
+  return { clickedSeason, clickedEpisode, notes };
 }
 
 export function playerUrlWithPrefix(url, prefix) {
@@ -2063,7 +2236,7 @@ export function hasSession(siteId) {
 
 export default {
   getBrowser, sniff, searchSite, browserInfo, browserLaunchError, closeBrowser, closeContexts,
-  flaresolverrStatus, describeSolverBootState,
+  flaresolverrStatus, describeSolverBootState, trySelectEpisode,
   looksLikeResultLink, waitForResultLinks, planSearchRetry, shouldRetryFlareSolverrFailure,
   sessionFile, hasSession,
 };

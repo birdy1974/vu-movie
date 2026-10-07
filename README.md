@@ -119,6 +119,16 @@ permissions, Container Manager project import, firewall, where the data lives).
 * Candidates are **probed with ffprobe**, ranked by resolution/codec/bitrate and
   deduplicated, so you choose a stream instead of a URL soup. Broken mirrors are
   marked, not offered.
+* **Series get a season/episode picker.** Below the selected title, one card per
+  season offers every episode as a checkbox (with per-season and
+  all-seasons toggles); the season list comes from MovieBox when the title has
+  it, else from TMDB (needs the key below), else from manual season/episode
+  numbers. Formats resolve **on demand per episode** — expanding an episode
+  group fetches it, “load selected” fetches the ticked ones — and a
+  **quality-coverage matrix** combines everything loaded into one row per
+  quality (episodes covered, providers, bulk “add all in 1080p”). Movies keep
+  the flat format list. Played episodes are added as `Title S01E02` items with
+  their season/episode stored on the stream (bouquet separators included).
 * **Discover titles** opens a Trending now / Top 10 / For you popup on Search
   and Mobile. Picking a title runs the normal source search. The first two lists
   use TMDB; For you uses every playlist-add event as its recommendation signal,

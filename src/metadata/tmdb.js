@@ -215,11 +215,93 @@ export function isConfigured() {
   return Boolean(apiKey());
 }
 
+/**
+ * List the seasons of a TV show (TMDB id), newest last.
+ * Returns [{ season, name, episodeCount, airDate, poster }] — season 0
+ * (Specials) is kept when TMDB lists it, the UI decides whether to show it.
+ */
+export async function getTVSeasons(tmdbId) {
+  if (!tmdbId) throw new Error('tmdbId required');
+  const details = await tmdbFetch(`/tv/${encodeURIComponent(String(tmdbId))}`);
+  const seasons = Array.isArray(details?.seasons) ? details.seasons : [];
+  return seasons
+    .map((s) => ({
+      season: Number(s.season_number),
+      name: s.name || `Season ${s.season_number}`,
+      episodeCount: Number(s.episode_count) || 0,
+      airDate: s.air_date || null,
+      poster: s.poster_path ? `${IMG_BASE}/w185${s.poster_path}` : null,
+      overview: s.overview || '',
+    }))
+    .filter((s) => Number.isFinite(s.season))
+    .sort((a, b) => a.season - b.season);
+}
+
+/**
+ * List the episodes of one season: [{ episode, name, airDate, overview,
+ * runtime, still }]. Pure normalizer below is unit tested; this does the I/O.
+ */
+export async function getSeasonEpisodes(tmdbId, seasonNumber) {
+  if (!tmdbId) throw new Error('tmdbId required');
+  const season = Number(seasonNumber);
+  if (!Number.isFinite(season)) throw new Error('seasonNumber required');
+  const data = await tmdbFetch(`/tv/${encodeURIComponent(String(tmdbId))}/season/${season}`);
+  return normalizeSeasonEpisodes(data);
+}
+
+/** Pure: TMDB `/tv/{id}/season/{n}` payload → episode rows. */
+export function normalizeSeasonEpisodes(data) {
+  const episodes = Array.isArray(data?.episodes) ? data.episodes : [];
+  return episodes
+    .map((e) => ({
+      episode: Number(e.episode_number),
+      name: e.name || `Episode ${e.episode_number}`,
+      airDate: e.air_date || null,
+      overview: e.overview || '',
+      runtime: Number(e.runtime) || null,
+      still: e.still_path ? `${IMG_BASE}/w300${e.still_path}` : null,
+    }))
+    .filter((e) => Number.isFinite(e.episode) && e.episode > 0)
+    .sort((a, b) => a.episode - b.episode);
+}
+
+/**
+ * Full series shape for the picker: every season with its episodes.
+ * Season detail calls run with a small concurrency so a 20-season show does
+ * not fire 20 requests at once; a single failing season keeps its count.
+ */
+export async function getTVSeasonsFull(tmdbId, { concurrency = 4 } = {}) {
+  const seasons = await getTVSeasons(tmdbId);
+  const out = [];
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(1, seasons.length)) }, async () => {
+    while (index < seasons.length) {
+      const current = seasons[index++];
+      try {
+        const episodes = await getSeasonEpisodes(tmdbId, current.season);
+        out.push({ ...current, episodeCount: episodes.length || current.episodeCount, episodes });
+      } catch (err) {
+        log.warn('metadata', `TMDB season ${current.season} of ${tmdbId} failed`, { error: err.message });
+        const fallback = Array.from({ length: current.episodeCount }, (_, i) => ({
+          episode: i + 1, name: `Episode ${i + 1}`, airDate: null, overview: '', runtime: null, still: null,
+        }));
+        out.push({ ...current, episodes: fallback });
+      }
+    }
+  });
+  await Promise.all(workers);
+  return out.sort((a, b) => a.season - b.season);
+}
+
 export default {
   searchTMDB,
   getTMDBDetails,
   getTrendingTMDB,
   getTopRatedTMDB,
   getTMDBRecommendations,
+  getTVSeasons,
+  getSeasonEpisodes,
+  getTVSeasonsFull,
+  normalizeSeasonEpisodes,
   isConfigured,
 };

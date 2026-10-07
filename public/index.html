@@ -265,10 +265,25 @@
               <div class="row" id="sel-providers"></div>
               <div id="sel-details" class="selected-details hide"></div>
               <div id="sel-meta-table" class="meta-table hide"></div>
-              <div id="sel-episode-controls" class="selected-episodes hide">
-                <div class="field"><label for="sel-season">Season</label><select id="sel-season"></select></div>
-                <div class="field"><label for="sel-episode">Episode</label><select id="sel-episode"></select></div>
-                <div id="sel-episode-status" class="meta episode-status"></div>
+              <div id="sel-episode-controls" class="series-picker hide">
+                <div class="series-picker-head">
+                  <b>Seasons &amp; episodes</b>
+                  <span class="tip" tabindex="0" role="note" aria-label="About the season picker" data-tip="Tick the seasons and episodes to fetch. Formats load on demand: expand an episode below to resolve it, or load everything selected at once. The quality view combines all loaded episodes into one row per quality.">i</span>
+                  <span class="mut" id="sel-series-source"></span>
+                </div>
+                <div id="sel-seasons" class="season-cards"><div class="meta">loading seasons…</div></div>
+                <div id="sel-series-manual" class="series-manual hide">
+                  <div class="field"><label for="sel-manual-season">Season</label><input id="sel-manual-season" type="number" min="0" value="1"></div>
+                  <div class="field"><label for="sel-manual-episodes">Episodes (e.g. 1-8 or 1,2,5)</label><input id="sel-manual-episodes" placeholder="1-8"></div>
+                  <button type="button" class="btn sm pri" id="btn-sel-manual-add">add episodes</button>
+                </div>
+                <div class="row series-picker-actions">
+                  <button type="button" class="btn sm ghost" id="btn-sel-series-all">✓ all seasons</button>
+                  <button type="button" class="btn sm ghost" id="btn-sel-series-clear">✕ clear</button>
+                  <button type="button" class="btn sm pri" id="btn-sel-series-load">⤓ load selected</button>
+                  <span class="mut" id="sel-series-summary"></span>
+                </div>
+                <div id="sel-episode-status" class="meta episode-status" role="status" aria-live="polite"></div>
               </div>
             </div>
           </div>
