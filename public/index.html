@@ -54,7 +54,16 @@
           <div class="field"><label for="mob-type">Type</label>
             <select id="mob-type"><option value="">both</option><option value="movie">movie</option><option value="series">series</option></select></div>
           <div class="field"><label for="mob-sources">Sources</label>
-            <select id="mob-sources"><option value="enabled">enabled sources</option><option value="all">all sources</option></select></div>
+            <select id="mob-sources"><option value="enabled">enabled sources</option><option value="all">all sources</option><option value="custom">custom…</option></select></div>
+        </div>
+        <div class="field">
+          <label>Pick sources (tap to toggle) <span class="tip" tabindex="0" role="note" aria-label="About source picker" data-tip="Tap a source to include or exclude it. All = every source."></span></label>
+          <div id="mob-source-chips" class="row" style="gap:6px;flex-wrap:wrap"><span class="meta">loading sources…</span></div>
+          <div class="row" style="margin-top:6px">
+            <button type="button" class="btn sm ghost" id="btn-mob-sources-all">✓ all</button>
+            <button type="button" class="btn sm ghost" id="btn-mob-sources-enabled">enabled only</button>
+            <span class="mut" id="mob-sources-count"></span>
+          </div>
         </div>
         <div class="row">
           <button class="btn pri grow" id="btn-mob-search">⌕ Search</button>

@@ -1652,14 +1652,23 @@ function renderStreamUrls() {
       ${item.enabled ? tag('in the outputs', 'ok') : tag('disabled — not in the outputs', 'warn')}
       <span class="mut">${item.session ? `${item.session.clients || 0} player(s) connected` : 'no relay session running'}</span>
     </div>
-    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => `
+    <div class="st-url-grid">${STREAM_URL_LABELS.map(([key, label]) => {
+      const url = urls[key] || '';
+      const canOpen = Boolean(url);
+      const isWatch = key === 'watch';
+      const isVlcLike = ['ts','mkv','forBox','hls','playlist','web'].includes(key);
+      const openLabel = isWatch ? 'open ↗' : 'VLC';
+      const openAttr = isWatch ? `data-open-url="${escapeHtml(url)}"` : `data-vlc-url="${escapeHtml(url)}"`;
+      return `
       <div class="field" style="margin:0">
         <label>${escapeHtml(label)}</label>
         <div class="row">
-          <input type="text" class="mono" readonly value="${escapeHtml(urls[key] || '')}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
-          <button type="button" class="btn sm" data-copy-url="${escapeHtml(urls[key] || '')}"${urls[key] ? '' : ' disabled'}>copy</button>
+          <input type="text" class="mono" readonly value="${escapeHtml(url)}" aria-label="${escapeHtml(label)} URL" style="flex:1;min-width:120px">
+          <button type="button" class="btn sm" data-copy-url="${escapeHtml(url)}"${canOpen ? '' : ' disabled'}>copy</button>
+          ${canOpen ? `<button type="button" class="btn sm ghost" ${openAttr} title="${isWatch ? 'open watch page' : 'open in VLC / player'}">${openLabel}</button>` : ''}
         </div>
-      </div>`).join('')}</div>
+      </div>`;
+    }).join('')}</div>
     ${urls.directNote ? `<div class="note mut" style="margin:8px 0 0">Direct upstream link ${escapeHtml(urls.directNote)}.</div>` : ''}`;
   $$('#st-urls input[readonly]').forEach((input) => input.addEventListener('click', () => input.select()));
   const note = $('#st-url-note');
@@ -1731,8 +1740,20 @@ function initStream() {
     URL.revokeObjectURL(link.href);
   });
   $('#st-outputs')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-copy]');
-    if (button) copyText(button.dataset.copy);
+    const copyBtn = event.target.closest('[data-copy]');
+    if (copyBtn) { copyText(copyBtn.dataset.copy); return; }
+    const vlcPl = event.target.closest('[data-vlc-pl]');
+    if (vlcPl?.dataset.vlcPl) {
+      const u = vlcPl.dataset.vlcPl;
+      try {
+        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        window.location.href = vlc;
+        setTimeout(() => toast(`VLC playlist: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
+      } catch {
+        window.open(u, '_blank');
+      }
+      return;
+    }
   });
   $('#st-items')?.addEventListener('click', (event) => {
     const copyButton = event.target.closest('[data-copy-item]');
@@ -1749,8 +1770,24 @@ function initStream() {
     copyText(lines.join('\n'));
   });
   $('#st-urls')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-copy-url]');
-    if (button?.dataset.copyUrl) copyText(button.dataset.copyUrl);
+    const copyBtn = event.target.closest('[data-copy-url]');
+    if (copyBtn?.dataset.copyUrl) { copyText(copyBtn.dataset.copyUrl); return; }
+    const openBtn = event.target.closest('[data-open-url]');
+    if (openBtn?.dataset.openUrl) { window.open(openBtn.dataset.openUrl, '_blank'); return; }
+    const vlcBtn = event.target.closest('[data-vlc-url]');
+    if (vlcBtn?.dataset.vlcUrl) {
+      const u = vlcBtn.dataset.vlcUrl;
+      // Try VLC protocol, fallback to opening URL
+      try {
+        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        window.location.href = vlc;
+        // Also copy to clipboard as hint
+        setTimeout(() => toast(`VLC URL: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
+      } catch {
+        window.open(u, '_blank');
+      }
+      return;
+    }
   });
   $('#btn-st-vlc')?.addEventListener('click', () => streamUrlAction('vlc'));
   $('#btn-st-session-start')?.addEventListener('click', () => streamUrlAction('start'));
@@ -1774,21 +1811,23 @@ async function refreshStream(announce = false) {
   $('#st-meta').innerHTML = `${escapeHtml(state.playlist.name || 'vu-movie')} · ${summary.enabled}/${summary.total} item(s) enabled · ${escapeHtml(state.playlist.items.filter((item) => item.hasTemplate).length)} with an FFmpeg template`;
   const xtream = urls.xtream || {};
   const entries = [
-    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true },
-    { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player', url: urls.m3u },
-    { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata', url: urls.m3uPlus },
-    { name: 'VLC playlist', hint: 'the same list, VLC preset', url: urls.vlc },
-    { name: 'Kodi playlist', hint: 'Kodi preset (.m3u)', url: urls.kodi },
-    { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json },
-    { name: 'Xtream Codes', hint: `player_api.php · user ${xtream.username || '—'}`, url: xtream.playerApi, kind: 'xtream', xtream },
-    { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet },
+    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true, vlc: false },
+    { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player (all enabled playlist items)', url: urls.m3u, kind: 'm3u', vlc: true },
+    { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata (all enabled)', url: urls.m3uPlus, kind: 'm3u', vlc: true },
+    { name: 'VLC playlist', hint: 'VLC preset — complete playlist (all streams defined in Playlist tab, enabled only)', url: urls.vlc, kind: 'm3u', vlc: true, isCompleteVlc: true },
+    { name: 'Kodi playlist', hint: 'Kodi preset (.m3u) — complete playlist', url: urls.kodi, kind: 'm3u', vlc: true },
+    { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json, kind: 'json', vlc: false },
+    { name: 'Xtream Codes', hint: `player_api.php · user ${xtream.username || '—'}`, url: xtream.playerApi, kind: 'xtream', xtream, vlc: false },
+    { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet, kind: 'bouquet', vlc: false },
   ];
   $('#st-outputs').innerHTML = entries.map((entry) => `
-    <div class="card">
+    <div class="card" ${entry.isCompleteVlc ? 'style="border-color:var(--acc);box-shadow:0 0 0 1px rgba(56,189,248,.25)"' : ''}>
       <div class="spread">
-        <div><h3 style="margin:0">${escapeHtml(entry.name)}</h3><div class="meta">${escapeHtml(entry.hint || '')}</div></div>
+        <div><h3 style="margin:0">${escapeHtml(entry.name)}${entry.isCompleteVlc ? ' <span class="tag info">complete playlist</span>' : ''}</h3><div class="meta">${escapeHtml(entry.hint || '')}</div></div>
         <div class="row" style="gap:6px">
           ${entry.kind === 'link' ? `<a class="btn sm" href="${escapeHtml(entry.url || '')}" target="_blank" rel="noreferrer">open ↗</a>` : ''}
+          ${entry.vlc ? `<button class="btn sm" data-vlc-pl="${escapeHtml(entry.url || '')}" title="open in VLC">▶ VLC</button>` : ''}
+          ${entry.kind === 'm3u' ? `<a class="btn sm ghost" href="${escapeHtml(entry.url || '')}" target="_blank" rel="noreferrer">open ↗</a>` : ''}
           <button class="btn sm ghost" data-copy="${escapeHtml(entry.url || '')}">copy</button>
         </div>
       </div>
@@ -2278,8 +2317,53 @@ function wireSettings() {
 
 async function initMobile() {
   await VMPlaylist.load().catch(() => {});
+  // Mobile source selection — mirrors desktop but lives in state.mobile.selectedSources
+  if (!Array.isArray(state.mobile.selectedSources)) state.mobile.selectedSources = [];
+  try {
+    const { sources } = await api('/api/sources', { silent: true });
+    if (sources?.length) {
+      state.sources = sources;
+      if (!state.mobile.selectedSources.length) {
+        state.mobile.selectedSources = sources.filter((s) => s.enabled).map((s) => s.id);
+      }
+      renderMobSourceChips();
+    }
+  } catch {}
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
+  $('#mob-sources')?.addEventListener('change', () => {
+    const v = $('#mob-sources')?.value;
+    if (v === 'all') {
+      state.mobile.selectedSources = state.sources.map((s) => s.id);
+    } else if (v === 'enabled') {
+      state.mobile.selectedSources = state.sources.filter((s) => s.enabled).map((s) => s.id);
+    }
+    // custom keeps current selection
+    renderMobSourceChips();
+  });
+  $('#mob-source-chips')?.addEventListener('click', (event) => {
+    const chip = event.target.closest('.chip');
+    if (!chip || !chip.dataset.id) return;
+    const id = chip.dataset.id;
+    const cur = state.mobile.selectedSources || [];
+    state.mobile.selectedSources = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+    // If user manually toggles, mark select as custom
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'custom';
+    renderMobSourceChips();
+  });
+  $('#btn-mob-sources-all')?.addEventListener('click', () => {
+    state.mobile.selectedSources = state.sources.map((s) => s.id);
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'all';
+    renderMobSourceChips();
+  });
+  $('#btn-mob-sources-enabled')?.addEventListener('click', () => {
+    state.mobile.selectedSources = state.sources.filter((s) => s.enabled).map((s) => s.id);
+    const sel = $('#mob-sources');
+    if (sel) sel.value = 'enabled';
+    renderMobSourceChips();
+  });
   $('#mob-results')?.addEventListener('click', (event) => {
     // A provider chip: only that provider's formats. The row itself: all of them.
     const provider = event.target.closest('[data-mprovider]');
@@ -2309,6 +2393,19 @@ async function initMobile() {
     const select = event.target.closest('[data-mtpl]');
     if (!select) return;
     VMPlaylist.assignTemplate(select.dataset.mtpl, select.value).then(() => refreshMobile());
+  });
+  $('#mob-list')?.addEventListener('click', (event) => {
+    const play = event.target.closest('[data-mob-play]');
+    if (play) {
+      const url = play.dataset.mobPlay;
+      if (url) window.open(url, '_blank');
+      return;
+    }
+    const rem = event.target.closest('[data-mob-remove]');
+    if (rem) {
+      VMPlaylist.removeItem(rem.dataset.mobRemove).then(() => refreshMobile());
+      return;
+    }
   });
   $('#btn-mob-sub-search')?.addEventListener('click', mobileSubtitleSearch);
   $('#mob-subs')?.addEventListener('click', (event) => {
@@ -2342,6 +2439,28 @@ async function initMobile() {
   $('#btn-mob-copy-url')?.addEventListener('click', () => copyText(state.playlist.urls?.page || ''));
 }
 
+function renderMobSourceChips() {
+  const host = $('#mob-source-chips');
+  const count = $('#mob-sources-count');
+  if (!host) return;
+  const sources = state.sources || [];
+  const selected = state.mobile.selectedSources || [];
+  if (!sources.length) {
+    host.innerHTML = '<span class="meta">no sources</span>';
+    if (count) count.textContent = '';
+    return;
+  }
+  host.innerHTML = sources.map((s) => `<span class="chip ${selected.includes(s.id) ? 'on' : ''}" data-id="${escapeHtml(s.id)}" role="button" tabindex="0" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>`).join('');
+  if (count) count.textContent = `${selected.length}/${sources.length} selected`;
+  // Sync the quick select
+  const sel = $('#mob-sources');
+  if (sel) {
+    if (selected.length === sources.length) sel.value = 'all';
+    else if (selected.length === sources.filter((x) => x.enabled).length && selected.every((id) => sources.find((x) => x.id === id)?.enabled)) sel.value = 'enabled';
+    else sel.value = 'custom';
+  }
+}
+
 function mobileHint(text) {
   const hint = $('#mob-search-hint');
   if (hint) hint.textContent = text;
@@ -2370,17 +2489,29 @@ async function mobileSearch() {
   beginMobileSearch(q);
   const params = new URLSearchParams({ q, moviebox: 'true' });
   if ($('#mob-type')?.value) params.set('type', $('#mob-type').value);
-  if ($('#mob-sources')?.value === 'enabled') params.set('sources', state.sources.filter((source) => source.enabled).map((source) => source.id).join(','));
+  const selSources = state.mobile.selectedSources || [];
+  if (selSources.length && selSources.length !== (state.sources||[]).length) {
+    params.set('sources', selSources.join(','));
+  } else if (!selSources.length) {
+    // No sources selected -> fallback to enabled
+    const enabled = (state.sources||[]).filter((s) => s.enabled).map((s) => s.id);
+    if (enabled.length) params.set('sources', enabled.join(','));
+  }
   try {
     const data = await api(`/api/find/search?${params}`, { silent: true });
     state.mobile.results = buildGroups(data.results || []).slice(0, 12);
     const host = $('#mob-results');
     host.innerHTML = state.mobile.results.length ? state.mobile.results.map((group) => {
       const providers = [...new Set(group.entries.map((entry) => entry.sourceId))];
+      const poster = group.poster || group.entries.find((e) => e.poster)?.poster || '';
       return `<div class="mob-result-wrap" data-mgroup="${escapeHtml(group.key)}">
-        <button class="mob-result">
-          <span class="mob-title">${escapeHtml(titleText(group))}</span>
-          <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
+        <button class="mob-result" style="flex-direction:row;align-items:flex-start;gap:10px">
+          ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:54px;height:81px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:54px;height:81px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
+          <span style="display:flex;flex-direction:column;gap:2px;min-width:0;text-align:left">
+            <span class="mob-title">${escapeHtml(titleText(group))}</span>
+            <span class="meta">${escapeHtml(group.kind)} · ${group.entries.length} format(s) from ${providers.length} provider(s)</span>
+            <span class="meta" style="white-space:normal">${providers.map((id) => escapeHtml(sourceName(id))).join(', ')}</span>
+          </span>
         </button>
         ${providers.length > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(group, { attr: 'data-mprovider' })}</div>` : ''}
       </div>`;
@@ -2462,17 +2593,27 @@ function refreshMobile() {
   if (!items.length) {
     host.innerHTML = '<div class="meta">the playlist is empty — search above and pick a format</div>';
   } else {
-    host.innerHTML = items.map((item) => `
-      <div class="mob-item">
+    host.innerHTML = items.map((item) => {
+      const poster = item.poster || '';
+      const watchUrl = item.urls?.watch || '';
+      const tsUrl = item.urls?.ts || '';
+      return `
+      <div class="mob-item" style="gap:10px">
+        ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:48px;height:72px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:48px;height:72px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
         <div class="mob-item-main">
           <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
-          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''}</div>
+          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'}</div>
+          <div class="row" style="margin-top:6px;gap:6px">
+            <button class="btn sm pri" data-mob-play="${escapeHtml(watchUrl || tsUrl)}" title="stream on your mobile">▶ stream</button>
+            <button class="btn sm ghost" data-mob-remove="${escapeHtml(item.streamId)}" title="remove from playlist">⊖</button>
+          </div>
         </div>
         <select class="mob-tpl" data-mtpl="${escapeHtml(item.streamId)}" aria-label="FFmpeg template for ${escapeHtml(item.title)}" title="FFmpeg template">
           <option value="">guided builder</option>
           ${VMPlaylist.templates().map((tpl) => `<option value="${escapeHtml(tpl.id)}"${(item.templateId || item.profileTemplateId) === tpl.id ? ' selected' : ''}>${escapeHtml(tpl.name)}</option>`).join('')}
         </select>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
   const select = $('#mob-sub-item');
   if (select) {
@@ -2589,10 +2730,23 @@ function wireFolds() {
     const fallback = button.getAttribute('aria-expanded') === 'false';
     const saved = stored[button.dataset.fold];
     setFold(button, typeof saved === 'boolean' ? saved : fallback, false);
-    button.addEventListener('click', () => {
+    const toggle = () => {
       const body = $(`[data-fold-body="${button.dataset.fold}"]`);
       if (body) setFold(button, !body.classList.contains('hide'));
+    };
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggle();
     });
+    const head = button.closest('.cardhead');
+    if (head) {
+      head.style.cursor = 'pointer';
+      head.addEventListener('click', (e) => {
+        if (e.target.closest('.tip')) return;
+        if (e.target.closest('.foldbtn')) return;
+        toggle();
+      });
+    }
   });
   $('#btn-mob-fold')?.addEventListener('click', () => {
     const buttons = mobileFoldButtons();

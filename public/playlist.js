@@ -624,42 +624,62 @@ const VMPlaylist = (() => {
     openModal({
       title: 'Preview web player',
       className: 'wide',
-      body: `<div class="player-box"><div class="meta" id="player-status"><span class="spin"></span> starting the relay session…</div></div>`,
+      body: `<div class="player-box"><div class="meta" id="player-status"><span class="spin"></span> loading stream info…</div></div>`,
     });
     const status = $('#player-status');
     try {
       const res = await api(`/api/streams/${encodeURIComponent(streamId)}`, { silent: true });
       const stream = res.stream;
       const urls = res.urls || {};
+      // Build modal that embeds the same /watch page that "Watch in browser" uses,
+      // so the preview button works exactly like the Stream URLs watch button.
+      const watchUrl = urls.watch || '';
+      const tsUrl = urls.ts || '';
+      const webUrl = urls.web || '';
       openModal({
         title: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
         className: 'wide',
         body: `
           <div class="player-box">
-            <video id="player-video" controls autoplay playsinline></video>
-            <div id="player-status" class="meta" style="margin-top:8px">connecting…</div>
-            <div class="row" style="margin-top:8px">
+            <div class="row" style="margin-bottom:8px">
+              <button class="btn sm pri" data-player-watch>▶ open Watch in browser ↗</button>
               <button class="btn sm" data-player-vlc>▶ open in VLC</button>
               <button class="btn sm ghost" data-player-copy>copy VLC URL</button>
-              <button class="btn sm ghost" data-player-newtab>open /watch page ↗</button>
               <button class="btn sm ghost" data-player-sub>▤ subtitle</button>
             </div>
-            <div class="meta" style="margin-top:8px">The web player transmuxes the MPEG-TS relay in <b>this browser</b>: it reports which codecs it can decode, and the relay builds the preview from that — <b>without subtitles</b> and ignoring the item’s FFmpeg template (that one is written for VLC/the VU+). HEVC or AC-3 sources are transcoded to H.264/AAC on the fly; a source the browser cannot decode at all still plays in VLC.</div>
-            <details class="meta" style="margin-top:6px"><summary style="cursor:pointer">preview URL</summary>
-              <div class="mono" id="player-weburl" style="word-break:break-all;margin-top:4px"></div></details>
+            <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#000">
+              <iframe id="player-iframe" src="${escapeHtml(watchUrl)}" style="width:100%;height:56vh;min-height:360px;border:0;background:#000" allow="autoplay; fullscreen" loading="lazy"></iframe>
+            </div>
+            <div id="player-status" class="meta" style="margin-top:8px">embedded Watch page — same player as "Watch in browser". If it does not start, use VLC or open the Watch page in a new tab.</div>
+            <details class="meta" style="margin-top:8px"><summary style="cursor:pointer">inline preview (same as Watch page, without iframe)</summary>
+              <div style="margin-top:8px">
+                <video id="player-video" controls autoplay playsinline style="width:100%;max-height:42vh;background:#000;border-radius:8px"></video>
+                <div class="meta" style="margin-top:6px">Fallback inline player — uses mpegts.js directly, same URL as the Watch page.</div>
+                <div class="mono" id="player-weburl" style="word-break:break-all;margin-top:4px">${escapeHtml(webUrl)}</div>
+              </div>
+            </details>
           </div>`,
         onMount: (root) => {
           const video = $('#player-video', root);
           const statusEl = $('#player-status', root);
-          $('[data-player-vlc]', root)?.addEventListener('click', () => { window.location.href = String(urls.ts).replace(/^https?:/, 'vlc:'); });
-          $('[data-player-copy]', root)?.addEventListener('click', () => copyText(urls.ts || ''));
-          $('[data-player-newtab]', root)?.addEventListener('click', () => window.open(urls.watch || '', '_blank'));
+          const iframe = $('#player-iframe', root);
+          $('[data-player-watch]', root)?.addEventListener('click', () => window.open(watchUrl, '_blank'));
+          $('[data-player-vlc]', root)?.addEventListener('click', () => {
+            try { window.location.href = String(tsUrl).replace(/^https?:/, 'vlc:'); } catch { window.open(tsUrl, '_blank'); }
+          });
+          $('[data-player-copy]', root)?.addEventListener('click', () => copyText(tsUrl || ''));
           $('[data-player-sub]', root)?.addEventListener('click', () => openSubtitlePicker(stream.id));
-          return startPlayback({ stream, urls, video, statusEl });
+          // Also start inline fallback player
+          const cleanup = startPlayback({ stream, urls, video, statusEl: statusEl || { textContent: '', className: '' } });
+          // Cleanup should also clear iframe
+          return () => {
+            try { if (iframe) iframe.src = 'about:blank'; } catch {}
+            try { cleanup?.(); } catch {}
+          };
         },
       });
     } catch (error) {
-      status.textContent = `could not load the stream: ${error.message}`;
+      if (status) status.textContent = `could not load the stream: ${error.message}`;
     }
   }
 
