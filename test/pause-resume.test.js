@@ -337,13 +337,15 @@ test('an idle stop keeps the play head, and the next play of the stream resumes 
     assert.equal(relay.getSession(stream.id), null, 'stopped when the window ends');
 
     const next = await startSession(stream);
-    assert.equal(next.resumeSeconds, 48, 'the play head (50 s) minus the 2 s rewind');
-    assert.match(lastArgv(), /-ss 48 /, 'ffmpeg was started with an input seek to 48 s');
+    // The play head (50 s), minus the 2 s rewind, minus the 10 s for what the
+    // player had not shown when it left.
+    assert.equal(next.resumeSeconds, 38, 'the play head minus both rewinds');
+    assert.match(lastArgv(), /-ss 38 /, 'ffmpeg was started with an input seek to 38 s');
     const again = await openPlayer(port);
-    await until(() => again.length >= 32, 'the resumed film to arrive');
+    await until(() => again.length >= 12 * 16, 'the resumed film to arrive');
     again.req.destroy();
-    assert.equal(again.bytes().subarray(0, 32).toString('latin1'), '000000000000049\n000000000000050\n',
-      'the first bytes are the seconds after the play head');
+    assert.equal(again.bytes().subarray(0, 16).toString('latin1'), '000000000000039\n',
+      'the first bytes are the second after the resume point');
   } finally {
     resetStub();
     relay.stopSession(stream.id, 'test done');
@@ -429,6 +431,85 @@ test('a session pins its upstream proxy while it lives, so the proxy sweep canno
   try {
     assert.ok(session.upProxy, 'a file source gets an upstream proxy');
     assert.equal(session.upProxy.pinned, true);
+  } finally {
+    relay.stopSession(stream.id, 'test done');
+  }
+});
+
+test('a player that left while paused: the next player starts 10 s earlier, so what the first one had not shown is sent again', async () => {
+  const stream = await makeStream('Left while paused');
+  serveStreamId = stream.id;
+  const session = await startSession(stream);
+  try {
+    const first = await openPlayer(port);
+    first.res.pause();
+    await until(() => session.held && session.clients.size === 1, 'the source to be held for the paused player');
+    await untilStableFor(() => session.bytesOut, 400, 'the source to stop once the buffers are full');
+    first.req.destroy(); // closed while paused: its buffered film is lost with the connection
+    await until(() => session.clients.size === 0, 'the first player to leave');
+    const playheadAtLeave = relay.playheadSeconds(session);
+    const launches = argvLines().length;
+
+    const second = await openPlayer(port); // the same movie, back again
+    await until(() => argvLines().length > launches, 'ffmpeg to be started again');
+    const restartedAt = Number(/-ss (\d+) /.exec(lastArgv())?.[1]);
+    assert.equal(restartedAt, Math.floor(playheadAtLeave) - 10, 'started 10 s before where the first player had got to');
+    await until(() => second.length >= 16, 'the second player to receive film');
+    assert.equal(second.bytes().subarray(0, 16).toString('latin1'), `${String(restartedAt + 1).padStart(15, '0')}\n`,
+      'the film continues from that point, with nothing skipped');
+    second.req.destroy();
+    await until(() => second.closed, 'the second player to close');
+    assert.ok(isUnbrokenRunOfTheFilm(second.bytes()), 'the second player got an unbroken run of the film');
+  } finally {
+    relay.stopSession(stream.id, 'test done');
+  }
+});
+
+test('a play head kept after a player left while paused is 10 s earlier as well', async (t) => {
+  config.saveConfig({ transcode: { pauseKeepSeconds: 20, resumeHours: 12 } });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.after(() => t.mock.timers.reset());
+  const stream = await makeStream('Kept after a paused leave');
+  serveStreamId = stream.id;
+  const session = await startSession(stream);
+  try {
+    const player = await openPlayer(port);
+    player.res.pause();
+    await until(() => session.held && session.clients.size === 1, 'the source to be held for the paused player');
+    await untilStableFor(() => session.bytesOut, 400, 'the source to stop once the buffers are full');
+    const playhead = relay.playheadSeconds(session);
+    player.req.destroy();
+    await until(() => session.clients.size === 0, 'the player to leave');
+
+    t.mock.timers.tick(20000); // the pause window ends: the idle stop keeps the play head
+    assert.equal(relay.getSession(stream.id), null, 'stopped after the pause window');
+    const next = await startSession(stream);
+    assert.equal(next.resumeSeconds, Math.floor(playhead) - 2 - 10, 'the 2 s rewind and the 10 s for the lost buffers');
+  } finally {
+    relay.stopSession(stream.id, 'test done');
+  }
+});
+
+test('a player that closes while still reading also leaves the 10 s rewind: the next player starts that much earlier', async () => {
+  const stream = await makeStream('Closed while reading');
+  serveStreamId = stream.id;
+  const session = await startSession(stream);
+  try {
+    const first = await openPlayer(port);
+    await until(() => first.length >= 3 * MB, 'the first player to be reading');
+    first.req.destroy();
+    await until(() => session.clients.size === 0, 'the first player to leave');
+    // The progress is read from ffmpeg's stderr, so it settles a moment after the hold.
+    await untilStableFor(() => relay.playheadSeconds(session), 400, 'the play head to settle');
+    const playheadAtLeave = relay.playheadSeconds(session);
+    const launches = argvLines().length;
+
+    const second = await openPlayer(port);
+    await until(() => argvLines().length > launches, 'ffmpeg to be started again');
+    assert.equal(Number(/-ss (\d+) /.exec(lastArgv())?.[1]), Math.floor(playheadAtLeave) - 10,
+      'the buffers were lost with the connection, so the film is sent again from 10 s earlier');
+    second.req.destroy();
+    await until(() => second.closed, 'the second player to close');
   } finally {
     relay.stopSession(stream.id, 'test done');
   }

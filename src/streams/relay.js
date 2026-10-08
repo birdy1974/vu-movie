@@ -548,6 +548,16 @@ const RESUME_REWIND_SECONDS = 2;
 /** Less than this played is not worth resuming (start-up noise). */
 const RESUME_MIN_PLAYHEAD_SECONDS = 10;
 
+/**
+ * The relay sends a player the film at the source's pace, and the player shows
+ * it a little later: the TCP buffers and the player's own cache hold the rest.
+ * When the player closes, that part is lost with the connection. Measured at
+ * ~5.5 MB of socket buffers for a 4 Mbps film (about 10 s). The next player to
+ * come back starts this many seconds earlier, so the lost part is sent again
+ * rather than skipped. The relay cannot see how much the player had shown.
+ */
+const RECONNECT_REWIND_SECONDS = 10;
+
 function resumeHoursLimit() {
   return Math.max(0, Number(getConfig().transcode.resumeHours) || 0);
 }
@@ -567,7 +577,7 @@ export function rememberResumePoint(session, { now = Date.now() } = {}) {
     return 0;
   }
   if (!(playhead >= RESUME_MIN_PLAYHEAD_SECONDS)) return 0;
-  const seconds = Math.floor(playhead) - RESUME_REWIND_SECONDS;
+  const seconds = Math.floor(playhead) - RESUME_REWIND_SECONDS - (session.pendingRewind || 0);
   resumePoints.set(session.streamId, { seconds, at: now });
   log.info('relay', `kept the play head of "${session.stream?.title || session.streamId}" at ${seconds}s`, {
     session: session.id, resumeHours: resumeHoursLimit(),
@@ -631,6 +641,25 @@ function applySourceFlow(session) {
     session.held = true;
     stdout.pause();
   }
+}
+
+/**
+ * Start ffmpeg again `seconds` before the play head, for a player that came
+ * back after another one left (see RECONNECT_REWIND_SECONDS). The old ffmpeg is
+ * stopped quietly: its exit is expected, so its handlers ignore it.
+ */
+function restartBack(session, seconds) {
+  const at = Math.max(0, Math.floor(playheadSeconds(session) - seconds));
+  log.info('relay', `session ${session.id} starts ${seconds}s back, at ${at}s, so what the last player had not shown is sent again`, {});
+  const old = session.child;
+  session.resumeSeconds = at;
+  session.stats = {};
+  session.command = argsToCommand(argsWithResume(session.args, at));
+  if (old) {
+    try { old.kill('SIGTERM'); } catch { /* already gone */ }
+    try { old.stdout?.destroy(); } catch { /* already gone */ }
+  }
+  spawnFfmpeg(session);
 }
 
 /**
@@ -868,6 +897,7 @@ export async function ensureSession(stream, opts = {}) {
     // head. HLS does not resume: its playlist would restart at zero.
     resumeSeconds: wantsHls ? 0 : takeResumePoint(stream.id),
     held: false,
+    pendingRewind: 0,
     child: null,
     hw,
     upProxy,
@@ -978,6 +1008,7 @@ function spawnFfmpeg(session) {
   session.held = false;
 
   child.stdout.on('data', (chunk) => {
+    if (session.child !== child) return; // replaced by a restart (restartBack)
     session.bytesOut += chunk.length;
     session.lastActivity = Date.now();
     for (const client of [...session.clients]) writeToClient(session, client, chunk);
@@ -988,6 +1019,7 @@ function spawnFfmpeg(session) {
 
   let stderrBuffer = '';
   child.stderr.on('data', (chunk) => {
+    if (session.child !== child) return;
     stderrBuffer += chunk.toString();
     const lines = stderrBuffer.split('\n');
     stderrBuffer = lines.pop() || '';
@@ -1008,12 +1040,15 @@ function spawnFfmpeg(session) {
   });
 
   child.on('error', (err) => {
+    if (session.child !== child) return;
     session.alive = false;
     logError('relay', `ffmpeg could not be started for session ${session.id}`, err, { command: truncate(session.command, 300) });
     endClients(session, 'ffmpeg could not be started');
   });
 
   child.on('close', async (code, signal) => {
+    // A child replaced by restartBack exits on purpose: nothing here applies to it.
+    if (session.child !== child) return;
     session.alive = false;
     const running = Math.round((Date.now() - session.startedAt) / 1000);
     const level = code === 0 || signal === 'SIGTERM' ? 'info' : 'error';
@@ -1125,6 +1160,12 @@ function scheduleHlsCleanup(session) {
 
 /** Attach an HTTP response (VLC, the Duo2, a browser) to a session. */
 export function attachClient(session, req, res, { onFinish } = {}) {
+  // The first player back to a session that a player left starts a little earlier.
+  if (session.clients.size === 0 && session.pendingRewind > 0 && session.alive && session.kind === 'pipe') {
+    const seconds = session.pendingRewind;
+    session.pendingRewind = 0;
+    restartBack(session, seconds);
+  }
   const client = {
     id: `c${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
     ip: req.ip || req.socket?.remoteAddress || 'unknown',
@@ -1149,10 +1190,14 @@ export function attachClient(session, req, res, { onFinish } = {}) {
 
   const finish = (reason) => {
     if (!session.clients.has(client)) return;
+    // What the relay had sent this player and it had not shown yet is lost with
+    // the connection, so the next start rewinds (see RECONNECT_REWIND_SECONDS).
+    session.pendingRewind = RECONNECT_REWIND_SECONDS;
     forgetClient(client);
     session.clients.delete(client);
     log.info('relay', `client detached from ${session.id}`, {
       reason, bytes: client.bytes, sec: Math.round((Date.now() - client.startedAt) / 1000), clients: session.clients.size,
+      notReading: Boolean(client.blocked), held: Boolean(session.held), pendingRewind: session.pendingRewind || 0,
     });
     // The last player left: keep the (frozen) session for pauseKeepSeconds, so a
     // player that comes back continues from the same point.

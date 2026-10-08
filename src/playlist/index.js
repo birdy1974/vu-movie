@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import { getConfig, saveConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
 import { log, errorText } from '../core/log.js';
-import { normaliseProfile } from '../core/media.js';
+import { normaliseProfile, streamKind } from '../core/media.js';
 import { uploadSubtitleToReceiver } from '../subtitles/push.js';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -614,22 +614,31 @@ export async function detachSubtitle(streamId) {
  * The .m3u / .m3u8 output of the playlist. `hls` picks the `.m3u8` (HLS) relay
  * URL for streams whose profile actually produces HLS segments; every other
  * stream gets its .ts URL, which is what VLC, Kodi and IPTV apps play.
+ *
+ * A file movie also gets a second, "(seekable)" entry on its direct link. The
+ * .ts relay output is a live stream and VLC cannot seek in it; the direct link
+ * is the file itself (or the relay serving it with Range), so VLC can seek.
+ * `count` is the number of entries, which is what the receiver sees.
  */
 export async function playlistText(baseUrl, { name: playlistName = null, hls = false } = {}) {
   const streams = await enabledStreams();
-  const items = streams.map((stream) => {
+  const items = [];
+  for (const stream of streams) {
     const urls = store.urlsFor(stream, baseUrl);
     const useHls = hls && stream.profile?.container === 'hls';
     const subtitle = stream.profile?.subtitlePath || '';
-    return {
-      title: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
-      url: useHls ? urls.hls : urls.ts,
+    const title = `${stream.title}${stream.year ? ` (${stream.year})` : ''}`;
+    const common = {
       logo: stream.poster,
       quality: stream.upstream?.quality,
       group: playlistName || name(),
       subtitle: subtitle || undefined,
     };
-  });
+    items.push({ ...common, title, url: useHls ? urls.hls : urls.ts });
+    if (urls.direct && streamKind(stream.upstream?.url) === 'file') {
+      items.push({ ...common, title: `${title} (seekable)`, url: urls.direct });
+    }
+  }
   return { text: exporter.buildM3U(items, { name: playlistName || name() }), count: items.length };
 }
 

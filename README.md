@@ -158,11 +158,16 @@ permissions, Container Manager project import, firewall, where the data lives).
   (900 s). A session that ends without anyone choosing it (the idle stop) keeps
   its play head for `RESUME_HOURS` (12 h), and the next play of that movie
   resumes there. A player that never reads again is dropped after
-  `CLIENT_STALL_SECONDS` (1800 s).
+  `CLIENT_STALL_SECONDS` (1800 s). When a player comes back after another one
+  left, the movie restarts 10 s earlier: the data the relay had sent but the
+  player had not shown yet is lost with the connection, so it is sent again
+  rather than skipped.
 * **Seeking**: a progressive file's `direct` link (`/s/<token>/direct`) seeks in
   VLC. For a file that needs no headers it redirects to the CDN; for one that
   needs a signed cookie or referer, the relay serves it with Range support. The
-  `.ts` relay output is a live stream and cannot seek.
+  `.ts` relay output is a live stream and cannot seek. The VLC playlist
+  (`/pl/<token>/vlc.m3u`) therefore has a second, `(seekable)` entry for each
+  file movie, next to the `.ts` entry.
 * **Paced at 1×** (ffmpeg `-re`, on by default for live outputs): the relay
   hands the stream to the player at the source's native rate instead of reading
   the upstream as fast as it can be served. Clients are real-time players that
