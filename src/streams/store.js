@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
-import { normaliseProfile } from '../core/media.js';
+import { normaliseProfile, streamKind } from '../core/media.js';
 
 const shortId = () => crypto.randomBytes(5).toString('hex');
 const token = () => crypto.randomBytes(12).toString('base64url');
@@ -208,16 +208,15 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
   const c = container || stream.profile?.container || cfg.transcode.container;
   const ext = c === 'matroska' ? 'mkv' : c === 'hls' ? 'm3u8' : 'ts';
   /**
-   * The `direct` endpoint 302s to the upstream URL, which only works when the
-   * CDN accepts an anonymous fetch. MovieBox (and every signed-cookie source)
-   * needs `Cookie: Edge-Cache-Cookie=…` / `Referer` on *every* request, so a
-   * plain redirect produces a 403 in VLC. The reference client never hands a
-   * raw CDN URL to a player for exactly this reason — it fetches through a
-   * header-injecting proxy. We mirror that: no direct URL is advertised when the
-   * candidate carries credentials, and the relay (which replays the headers) is
-   * the only offer.
+   * The `direct` endpoint 302s to the upstream URL when the CDN accepts an
+   * anonymous fetch. A plain redirect cannot carry the `Cookie` / `Referer` a
+   * signed source needs on *every* request (it would 403 in VLC), so for a
+   * progressive file with such headers the same link is served by the relay,
+   * which replays the headers through its proxy and answers Range requests.
+   * DASH and HLS with headers have no direct link at all.
    */
   const directUsable = directPlaybackAvailable(stream);
+  const directViaRelay = !directUsable && directProxyAvailable(stream);
   const token = stream.token;
   return {
     raw: `${base}/s/${token}/${slug}.${ext}`,
@@ -225,10 +224,12 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
     mkv: `${base}/s/${token}/${slug}.mkv`,
     hls: `${base}/s/${token}/${slug}.m3u8`,
     playlist: `${base}/s/${token}/${slug}.m3u`,
-    direct: directUsable ? `${base}/s/${token}/direct` : null,
+    direct: directUsable || directViaRelay ? `${base}/s/${token}/direct` : null,
     directNote: directUsable
       ? null
-      : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
+      : directViaRelay
+        ? 'is served through the relay, which replays the request headers: players can seek, and the file plays as it is (no transcoding, profile or subtitles)'
+        : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
     download: `${base}/dl/${token}/${slug}.${ext}`,
     watch: `${base}/watch/${token}`,
     // The URL that tells the relay "this is the browser preview": subtitle-free,
@@ -285,6 +286,18 @@ export function outputTypeForEnigma2Request(req) {
   const flag = String(req?.query?.enigma2 || req?.headers?.['x-vu-enigma'] || '');
   if (flag === '1' || flag === 'true') return 'enigma2';
   return '';
+}
+
+/**
+ * A progressive file can be offered as a direct link even when it needs request
+ * headers: the relay serves it through its own proxy (see serveDirectFile). Only
+ * file sources qualify, and only while the upstream proxy is switched on.
+ */
+export function directProxyAvailable(stream) {
+  const url = String(stream?.upstream?.url || '');
+  if (!/^https?:/i.test(url)) return false;
+  if (getConfig().transcode?.upstreamProxy === false) return false;
+  return (stream?.upstream?.kind || streamKind(url)) === 'file';
 }
 
 /**

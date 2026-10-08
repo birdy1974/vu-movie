@@ -30,6 +30,14 @@ function merge(base, patch) {
   return out;
 }
 
+/** A number from the environment; a blank or non-numeric value means the fallback (0 is a real value). */
+function numberFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 export const DEFAULTS = {
   app: {
     /** Port the web UI + stream endpoints listen on. */
@@ -175,21 +183,45 @@ export const DEFAULTS = {
     /** Empty means use the guided profile builder for newly-created streams. */
     defaultFfmpegTemplateId: '',
     encoderFallback: process.env.ENCODER_FALLBACK || 'libx264 -preset veryfast -crf 22',
-    /** Seconds of "no clients" before an idle stream session is killed. */
+    /**
+     * Seconds a relay session waits for its first player before it is stopped.
+     * Once a player has been attached, PAUSE_KEEP_SECONDS applies instead.
+     */
     idleStopSeconds: Number(process.env.STREAM_IDLE_SECONDS || 45),
-    /** Buffered TS parts kept per client before we drop the client (bytes). */
-    maxClientBacklog: Number(process.env.MAX_CLIENT_BACKLOG || 12 * 1024 * 1024),
+    /**
+     * How long a session is kept after its last player left (a paused VLC, a
+     * closed tab, a box that switched away). While nobody is attached the source
+     * is frozen in place, so the same stream continues from the same point when
+     * a player comes back. After this many seconds the session is stopped and its
+     * play head is remembered (see resumeHours). 0 means idleStopSeconds.
+     */
+    pauseKeepSeconds: numberFromEnv('PAUSE_KEEP_SECONDS', 900),
+    /**
+     * A session that ends without anyone choosing it (the idle stop above, or
+     * ffmpeg giving up with nobody attached) leaves its play head behind for
+     * this many hours, so a new play of the movie resumes there. Deliberate stops
+     * leave nothing behind. 0 turns the memory off.
+     */
+    resumeHours: numberFromEnv('RESUME_HOURS', 12),
+    /**
+     * A player that has accepted no data for this many seconds is dropped. Its
+     * response ends after the data it already has, so a player that is still
+     * reading loses nothing, and the session stays for pauseKeepSeconds. A paused
+     * player is held for up to this long, so this only reaps dead connections.
+     */
+    clientStallSeconds: numberFromEnv('CLIENT_STALL_SECONDS', 1800),
     /**
      * Pace live playback at the source's native rate (ffmpeg `-re`).
      *
      * The relay's clients are real-time players (VLC, a browser, the VU+), not
      * downloaders: they consume ~1-3 MB/s. Without `-re`, ffmpeg reads the
-     * loopback upstream proxy as fast as it is served, so the relay pushes tens
-     * of MB/s at a client that cannot possibly drain it — the socket backlog
-     * passes `maxClientBacklog` within seconds and the client is dropped with
-     * "cannot keep up" (then the receiver goes black). Pacing the input keeps
+     * source as fast as it can, so the encoder runs far ahead of any player and
+     * the CDN is read at full speed for the whole film. Pacing the input keeps
      * the encoder at 1x, which also stops the wasted CDN traffic while a
-     * session is up. Set REALTIME_PLAYBACK=false to get the old behaviour.
+     * session is up. A player that stops reading holds the source (ffmpeg waits
+     * on a full pipe) instead of being dropped, so a paused player continues from
+     * the same point; see clientStallSeconds. Set REALTIME_PLAYBACK=false to read
+     * the source as fast as the player takes it.
      */
     realtime: String(process.env.REALTIME_PLAYBACK || 'true').toLowerCase() !== 'false',
     /**
@@ -469,6 +501,12 @@ function envOverrides() {
   const ttlEnv = process.env.TOKEN_TTL_MINUTES;
   if (ttlEnv !== undefined && ttlEnv.trim() !== '' && Number.isFinite(Number(ttlEnv))) set('app.tokenTtlMinutes', Number(ttlEnv));
   if (process.env.PROBE_DURATION !== undefined) set('transcode.probeDuration', String(process.env.PROBE_DURATION).toLowerCase() !== 'false');
+  // Pause and resume settings: the environment wins over Settings, as above, and
+  // a blank or non-numeric value is ignored (0 is a real value: no memory).
+  for (const [name, key] of [['PAUSE_KEEP_SECONDS', 'transcode.pauseKeepSeconds'], ['RESUME_HOURS', 'transcode.resumeHours'], ['CLIENT_STALL_SECONDS', 'transcode.clientStallSeconds']]) {
+    const raw = process.env[name];
+    if (raw !== undefined && raw.trim() !== '' && Number.isFinite(Number(raw))) set(key, Number(raw));
+  }
   // Read in DEFAULTS too, but that only applies when the file says nothing:
   // without these two lines a value saved from Settings → Xtream Codes would
   // silently outrank the documented XTREAM_USERNAME / XTREAM_PASSWORD.
@@ -501,6 +539,9 @@ function envOverrides() {
   return o;
 }
 
+/** Options that existed and were removed (`section.name`). See readFileConfig. */
+const RETIRED_OPTIONS = ['transcode.maxClientBacklog'];
+
 function readFileConfig() {
   let parsed;
   try {
@@ -520,7 +561,21 @@ function readFileConfig() {
   // Only file I/O and JSON.parse are guarded above: a bug in our own folding
   // must not masquerade as "your config file is broken" (which silently
   // discards every setting in it — that is how this trap started).
+  // Options that were removed. A saved Settings form wrote them to the file, so
+  // they are dropped here quietly instead of warning about an unknown option on
+  // every start.
+  const retired = [];
+  for (const key of RETIRED_OPTIONS) {
+    const [section, name] = key.split('.');
+    if (parsed?.[section] && typeof parsed[section] === 'object' && name in parsed[section]) {
+      delete parsed[section][name];
+      retired.push(key);
+    }
+  }
   const { config, applied, ignored, unknown } = foldDottedKeys(parsed);
+  if (retired.length) {
+    log.info('config', `removed retired option(s) from ${CONFIG_FILE}; they no longer do anything`, { keys: retired.join(', ') });
+  }
   if (applied.length) {
     log.warn('config', `${CONFIG_FILE} uses flat dotted key(s) — JSON has no dotted paths, so they were folded into the nested objects`,
       { keys: applied.join(', ') });

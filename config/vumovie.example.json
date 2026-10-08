@@ -29,6 +29,9 @@
     "fps": "source",
     "container": "mpegts",
     "idleStopSeconds": 45,
+    "pauseKeepSeconds": 900,
+    "resumeHours": 12,
+    "clientStallSeconds": 1800,
     "maxRestarts": 3,
     "realtime": true,
     "upstreamProxy": true,
@@ -38,7 +41,6 @@
     "upstreamCacheMb": 64,
     "upstreamRequestTimeoutMs": 30000,
     "encoderFallback": "libx264 -preset veryfast -crf 22",
-    "maxClientBacklog": 12582912,
     "ffmpegTemplates": [],
     "defaultFfmpegTemplateId": ""
   },

@@ -18,10 +18,15 @@
  *   hls   — ffmpeg's HLS muxer writes segments into a temp dir, clients pull
  *           index.m3u8 + segments (seekable-live, works in browsers too)
  *
- * A session is started lazily and killed after `transcode.idleStopSeconds`
- * with no clients, because the DS918+ GPU can only handle one 1080p encode at
- * a time. Sessions started by a preflight/HEAD request or the session API also
- * get an idle lease immediately; HLS HTTP requests renew it while being polled.
+ * A session is started lazily. While no player is attached, or a player has
+ * stopped reading, the source is held: ffmpeg waits on a full pipe, so the movie
+ * stays exactly where it was and a paused player picks it up from there. The
+ * session is stopped after `transcode.pauseKeepSeconds` without a player
+ * (`idleStopSeconds` when nobody ever attached), because the DS918+ GPU can only
+ * handle one 1080p encode at a time. An unchosen stop leaves its play head for
+ * `transcode.resumeHours`, so the next play of the movie resumes there. Sessions
+ * started by a preflight/HEAD request or the session API get an idle lease
+ * immediately; HLS HTTP requests renew it while being polled.
  */
 
 import fs from 'node:fs';
@@ -36,7 +41,7 @@ import {
 } from '../core/media.js';
 import * as store from './store.js';
 import {
-  maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
+  maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats, pinUpstreamProxy,
 } from './upstream.js';
 import { decideWebProfile, describeWebDecisions } from './web-preview.js';
 
@@ -320,16 +325,26 @@ export function releaseUpstreamProxy(session, reason = 'stopped', { graceMs = 30
   }
 }
 
-export function stopSession(streamId, reason = 'requested') {
+/**
+ * Stop a session. `remember` is set only by the idle stop: nobody chose it, so
+ * the play head is kept for the next play (see rememberResumePoint).
+ */
+export function stopSession(streamId, reason = 'requested', { remember = false } = {}) {
   const session = sessions.get(streamId);
   if (!session) return false;
+  const keptAt = remember ? rememberResumePoint(session) : 0;
   log.info('relay', `stopping session ${session.id} (${reason})`, {
     clients: session.clients.size, uptimeSec: Math.round((Date.now() - session.startedAt) / 1000),
-    bytesOut: session.bytesOut,
+    bytesOut: session.bytesOut, ...(keptAt ? { keptAtSec: keptAt } : {}),
   });
   clearIdleTimer(session);
   endClients(session, `session stopped (${reason})`);
-  try { session.child?.kill('SIGTERM'); } catch (err) { logError('relay', 'could not kill ffmpeg', err); }
+  const child = session.child;
+  try { child?.kill('SIGTERM'); } catch (err) { logError('relay', 'could not kill ffmpeg', err); }
+  // ffmpeg may be blocked in a write to a pipe nobody reads, and SIGTERM does
+  // not wake a blocked write. Closing the read end makes that write fail, so
+  // ffmpeg exits now rather than at the SIGKILL below.
+  if (child?.stdout) { try { child.stdout.destroy(); } catch { /* gone */ } }
   setTimeout(() => { try { session.child?.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
   sessions.delete(streamId);
   releaseUpstreamProxy(session, reason);
@@ -485,17 +500,186 @@ function clearIdleTimer(session) {
   if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null; }
 }
 
-function scheduleIdleStop(session) {
+/** The lease for a session that no player has attached to (API pre-start, HEAD). */
+function leaseSeconds() {
+  return Math.max(5, Number(getConfig().transcode.idleStopSeconds) || 45);
+}
+
+/** How long a session is kept once its last player has left. */
+export function pauseKeepSeconds() {
+  const keep = Number(getConfig().transcode.pauseKeepSeconds);
+  return Math.max(5, Number.isFinite(keep) && keep > 0 ? keep : leaseSeconds());
+}
+
+function scheduleIdleStop(session, seconds = leaseSeconds()) {
   clearIdleTimer(session);
-  const seconds = Math.max(5, getConfig().transcode.idleStopSeconds);
+  const wait = Math.max(5, Number(seconds) || leaseSeconds());
   session.idleTimer = setTimeout(() => {
     // Only the session that is still registered may stop itself: a timer armed
     // by a detaching client of a *replaced* session must never kill its
     // successor (the stream can be restarted within the idle window).
     if (sessions.get(session.streamId) !== session) return;
-    if (session.clients.size === 0) stopSession(session.streamId, `idle for ${seconds}s`);
-  }, seconds * 1000);
+    // Nobody chose this stop, so the play head is kept for the next play.
+    if (session.clients.size === 0) stopSession(session.streamId, `idle for ${wait}s`, { remember: true });
+  }, wait * 1000);
   session.idleTimer.unref?.();
+}
+
+/* ------------------------------------------------------------------ *
+ * The play head of an unfinished movie
+ *
+ * A session that ends without anyone choosing it (the idle stop after the last
+ * player left, or ffmpeg giving up while nobody is attached) leaves its play
+ * head here. The next session for the same stream starts there, within
+ * transcode.resumeHours. Like the sessions, this lives in memory, and a play
+ * consumes it. A deliberate stop (a user request, a changed profile or subtitle)
+ * leaves nothing, so the next play starts from the beginning.
+ * ------------------------------------------------------------------ */
+
+/** streamId → { seconds, at } */
+const resumePoints = new Map();
+
+/**
+ * Seconds given back when a play head is remembered. Without it the resume can
+ * start mid-GOP, and the player would show a few seconds of smeared frames.
+ */
+const RESUME_REWIND_SECONDS = 2;
+
+/** Less than this played is not worth resuming (start-up noise). */
+const RESUME_MIN_PLAYHEAD_SECONDS = 10;
+
+function resumeHoursLimit() {
+  return Math.max(0, Number(getConfig().transcode.resumeHours) || 0);
+}
+
+/**
+ * Remember where a session had got to. Returns the seconds kept, or 0 when
+ * nothing is kept: the memory is off, the session is HLS, the play was short, or
+ * the movie was played to its end (the memory of that stream is cleared).
+ */
+export function rememberResumePoint(session, { now = Date.now() } = {}) {
+  if (!session || session.kind !== 'pipe' || !session.streamId) return 0;
+  if (resumeHoursLimit() <= 0) return 0;
+  const playhead = playheadSeconds(session);
+  const duration = knownDurationSec(session.stream);
+  if (duration && playhead >= duration * 0.99) {
+    resumePoints.delete(session.streamId);
+    return 0;
+  }
+  if (!(playhead >= RESUME_MIN_PLAYHEAD_SECONDS)) return 0;
+  const seconds = Math.floor(playhead) - RESUME_REWIND_SECONDS;
+  resumePoints.set(session.streamId, { seconds, at: now });
+  log.info('relay', `kept the play head of "${session.stream?.title || session.streamId}" at ${seconds}s`, {
+    session: session.id, resumeHours: resumeHoursLimit(),
+  });
+  return seconds;
+}
+
+/**
+ * The play head kept for a stream, or 0. Taking it consumes it, and a memory
+ * older than transcode.resumeHours is ignored.
+ */
+export function takeResumePoint(streamId, { now = Date.now() } = {}) {
+  const entry = resumePoints.get(streamId);
+  if (!entry) return 0;
+  resumePoints.delete(streamId);
+  const hours = resumeHoursLimit();
+  if (hours <= 0 || now - entry.at > hours * 3600e3) return 0;
+  return entry.seconds >= 3 ? entry.seconds : 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Holding the source
+ *
+ * ffmpeg writes the movie into a pipe. While nothing reads that pipe, ffmpeg
+ * blocks and stops reading its own input, so the source is held exactly where
+ * it is. The source is held when no attached player can take data:
+ *   - nobody is attached: the movie waits for its player (a paused VLC, a tab
+ *     that comes back) instead of running to the end unwatched;
+ *   - every attached player has stopped reading (its socket is full). A paused
+ *     player is not dropped for that. The source waits for it, and a player that
+ *     stays stuck for transcode.clientStallSeconds is dropped (see blockClient).
+ * When another player is still reading, the source keeps flowing. A stuck
+ * player queues what it is sent, up to BLOCKED_QUEUE_LIMIT, and is dropped past
+ * that: one slow viewer must not stop the others.
+ * Only pipe sessions have a source to hold. An HLS session writes files.
+ * ------------------------------------------------------------------ */
+
+/** Bytes a stuck player may queue while others keep the source flowing. */
+const BLOCKED_QUEUE_LIMIT = 64 * 1024 * 1024;
+
+/** Whether ffmpeg should be writing now. Pure. */
+export function sourceFlowsFor(session) {
+  if (!session?.clients || session.clients.size === 0) return false;
+  for (const client of session.clients) if (!client.blocked) return true;
+  return false;
+}
+
+/**
+ * Pause or resume ffmpeg's output to match sourceFlowsFor(). This runs on every
+ * full socket and every drain, so it is kept silent: the state is visible as
+ * `held` in the session's status instead.
+ */
+function applySourceFlow(session) {
+  const stdout = session?.kind === 'pipe' ? session.child?.stdout : null;
+  if (!stdout) return;
+  const flows = sourceFlowsFor(session);
+  if (flows && session.held) {
+    session.held = false;
+    stdout.resume();
+  } else if (!flows && !session.held) {
+    session.held = true;
+    stdout.pause();
+  }
+}
+
+/**
+ * A player whose socket is full. The source is held unless another player is
+ * still reading (sourceFlowsFor); a stall timer drops a player that never reads
+ * again.
+ */
+function blockClient(session, client) {
+  client.blocked = true;
+  client.blockedAt = Date.now();
+  const seconds = Math.max(5, Number(getConfig().transcode.clientStallSeconds) || 1800);
+  client.stallTimer = setTimeout(() => {
+    client.stallTimer = null;
+    if (!session.clients.has(client)) return;
+    log.warn('relay', 'dropping a player that has not read for too long (the source was held for it)', {
+      session: session.id, ip: client.ip, stalledSec: seconds,
+      clientSec: Math.round((Date.now() - client.startedAt) / 1000),
+    });
+    dropClient(session, client, 'stalled');
+  }, seconds * 1000);
+  client.stallTimer.unref?.();
+  client.res.once('drain', () => releaseClient(session, client));
+  applySourceFlow(session);
+}
+
+function releaseClient(session, client) {
+  if (!client.blocked) return;
+  client.blocked = false;
+  clearTimeout(client.stallTimer);
+  client.stallTimer = null;
+  if (session.clients.has(client)) applySourceFlow(session);
+}
+
+/** A client that leaves, or is dropped, must not keep a stall timer or a hold. */
+function forgetClient(client) {
+  clearTimeout(client.stallTimer);
+  client.stallTimer = null;
+  client.blocked = false;
+}
+
+/**
+ * End one player's response. The attach lifecycle does the bookkeeping (idle
+ * lease, flow). `res.end()` sends what the player already has, then the end, so
+ * a player that is still reading loses nothing.
+ */
+function dropClient(session, client, reason) {
+  if (client.detach) client.detach(reason);
+  else session.clients.delete(client);
+  try { client.res.end(); } catch { /* already gone */ }
 }
 
 function cleanupHlsDir(session) {
@@ -607,6 +791,9 @@ export async function ensureSession(stream, opts = {}) {
   // per-request retries) and serve ffmpeg from a loopback endpoint. HLS stays
   // direct — ffmpeg's HLS demuxer already fetches small segments.
   const upProxy = await maybeCreateUpstreamProxy({ streamId: stream.id, upstream: stream.upstream });
+  // The session owns its proxy: a paused, frozen session makes no fetches for
+  // minutes, and the proxy's idle sweep must not close it under the session.
+  if (upProxy) pinUpstreamProxy(upProxy, true);
 
   const args = buildFfmpegArgs({
     source: {
@@ -677,7 +864,10 @@ export async function ensureSession(stream, opts = {}) {
     lastActivity: Date.now(),
     alive: true,
     restarts: 0,
-    resumeSeconds: 0,
+    // A movie that was stopped without anyone choosing it resumes at its play
+    // head. HLS does not resume: its playlist would restart at zero.
+    resumeSeconds: wantsHls ? 0 : takeResumePoint(stream.id),
+    held: false,
     child: null,
     hw,
     upProxy,
@@ -779,17 +969,22 @@ function spawnFfmpeg(session) {
   // the driver that failed on every session.
   const args = session.resumeSeconds > 0 ? argsWithResume(session.args, session.resumeSeconds) : session.args;
   if (session.resumeSeconds > 0) {
-    log.info('relay', `session ${session.id} resumes at ${session.resumeSeconds}s after the restart`, {});
+    session.command = argsToCommand(args);
+    log.info('relay', `session ${session.id} resumes at ${session.resumeSeconds}s`, {});
   }
   const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(session.hw) });
   session.child = child;
   session.alive = true;
+  session.held = false;
 
   child.stdout.on('data', (chunk) => {
     session.bytesOut += chunk.length;
     session.lastActivity = Date.now();
-    for (const client of session.clients) writeToClient(session, client, chunk);
+    for (const client of [...session.clients]) writeToClient(session, client, chunk);
   });
+  // Nobody attached (a restart, or a session started by an API call): hold the
+  // source at once, so the movie does not run on into a pipe nobody reads.
+  applySourceFlow(session);
 
   let stderrBuffer = '';
   child.stderr.on('data', (chunk) => {
@@ -880,6 +1075,10 @@ function spawnFfmpeg(session) {
     const endReason = fatal
       ? `ffmpeg cannot process this source (${truncate(fatal.hint, 160)})`
       : code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`;
+    // Nobody was attached when it ended (the CDN gave up on a held source, or
+    // ffmpeg crashed while the player was away): keep the play head so the next
+    // play resumes there. A fatal startup failure would repeat, so it keeps nothing.
+    if (!fatal && session.clients.size === 0) rememberResumePoint(session);
     endClients(session, endReason);
     sessions.delete(session.streamId);
     releaseUpstreamProxy(session, decision.reason, { graceMs: 0 });
@@ -930,14 +1129,19 @@ export function attachClient(session, req, res, { onFinish } = {}) {
     id: `c${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
     ip: req.ip || req.socket?.remoteAddress || 'unknown',
     userAgent: req.headers['user-agent'] || '',
-    pending: 0,
     bytes: 0,
     startedAt: Date.now(),
     res,
+    // Flow control: `blocked` while the socket is full (see blockClient).
+    blocked: false,
+    blockedAt: 0,
+    stallTimer: null,
+    detach: null,
   };
   session.clients.add(client);
   session.lastActivity = Date.now();
   clearIdleTimer(session);
+  applySourceFlow(session);
 
   log.info('relay', `client attached to ${session.id}`, {
     clients: session.clients.size, ip: client.ip, ua: truncate(client.userAgent, 70), mode: session.mode,
@@ -945,13 +1149,18 @@ export function attachClient(session, req, res, { onFinish } = {}) {
 
   const finish = (reason) => {
     if (!session.clients.has(client)) return;
+    forgetClient(client);
     session.clients.delete(client);
     log.info('relay', `client detached from ${session.id}`, {
       reason, bytes: client.bytes, sec: Math.round((Date.now() - client.startedAt) / 1000), clients: session.clients.size,
     });
-    if (session.clients.size === 0) scheduleIdleStop(session);
+    // The last player left: keep the (frozen) session for pauseKeepSeconds, so a
+    // player that comes back continues from the same point.
+    if (session.clients.size === 0) scheduleIdleStop(session, pauseKeepSeconds());
+    applySourceFlow(session);
     onFinish?.(client);
   };
+  client.detach = finish;
 
   req.on('close', () => finish('client closed'));
   req.on('aborted', () => finish('client aborted'));
@@ -960,33 +1169,35 @@ export function attachClient(session, req, res, { onFinish } = {}) {
 }
 
 function writeToClient(session, client, chunk) {
-  const cfg = getConfig();
+  let flushed;
   try {
-    const flushed = client.res.write(chunk);
-    client.bytes += chunk.length;
-    if (!flushed) {
-      client.pending += chunk.length;
-      if (client.pending > cfg.transcode.maxClientBacklog) {
-        log.warn('relay', 'dropping a client that cannot keep up (protecting the encoder)', {
-          session: session.id, ip: client.ip, pendingBytes: client.pending,
-          clientSec: Math.round((Date.now() - client.startedAt) / 1000),
-          hint: 'the player is draining slower than the source delivers — the relay paces live sessions with -re (transcode.realtime / REALTIME_PLAYBACK)',
-        });
-        session.clients.delete(client);
-        try { client.res.end(); } catch { /* ignore */ }
-        if (session.clients.size === 0) scheduleIdleStop(session);
-      } else {
-        client.res.once('drain', () => { client.pending = 0; });
-      }
-    }
+    flushed = client.res.write(chunk);
   } catch (err) {
     log.warn('relay', 'write to client failed — dropping it', { error: String(err?.message || err), ip: client.ip });
-    session.clients.delete(client);
+    dropClient(session, client, 'write failed');
+    return;
+  }
+  client.bytes += chunk.length;
+  if (flushed) return;
+  if (!client.blocked) {
+    // A full socket is no longer grounds for dropping the player. The source is
+    // held (or, while others read, this player queues) until it catches up.
+    blockClient(session, client);
+    return;
+  }
+  // Still behind, and the source kept flowing for another player: the queue
+  // grows. Past the limit this player is lost, so the others are not held back.
+  if (client.res.writableLength > BLOCKED_QUEUE_LIMIT) {
+    log.warn('relay', 'dropping a player that cannot keep up while others watch', {
+      session: session.id, ip: client.ip, queuedMb: Math.round(client.res.writableLength / 1048576),
+    });
+    dropClient(session, client, 'cannot keep up');
   }
 }
 
 function endClients(session, reason) {
   for (const client of [...session.clients]) {
+    forgetClient(client);
     try { client.res.end(); } catch { /* ignore */ }
     session.clients.delete(client);
   }
@@ -1009,6 +1220,10 @@ export function publicSession(session) {
     templateId: session.templateId || '',
     templateSource: session.templateSource || '',
     clients: session.clients.size,
+    // true while the source is held (no player, or a player not reading): the
+    // movie is waiting, not stuck.
+    held: Boolean(session.held),
+    resumeSeconds: session.resumeSeconds || 0,
     startedAt: new Date(session.startedAt).toISOString(),
     uptimeSec: Math.round((Date.now() - session.startedAt) / 1000),
     bytesOut: session.bytesOut,

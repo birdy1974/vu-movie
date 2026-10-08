@@ -874,8 +874,8 @@ function mergeTemplateHeaders(existing, sourceHeaders) {
  *
  * A relayed stream is watched by real-time players, so ffmpeg must not read a
  * local source (the chunked upstream proxy, a downloaded file) as fast as the
- * disk allows: that floods the client socket, trips the relay's backlog guard
- * and stops the picture a few seconds in. `transcode.realtime` is the global
+ * disk allows: that floods the client socket and the relay's queue for it, and
+ * the picture stalls a few seconds in. `transcode.realtime` is the global
  * switch, `profile.realtime` an optional per-stream override. A template that
  * spells out `-re`/`-readrate`/`-nore` always wins — never inject a second one.
  */
@@ -1047,7 +1047,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       addInputOption('-live_start_index', '-3', streamKind(source.url) === 'hls');
       // Live playback is paced to the source's native rate. Without it the
       // relay pushes the movie at many times real time into a player that can
-      // only drain 1x, and the backlog guard drops the client seconds in.
+      // only drain 1x, and that player's queue in the relay grows without end.
       const paced = hasOption('-re') || hasOption('-readrate') || hasOption('-nore');
       addInputOption('-re', null, realtimePacing(profile) && !paced);
     }
@@ -1468,8 +1468,8 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   }
   // Live playback is paced to the source's native rate (`-re`): the relay's
   // clients are real-time players, so reading the loopback proxy as fast as it
-  // can be served simply floods the client socket and gets it dropped by the
-  // backlog guard a few seconds into the movie. `mode: 'file'` (downloads,
+  // can be served simply floods the client socket and the queue kept for it.
+  // `mode: 'file'` (downloads,
   // template tests) deliberately stays unpaced.
   if (mode === 'live' && realtimePacing(p)) args.push('-re');
   // Live playback: a 1 MB probe window starts the picture sooner and stops

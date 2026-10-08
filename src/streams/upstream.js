@@ -23,7 +23,9 @@
  *     backed by a chunk-aligned fetcher with per-chunk retries and an LRU
  *     byte cache (so ffmpeg can seek into the moov atom and reconnects are
  *     cheap). A CDN that ignores Range is captured to a temp file under
- *     `storage.tmp/upstream/` instead, removed when the session closes;
+ *     `storage.tmp/upstream/` instead, removed when the session closes. The
+ *     same proxy answers a player's `/s/<token>/direct` link for a file that
+ *     needs request headers (serveDirectFile), so that link can be sought in VLC;
  *   - `dash` sources get their MPD fetched with the source headers and
  *     rewritten so every init/segment URL points back at
  *     `/up/<secret>/dash/...`; each segment is assembled from ranged
@@ -522,10 +524,22 @@ function baseDirOf(url) {
 
 let idleSweeper = null;
 
+/**
+ * Keep a proxy from being swept while its relay session still owns it, or while
+ * a player holds a request open. A paused player and a frozen relay session
+ * make no fetches, so "no fetches for 10 minutes" would otherwise close a
+ * session that is still waiting for its player to come back.
+ */
+export function pinUpstreamProxy(session, pinned = true) {
+  if (session) session.pinned = Boolean(pinned);
+  return session || null;
+}
+
 function ensureIdleSweeper() {
   if (idleSweeper) return;
   idleSweeper = setInterval(() => {
     for (const [secret, session] of proxies) {
+      if (session.pinned || session.openRequests > 0) continue;
       if (Date.now() - session.lastActivity > IDLE_CLOSE_MS) {
         log.info('upstream', `closing idle upstream proxy ${session.id} (no fetches for ${Math.round(IDLE_CLOSE_MS / 60000)} min)`);
         closeUpstreamProxy(session, 'idle');
@@ -565,6 +579,9 @@ export async function createUpstreamProxy({ streamId, url, headers = {}, kind = 
     lastActivity: Date.now(),
     closed: false,
     linear: null,                          // 200-mode background capture (no Range support)
+    pinned: false,                         // owned by a relay session (see pinUpstreamProxy)
+    openRequests: 0,                       // player requests still open on this proxy
+    direct: false,                         // serves a /s/<token>/direct link (see serveDirectFile)
   };
   session.inputUrl = kind === 'dash'
     ? `${session.base}/up/${secret}/m`
@@ -1091,6 +1108,46 @@ export function upstreamProxyMiddleware(req, res, next) {
   return sendError(res, 404, 'no such upstream proxy route');
 }
 
+/**
+ * The `/s/<token>/direct` link for a progressive file that needs request
+ * headers (a signed Cookie, a Referer). A 302 cannot carry those headers, so the
+ * player is served here through the same proxy the relay uses. That proxy
+ * answers Range requests once the size is known, so a player can seek.
+ *
+ * One proxy serves a stream's direct links while players use them. It is made
+ * again when the upstream link has changed (a refreshed signature) or after the
+ * sweeper closed it, and an open request keeps it from being swept.
+ */
+export async function serveDirectFile(stream, req, res) {
+  const upstream = stream?.upstream || {};
+  const wantedHeaders = headerObject(upstream.headers || {});
+  let proxy = findDirectProxy(stream.id);
+  if (proxy && (proxy.upstreamUrl !== upstream.url || JSON.stringify(proxy.headers) !== JSON.stringify(wantedHeaders))) {
+    closeUpstreamProxy(proxy, 'upstream link changed');
+    proxy = null;
+  }
+  if (!proxy) {
+    proxy = await createUpstreamProxy({ streamId: stream.id, url: upstream.url, headers: wantedHeaders, kind: 'file' });
+    proxy.direct = true;
+  }
+  const current = proxy;
+  current.openRequests += 1;
+  let released = false;
+  res.once('close', () => {
+    if (released) return;
+    released = true;
+    current.openRequests = Math.max(0, current.openRequests - 1);
+  });
+  return serveFile(current, req, res);
+}
+
+function findDirectProxy(streamId) {
+  for (const session of proxies.values()) {
+    if (session.direct && session.streamId === streamId && !session.closed) return session;
+  }
+  return null;
+}
+
 /** For tests / diagnostics: how many proxy sessions are alive. */
 export function listUpstreamProxies() {
   return [...proxies.values()].map((s) => ({ id: s.id, streamId: s.streamId, kind: s.kind, stats: proxyStats(s) }));
@@ -1099,4 +1156,5 @@ export function listUpstreamProxies() {
 export default {
   createUpstreamProxy, maybeCreateUpstreamProxy, shouldProxyUpstream, closeUpstreamProxy,
   proxyStats, upstreamProxyMiddleware, rewriteDashManifest, parseClientRange, listUpstreamProxies,
+  pinUpstreamProxy, serveDirectFile,
 };

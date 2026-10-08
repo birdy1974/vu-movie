@@ -99,7 +99,7 @@ test('every signed request carries the reference header set, and the shared iden
   assert.equal(login.body, '{}');
 });
 
-test('the direct (302) upstream link is withheld for sources that need request headers', () => {
+test('the direct link is withheld from DASH sources that need request headers; the relay serves signed files', () => {
   const base = 'http://nas:8080';
   const signedCookie = {
     title: 'MovieBox film', token: 'tok',
@@ -125,6 +125,14 @@ test('the direct (302) upstream link is withheld for sources that need request h
   assert.equal(c.directNote, null);
   // The relay URL is always the answer for header-dependent sources.
   assert.equal(a.ts, 'http://nas:8080/s/tok/MovieBox-film.ts');
+  // A progressive file with a signed cookie is not a 302, but the relay can
+  // replay the cookie itself: its direct link is served through the relay.
+  const signedFile = {
+    title: 'Signed file', token: 'tok4',
+    upstream: { url: 'https://cdn.example/signed.mp4', kind: 'file', headers: { Cookie: 'sig=abc' } },
+  };
+  assert.equal(urlsFor(signedFile, base).direct, 'http://nas:8080/s/tok4/direct');
+  assert.match(urlsFor(signedFile, base).directNote, /served through the relay/);
 
   assert.equal(directPlaybackAvailable(signedCookie), false);
   assert.equal(directPlaybackAvailable(signedHeaders), true);
