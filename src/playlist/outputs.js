@@ -14,12 +14,14 @@
  *   GET /pl/<token>/kodi.m3u            same list, Kodi-friendly naming
  *   GET /pl/<token>/playlist.json       machine-readable list (title/url/logo)
  *   GET /pl/<token>/userbouquet.tv      the Enigma2 bouquet file
- *   GET /xtream/<token>/player_api.php  Xtream Codes API (what TiviMate/VLC ask)
- *   GET /xtream/<token>/get.php         Xtream M3U_plus download
+ *   GET /xtream/<token>/player_api.php  Xtream catalogue/API
+ *   GET /xtream/<token>/get.php         complete enabled-playlist M3U_plus
+ *   GET /xtream/<token>/<type>/…        token + account protected playback relay
  *   GET /xtream/<token>/xmltv.php       (empty) EPG, so clients stop retrying
  */
 
 import express from 'express';
+import crypto from 'node:crypto';
 import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import * as store from '../streams/store.js';
@@ -45,47 +47,129 @@ function requireToken(req, res) {
   return false;
 }
 
-function xtreamAuthorised(req) {
+function xtreamExpectedCredentials(token = playlist.token()) {
   const cfg = getConfig().playlist;
-  const expectedUser = cfg.xtreamUsername || 'vumovie';
-  const expectedPass = cfg.xtreamPassword || playlist.token();
+  return {
+    username: cfg.xtreamUsername || 'vumovie',
+    password: cfg.xtreamPassword || token,
+  };
+}
+
+function xtreamAuthorised(req) {
+  const expected = xtreamExpectedCredentials(req.params.token);
   const user = req.query.username || req.query.user || '';
   const pass = req.query.password || req.query.pass || '';
-  // Xtream clients are not always able to send both; the token in the path is
-  // already a secret, so a wrong password alone is not a reason to fail — but it
-  // is logged so a typo is visible.
-  if (user && user !== expectedUser) {
+  // The playlist token in the route is itself a secret, so Xtream clients that
+  // omit redundant query credentials are still allowed. Supplied credentials
+  // must match; this keeps a typo visible instead of silently accepting it.
+  if (user && user !== expected.username) {
     log.warn('playlist', 'xtream request with an unexpected username', { user: String(user).slice(0, 40) });
     return false;
   }
-  if (pass && pass !== expectedPass) {
+  if (pass && pass !== expected.password) {
     log.warn('playlist', 'xtream request with a wrong password');
     return false;
   }
   return true;
 }
 
-function xtreamItem(entry, index, baseUrl) {
+function xtreamPathAuthorised(req) {
+  const expected = xtreamExpectedCredentials(req.params.token);
+  if (String(req.params.username || '') !== expected.username) {
+    log.warn('playlist', 'xtream stream request with an unexpected username', { user: String(req.params.username || '').slice(0, 40) });
+    return false;
+  }
+  if (String(req.params.password || '') !== expected.password) {
+    log.warn('playlist', 'xtream stream request with a wrong password');
+    return false;
+  }
+  return true;
+}
+
+/** Stable numeric Xtream IDs: reordering the playlist does not change a stream URL. */
+function xtreamStreamId(stream) {
+  const value = String(stream?.id || '');
+  if (/^[a-f0-9]{1,13}$/i.test(value)) {
+    const numeric = Number.parseInt(value, 16);
+    if (Number.isSafeInteger(numeric) && numeric > 0) return numeric;
+  }
+  return crypto.createHash('sha256').update(value).digest().readUIntBE(0, 6) || 1;
+}
+
+function xtreamExtension(stream) {
+  return stream.profile?.container === 'matroska' ? 'mkv' : 'ts';
+}
+
+function xtreamStreamUrl(baseUrl, token, stream, type = 'live') {
+  const { username, password } = xtreamExpectedCredentials(token);
+  const root = `${String(baseUrl || '').replace(/\/$/, '')}/xtream/${encodeURIComponent(token)}`;
+  return `${root}/${type}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${xtreamStreamId(stream)}.${xtreamExtension(stream)}`;
+}
+
+function xtreamItem(entry, index, baseUrl, token, type = 'live') {
   const stream = entry.stream;
   const urls = store.urlsFor(stream, baseUrl);
-  const ext = stream.profile?.container === 'matroska' ? 'mkv' : 'ts';
+  const ext = xtreamExtension(stream);
+  const streamUrl = xtreamStreamUrl(baseUrl, token, stream, type);
   return {
     num: index + 1,
     name: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
-    stream_type: 'live',
-    stream_id: index + 1,
+    stream_type: type === 'movie' ? 'movie' : 'live',
+    stream_id: xtreamStreamId(stream),
     stream_icon: stream.poster || '',
     epg_channel_id: null,
-    added: stream.created_at ? String(new Date(stream.created_at).getTime()).slice(0, 10) : '',
+    added: stream.created_at ? String(Math.floor(new Date(stream.created_at).getTime() / 1000)) : '',
     category_id: '1',
     custom_sid: '',
     tv_archive: 0,
-    direct_source: '',
+    direct_source: streamUrl,
     tv_archive_duration: 0,
     // Extra fields (ignored by strict clients, useful in the info page):
     vu_movie_id: stream.id,
     vu_movie_url: urls.ts,
     container_extension: ext,
+  };
+}
+
+/** Series are stored as one playlist stream per selected episode. */
+function xtreamSeriesGroups(entries = []) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const stream = entry?.stream;
+    if (!stream || stream.kind !== 'series') continue;
+    const title = String(stream.title || 'Untitled series');
+    const name = title.replace(/\s+S\d{1,3}E\d{1,3}.*$/i, '').trim() || title;
+    const key = name.toLowerCase();
+    if (!groups.has(key)) groups.set(key, { key, name, episodes: [] });
+    groups.get(key).episodes.push(entry);
+  }
+  return [...groups.values()];
+}
+
+function xtreamSeriesId(group) {
+  return xtreamStreamId({ id: `series:${group.key}` });
+}
+
+function xtreamSeriesInfo(group, index) {
+  const first = group.episodes[0]?.stream || {};
+  return {
+    num: index + 1,
+    name: group.name,
+    series_id: xtreamSeriesId(group),
+    cover: first.poster || '',
+    cover_big: first.poster || '',
+    plot: first.description || '',
+    cast: '',
+    director: '',
+    genre: '',
+    releaseDate: first.year ? String(first.year) : '',
+    last_modified: first.created_at ? String(Math.floor(new Date(first.created_at).getTime() / 1000)) : '',
+    rating: '0',
+    rating_5based: 0,
+    backdrop_path: first.poster ? [first.poster] : [],
+    youtube_trailer: '',
+    episode_run_time: '0',
+    category_id: '1',
   };
 }
 
@@ -122,7 +206,8 @@ li{margin:4px 0}</style></head><body>
 <li>M3U: <code>${escapeHtml(`${root}/playlist.m3u`)}</code></li>
 <li>VLC: <code>${escapeHtml(`${root}/vlc.m3u`)}</code></li>
 <li>Enigma2 bouquet: <code>${escapeHtml(`${root}/userbouquet.tv`)}</code></li>
-<li>Xtream: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/player_api.php`)}</code> (user <code>${escapeHtml(cfgPlaylist.xtreamUsername || 'vumovie')}</code>)</li>
+<li>Xtream API: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/player_api.php`)}</code> (user <code>${escapeHtml(cfgPlaylist.xtreamUsername || 'vumovie')}</code>)</li>
+<li>Xtream M3U+: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/get.php?username=${encodeURIComponent(cfgPlaylist.xtreamUsername || 'vumovie')}&password=${encodeURIComponent(cfgPlaylist.xtreamPassword || req.params.token)}&type=m3u_plus`)}</code></li>
 </ul>
 <h2>Items</h2>
 <table><thead><tr><th>#</th><th>Title</th><th>Quality</th><th>FFmpeg template</th><th>Links</th></tr></thead>
@@ -178,12 +263,12 @@ router.get('/pl/:token/:file', async (req, res) => {
  * ------------------------------------------------------------------ */
 
 function xtreamInfo(baseUrl, token) {
-  const cfg = getConfig().playlist;
+  const { username, password } = xtreamExpectedCredentials(token);
   const url = new URL(baseUrl);
   return {
     user_info: {
-      username: cfg.xtreamUsername || 'vumovie',
-      password: cfg.xtreamPassword || token,
+      username,
+      password,
       message: 'vu-movie',
       auth: 1,
       status: 'Active',
@@ -192,7 +277,7 @@ function xtreamInfo(baseUrl, token) {
       active_cons: 0,
       created_at: String(Math.floor(Date.now() / 1000)),
       max_connections: '0',
-      allowed_output_formats: ['m3u8', 'ts'],
+      allowed_output_formats: ['m3u8', 'ts', 'mkv'],
     },
     server_info: {
       url: url.hostname,
@@ -208,23 +293,79 @@ function xtreamInfo(baseUrl, token) {
   };
 }
 
+function xtreamEpisode(entry, index, baseUrl, token) {
+  const stream = entry.stream;
+  const season = Number(stream.upstream?.season) || 1;
+  const episode = Number(stream.upstream?.episode) || index + 1;
+  const date = stream.created_at ? String(Math.floor(new Date(stream.created_at).getTime() / 1000)) : '';
+  return {
+    id: xtreamStreamId(stream),
+    episode_num: episode,
+    title: stream.title,
+    container_extension: xtreamExtension(stream),
+    info: {
+      movie_image: stream.poster || '',
+      plot: stream.description || '',
+      releasedate: stream.year ? String(stream.year) : '',
+      rating: '0',
+      duration_secs: 0,
+      duration: '00:00:00',
+      bitrate: 0,
+    },
+    season,
+    added: date,
+    direct_source: xtreamStreamUrl(baseUrl, token, stream, 'series'),
+  };
+}
+
+function xtreamSeriesDetails(group, baseUrl, token) {
+  const orderedEpisodes = group.episodes.map((entry, index) => xtreamEpisode(entry, index, baseUrl, token));
+  const bySeason = new Map();
+  for (const episode of orderedEpisodes) {
+    if (!bySeason.has(episode.season)) bySeason.set(episode.season, []);
+    bySeason.get(episode.season).push(episode);
+  }
+  for (const episodes of bySeason.values()) episodes.sort((a, b) => a.episode_num - b.episode_num);
+  const episodes = Object.fromEntries([...bySeason.entries()].map(([season, values]) => [String(season), values]));
+  const seasons = [...bySeason.entries()].map(([season, values]) => ({
+    air_date: '',
+    episode_count: values.length,
+    id: xtreamStreamId({ id: `series:${group.key}:season:${season}` }),
+    name: `Season ${season}`,
+    overview: '',
+    season_number: season,
+    cover: values[0]?.info?.movie_image || '',
+    cover_big: values[0]?.info?.movie_image || '',
+  }));
+  return { episodes, seasons, info: xtreamSeriesInfo(group, 0) };
+}
+
 router.all('/xtream/:token/player_api.php', async (req, res) => {
   if (!requireToken(req, res)) return;
   if (!xtreamAuthorised(req)) return res.status(401).json({ user_info: { auth: 0, status: 'Invalid credentials' } });
   const action = String(req.query.action || '');
   const baseUrl = baseUrlFrom(req);
   const entries = (await playlist.entries({ baseUrl })).filter((entry) => entry.enabled);
-  const streams = entries.map((entry, index) => xtreamItem(entry, index, baseUrl));
+  const movies = entries.filter((entry) => entry.stream.kind !== 'series');
+  const series = xtreamSeriesGroups(entries);
   switch (action) {
     case 'get_live_categories':
     case 'get_vod_categories':
     case 'get_series_categories':
       return res.json([{ category_id: '1', category_name: playlist.name(), parent_id: 0 }]);
     case 'get_live_streams':
-      return res.json(streams);
+      // This app's catalogue is on-demand; exposing its movies here as well
+      // keeps older clients that only query the live action working.
+      return res.json(movies.map((entry, index) => xtreamItem(entry, index, baseUrl, req.params.token, 'live')));
     case 'get_vod_streams':
-      return res.json(streams.map((item) => ({ ...item, stream_type: 'movie' })));
+      return res.json(movies.map((entry, index) => xtreamItem(entry, index, baseUrl, req.params.token, 'movie')));
     case 'get_series':
+      return res.json(series.map((group, index) => xtreamSeriesInfo(group, index)));
+    case 'get_series_info': {
+      const wanted = Number(req.query.series_id);
+      const group = series.find((item) => xtreamSeriesId(item) === wanted);
+      return res.json(group ? xtreamSeriesDetails(group, baseUrl, req.params.token) : {});
+    }
     case 'get_short_epg':
     case 'get_simple_data_table':
       return res.json([]);
@@ -233,6 +374,28 @@ router.all('/xtream/:token/player_api.php', async (req, res) => {
     default:
       return res.json(xtreamInfo(baseUrl, req.params.token));
   }
+});
+
+/** Xtream clients play catalogue entries through the familiar /live/... URL. */
+router.get('/xtream/:token/:type/:username/:password/:streamId.:ext', async (req, res) => {
+  if (!requireToken(req, res)) return;
+  if (!xtreamPathAuthorised(req)) return res.status(401).type('text/plain').send('Invalid credentials');
+  const type = String(req.params.type || '').toLowerCase();
+  const ext = String(req.params.ext || '').toLowerCase();
+  if (!['live', 'movie', 'series'].includes(type) || !['ts', 'mkv', 'm3u8'].includes(ext)) {
+    return res.status(404).type('text/plain').send('Unknown Xtream stream');
+  }
+  const id = Number(req.params.streamId);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(404).type('text/plain').send('Unknown Xtream stream');
+  const baseUrl = baseUrlFrom(req);
+  const entries = (await playlist.entries({ baseUrl })).filter((entry) => entry.enabled);
+  const entry = entries.find((item) => xtreamStreamId(item.stream) === id);
+  if (!entry || (type === 'series') !== (entry.stream.kind === 'series')) {
+    return res.status(404).type('text/plain').send('Unknown Xtream stream');
+  }
+  const urls = store.urlsFor(entry.stream, baseUrl);
+  const target = ext === 'mkv' ? urls.mkv : ext === 'm3u8' ? urls.hls : urls.ts;
+  return res.redirect(302, target);
 });
 
 router.all('/xtream/:token/get.php', async (req, res) => {
@@ -262,7 +425,7 @@ router.get('/xtream/:token/', async (req, res) => {
 Username: <code>${escapeHtml(getConfig().playlist.xtreamUsername || 'vumovie')}</code><br>
 Password: <code>${escapeHtml(getConfig().playlist.xtreamPassword || req.params.token)}</code></p>
 <p>player_api.php: <code>${escapeHtml(`${root}/player_api.php`)}</code><br>
-get.php: <code>${escapeHtml(`${root}/get.php?username=&password=&type=m3u_plus`)}</code></p></body></html>`);
+complete M3U+: <code>${escapeHtml(`${root}/get.php?username=${encodeURIComponent(getConfig().playlist.xtreamUsername || 'vumovie')}&password=${encodeURIComponent(getConfig().playlist.xtreamPassword || req.params.token)}&type=m3u_plus`)}</code></p></body></html>`);
 });
 
 function escapeHtml(text) {

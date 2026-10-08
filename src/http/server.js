@@ -114,7 +114,7 @@ export function createApp() {
 
   // ---- playlist outputs (token-protected, no password) ----
   // /pl/<token>/… (m3u, m3u8, json, userbouquet.tv) and
-  // /xtream/<token>/… (player_api.php, get.php, xmltv.php).
+  // /xtream/<token>/… (catalogue, complete M3U+, playback, XMLTV).
   app.use(playlistOutputsRouter);
 
   // ---- playlist + live FFmpeg test API (before the main router) ----
@@ -125,6 +125,10 @@ export function createApp() {
 
   // ---- HLS segments produced by an "hls" container session ----
   app.get('/hls/:token/:file', async (req, res) => {
+    // HLS is fetched as short playlist/segment requests rather than one long
+    // attached response. Renew the no-client idle lease on every poll, including
+    // the initial poll while FFmpeg is still creating the first segment.
+    relay.touchSessionByToken(req.params.token);
     const cfgNow = getConfig();
     const dir = path.join(cfgNow.storage.tmp, 'hls', req.params.token);
     const file = path.basename(req.params.file);

@@ -162,6 +162,18 @@ permissions, Container Manager project import, firewall, where the data lives).
   `transcode.realtime` in `/config/vumovie.json`; a single stream can opt out
   with `"realtime": false` in its profile.
 
+### Complete playlist and Xtream IPTV output
+
+The **Stream** tab exposes both the Xtream `player_api.php` server URL and the
+**complete M3U+ playlist** (`get.php?type=m3u_plus`). Both are built from the
+Playlist tab: every **enabled** item is included in playlist order; disabled
+items stay out of all public outputs. The Xtream API also advertises enabled
+movies as VOD and groups enabled series episodes by season. Each catalogue item
+has a token-protected Xtream playback URL that relays through vu-movie rather
+than exposing the upstream source. Use the displayed username/password in
+TiviMate, IPTV Smarters or another Xtream-compatible player; the playlist token
+remains part of the server URL.
+
 ### Hardware transcoding that respects the J3455
 * VAAPI via `/dev/dri/renderD128` with the exact command family from the
   requirements (`-init_hw_device vaapi=intel:… -hwaccel vaapi -hwaccel_output_format
