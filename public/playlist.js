@@ -773,7 +773,7 @@ const VMPlaylist = (() => {
           const iframe = $('#player-iframe', root);
           $('[data-player-watch]', root)?.addEventListener('click', () => window.open(watchUrl, '_blank'));
           $('[data-player-vlc]', root)?.addEventListener('click', () => {
-            try { window.location.href = String(tsUrl).replace(/^https?:/, 'vlc:'); } catch { window.open(tsUrl, '_blank'); }
+            try { window.location.href = String(tsUrl).replace(/^(https?:\/\/)/i, 'vlc://$1'); } catch { window.open(tsUrl, '_blank'); }
           });
           $('[data-player-copy]', root)?.addEventListener('click', () => copyText(tsUrl || ''));
           $('[data-player-sub]', root)?.addEventListener('click', () => openSubtitlePicker(stream.id));

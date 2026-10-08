@@ -2860,7 +2860,7 @@ async function streamUrlAction(action) {
     if (action === 'vlc') {
       const url = VMPlaylist.itemFor(id)?.urls?.ts;
       if (!url) return toast('This stream has no .ts URL', 'warn');
-      window.location.href = String(url).replace(/^https?:/, 'vlc:');
+      window.location.href = String(url).replace(/^(https?:\/\/)/i, 'vlc://$1');
       return;
     }
     if (action === 'start' || action === 'stop') {
@@ -2924,7 +2924,7 @@ function initStream() {
     if (vlcPl?.dataset.vlcPl) {
       const u = vlcPl.dataset.vlcPl;
       try {
-        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        const vlc = String(u).replace(/^(https?:\/\/)/i, 'vlc://$1');
         window.location.href = vlc;
         setTimeout(() => toast(`VLC playlist: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
       } catch {
@@ -2957,7 +2957,7 @@ function initStream() {
       const u = vlcBtn.dataset.vlcUrl;
       // Try VLC protocol, fallback to opening URL
       try {
-        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        const vlc = String(u).replace(/^(https?:\/\/)/i, 'vlc://$1');
         window.location.href = vlc;
         // Also copy to clipboard as hint
         setTimeout(() => toast(`VLC URL: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);

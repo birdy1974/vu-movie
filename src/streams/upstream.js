@@ -22,7 +22,8 @@
  *     from `/up/<secret>/f` with a real Content-Length and Accept-Ranges,
  *     backed by a chunk-aligned fetcher with per-chunk retries and an LRU
  *     byte cache (so ffmpeg can seek into the moov atom and reconnects are
- *     cheap);
+ *     cheap). A CDN that ignores Range is captured to a temp file under
+ *     `storage.tmp/upstream/` instead, removed when the session closes;
  *   - `dash` sources get their MPD fetched with the source headers and
  *     rewritten so every init/segment URL points back at
  *     `/up/<secret>/dash/...`; each segment is assembled from ranged
@@ -38,6 +39,8 @@
  */
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { log, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { headerObject, streamKind } from '../core/media.js';
@@ -116,11 +119,17 @@ class ChunkedFetchError extends Error {
  * transfer still returns the bytes that arrived (the caller resumes from
  * there) instead of throwing them away.
  *
- * Returns { status, buf, total, truncated }:
- *   status  — 206 (range honoured) or 200 (server ignored Range)
- *   total   — full object size from Content-Range, or null
+ * Returns { status, buf, total, contentLength, truncated, cancelled }:
+ *   status    — 206 (range honoured) or 200 (server ignored Range)
+ *   total     — full object size from Content-Range, or null
+ *   truncated — the CDN cut the body (buf holds what arrived before the cut)
+ *   cancelled — a 200 body was stopped early at `maxBytes` (buf is the head
+ *               of the object; the rest was NOT downloaded)
+ *
+ * A 200 answer is the whole object from byte 0. Callers pass `maxBytes` (the
+ * end of the window they need), so a range-less server is read only that far.
  */
-async function rangedRequest(session, url, start, end, signal) {
+async function rangedRequest(session, url, start, end, signal, { maxBytes = Infinity } = {}) {
   const headers = { ...session.headers, Range: `bytes=${start}-${end}` };
   session.stats.cdnRequests += 1;
   const res = await fetch(url, {
@@ -155,21 +164,32 @@ async function rangedRequest(session, url, start, end, signal) {
   }
   const contentType = res.headers.get('content-type') || null;
 
+  // Read a 200 only as far as the caller needs, then cancel the rest of the
+  // body. Without this, a range-less CDN would have the whole movie pulled
+  // into memory before the first byte is served.
+  const limit = res.status === 200 ? maxBytes : Infinity;
   const chunks = [];
+  let received = 0;
   let truncated = false;
+  let cancelled = false;
   try {
-    for await (const part of res.body) chunks.push(Buffer.from(part));
+    for await (const part of res.body) {
+      chunks.push(Buffer.from(part));
+      received += part.byteLength;
+      if (received >= limit) { cancelled = true; break; }
+    }
   } catch (err) {
     truncated = true;
     session.stats.truncations += 1;
-    log.debug('upstream', `CDN cut the transfer after ${chunks.reduce((n, c) => n + c.length, 0)} bytes — resuming with the next ranged request`, {
+    log.debug('upstream', `CDN cut the transfer after ${received} bytes — resuming with the next ranged request`, {
       session: session.id, url: truncate(url, 110), error: errorText(err),
     });
   }
-  const buf = Buffer.concat(chunks);
-  session.stats.cdnBytes += buf.length;
+  const all = Buffer.concat(chunks);
+  const buf = all.length > limit ? all.subarray(0, limit) : all;
+  session.stats.cdnBytes += received;
   session.lastActivity = Date.now();
-  return { status: res.status, buf, total, contentLength, truncated, contentType };
+  return { status: res.status, buf, total, contentLength, truncated, cancelled, contentType };
 }
 
 /**
@@ -192,7 +212,11 @@ async function fetchByteWindow(session, url, start, end, signal) {
     if (signal?.aborted) throw new ChunkedFetchError('client went away');
     const reqEnd = Math.min(end, pos + session.tune.chunkBytes - 1);
     try {
-      const { status, buf, total, contentLength, contentType } = await rangedRequest(session, url, pos, reqEnd, signal);
+      // On a 200 the body is read from byte 0 up to `end` only (the window's
+      // end is all we need), never the rest of the object.
+      const { status, buf, total, contentLength, contentType, truncated, cancelled } = await rangedRequest(
+        session, url, pos, reqEnd, signal, { maxBytes: end + 1 },
+      );
       if (total != null && windowTotal == null) windowTotal = total;
       if (status === 200) {
         // The server ignored Range and answered with the whole object from
@@ -200,7 +224,7 @@ async function fetchByteWindow(session, url, start, end, signal) {
         // (file store) additionally caches the head for probe/moov reads.
         const usable = pos === 0 ? buf : buf.subarray(Math.min(buf.length, pos));
         if (!usable.length) throw new ChunkedFetchError('range-less server sent no usable bytes');
-        return { buf: usable, fromFullObject: buf, total, contentLength };
+        return { buf: usable, fromFullObject: buf, total, contentLength, truncated, cancelled };
       }
       if (!buf.length) throw new ChunkedFetchError('empty 206 response');
       if (firstStatus == null) { firstStatus = status; firstContentType = contentType; }
@@ -236,7 +260,9 @@ async function fetchObjectChunked(session, url, signal) {
   const chunk = session.tune.segmentChunkBytes;
   let first = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
-    first = await rangedRequest(session, url, 0, chunk - 1, signal);
+    // A range-less 200 is read only up to the segment cap (one byte over it
+    // is enough to know it is too large).
+    first = await rangedRequest(session, url, 0, chunk - 1, signal, { maxBytes: MAX_SEGMENT_BYTES + 1 });
     // A truncated 200 cannot be resumed with Range on this server — retry it
     // wholesale. A truncated 206 resumes below through the remaining ranges.
     if (!(first.truncated && first.status === 200)) break;
@@ -556,6 +582,7 @@ export function closeUpstreamProxy(session, reason = 'stopped') {
   session.closed = true;
   try { session.abort.abort(); } catch { /* ignore */ }
   proxies.delete(session.secret);
+  removeCaptureFile(session);
   log.info('upstream', `upstream proxy closed (${reason})`, {
     session: session.id, stream: session.streamId,
     cdnRequests: session.stats.cdnRequests, cdnMb: Math.round(session.stats.cdnBytes / 1048576),
@@ -622,18 +649,21 @@ function ensureFileMeta(session, signal) {
   if (!session.metaPromise) {
     session.metaPromise = (async () => {
       const probeEnd = Math.min(session.tune.chunkBytes - 1, 2 * 1024 * 1024);
-      const { status, buf, total, contentLength, contentType, fromFullObject } = await fetchByteWindow(
-        session, session.upstreamUrl, 0, probeEnd, signal,
-      );
+      const {
+        status, buf, total, contentLength, contentType, fromFullObject, truncated, cancelled,
+      } = await fetchByteWindow(session, session.upstreamUrl, 0, probeEnd, signal);
       session.meta.contentType = contentType || session.meta.contentType;
       if (fromFullObject) {
-        // The CDN ignored Range and streamed the object from byte 0. We know
-        // the true total only when Content-Length said so; a chunked 200 keeps
-        // total unknown and the linear capture below finishes it.
+        // The CDN ignored Range and streamed the object from byte 0 (we read
+        // only as far as the probe needed). The size is known from
+        // Content-Length, or from a body that ended by itself inside the
+        // probe (a small chunked object). Otherwise the total stays unknown
+        // and the linear capture below finishes the object.
         session.meta.rangeSupported = false;
-        if (contentLength != null) session.meta.total = contentLength;
-        const complete = contentLength != null && fromFullObject.length >= contentLength;
-        session.store.put(0, fromFullObject, { allowPartialTail: complete, total: complete ? contentLength : null });
+        const knownSize = contentLength != null ? contentLength : (cancelled || truncated ? null : fromFullObject.length);
+        if (knownSize != null) session.meta.total = knownSize;
+        const complete = knownSize != null && fromFullObject.length >= knownSize;
+        session.store.put(0, fromFullObject, { allowPartialTail: complete, total: complete ? fromFullObject.length : null });
         if (!complete) startLinearCapture(session);
         return;
       }
@@ -655,6 +685,13 @@ async function serveFile(session, req, res) {
   req.on('close', () => signal.abort());
   try {
     await ensureFileMeta(session, signal.signal);
+    // While a range-less capture is still running the size is unknown, and a
+    // Range request (a seek, a reconnect) can only be answered with it. Hold
+    // such a request until the capture has finished. A plain sequential GET
+    // is not held: it streams as the capture fills in.
+    if (session.meta.total == null && req.headers.range && session.linear && !session.linear.done) {
+      await waitForLinearSize(session, signal.signal);
+    }
   } catch (err) {
     return sendError(res, 502, `upstream unreachable: ${err.message}`);
   }
@@ -732,71 +769,124 @@ async function serveFile(session, req, res) {
 }
 
 /**
- * Background capture for servers that ignore Range: keep one GET open, append
- * incoming bytes to the store; on a truncation reopen the GET and skip the
- * bytes already captured. (Wasteful but correct — and rare, since every CDN
- * that matters for video supports Range.)
+ * Background capture for servers that ignore Range (a plain or chunked 200):
+ * keep one GET open and write its bytes to a temp file as they arrive. A GET
+ * always starts at byte 0, so when the CDN cuts a transfer we reopen it and
+ * read past the bytes already on disk.
+ *
+ * The file, not RAM, is the store for these objects. The capture can run far
+ * ahead of the player, and the player may read anywhere in the object at any
+ * time (an MP4 index at the end, a seek back to the start); a RAM cache evicts
+ * the bytes the player still needs first. `session.linear.captured` is the
+ * frontier: every byte before it is in the file.
  */
 function startLinearCapture(session) {
   if (session.linear) return;
-  session.linear = { started: true, done: false, failed: false, captured: 0, listeners: new Set() };
+  const dir = path.join(getConfig().storage?.tmp || '/tmp/vumovie', 'upstream');
+  sweepStaleCaptureFiles(dir);
+  session.linear = {
+    started: true, done: false, failed: false, captured: 0, listeners: new Set(),
+    file: path.join(dir, `${session.id}-${session.secret.slice(0, 8)}.part`), fh: null,
+  };
   linearCaptureLoop(session).catch((err) => {
     log.warn('upstream', 'range-less capture loop ended', { session: session.id, error: errorText(err) });
   });
 }
 
+let captureDirSwept = false;
+
+/** Capture files left behind by an earlier process (crash, power cut): once
+ *  per process, and only ones nobody has written to for a day. */
+function sweepStaleCaptureFiles(dir) {
+  if (captureDirSwept) return;
+  captureDirSwept = true;
+  try {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.part')) continue;
+      const file = path.join(dir, name);
+      if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file, { force: true });
+    }
+  } catch { /* no directory yet — it is created on demand */ }
+}
+
+/** Close and delete a session's capture file (the session is over). */
+function removeCaptureFile(session) {
+  const linear = session.linear;
+  if (!linear?.file) return;
+  const { fh } = linear;
+  linear.fh = null;
+  if (fh) fh.close().catch(() => { /* already closed */ });
+  try { fs.rmSync(linear.file, { force: true }); } catch { /* ignore */ }
+}
+
 async function linearCaptureLoop(session) {
-  let skip = session.linear.captured;
+  try {
+    await fs.promises.mkdir(path.dirname(session.linear.file), { recursive: true });
+    session.linear.fh = await fs.promises.open(session.linear.file, 'w+');
+  } catch (err) {
+    session.linear.failed = true;
+    notifyLinear(session, 0);
+    log.error('upstream', 'cannot create the capture file — this range-less upstream cannot be played', {
+      session: session.id, file: session.linear.file, error: errorText(err),
+    });
+    return;
+  }
+  if (session.closed) { removeCaptureFile(session); return; }
   let stuck = 0;
   let lastCaptured = -1;
   while (!session.closed) {
+    // Bytes before `resumeFrom` are already held: this GET re-reads them from
+    // the start and drops them. `position` counts the bytes of THIS GET only,
+    // so the offset to store at is always derived from it.
+    const resumeFrom = session.linear.captured;
+    let position = 0;
     try {
+      session.stats.cdnRequests += 1;
       const res = await fetch(session.upstreamUrl, {
         headers: session.headers,
         signal: AbortSignal.any([session.abort.signal, AbortSignal.timeout(session.tune.requestTimeoutMs * 10)]),
       });
       if (!res.ok) throw new ChunkedFetchError(`HTTP ${res.status} from upstream`, { status: res.status });
-      let skipped = 0;
       for await (const part of res.body) {
         const buf = Buffer.from(part);
-        if (skipped < skip) {
-          const drop = Math.min(buf.length, skip - skipped);
-          skipped += drop;
-          if (drop === buf.length) continue;
-          const rest = buf.subarray(drop);
-          session.store.put(skip, rest, {});
-          skip += rest.length;
-          notifyLinear(session, skip);
-          continue;
-        }
-        session.store.put(skip, buf, {});
-        skip += buf.length;
-        notifyLinear(session, skip);
+        const partStart = position;
+        position += buf.length;
+        session.stats.cdnBytes += buf.length;
+        session.lastActivity = Date.now();
+        if (position <= resumeFrom) continue; // all of it is captured already
+        const from = Math.max(0, resumeFrom - partStart);
+        // Written at its absolute offset; the frontier moves only once it is on disk.
+        await session.linear.fh.write(buf, from, buf.length - from, partStart + from);
+        notifyLinear(session, position);
       }
-      // Clean EOF — the whole object arrived (a range-less server cannot
-      // truncate a chunked response without us noticing as a thrown error).
+      if (position < resumeFrom) {
+        throw new ChunkedFetchError(`upstream sent ${position} bytes, fewer than the ${resumeFrom} already captured`);
+      }
+      // Clean EOF: `position` is the size of the whole object. A chunked
+      // response that the CDN cut short surfaces as an error above instead.
+      session.meta.total = position;
       session.linear.done = true;
-      session.meta.total = skip;
-      notifyLinear(session, skip);
+      notifyLinear(session, position);
       return;
     } catch (err) {
       if (session.closed) return;
       session.stats.retries += 1;
-      notifyLinear(session, skip);
+      const at = session.linear.captured;
       // Give up when the capture makes no progress at all — otherwise a CDN
       // that cuts every plain GET at the same spot would loop forever.
-      stuck = skip === lastCaptured ? stuck + 1 : 0;
-      lastCaptured = skip;
+      stuck = at === lastCaptured ? stuck + 1 : 0;
+      lastCaptured = at;
       if (stuck >= 8) {
         log.error('upstream', 'range-less capture makes no progress — giving up on this upstream', {
-          session: session.id, at: skip,
+          session: session.id, at,
         });
         session.linear.failed = true;
-        notifyLinear(session, skip);
+        notifyLinear(session, at);
         return;
       }
       log.warn('upstream', 'range-less capture interrupted — reopening the GET and skipping ahead', {
-        session: session.id, at: skip, error: errorText(err),
+        session: session.id, at, error: errorText(err),
       });
       await sleep(1000);
     }
@@ -821,14 +911,13 @@ function waitForLinearBytes(session, pos, len, signal) {
       if (signal?.aborted) { cleanup(); return reject(new ChunkedFetchError('client went away')); }
       if (session.closed) { cleanup(); return reject(new ChunkedFetchError('proxy session closed')); }
       if (session.linear?.failed) { cleanup(); return reject(new ChunkedFetchError('the range-less upstream keeps cutting the transfer')); }
-      const buf = session.store.get(pos, len);
-      if (buf) { cleanup(); return resolve(buf); }
-      if (session.linear?.done && pos + len > session.linear.captured) {
-        // EOF reached — hand back whatever remains (possibly nothing).
-        const rest = session.store.get(pos, Math.max(0, session.linear.captured - pos));
+      const have = session.linear?.captured ?? 0;
+      // Everything asked for is on disk — or the object ended before it.
+      if (have >= pos + len || (session.linear?.done && have > pos)) {
         cleanup();
-        return resolve(rest || Buffer.alloc(0));
+        return readLinearFile(session, pos, Math.min(len, have - pos)).then(resolve, reject);
       }
+      if (session.linear?.done) { cleanup(); return resolve(Buffer.alloc(0)); } // at or past EOF
       return undefined;
     };
     timer = setInterval(check, 100);
@@ -839,18 +928,52 @@ function waitForLinearBytes(session, pos, len, signal) {
   });
 }
 
+/** Resolve once the capture has finished (the size is known), or reject. */
+function waitForLinearSize(session, signal) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearInterval(timer);
+      session.linear?.listeners.delete(check);
+    };
+    const check = () => {
+      if (signal?.aborted) { cleanup(); return reject(new ChunkedFetchError('client went away')); }
+      if (session.closed) { cleanup(); return reject(new ChunkedFetchError('proxy session closed')); }
+      if (!session.linear || session.linear.failed) {
+        cleanup();
+        return reject(new ChunkedFetchError('the range-less upstream keeps cutting the transfer'));
+      }
+      if (session.linear.done) { cleanup(); return resolve(); }
+      return undefined;
+    };
+    timer = setInterval(check, 100);
+    timer.unref?.();
+    session.linear.listeners.add(check);
+    check();
+  });
+}
+
+/** Read [pos, pos+len) of a range-less object from its capture file. */
+async function readLinearFile(session, pos, len) {
+  const out = Buffer.alloc(len);
+  const { bytesRead } = await session.linear.fh.read(out, 0, len, pos);
+  session.lastActivity = Date.now();
+  return out.subarray(0, bytesRead);
+}
+
 /** Serve the rewritten MPD. */
 async function serveMpd(session, req, res) {
   try {
     if (!session.mpd) {
       let first = null;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        first = await rangedRequest(session, session.upstreamUrl, 0, MAX_MANIFEST_BYTES - 1);
+        first = await rangedRequest(session, session.upstreamUrl, 0, MAX_MANIFEST_BYTES - 1, undefined, { maxBytes: MAX_MANIFEST_BYTES });
         if (!first.truncated) break;
         // A truncated manifest would rewrite into broken XML — fetch it again.
         if (attempt < 3) await sleep(backoff(attempt));
       }
       if (first.truncated) throw new ChunkedFetchError('the CDN keeps truncating the manifest');
+      if (first.cancelled) throw new ChunkedFetchError('the DASH manifest is larger than the 10 MB limit');
       const body = first.status === 206 && first.total != null && first.total < first.buf.length
         ? first.buf.subarray(0, first.total)
         : first.buf;

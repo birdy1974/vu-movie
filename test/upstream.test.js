@@ -10,6 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
 import express from 'express';
 import { EventEmitter } from 'node:events';
 import {
@@ -243,9 +244,11 @@ function startTruncatingCdn(files, { cutAfterBytes = Infinity, supportRange = tr
     }
     let pos = start;
     let sent = 0;
+    // `cutAfterBytes` may be a number or a function of the request number.
+    const cut = typeof cutAfterBytes === 'function' ? cutAfterBytes(stats.requests) : cutAfterBytes;
     const tick = () => {
       if (req.socket.destroyed) return;
-      if (sent >= cutAfterBytes) return req.socket.destroy(); // the CDN "ends the chunked transfer"
+      if (sent >= cut) return req.socket.destroy(); // the CDN "ends the chunked transfer"
       if (pos > end) return res.end();
       const slice = buf.subarray(pos, Math.min(pos + 16384, end + 1));
       pos += slice.length;
@@ -275,6 +278,21 @@ function get(url, { headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.get(url, { headers }, (res) => {
       const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+/** Like get(), but the reader waits before it starts reading — a player that is slow to start. */
+function getDelayed(url, { startDelayMs = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      const chunks = [];
+      res.pause();
+      setTimeout(() => res.resume(), startDelayMs);
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
       res.on('error', reject);
@@ -360,6 +378,216 @@ test('file source: a range-less CDN (plain 200) still plays to the end', { timeo
   }
 });
 
+test('file source: a range-less CDN that streams chunked (no Content-Length) still plays to the end', { timeout: 60000 }, async () => {
+  // Many CDNs ignore Range AND send no Content-Length (chunked 200). The
+  // background capture used to keep only a fraction of the bytes and then
+  // report a clean EOF, so ffmpeg reconnected at the same offset forever.
+  const source = pseudoBytes(900 * 1024, 11);
+  const cdn = await startTruncatingCdn(new Map([['/chunked.mp4', { buf: source, type: 'video/mp4' }]]), { supportRange: false, countResponseSizes: false });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-chunked',
+    url: `http://127.0.0.1:${cdn.port}/chunked.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const res = await get(session.inputUrl);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.length, source.length, 'every byte arrives, not just the first few hundred KB');
+    assert.ok(res.body.equals(source), 'bytes are identical to the source');
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('file source: a range-less chunked CDN that cuts every connection still delivers every byte', { timeout: 60000 }, async () => {
+  // Each plain GET is cut after a growing amount (300 KB, 600 KB, …). The
+  // capture must reopen the GET and read past the bytes it already holds —
+  // storing that head a second time would shift the rest of the movie.
+  const source = pseudoBytes(1100 * 1024, 13);
+  const cdn = await startTruncatingCdn(new Map([['/cut.mp4', { buf: source, type: 'video/mp4' }]]), {
+    supportRange: false,
+    countResponseSizes: false,
+    cutAfterBytes: (n) => n * 300 * 1024,
+  });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-cut-chunked',
+    url: `http://127.0.0.1:${cdn.port}/cut.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const res = await get(session.inputUrl);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.length, source.length, 'every byte arrives across the reopened GETs');
+    assert.ok(res.body.equals(source), 'no byte was stored twice or out of place');
+    assert.ok(cdn.stats.requests >= 3, `expected several reopened GETs, saw ${cdn.stats.requests}`);
+    assert.ok(proxyStats(session).retries >= 2, 'the capture noticed each cut');
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('file source: a range-less CDN is read only as far as the probe needs, not to the end first', { timeout: 60000 }, async () => {
+  // The probe used to pull the whole object into memory before playback could
+  // start, and the background capture then downloaded it a second time.
+  const source = pseudoBytes(3 * 1024 * 1024, 17);
+  const cdn = await startTruncatingCdn(new Map([['/big.mp4', { buf: source, type: 'video/mp4' }]]), {
+    supportRange: false,
+    countResponseSizes: false,
+  });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-big-chunked',
+    url: `http://127.0.0.1:${cdn.port}/big.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const res = await get(session.inputUrl);
+    assert.equal(res.status, 200);
+    assert.ok(res.body.equals(source), 'bytes are identical to the source');
+    // Count what the CDN actually sent: one pass over the object plus the
+    // 256 KB probe — not two full passes (a 2.0× download before the fix).
+    assert.ok(cdn.stats.bytes < 1.5 * source.length, `the CDN sent ${(cdn.stats.bytes / source.length).toFixed(2)}× the object, expected ~1.1×`);
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('file source: a range-less CDN bigger than the RAM cache still plays to the end', { timeout: 60000 }, async () => {
+  // The capture runs ahead of a player that reads slowly (ffmpeg -re). With
+  // only a RAM cache, the bytes the player has not read yet are the oldest and
+  // are evicted first, so a movie larger than the cache stalled. The capture is
+  // kept in a temp file instead.
+  const source = pseudoBytes(24 * 1024 * 1024, 19);
+  const cdn = await startTruncatingCdn(new Map([['/huge.mp4', { buf: source, type: 'video/mp4' }]]), {
+    supportRange: false,
+    countResponseSizes: false,
+  });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+  cfg.transcode.upstreamCacheMb = 8;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-huge-chunked',
+    url: `http://127.0.0.1:${cdn.port}/huge.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const res = await getDelayed(session.inputUrl, { startDelayMs: 2000 });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.length, source.length, 'the whole object arrives, not just what fit in the cache');
+    assert.ok(res.body.equals(source));
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('file source: a range-less capture can be read back from any offset, and is removed with the session', { timeout: 60000 }, async () => {
+  // A moov atom at the end of an MP4 makes the player seek back to the start
+  // and into the middle once the download has finished.
+  const source = pseudoBytes(12 * 1024 * 1024, 23);
+  const cdn = await startTruncatingCdn(new Map([['/seek.mp4', { buf: source, type: 'video/mp4' }]]), {
+    supportRange: false,
+    countResponseSizes: false,
+  });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+  cfg.transcode.upstreamCacheMb = 8;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-seek-chunked',
+    url: `http://127.0.0.1:${cdn.port}/seek.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const whole = await get(session.inputUrl);
+    assert.ok(whole.body.equals(source), 'sequential read is byte-exact');
+    const file = session.linear?.file;
+    assert.ok(file, 'the capture is written to a temp file');
+    assert.ok(fs.existsSync(file));
+
+    for (const [start, end] of [[0, 1023], [600_000, 601_023], [source.length - 4096, source.length - 1]]) {
+      const ranged = await get(session.inputUrl, { headers: { Range: `bytes=${start}-${end}` } });
+      assert.equal(ranged.status, 206);
+      assert.ok(ranged.body.equals(source.subarray(start, end + 1)), `bytes ${start}-${end} read back exactly`);
+    }
+
+    closeUpstreamProxy(session, 'test done');
+    assert.equal(fs.existsSync(file), false, 'the temp file is removed with the session');
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('file source: a Range request that arrives while a range-less capture is still running gets the real size', { timeout: 60000 }, async () => {
+  // ffmpeg asks for the end of an MP4 (the moov atom) right after it starts.
+  // The size is only known once the capture has finished, so the request must
+  // be held until then — answering it from byte 0 makes ffmpeg give up.
+  const source = pseudoBytes(12 * 1024 * 1024, 29);
+  const cdn = await startTruncatingCdn(new Map([['/tail.mp4', { buf: source, type: 'video/mp4' }]]), {
+    supportRange: false,
+    countResponseSizes: false,
+  });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamChunkBytes = 256 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-tail-chunked',
+    url: `http://127.0.0.1:${cdn.port}/tail.mp4`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  try {
+    const whole = get(session.inputUrl);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(session.meta.total, null, 'the capture is still running');
+    const start = source.length - 65536;
+    const tail = await get(session.inputUrl, { headers: { Range: `bytes=${start}-` } });
+    assert.equal(tail.status, 206, 'a Range request is answered as a Range, not from byte 0');
+    assert.equal(tail.headers['content-range'], `bytes ${start}-${source.length - 1}/${source.length}`);
+    assert.ok(tail.body.equals(source.subarray(start)), 'the tail is byte-exact');
+    assert.ok((await whole).body.equals(source));
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
 const TEST_MPD = `<?xml version="1.0"?>
 <MPD type="static" mediaPresentationDuration="PT1H30M">
   <Period>
@@ -436,6 +664,49 @@ test('dash source: the rewritten MPD plus chunked segment fetches deliver every 
     const stats = proxyStats(session);
     assert.equal(stats.mode, 'dash');
     assert.ok(stats.truncations >= 3);
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    cdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('dash source: a range-less CDN (plain chunked 200s) still delivers whole segments', { timeout: 60000 }, async () => {
+  const init = pseudoBytes(120 * 1024, 1);
+  const seg1 = pseudoBytes(400 * 1024, 2);
+  const files = new Map([
+    ['/dash/movie/index.mpd', { buf: Buffer.from(TEST_MPD), type: 'application/dash+xml' }],
+    ['/dash/movie/init-stream0.m4s', { buf: init, type: 'video/mp4' }],
+    ['/dash/movie/chunk-stream0-00001.m4s', { buf: seg1, type: 'video/mp4' }],
+  ]);
+  const cdn = await startTruncatingCdn(files, { supportRange: false, countResponseSizes: false });
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamSegmentChunkBytes = 95 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-dash-plain',
+    url: `http://127.0.0.1:${cdn.port}/dash/movie/index.mpd`,
+    headers: {},
+    kind: 'dash',
+    baseOverride: proxy.base,
+  });
+  try {
+    const mpdRes = await get(session.inputUrl);
+    assert.equal(mpdRes.status, 200);
+    const rewritten = mpdRes.body.toString('utf8');
+    const initMatch = /initialization="([^"]+)"/.exec(rewritten);
+    const mediaMatch = /media="([^"]+)"/.exec(rewritten);
+    assert.ok(initMatch && mediaMatch, 'both template attributes were rewritten');
+
+    const initRes = await get(initMatch[1].replace('$RepresentationID$', '0'));
+    assert.equal(initRes.status, 200);
+    assert.ok(initRes.body.equals(init), 'init segment arrives whole from a range-less CDN');
+
+    const dir = mediaMatch[1].slice(0, mediaMatch[1].lastIndexOf('/') + 1);
+    const segRes = await get(`${dir}chunk-stream0-00001.m4s`);
+    assert.equal(segRes.status, 200);
+    assert.ok(segRes.body.equals(seg1), 'segment arrives whole from a range-less CDN');
   } finally {
     closeUpstreamProxy(session, 'test done');
     cdn.server.close();
