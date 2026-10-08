@@ -142,6 +142,23 @@ permissions, Container Manager project import, firewall, where the data lives).
   retaining removed/deleted titles and never consulting playback history. Add a
   free TMDB API key in **Settings → Metadata** to enable the lists.
 
+### Xtream output for OwnTV and IPTV clients
+The Playlist tab also publishes a token-scoped Xtream Codes-compatible server. It is
+compatible with OwnTV's Xtream importer (and clients such as TiviMate):
+
+* Server URL: `http://<nas>:8080/xtream/<playlist-token>`
+* Username: `XTREAM_USERNAME` (default `vumovie`)
+* Password: `XTREAM_PASSWORD`, or the playlist token when left empty
+* Optional EPG URL: `http://<nas>:8080/xtream/<playlist-token>/xmltv.php`
+
+The server implements `player_api.php`, live/VOD categories and streams, `get.php`
+(M3U Plus), and native Xtream playback paths (`/live/...`, `/movie/...`). Those
+native paths redirect into vu-movie's authenticated relay, so signed upstream
+headers, automatic recovery and FFmpeg templates are retained. Enable, disable and
+reorder items in the Playlist tab; the Xtream catalogue follows that list. The
+current URLs and credentials are shown in the Stream tab. A client on the LAN must
+be able to reach the NAS address; do not use `localhost` in OwnTV.
+
 ### One stream for VLC
 * `http://<nas>:8080/s/<token>/<title>.ts` — a single continuous MPEG-TS.
   The token never expires (until you delete the stream), so it can live in a

@@ -65,14 +65,26 @@ function xtreamAuthorised(req) {
   return true;
 }
 
+function xtreamKind(entry) {
+  const kind = String(entry.stream?.kind || entry.stream?.upstream?.kind || '').toLowerCase();
+  return /series|tv|show/.test(kind) ? 'series' : /movie|vod/.test(kind) ? 'movie' : 'live';
+}
+
+/**
+ * Xtream clients do not know vu-movie's opaque stream ids.  Use a compact,
+ * deterministic id from the current playlist order and resolve it back to the
+ * playlist entry in the compatibility URL handlers below.  This is also what
+ * OwnTV does when it turns a catalogue row into `/movie/.../<stream_id>.*`.
+ */
 function xtreamItem(entry, index, baseUrl) {
   const stream = entry.stream;
   const urls = store.urlsFor(stream, baseUrl);
-  const ext = stream.profile?.container === 'matroska' ? 'mkv' : 'ts';
+  const kind = xtreamKind(entry);
+  const ext = kind === 'movie' ? (stream.profile?.container === 'matroska' ? 'mkv' : 'mp4') : 'ts';
   return {
     num: index + 1,
     name: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
-    stream_type: 'live',
+    stream_type: kind,
     stream_id: index + 1,
     stream_icon: stream.poster || '',
     epg_channel_id: null,
@@ -214,7 +226,15 @@ router.all('/xtream/:token/player_api.php', async (req, res) => {
   const action = String(req.query.action || '');
   const baseUrl = baseUrlFrom(req);
   const entries = (await playlist.entries({ baseUrl })).filter((entry) => entry.enabled);
-  const streams = entries.map((entry, index) => xtreamItem(entry, index, baseUrl));
+  const allStreams = entries.map((entry, index) => xtreamItem(entry, index, baseUrl));
+  const streams = allStreams.filter((item) => {
+    const entry = entries[item.stream_id - 1];
+    return xtreamKind(entry) === 'live';
+  });
+  const vodStreams = allStreams.filter((item) => {
+    const entry = entries[item.stream_id - 1];
+    return xtreamKind(entry) === 'movie';
+  });
   switch (action) {
     case 'get_live_categories':
     case 'get_vod_categories':
@@ -223,7 +243,7 @@ router.all('/xtream/:token/player_api.php', async (req, res) => {
     case 'get_live_streams':
       return res.json(streams);
     case 'get_vod_streams':
-      return res.json(streams.map((item) => ({ ...item, stream_type: 'movie' })));
+      return res.json(vodStreams);
     case 'get_series':
     case 'get_short_epg':
     case 'get_simple_data_table':
@@ -234,6 +254,38 @@ router.all('/xtream/:token/player_api.php', async (req, res) => {
       return res.json(xtreamInfo(baseUrl, req.params.token));
   }
 });
+
+/**
+ * Native Xtream playback URLs. OwnTV (and most Xtream clients) does not use
+ * `vu_movie_url`; it constructs these paths from stream_id itself. Redirecting
+ * to the normal relay keeps signed upstream headers, transcoding and recovery
+ * in one place while preserving the standard Xtream contract.
+ */
+async function redirectXtreamStream(req, res, mode) {
+  if (!requireToken(req, res)) return;
+  const cfg = getConfig().playlist;
+  const expectedUser = cfg.xtreamUsername || 'vumovie';
+  const expectedPass = cfg.xtreamPassword || playlist.token();
+  if (String(req.params.username) !== expectedUser || String(req.params.password) !== expectedPass) {
+    return res.status(401).type('text/plain').send('Invalid credentials');
+  }
+  const number = Number(req.params.streamId);
+  if (!Number.isInteger(number) || number < 1) return res.status(404).type('text/plain').send('Unknown stream');
+  const entries = (await playlist.entries({ baseUrl: baseUrlFrom(req) })).filter((entry) => entry.enabled);
+  const entry = entries[number - 1];
+  if (!entry) return res.status(404).type('text/plain').send('Unknown stream');
+  const kind = xtreamKind(entry);
+  if ((mode === 'live' && kind !== 'live') || (mode === 'vod' && kind !== 'movie')) {
+    return res.status(404).type('text/plain').send('Unknown stream');
+  }
+  const urls = store.urlsFor(entry.stream, baseUrlFrom(req));
+  return res.redirect(307, mode === 'live' ? urls.ts : urls.mkv || urls.ts);
+}
+
+router.get('/xtream/:token/live/:username/:password/:streamId.ts', (req, res) => redirectXtreamStream(req, res, 'live'));
+router.get('/xtream/:token/live/:username/:password/:streamId.m3u8', (req, res) => redirectXtreamStream(req, res, 'live'));
+router.get('/xtream/:token/movie/:username/:password/:streamId.:extension', (req, res) => redirectXtreamStream(req, res, 'vod'));
+router.get('/xtream/:token/series/:username/:password/:streamId.:extension', (req, res) => redirectXtreamStream(req, res, 'vod'));
 
 router.all('/xtream/:token/get.php', async (req, res) => {
   if (!requireToken(req, res)) return;
