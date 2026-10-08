@@ -42,7 +42,9 @@ export const DEFAULTS = {
     username: process.env.APP_USERNAME || '',
     password: process.env.APP_PASSWORD || '',
     /** How long a generated stream token stays valid (minutes). 0 = forever. */
-    tokenTtlMinutes: Number(process.env.TOKEN_TTL_MINUTES || 4320),
+    // 0 = a stream's token never expires (the default). A positive value is a
+    // lifetime in minutes after which the stream is treated as expired.
+    tokenTtlMinutes: Number(process.env.TOKEN_TTL_MINUTES || 0),
   },
   db: {
     url: process.env.DATABASE_URL || '',
@@ -202,6 +204,12 @@ export const DEFAULTS = {
      * Set UPSTREAM_PROXY=false to go back to direct ffmpeg fetching.
      */
     upstreamProxy: String(process.env.UPSTREAM_PROXY || 'true').toLowerCase() !== 'false',
+    /**
+     * Learn each movie's length once with ffprobe, so the relay can tell the
+     * genuine end of a movie from an early cut and stops instead of repeating
+     * the film. Set PROBE_DURATION=false to skip the probe.
+     */
+    probeDuration: String(process.env.PROBE_DURATION || 'true').toLowerCase() !== 'false',
     /** Range size for progressive files (1 MB keeps requests small and cheap). */
     upstreamChunkBytes: Number(process.env.UPSTREAM_CHUNK_BYTES || 1024 * 1024),
     /** Range size inside one DASH segment — 95 KB, exactly like the TUI. */
@@ -456,6 +464,11 @@ function envOverrides() {
   if (process.env.PLAYLIST_AUTO_CHECK !== undefined) set('playlist.autoCheckEnabled', String(process.env.PLAYLIST_AUTO_CHECK).toLowerCase() !== 'false');
   if (process.env.PLAYLIST_CHECK_INTERVAL_MINUTES !== undefined) set('playlist.autoCheckIntervalMinutes', Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES));
   if (process.env.PLAYLIST_AUTO_REPAIR !== undefined) set('playlist.autoRepairEnabled', String(process.env.PLAYLIST_AUTO_REPAIR).toLowerCase() !== 'false');
+  // Environment wins over a value saved from Settings, like PORT. Blank and
+  // non-numeric values are ignored rather than read as 0 (= never expires).
+  const ttlEnv = process.env.TOKEN_TTL_MINUTES;
+  if (ttlEnv !== undefined && ttlEnv.trim() !== '' && Number.isFinite(Number(ttlEnv))) set('app.tokenTtlMinutes', Number(ttlEnv));
+  if (process.env.PROBE_DURATION !== undefined) set('transcode.probeDuration', String(process.env.PROBE_DURATION).toLowerCase() !== 'false');
   // Read in DEFAULTS too, but that only applies when the file says nothing:
   // without these two lines a value saved from Settings → Xtream Codes would
   // silently outrank the documented XTREAM_USERNAME / XTREAM_PASSWORD.

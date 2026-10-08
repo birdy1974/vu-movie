@@ -31,7 +31,7 @@ function targetFor(stream) {
     url: stream.upstream?.url || '',
     headers: stream.upstream?.headers || {},
     kind: stream.upstream?.kind || stream.kind || null,
-    expiresAt: stream.expires_at || null,
+    expiresAt: store.tokenExpiresAt(stream),
   };
 }
 

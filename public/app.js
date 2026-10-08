@@ -3264,7 +3264,7 @@ const SETTINGS_SECTIONS = [
       ['container', 'select', ['mpegts', 'matroska', 'hls']],
       ['alwaysTranscode', 'bool'], ['hardware', 'bool'], ['maxConcurrent', 'number'],
       ['device', 'text'], ['idleStopSeconds', 'number'], ['encoderFallback', 'text'],
-      ['realtime', 'bool'],
+      ['realtime', 'bool'], ['probeDuration', 'bool'],
     ],
   },
   {
@@ -3348,6 +3348,7 @@ const SETTINGS_LABELS = {
   'transcode.hardware': ['Use hardware (VAAPI)', 'Prefer the iGPU when the box exposes /dev/dri.'],
   'transcode.maxConcurrent': ['Max concurrent jobs', 'How many relay sessions and downloads may run at the same time.'],
   'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
+  'transcode.probeDuration': ['Probe movie length', 'Learn each movie length once with ffprobe, so the relay stops at the real end instead of restarting and repeating the film.'],
   'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session when no player has read from it for this long.'],
   'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
   'transcode.realtime': ['Pace live output', 'Throttle the relay to the source rate so real-time players do not starve.'],

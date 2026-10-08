@@ -114,14 +114,39 @@ export async function createStream({
   return saved;
 }
 
+/**
+ * The expiry that applies to a stream's token, or null when it never expires.
+ * A token lifetime of 0 (the default, "never expires") ignores the date stored
+ * at creation, so streams created under an older 3-day setting stop expiring
+ * too. Ephemeral previews keep their own short TTL either way.
+ */
+export function tokenExpiresAt(rec) {
+  if (!rec?.expires_at) return null;
+  if (rec.payload?.meta?.ephemeral === true) return rec.expires_at;
+  return getConfig().app.tokenTtlMinutes > 0 ? rec.expires_at : null;
+}
+
 export async function getStream(idOrToken) {
   const rec = await repo.getStream(idOrToken);
   if (!rec) return null;
-  if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) {
+  const expiry = tokenExpiresAt(rec);
+  if (expiry && new Date(expiry).getTime() < Date.now()) {
     log.warn('streams', `stream ${rec.id} has expired (token TTL) — still serving, re-resolve for a fresh upstream URL`);
     rec.expired = true;
   }
   return rec;
+}
+
+/** Remember the movie's length on the stream (learned by the relay, see
+ *  relay.learnMovieDuration). Stored beside the upstream, not inside its probe,
+ *  because profile building treats a present probe as a full media analysis. */
+export async function setUpstreamDuration(streamId, durationSec) {
+  const rec = await repo.getStream(streamId);
+  if (!rec || !(Number(durationSec) > 0)) return null;
+  return repo.saveStream({
+    ...rec,
+    upstream: { ...(rec.upstream || {}), durationSec: Math.round(Number(durationSec) * 100) / 100 },
+  });
 }
 
 export async function listStreams() {
@@ -141,7 +166,7 @@ export async function listStreams() {
     sourceId: r.source_id,
     quality: r.upstream?.quality || null,
     createdAt: r.created_at,
-    expiresAt: r.expires_at,
+    expiresAt: tokenExpiresAt(r),
     subtitleId: r.subtitle_id,
     season: r.upstream?.season || null,
     episode: r.upstream?.episode || null,
@@ -285,4 +310,4 @@ export function slugify(text) {
     .slice(0, 70) || 'stream';
 }
 
-export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, EPHEMERAL_TTL_MINUTES };
+export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, tokenExpiresAt, setUpstreamDuration, EPHEMERAL_TTL_MINUTES };

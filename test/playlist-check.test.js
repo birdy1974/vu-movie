@@ -20,6 +20,9 @@ process.env.CONFIG_FILE = path.join(dir, 'vumovie.json');
 process.env.LOG_LEVEL = 'error';
 
 const { checkStreams, summariseCheck, trimProbe, CHECK_STATES, BROKEN_STATES } = await import('../src/playlist/check.js');
+// The expired-token verdict needs a positive lifetime; 0 (the default) means
+// the token never expires, so the lifetime is pinned explicitly for this file.
+(await import('../src/core/config.js')).getConfig().app.tokenTtlMinutes = 4320;
 
 /* ---------------- fixtures ---------------- */
 

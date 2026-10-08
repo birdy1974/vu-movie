@@ -32,7 +32,9 @@ import { getConfig } from '../core/config.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
   validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes, probeSubtitleList,
+  probe as probeMedia,
 } from '../core/media.js';
+import * as store from './store.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats,
 } from './upstream.js';
@@ -357,6 +359,76 @@ export function decideRestart({ clients = 0, restarts = 0, code = null, signal =
     return { restart: false, reason: 'the movie reached its known duration — genuine end of stream' };
   }
   return { restart: true, reason: 'clean EOF while clients are watching — upstream likely ended the transfer early (chunked CDN), resuming' };
+}
+
+/** How long learning a movie's length may take (one ffprobe run). */
+const DURATION_PROBE_TIMEOUT_MS = 20000;
+
+/** The movie's length when it is known — learned by the relay or from the
+ *  candidate probe — or null. */
+export function knownDurationSec(stream) {
+  for (const value of [stream?.upstream?.durationSec, stream?.upstream?.probe?.durationSec]) {
+    const sec = Number(value);
+    if (Number.isFinite(sec) && sec > 0) return sec;
+  }
+  return null;
+}
+
+/**
+ * Where the movie is, counted from its start. ffmpeg reports time from its own
+ * start, and a resumed run starts again at zero, so the resume offset of the
+ * running process is added back before the end of the movie is compared.
+ */
+export function playheadSeconds(session) {
+  const outSec = Number.isFinite(session?.stats?.outTimeMs) ? session.stats.outTimeMs / 1000 : 0;
+  return (Number(session?.resumeSeconds) || 0) + outSec;
+}
+
+/**
+ * Only a clean end while someone is watching is ambiguous, and only an unknown
+ * length needs a probe. Nothing is probed when no restart could follow anyway.
+ */
+export function shouldLearnDuration(session, { code = null, signal = null } = {}) {
+  if (code !== 0 || signal) return false;
+  if (!session?.clients || session.clients.size <= 0) return false;
+  if (knownDurationSec(session.stream)) return false;
+  const cfg = getConfig().transcode;
+  if (cfg.probeDuration === false) return false;
+  return session.restarts < Math.max(1, Number(cfg.maxRestarts) || 3);
+}
+
+/**
+ * Learn the movie's length with ffprobe and keep it on the stream, so the next
+ * clean end can be recognised as the real end instead of restarting. Probes the
+ * proxied input (it serves the complete object, from cache or from the capture
+ * file) or, without a proxy, the upstream URL with its headers. Returns the
+ * length in seconds, or null when it could not be learned.
+ */
+export async function learnMovieDuration(session, { probe = probeMedia } = {}) {
+  const stream = session?.stream;
+  if (!stream?.id) return null;
+  const viaProxy = Boolean(session.upProxy);
+  const url = viaProxy ? session.upProxy.inputUrl : stream.upstream?.url;
+  if (!url) return null;
+  const headers = viaProxy ? {} : (stream.upstream?.headers || {});
+  const info = await probe(url, { headers, timeoutMs: DURATION_PROBE_TIMEOUT_MS }).catch(() => null);
+  const durationSec = Math.round(Number(info?.durationSec) * 100) / 100;
+  if (!(durationSec > 0)) {
+    log.warn('relay', 'could not learn the movie length — a clean end will restart and may repeat the film', {
+      session: session.id, stream: stream.id, via: viaProxy ? 'proxy' : 'upstream',
+    });
+    return null;
+  }
+  stream.upstream = { ...(stream.upstream || {}), durationSec };
+  try {
+    await store.setUpstreamDuration(stream.id, durationSec);
+  } catch (err) {
+    log.warn('relay', 'could not save the movie length', { stream: stream.id, error: errorText(err) });
+  }
+  log.info('relay', `learned the movie length (${Math.round(durationSec)} s) — playback now stops at the real end`, {
+    session: session.id, stream: stream.id,
+  });
+  return durationSec;
 }
 
 /**
@@ -746,7 +818,7 @@ function spawnFfmpeg(session) {
     endClients(session, 'ffmpeg could not be started');
   });
 
-  child.on('close', (code, signal) => {
+  child.on('close', async (code, signal) => {
     session.alive = false;
     const running = Math.round((Date.now() - session.startedAt) / 1000);
     const level = code === 0 || signal === 'SIGTERM' ? 'info' : 'error';
@@ -766,14 +838,21 @@ function spawnFfmpeg(session) {
     const fatal = fatalFfmpegFailure(session.stderrTail, {
       bytesOut: session.bytesOut, code, kind: session.kind,
     });
+    // A clean end while clients watch is either the real end or an early cut.
+    // If the movie's length is unknown, learn it first so the two can be told apart.
+    if (!fatal && shouldLearnDuration(session, { code, signal })) {
+      await learnMovieDuration(session).catch(() => null);
+      if (sessions.get(session.streamId) !== session) return; // stopped while probing
+    }
+    const playedSec = playheadSeconds(session);
     const decision = fatal
       ? { restart: false, reason: 'fatal ffmpeg startup error — a restart repeats it' }
       : decideRestart({
         clients: session.clients.size,
         restarts: session.restarts,
         code, signal,
-        outTimeMs: session.stats?.outTimeMs ?? null,
-        durationSec: session.stream?.upstream?.probe?.durationSec ?? null,
+        outTimeMs: playedSec * 1000,
+        durationSec: knownDurationSec(session.stream),
         maxRestarts: Math.max(1, Number(getConfig().transcode.maxRestarts) || 3),
       });
     if (fatal) {
@@ -784,7 +863,6 @@ function spawnFfmpeg(session) {
     }
     if (decision.restart) {
       session.restarts += 1;
-      const playedSec = Number.isFinite(session.stats?.outTimeMs) ? session.stats.outTimeMs / 1000 : 0;
       // Resume a couple of seconds before the last play head so the player
       // does not lose the GOP boundary it was decoding.
       session.resumeSeconds = playedSec > 10 ? Math.max(0, Math.floor(playedSec) - 2) : 0;
