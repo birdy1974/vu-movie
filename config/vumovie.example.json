@@ -118,7 +118,7 @@
     "cacheBudgetMb": 2048
   },
   "playlist": {
-    "_comment": "The app maintains token and items itself; name/xtreamUsername are safe to edit (or set PLAYLIST_NAME / XTREAM_USERNAME).",
+    "_comment": "The app maintains token and items itself; name and the Xtream account are editable here or in the Settings tab (PLAYLIST_NAME / XTREAM_USERNAME / XTREAM_PASSWORD win). An empty xtreamPassword means the token doubles as the password.",
     "name": "vu-movie",
     "token": "",
     "xtreamUsername": "vumovie",
