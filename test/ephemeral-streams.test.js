@@ -18,14 +18,16 @@ function makeCandidate() {
 }
 
 test('ephemeral preview streams are flagged, short-lived and never listed', async () => {
-  const before = Date.now();
   const preview = await store.createStream({ title: 'Preview Me', year: 2024, candidate: makeCandidate(), ephemeral: true });
   const saved = await store.createStream({ title: 'Keep Me', year: 2024, candidate: makeCandidate() });
 
   assert.equal(preview.payload?.meta?.ephemeral, true);
   assert.equal(saved.payload?.meta?.ephemeral, undefined);
-  const ttlMs = Date.parse(preview.expires_at) - before;
-  assert.ok(ttlMs > 59 * 60_000 && ttlMs <= 60 * 60_000, `ephemeral TTL is 60 minutes, got ${ttlMs}ms`);
+  // Measure from the record's own creation timestamp, not before the awaited
+  // save: store/database latency otherwise makes a correct 60-minute expiry
+  // appear to exceed the upper bound by a few milliseconds.
+  const ttlMs = Date.parse(preview.expires_at) - Date.parse(preview.created_at);
+  assert.equal(ttlMs, 60 * 60_000, `ephemeral TTL is 60 minutes, got ${ttlMs}ms`);
 
   // Playable directly (the player and the relay use getStream), invisible in
   // every listing (playlist, .m3u, bouquet — all read listStreams).

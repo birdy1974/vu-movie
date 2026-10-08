@@ -18,9 +18,10 @@
  *   hls   — ffmpeg's HLS muxer writes segments into a temp dir, clients pull
  *           index.m3u8 + segments (seekable-live, works in browsers too)
  *
- * A session is started lazily on the first client and killed after
- * `transcode.idleStopSeconds` with no clients, because the DS918+ GPU can only
- * handle one 1080p encode at a time.
+ * A session is started lazily and killed after `transcode.idleStopSeconds`
+ * with no clients, because the DS918+ GPU can only handle one 1080p encode at
+ * a time. Sessions started by a preflight/HEAD request or the session API also
+ * get an idle lease immediately; HLS HTTP requests renew it while being polled.
  */
 
 import fs from 'node:fs';
@@ -201,6 +202,23 @@ export function listSessions() {
 
 export function getSession(streamId) {
   return sessions.get(streamId) || null;
+}
+
+/**
+ * Keep an HLS relay alive while a player is polling its playlist/segments.
+ * HLS clients make short HTTP requests rather than holding a pipe response open,
+ * so they cannot use attachClient()'s disconnect lifecycle. The token identifies
+ * the HLS output directory; this only renews the idle lease for a live HLS
+ * session, never for an unrelated pipe session.
+ */
+export function touchSessionByToken(token) {
+  const wanted = String(token || '');
+  if (!wanted) return false;
+  const session = [...sessions.values()].find((candidate) => candidate.stream?.token === wanted);
+  if (!session || session.kind !== 'hls' || !session.alive) return false;
+  session.lastActivity = Date.now();
+  if (session.clients.size === 0) scheduleIdleStop(session);
+  return true;
 }
 
 /**
@@ -595,6 +613,11 @@ export async function ensureSession(stream, opts = {}) {
 
   sessions.set(stream.id, session);
   spawnFfmpeg(session);
+  // Not every way of creating a session attaches a streaming response: the
+  // session API can pre-start one, and HLS redirects before the client polls
+  // /hls. Without an initial lease those zero-client sessions can pin an old
+  // FFmpeg process/upstream forever and be reused after its signed URL expires.
+  scheduleIdleStop(session);
   log.info('relay', `session ${session.id} started`, {
     mode: session.mode, encoder: session.encoder, container: session.container,
     outputType: session.outputType || '',
@@ -927,5 +950,5 @@ export function stopAll(reason = 'shutdown') {
 
 export default {
   ensureSession, attachClient, stopSession, releaseUpstreamProxy, listSessions, getSession,
-  stopAll, publicSession, runTemplateTest,
+  touchSessionByToken, stopAll, publicSession, runTemplateTest,
 };
