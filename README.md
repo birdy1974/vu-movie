@@ -174,6 +174,14 @@ than exposing the upstream source. Use the displayed username/password in
 TiviMate, IPTV Smarters or another Xtream-compatible player; the playlist token
 remains part of the server URL.
 
+The account itself is set in **Settings → Xtream Codes** (or with
+`XTREAM_USERNAME` / `XTREAM_PASSWORD`, which win over a saved value). The
+password may be left empty: the playlist token then doubles as the password,
+which is the default. Values that cannot travel inside a playback URL — a
+space, `/`, `?`, `#`, `%`, `&` — are refused on save, because an IPTV app would
+store a link it cannot fetch. Changing the account invalidates the links already
+saved in your IPTV app; the Stream tab always shows the current credentials.
+
 ### Hardware transcoding that respects the J3455
 * VAAPI via `/dev/dri/renderD128` with the exact command family from the
   requirements (`-init_hw_device vaapi=intel:… -hwaccel vaapi -hwaccel_output_format

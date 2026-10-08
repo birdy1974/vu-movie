@@ -63,6 +63,20 @@ const inlineSchema = {
 
 /* ---------------- mocked API ---------------- */
 
+/** What GET /api/config answers — the shape publicConfig() really serves. */
+const mockConfig = {
+  app: { port: 8080, baseUrl: '', username: '', password: '••••••', logLevel: 'info', tokenTtlMinutes: 4320 },
+  transcode: { mode: 'auto', resolution: 1080, aspect: 'source', videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', container: 'mpegts', alwaysTranscode: false, hardware: true, maxConcurrent: 1, device: '/dev/dri/renderD128', idleStopSeconds: 45, encoderFallback: 'x264', realtime: true },
+  subtitles: { languages: ['nl', 'en'], autoSearch: true, pushToReceiver: false, receiverDir: '/media/hdd', disabledProviders: [] },
+  playlist: { autoCheckEnabled: true, autoCheckIntervalMinutes: 360, autoRepairEnabled: true, xtreamUsername: 'vumovie', xtreamPassword: '••••••••' },
+  enigma2: { host: '', port: 80, username: 'root', password: '••••', bouquetName: 'vu-movie', rootDir: '/etc/enigma2', serviceType: 4097, ftpEnabled: true, ftpPort: 21, autoPush: false },
+  scraper: { browserConcurrency: 1, browserIdleSeconds: 180, resolveTimeoutMs: 45000, probeCandidates: true, maxCandidates: 12, flaresolverrUrl: '', externalExtractorUrl: '', sessionDir: '/data/sessions', userAgent: 'Mozilla/5.0' },
+  storage: { downloads: '/downloads', tmp: '/tmp', cacheBudgetMb: 2048 },
+};
+/** The body of the last PUT /api/config, so the checks can see the real patch. */
+let lastConfigPatch = null;
+
+
 async function fetchMock(url, options = {}) {
   const u = String(url);
   const method = (options.method || 'GET').toUpperCase();
@@ -98,14 +112,12 @@ async function fetchMock(url, options = {}) {
   }] });
   if (u.startsWith('/api/sources')) return json({ ok: true, sources: [{ id: 'overlook', name: 'Overlook', enabled: true, home: 'https://overlook.example' }] });
   if (u.startsWith('/api/config/hwaccel')) return json({ ok: true, hwaccel: { available: false, reason: 'no /dev/dri' } });
-  if (u.startsWith('/api/config')) return json({ ok: true, config: {
-    app: { port: 8080, baseUrl: '', username: '', password: '••••••', logLevel: 'info', tokenTtlMinutes: 4320 },
-    transcode: { mode: 'auto', resolution: 1080, aspect: 'source', videoBitrate: 8000, audioBitrate: 192, audioChannels: 6, fps: '25', container: 'mpegts', alwaysTranscode: false, hardware: true, maxConcurrent: 1, device: '/dev/dri/renderD128', idleStopSeconds: 45, encoderFallback: 'x264', realtime: true },
-    subtitles: { languages: ['nl', 'en'], autoSearch: true, pushToReceiver: false, receiverDir: '/media/hdd', disabledProviders: [] },
-    enigma2: { host: '', port: 80, username: 'root', password: '••••', bouquetName: 'vu-movie', rootDir: '/etc/enigma2', serviceType: 4097, ftpEnabled: true, ftpPort: 21, autoPush: false },
-    scraper: { browserConcurrency: 1, browserIdleSeconds: 180, resolveTimeoutMs: 45000, probeCandidates: true, maxCandidates: 12, flaresolverrUrl: '', externalExtractorUrl: '', sessionDir: '/data/sessions', userAgent: 'Mozilla/5.0' },
-    storage: { downloads: '/downloads', tmp: '/tmp', cacheBudgetMb: 2048 },
-  } });
+  if (u.startsWith('/api/config') && method === 'PUT') {
+    // What the Settings form actually posted — checked below for the Xtream card.
+    lastConfigPatch = JSON.parse(options.body || '{}');
+    return json({ ok: true, config: mockConfig, changed: Object.keys(lastConfigPatch) });
+  }
+  if (u.startsWith('/api/config')) return json({ ok: true, config: mockConfig });
   if (u.startsWith('/api/subtitles/search')) return json({ ok: true, results: [{ providerId: 'podnapisi', language: 'en', title: 'Quality Movie', release: 'Quality.Movie.2026.1080p', url: 'https://subs.example/file.srt' }] });
   if (u.startsWith('/api/subtitles/download')) return json({ ok: true, language: 'en', srt: '1\n00:00:01,000 --> 00:00:02,000\nHello\n' });
   if (u.startsWith('/api/subtitles/providers')) return json({ ok: true, providers: [] });
@@ -285,6 +297,12 @@ check('old-tab actions exist', ['btn-st-vlc', 'btn-st-session-start', 'btn-st-se
 $('#st-pick').value = 's2';
 $('#st-pick').dispatchEvent(new window.Event('change', { bubbles: true }));
 check('switching the stream re-renders its URLs', $$('#st-urls input[readonly]').some((i) => i.value.endsWith('b.ts')));
+// The credentials are printed here, but the account is set in Settings.
+const xtreamAccountButton = $('#st-outputs [data-xtream-settings]');
+check('the Stream tab offers to change the Xtream account', Boolean(xtreamAccountButton), xtreamAccountButton?.textContent?.trim());
+xtreamAccountButton?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(150);
+check('“change account” opens the Settings tab', window.location.hash === '#set' && !$('#p-set').classList.contains('hide'), window.location.hash);
 
 /* ---------------- 7. playlist drag & drop ---------------- */
 
@@ -348,6 +366,31 @@ const sectionCards = $$('#settings-grid [data-set-section]').map((c) => c.datase
 if (!sectionCards.length) console.log('DEBUG settings-grid:', $('#settings-grid')?.innerHTML.slice(0, 400));
 check('settings sections include playlist recovery controls', ['transcode', 'subtitles', 'playlist', 'enigma2', 'scraper', 'storage', 'app'].every((k) => sectionCards.includes(k)), sectionCards.join(','));
 check('playlist schedule and auto-repair settings are available', ['autoCheckEnabled', 'autoCheckIntervalMinutes', 'autoRepairEnabled'].every((key) => $(`#set-playlist-${key}`)), 'schedule · interval · auto-refresh');
+// The Xtream account has its own card but its two options live under
+// `playlist` in the config, which is what the save has to reproduce.
+const xtreamCard = $('#settings-grid [data-set-section="xtream"]');
+const xtreamUser = $('#set-xtream-xtreamUsername');
+const xtreamPass = $('#set-xtream-xtreamPassword');
+check('the Xtream account is editable in Settings', Boolean(xtreamCard && xtreamUser && xtreamPass), sectionCards.join(','));
+check('the Xtream card is prefilled and masks the password like every other secret',
+  xtreamUser?.value === 'vumovie' && xtreamPass?.type === 'password' && xtreamPass?.value === '••••••••',
+  `${xtreamUser?.value} / ${xtreamPass?.type}:${xtreamPass?.value}`);
+check('the Xtream card says which account is in use', /Account in use: vumovie/.test(xtreamCard?.textContent || ''), xtreamCard?.textContent?.replace(/\s+/g, ' ').slice(-90));
+
+xtreamUser.value = 'tivimate';
+$('#btn-save-settings').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(150);
+check('saving writes the Xtream account into the playlist config section',
+  lastConfigPatch?.playlist?.xtreamUsername === 'tivimate' && lastConfigPatch?.playlist?.autoCheckIntervalMinutes === 360,
+  JSON.stringify(lastConfigPatch?.playlist));
+check('an untouched masked password is not posted back', !('xtreamPassword' in (lastConfigPatch?.playlist || {})),
+  JSON.stringify(lastConfigPatch?.playlist));
+
+xtreamPass.value = 'hunter2';
+$('#btn-save-settings').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await tick(150);
+check('a typed Xtream password is posted', lastConfigPatch?.playlist?.xtreamPassword === 'hunter2', JSON.stringify(lastConfigPatch?.playlist));
+
 const checkInterval = $('#set-playlist-autoCheckIntervalMinutes');
 check('check interval is constrained to 15–10080 minutes', checkInterval?.min === '15' && checkInterval?.max === '10080', `${checkInterval?.min}–${checkInterval?.max}`);
 const setInputs = $$('#settings-grid input,#settings-grid select');

@@ -291,7 +291,12 @@ export const DEFAULTS = {
     autoCheckIntervalMinutes: Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES || 360),
     autoRepairEnabled: String(process.env.PLAYLIST_AUTO_REPAIR || 'true').toLowerCase() !== 'false',
     token: '',
-    /** Username/password an Xtream Codes client sends (empty = token only). */
+    /**
+     * Username/password an Xtream Codes client sends (an empty password means
+     * the playlist token doubles as the password, so a default install works
+     * without typing anything). Editable in Settings → Xtream Codes;
+     * XTREAM_USERNAME / XTREAM_PASSWORD still win over the saved file.
+     */
     xtreamUsername: process.env.XTREAM_USERNAME || 'vumovie',
     xtreamPassword: process.env.XTREAM_PASSWORD || '',
   },
@@ -451,6 +456,11 @@ function envOverrides() {
   if (process.env.PLAYLIST_AUTO_CHECK !== undefined) set('playlist.autoCheckEnabled', String(process.env.PLAYLIST_AUTO_CHECK).toLowerCase() !== 'false');
   if (process.env.PLAYLIST_CHECK_INTERVAL_MINUTES !== undefined) set('playlist.autoCheckIntervalMinutes', Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES));
   if (process.env.PLAYLIST_AUTO_REPAIR !== undefined) set('playlist.autoRepairEnabled', String(process.env.PLAYLIST_AUTO_REPAIR).toLowerCase() !== 'false');
+  // Read in DEFAULTS too, but that only applies when the file says nothing:
+  // without these two lines a value saved from Settings → Xtream Codes would
+  // silently outrank the documented XTREAM_USERNAME / XTREAM_PASSWORD.
+  if (process.env.XTREAM_USERNAME) set('playlist.xtreamUsername', process.env.XTREAM_USERNAME);
+  if (process.env.XTREAM_PASSWORD) set('playlist.xtreamPassword', process.env.XTREAM_PASSWORD);
   if (process.env.DATABASE_URL) set('db.url', process.env.DATABASE_URL);
   if (process.env.DOWNLOADS_DIR) set('storage.downloads', process.env.DOWNLOADS_DIR);
   if (process.env.TMP_DIR) set('storage.tmp', process.env.TMP_DIR);
@@ -530,11 +540,95 @@ export function cfg(pathStr, fallback) {
   return value === undefined ? fallback : value;
 }
 
+/** Options whose value must never reach the browser (or a log line). */
+const SECRET_PATHS = [
+  'app.password',
+  'enigma2.password',
+  'playlist.xtreamPassword',
+  'subtitles.keys.opensubtitlesCom',
+  'subtitles.keys.subdl',
+  'subtitles.credentials.opensubtitlesOrgPass',
+  'subtitles.credentials.addic7edPass',
+];
+
+/** What publicConfig() puts in place of a secret, and the UI shows in its field. */
+const SECRET_MASK = '••••••••';
+const isMaskedSecret = (value) => typeof value === 'string' && /^•+$/.test(value);
+
+/** Reads `patch.playlist.xtreamPassword` (and any other dotted path) if present. */
+function readPath(node, pathStr) {
+  return pathStr.split('.').reduce((acc, key) => (acc == null ? undefined : acc[key]), node);
+}
+
+/** Deletes a nested path, leaving empty parents behind (harmless in a patch). */
+function deletePath(node, pathStr) {
+  const parts = pathStr.split('.');
+  const parent = parts.slice(0, -1).reduce((acc, key) => (acc == null ? undefined : acc[key]), node);
+  if (parent && typeof parent === 'object') delete parent[parts.at(-1)];
+}
+
+/**
+ * A Settings save posts the whole form back, including the masked fields it
+ * could not show. Writing `••••••••` over a real password would lock everybody
+ * out with a password nobody knows, so masked values mean "keep what is
+ * stored" — the same rule the browser form applies before it sends.
+ */
+function dropMaskedSecrets(node) {
+  if (!node || typeof node !== 'object') return node;
+  for (const pathStr of SECRET_PATHS) {
+    if (isMaskedSecret(readPath(node, pathStr))) deletePath(node, pathStr);
+    if (isMaskedSecret(node[pathStr])) delete node[pathStr];  // a flat "a.b" key, just in case
+  }
+  return node;
+}
+
+/**
+ * The Xtream account is the one setting that is both typed into a third-party
+ * app *and* carried inside a URL: the catalogue hands out
+ * `/xtream/<token>/live/<username>/<password>/<id>.ts` and `get.php` takes the
+ * same pair as query parameters. A password with a slash, a space or a `%` in
+ * it yields links the player cannot fetch (or that stop at the wrong path
+ * segment), and that only becomes visible hours later on the TV — so the
+ * Settings save rejects it up front instead of accepting it silently.
+ *
+ * Returns a list of human-readable problems; an empty list means the patch is
+ * acceptable. Only the keys the patch actually sets are looked at.
+ */
+const XTREAM_ACCOUNT_MAX = 64;
+const XTREAM_ACCOUNT_FORBIDDEN = /[/\\?#%&"'<>|]/;
+
+export function validateConfigPatch(patch) {
+  // Folded first, so the flat "playlist.xtreamPassword" spelling is checked too.
+  const { config } = foldDottedKeys(patch || {});
+  const account = (config.playlist && typeof config.playlist === 'object') ? config.playlist : {};
+  const problems = [];
+  for (const key of ['xtreamUsername', 'xtreamPassword']) {
+    const value = account[key];
+    // Empty keeps the documented fallback (the playlist token doubles as the
+    // password), and a mask is dropped by saveConfig() as "unchanged".
+    if (value === undefined || value === null || value === '' || isMaskedSecret(value)) continue;
+    const label = key === 'xtreamUsername' ? 'Xtream username' : 'Xtream password';
+    if (typeof value !== 'string') { problems.push(`${label}: enter text.`); continue; }
+    if (value.length > XTREAM_ACCOUNT_MAX) { problems.push(`${label}: ${XTREAM_ACCOUNT_MAX} characters maximum.`); continue; }
+    if (/\s/.test(value)) { problems.push(`${label}: cannot contain spaces — IPTV apps put the account in a URL.`); continue; }
+    const forbidden = value.match(XTREAM_ACCOUNT_FORBIDDEN);
+    if (forbidden) {
+      problems.push(`${label}: “${forbidden[0]}” cannot be used — IPTV apps put the account in a URL. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe.`);
+    }
+  }
+  return problems;
+}
+
 /** Write the config file atomically (used by PUT /api/config). */
 export function saveConfig(patch) {
+  // A Settings save posts the whole form back, including the masked password
+  // fields it could not display. Those mean "keep the stored value", not "set
+  // the password to ••••••••" — which would lock everybody out with a password
+  // nobody knows. Cloned first so the caller's object is never edited.
+  const incoming = dropMaskedSecrets(structuredClone(patch || {}));
   // Fold dotted keys coming from an API client / older UI the same way the file
   // reader does, so a patch can never create an ignored flat key on disk.
-  const { config: folded, ignored, unknown } = foldDottedKeys(patch || {});
+  const { config: folded, ignored, unknown } = foldDottedKeys(incoming);
   if (ignored.length || unknown.length) {
     log.warn('config', 'ignoring unusable option(s) in the config update', { ignored: ignored.join(', '), unknown: unknown.join(', ') });
   }
@@ -574,16 +668,6 @@ export function saveConfig(patch) {
  */
 function stripSecretsForDisk(cfgObject) { return cfgObject; }
 
-/** Options whose value must never reach the browser (or a log line). */
-const SECRET_PATHS = [
-  'app.password',
-  'enigma2.password',
-  'subtitles.keys.opensubtitlesCom',
-  'subtitles.keys.subdl',
-  'subtitles.credentials.opensubtitlesOrgPass',
-  'subtitles.credentials.addic7edPass',
-];
-
 /** Returns a copy with passwords/keys masked, for the UI. */
 export function publicConfig() {
   // These playlist internals are intentionally exposed only by the dedicated
@@ -595,10 +679,15 @@ export function publicConfig() {
   // served only by /api/ffmpeg/templates to the template editor, never the
   // general settings/health config response.
   delete clone.transcode.ffmpegTemplates;
-  const mask = (v) => (v ? '••••••••' : '');
+  const mask = (v) => (v ? SECRET_MASK : '');
   clone.app.password = mask(clone.app.password);
   clone.db.url = clone.db.url ? clone.db.url.replace(/:[^:@/]*@/, ':***@') : '';
   clone.enigma2.password = mask(clone.enigma2.password);
+  // The Xtream password is a real credential (it guards the /xtream/<token>/…
+  // playback URLs), so Settings shows the same mask as every other password.
+  // The Stream tab keeps showing it in clear text: that panel exists so the
+  // account can be typed into TiviMate.
+  clone.playlist.xtreamPassword = mask(clone.playlist.xtreamPassword);
   clone.subtitles.keys.opensubtitlesCom = mask(clone.subtitles.keys.opensubtitlesCom);
   clone.subtitles.keys.subdl = mask(clone.subtitles.keys.subdl);
   clone.subtitles.credentials.opensubtitlesOrgPass = mask(clone.subtitles.credentials.opensubtitlesOrgPass);

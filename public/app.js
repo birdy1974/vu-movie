@@ -2918,6 +2918,8 @@ function initStream() {
   $('#st-outputs')?.addEventListener('click', (event) => {
     const copyBtn = event.target.closest('[data-copy]');
     if (copyBtn) { copyText(copyBtn.dataset.copy); return; }
+    // The credentials are shown here but set in Settings → Xtream Codes.
+    if (event.target.closest('[data-xtream-settings]')) { go('set'); return; }
     const vlcPl = event.target.closest('[data-vlc-pl]');
     if (vlcPl?.dataset.vlcPl) {
       const u = vlcPl.dataset.vlcPl;
@@ -3008,7 +3010,7 @@ async function refreshStream(announce = false) {
         </div>
       </div>
       <div class="mono url-line">${escapeHtml(entry.url || '—')}</div>
-      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Give these credentials to TiviMate, IPTV Smarters or another Xtream-compatible app; the player API URL above is the server address. Xtream catalogue and M3U+ output include every enabled playlist item in order.">i</span></div><div class="row" style="gap:6px;margin-top:8px"><a class="btn sm ghost" href="${escapeHtml(entry.xtream.get || '')}" target="_blank" rel="noreferrer">complete M3U+ ↗</a><button class="btn sm ghost" data-copy="${escapeHtml(entry.xtream.get || '')}">copy M3U+</button></div><div class="mono url-line">${escapeHtml(entry.xtream.get || '—')}</div>` : ''}
+      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Give these credentials to TiviMate, IPTV Smarters or another Xtream-compatible app; the player API URL above is the server address. Xtream catalogue and M3U+ output include every enabled playlist item in order. The account is set in Settings → Xtream Codes.">i</span></div><div class="row" style="gap:6px;margin-top:8px"><a class="btn sm ghost" href="${escapeHtml(entry.xtream.get || '')}" target="_blank" rel="noreferrer">complete M3U+ ↗</a><button class="btn sm ghost" data-copy="${escapeHtml(entry.xtream.get || '')}">copy M3U+</button><button class="btn sm ghost" data-xtream-settings>change account</button></div><div class="mono url-line">${escapeHtml(entry.xtream.get || '—')}</div>` : ''}
     </div>`).join('');
 
   $('#st-item-count').textContent = `${state.playlist.items.length} item(s)`;
@@ -3285,6 +3287,12 @@ const SETTINGS_SECTIONS = [
     ],
   },
   {
+    // Its own card (so the account is easy to find) but the same config
+    // section: these two options live under `playlist` on disk.
+    key: 'xtream', path: 'playlist', title: 'Xtream Codes',
+    fields: [['xtreamUsername', 'text'], ['xtreamPassword', 'password']],
+  },
+  {
     key: 'enigma2', title: 'Enigma2',
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
@@ -3320,6 +3328,7 @@ const SETTINGS_NOTES = {
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
   metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
   playlist: 'Scheduled stream health checks and automatic recovery. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
+  xtream: 'The account an Xtream Codes app (TiviMate, IPTV Smarters, …) logs in with. The server address and the ready-to-paste credentials are on the Stream tab; the playlist token stays part of that address.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
   storage: 'Folders inside the container, and how much disk the cache may use.',
@@ -3356,6 +3365,9 @@ const SETTINGS_LABELS = {
   'playlist.autoCheckEnabled': ['Scheduled checks', 'Check every stream in the Playlist after startup and repeat on the interval below.'],
   'playlist.autoCheckIntervalMinutes': ['Check interval (min)', '15–10080 minutes; default is every 6 hours. The first scheduled check starts shortly after boot.'],
   'playlist.autoRepairEnabled': ['Auto-refresh inactive streams', 'When a check fails, resolve the same title on its current provider first, then try other enabled providers. The stream token and output URLs stay the same.'],
+
+  'playlist.xtreamUsername': ['Username', 'Account name for the Xtream catalogue, “vumovie” by default. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe — the account is part of the playback URL.'],
+  'playlist.xtreamPassword': ['Password', 'Password the Xtream app sends. Leave it empty to keep using the playlist token as the password. Shown masked; leave it untouched to keep the current one. Changing it invalidates the links already saved in your IPTV app.'],
 
   'enigma2.host': ['Host', 'IP or hostname of the VU+ on the LAN.'],
   'enigma2.port': ['Port', 'Enigma2 web interface port, 80 by default.'],
@@ -3395,20 +3407,38 @@ async function initSettings() {
   await loadSettings();
 }
 
+/**
+ * The Xtream card also says which account is in use right now: the password
+ * field is masked like every other secret, and an empty password means the
+ * playlist token doubles as it — neither is visible from the inputs alone.
+ */
+function xtreamAccountNote(playlistSection = {}) {
+  const username = String(playlistSection.xtreamUsername || 'vumovie');
+  const passwordNote = String(playlistSection.xtreamPassword || '')
+    ? 'password set (masked here — the Stream tab shows the full account)'
+    : 'no password set, so the playlist token doubles as it';
+  return `<div class="mut" style="margin-top:10px">Account in use: <b>${escapeHtml(username)}</b> — ${escapeHtml(passwordNote)}. The Stream tab lists the server address to paste into the IPTV app.</div>`;
+}
+
 async function loadSettings() {
   try {
     const res = await api('/api/config');
     state.config = res.config;
     const draft = structuredClone(res.config);
-    $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => `
+    $('#settings-grid').innerHTML = SETTINGS_SECTIONS.map((section) => {
+      // A card is a UI grouping, not necessarily a config section: Xtream Codes
+      // has its own card but its two options live under `playlist`.
+      const configKey = section.path || section.key;
+      const source = draft[configKey] || {};
+      return `
       <div class="card" data-set-section="${escapeHtml(section.key)}">
         <div class="cardhead"><h2 style="margin:0">${titleWithTip(section.title, SETTINGS_NOTES[section.key])}</h2>
           <span class="mut">${section.fields.length} field(s)</span></div>
         <div class="set-fields">
         ${section.fields.map(([key, type, options]) => {
-          const value = draft[section.key]?.[key];
+          const value = source[key];
           const id = `set-${section.key}-${key}`;
-          const [label, hint] = SETTINGS_LABELS[`${section.key}.${key}`] || [key, ''];
+          const [label, hint] = SETTINGS_LABELS[`${configKey}.${key}`] || [key, ''];
           if (type === 'bool') {
             return `<div class="field" data-set-field="${id}"><label class="check-row" style="margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(label)} ${tip(hint)}</label></div>`;
           }
@@ -3424,7 +3454,9 @@ async function loadSettings() {
           return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}"${constraints} value="${escapeHtml(value ?? '')}"></div>`;
         }).join('')}
         </div>
-      </div>`).join('');
+        ${section.key === 'xtream' ? xtreamAccountNote(source) : ''}
+      </div>`;
+    }).join('');
     const hint = $('#settings-hint');
     if (hint) hint.textContent = `${SETTINGS_SECTIONS.length} section(s) loaded from /api/config`;
   } catch (error) {
@@ -3440,7 +3472,11 @@ async function loadSettings() {
 async function saveSettings() {
   const patch = {};
   for (const section of SETTINGS_SECTIONS) {
-    patch[section.key] = {};
+    // Cards are a UI grouping: Xtream Codes has its own card but writes into the
+    // `playlist` config section, so two cards can share one target. Merge into
+    // what an earlier card collected instead of replacing it.
+    const configKey = section.path || section.key;
+    const target = patch[configKey] || (patch[configKey] = {});
     for (const [key, type] of section.fields) {
       const el = $(`#set-${section.key}-${key}`);
       if (!el) continue;
@@ -3449,13 +3485,18 @@ async function saveSettings() {
       else if (type === 'number') value = Number(el.value);
       else if (type === 'list') value = el.value.split(',').map((part) => part.trim()).filter(Boolean);
       else value = el.value;
+      // A masked password field the operator did not touch means "keep it" —
+      // the server drops the mask too, but never send it in the first place.
       if (type === 'password' && /^•+$/.test(String(value))) continue;
-      patch[section.key][key] = value;
+      target[key] = value;
     }
   }
   await api('/api/config', { method: 'PUT', body: patch });
   toast('Settings saved to /config/vumovie.json', 'ok');
   loadHealth();
+  // The Stream tab prints the Xtream account and every URL that carries it, so
+  // a new username/password has to show up there without a page reload.
+  if (initialized.has('stream')) refreshStream().catch(() => {});
 }
 
 function wireSettings() {

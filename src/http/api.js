@@ -12,7 +12,7 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { log, logError, errorText, getRecentLogs, knownComponents, getLogLevel, setLogLevel, subscribeLogs } from '../core/log.js';
-import { getConfig, publicConfig, saveConfig, cfg } from '../core/config.js';
+import { getConfig, publicConfig, saveConfig, validateConfigPatch, cfg } from '../core/config.js';
 import { dbState, isPostgres } from '../core/db.js';
 import {
   hardware, hardwareStatus, hardwarePending, binariesStatus,
@@ -301,6 +301,14 @@ router.get('/config', wrap(async (req, res) => res.json({ ok: true, config: publ
 router.put('/config', wrap(async (req, res) => {
   const patch = req.body || {};
   log.info('api', 'config update requested', { sections: Object.keys(patch).join(',') });
+  // Values that end up inside an URL an IPTV app has to fetch (the Xtream
+  // account) are rejected here, so the Settings tab reports them instead of
+  // saving a password no player can request a stream with.
+  const problems = validateConfigPatch(patch);
+  if (problems.length) {
+    log.warn('api', 'config update rejected', { problems: problems.join(' ') });
+    return res.status(400).json({ ok: false, error: `Settings not saved. ${problems.join(' ')}` });
+  }
   saveConfig(patch);
   if (patch.app?.logLevel) setLogLevel(patch.app.logLevel);
   if (patch.enigma2) enigma2.resetStatusCache();
