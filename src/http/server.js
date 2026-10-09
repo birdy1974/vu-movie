@@ -273,7 +273,8 @@ export function createApp() {
       mode: session.mode, encoder: session.encoder, container, hw: hw.available ? 'vaapi' : 'software',
       outputType, isEnigma2,
     });
-    const { finish } = relay.attachClient(session, req, res);
+    // The Enigma2 box is a receiver: when it leaves the movie, the movie is not kept.
+    const { finish } = relay.attachClient(session, req, res, { receiver: isEnigma2 });
     res.on('close', () => finish('socket closed'));
     return undefined;
   });

@@ -1067,6 +1067,14 @@ router.delete('/streams/:id/session', wrap(async (req, res) => {
   res.json({ ok: true, stopped });
 }));
 
+// The Mobile tab's "stop all sessions": every running relay session, web previews
+// included. A deliberate stop, so nothing is kept: the next play of each movie
+// starts from the beginning.
+router.post('/sessions/stop-all', wrap(async (req, res) => {
+  const stopped = relay.stopAll('stop all sessions');
+  res.json({ ok: true, stopped });
+}));
+
 router.post('/streams/:id/playlist', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });

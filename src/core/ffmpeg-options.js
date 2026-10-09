@@ -322,6 +322,10 @@ export const TEMPLATE_FIELDS = [
     kind: 'integer', min: 8000, max: 384000,
     choices: ['', '8000', '11025', '12000', '16000', '22050', '24000', '32000', '44100', '48000', '64000', '88200', '96000', '176400', '192000', '384000'],
   }),
+  field('audio_gain', 'Volume change', 'audio', {
+    help: 'Level change for this output in dB: +6 is about twice as loud, -6 about half, 0 leaves the sound alone. The audio is re-encoded to apply it, so the audio encoder cannot be copy (AC-3 suits the box). Above 0 dB a limiter keeps the peaks from clipping.',
+    kind: 'decibels', min: -12, max: 12, step: 1,
+  }),
   field('subs', 'Subtitles', 'subtitles', {
     help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed on top of this choice; burn-in needs the full command.',
     kind: 'enum', choices: [...SUB_MODES], custom: false,
@@ -427,6 +431,7 @@ export const TEMPLATE_OPTION_DEFAULTS = {
   audio_bitrate: '',
   audio_channels: '',
   audio_rate: '',
+  audio_gain: '0',
   subs: 'drop',
   output_format: 'mpegts',
   extra_input: '',
@@ -446,7 +451,7 @@ export const TEMPLATE_PARSE_BASELINE = {
   ...TEMPLATE_OPTION_DEFAULTS,
   video_bitrate: '', maxrate: '', bufsize: '', fps: '', gop: '', profile: '', level: '',
   rc_mode: '', global_quality: '', async_depth: '',
-  audio_bitrate: '', audio_channels: '', audio_rate: '',
+  audio_bitrate: '', audio_channels: '', audio_rate: '', audio_gain: '',
 };
 
 /** Defaults applied by the relay when a flag is absent (shown in the help text). */
@@ -625,6 +630,7 @@ export function activeParameters(options = {}, { container = null } = {}) {
     vaapiTuning: VAAPI_ENCODERS.includes(o.video_codec),
     audio: o.audio_codec !== 'none',
     audioRateControl: o.audio_codec !== 'none' && o.audio_codec !== 'copy',
+    audioGain: o.audio_codec !== 'none' && o.audio_codec !== 'copy' && audioGainDb(o.audio_gain) !== 0 && !hasForeignAudioFilter(o),
     subs: (container || o.output_format) === 'matroska' && o.subs === 'keep' ? 'keep' : (o.subs === 'drop' ? 'drop' : 'dvb'),
     copyRemux: !transcode,
     mpegts: live,
@@ -650,6 +656,12 @@ function validateValue(key, value, definition) {
       if (definition.min !== undefined && definition.min !== null && Number(text) < definition.min) return `use at least ${definition.min}`;
       if (definition.max !== undefined && definition.max !== null && Number(text) > definition.max) return `use at most ${definition.max}`;
       return null;
+    case 'decibels': {
+      if (!/^[+-]?\d+(?:\.\d+)?$/.test(text.trim())) return 'use a level in dB such as 6 or -3';
+      const db = Number(text.trim());
+      if (db < definition.min || db > definition.max) return `use a level from ${definition.min} to ${definition.max} dB`;
+      return null;
+    }
     case 'positive': {
       const number = Number(text);
       if (!Number.isFinite(number) || number <= 0 || number > 1000) return 'use a rate greater than 0 and at most 1000';
@@ -749,6 +761,11 @@ export function templateOptionWarnings(options = {}, { container = null } = {}) 
   if ((fmt === 'mpegts' || fmt === 'hls') && o.audio_codec && !TS_AUDIO_CODECS.includes(o.audio_codec)) {
     warnings.push(`${fmt === 'mpegts' ? 'MPEG-TS' : 'HLS'} carries AAC, AC-3, E-AC-3, MP2 or MP3 audio: ${o.audio_codec} needs the Matroska container`);
   }
+  if (audioGainDb(o.audio_gain) !== 0) {
+    if (o.audio_codec === 'none') warnings.push('the volume change is ignored: the audio is removed');
+    else if (o.audio_codec === 'copy') warnings.push('the volume change is not applied while the audio is copied: choose an audio encoder (AC-3 suits the box) to re-encode it');
+    else if (hasForeignAudioFilter(o)) warnings.push('the extra flags already carry an audio filter (-af), so the volume change is not added: put the level into that filter chain instead');
+  }
   const snippet = vfSnippet(o.vf_preset, o.hw_accel);
   if (VF_PRESET_IDS.has(o.vf_preset) && o.vf_preset !== 'none' && !snippet) {
     const needs = vfPresetNeeds(o.vf_preset);
@@ -763,6 +780,68 @@ export function templateOptionWarnings(options = {}, { container = null } = {}) 
  * ------------------------------------------------------------------ */
 
 function rateOrNull(value) { return value ? String(value) : null; }
+
+/* ------------------------------------------------------------------ *
+ * volume change (audio_gain): one -af chain the form owns
+ * ------------------------------------------------------------------ */
+
+/**
+ * The limiter after a boost. `level=disabled` keeps the boost exact: with
+ * auto level on, ffmpeg adds about 0.4 dB of make-up gain on top of +6. The
+ * ceiling sits near -1 dBFS, which leaves room for the overshoot the AC-3 and
+ * AAC encoders add to a full-scale peak.
+ */
+const AUDIO_LIMITER = 'alimiter=limit=0.89:level=disabled';
+
+/** Channel count → ffmpeg layout name. The layout goes in the chain, so a downmix happens before the limiter. */
+const CHANNEL_LAYOUTS = { 1: 'mono', 2: 'stereo', 6: '5.1', 8: '7.1' };
+
+/** The level change in dB; 0 (off) for a blank or unreadable field. */
+export function audioGainDb(value) {
+  const db = Number(String(value ?? '').trim() || 0);
+  return Number.isFinite(db) ? db : 0;
+}
+
+/** Whether the extra flags already carry an audio filter the form did not write. */
+function hasForeignAudioFilter(o) {
+  return splitFlagString(o.extra_output).some((token) => token === '-af' || token === '-filter:a');
+}
+
+/**
+ * The -af chain for a level change, or null when nothing is applied. It needs
+ * samples to work on, so the renderer only uses it on a re-encoded stream
+ * (ffmpeg refuses -af together with -c:a copy).
+ */
+export function audioGainFilter(value, channels = '') {
+  const db = audioGainDb(value);
+  if (db === 0) return null;
+  const parts = [];
+  const layout = CHANNEL_LAYOUTS[String(channels || '')];
+  if (layout) parts.push(`aformat=channel_layouts=${layout}`);
+  parts.push(`volume=${db}dB`);
+  if (db > 0) parts.push(AUDIO_LIMITER);
+  return parts.join(',');
+}
+
+/**
+ * The level in a -af value the form would have written: an optional layout
+ * (matching the channel field), volume=<n>dB, and the limiter only after a
+ * boost. Returns the dB as a string, or null when the chain is anything else —
+ * then it stays in the extra flags exactly as typed.
+ */
+function ownAudioChainGain(chain, channels) {
+  const pieces = splitFilterChain(chain);
+  let at = 0;
+  const layout = CHANNEL_LAYOUTS[String(channels || '')];
+  if (layout && pieces[at] === `aformat=channel_layouts=${layout}`) at += 1;
+  const volume = /^volume=([+-]?\d+(?:\.\d+)?)dB$/.exec(pieces[at] || '');
+  if (!volume) return null;
+  const db = Number(volume[1]);
+  at += 1;
+  if (db > 0 && pieces[at] === AUDIO_LIMITER) at += 1;
+  else if (pieces[at] === AUDIO_LIMITER) return null;
+  return at === pieces.length ? String(db) : null;
+}
 
 /**
  * Render the complete ffmpeg command for an option set.
@@ -858,6 +937,10 @@ export function buildTemplateCommand(rawOptions = {}, {
       if (o.audio_bitrate) tokens.push('-b:a', o.audio_bitrate);
       if (o.audio_channels) tokens.push('-ac', String(o.audio_channels));
       if (o.audio_rate) tokens.push('-ar', String(o.audio_rate));
+      // A level change needs samples to work on, so it only applies to a
+      // re-encode, and not on top of an audio filter the operator wrote.
+      const gainChain = audioGainFilter(o.audio_gain, o.audio_channels);
+      if (gainChain && !hasForeignAudioFilter(o)) tokens.push('-af', gainChain);
     }
   }
 
@@ -1069,6 +1152,15 @@ export function parseTemplateCommand(command, { base = null, container = null } 
           else warnings.push(`unrecognised video filter '${filter}' — it cannot be represented as a field and will be dropped`);
         }
       }
+      i += next === null ? 1 : 2;
+      continue;
+    }
+    if (token === '-af' || token === '-filter:a') {
+      // The level change the form writes is read back into its field; any
+      // other audio filter stays in the extra flags exactly as it was typed.
+      const gain = next === null ? null : ownAudioChainGain(next, out.audio_channels);
+      if (gain !== null) out.audio_gain = gain;
+      else unhandledOut.push(...(next === null ? [token] : [token, next]));
       i += next === null ? 1 : 2;
       continue;
     }

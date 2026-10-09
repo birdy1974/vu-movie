@@ -24,7 +24,9 @@
  * session is stopped after `transcode.pauseKeepSeconds` without a player
  * (`idleStopSeconds` when nobody ever attached), because the DS918+ GPU can only
  * handle one 1080p encode at a time. An unchosen stop leaves its play head for
- * `transcode.resumeHours`, so the next play of the movie resumes there. Sessions
+ * `transcode.resumeHours`, so the next play of the movie resumes there. The Enigma2
+ * box is a receiver: when it leaves the movie (a channel change, a stop) nothing is
+ * kept and the next play starts at the beginning (see attachClient). Sessions
  * started by a preflight/HEAD request or the session API get an idle lease
  * immediately; HLS HTTP requests renew it while being polled.
  */
@@ -569,6 +571,8 @@ function resumeHoursLimit() {
  */
 export function rememberResumePoint(session, { now = Date.now() } = {}) {
   if (!session || session.kind !== 'pipe' || !session.streamId) return 0;
+  // A receiver (the Enigma2 box) left this movie on purpose: nothing is kept.
+  if (session.receiverLeft) { resumePoints.delete(session.streamId); return 0; }
   if (resumeHoursLimit() <= 0) return 0;
   const playhead = playheadSeconds(session);
   const duration = knownDurationSec(session.stream);
@@ -898,6 +902,8 @@ export async function ensureSession(stream, opts = {}) {
     resumeSeconds: wantsHls ? 0 : takeResumePoint(stream.id),
     held: false,
     pendingRewind: 0,
+    // Set when a receiver (the Enigma2 box) has left: this movie is not kept.
+    receiverLeft: false,
     child: null,
     hw,
     upProxy,
@@ -1158,8 +1164,22 @@ function scheduleHlsCleanup(session) {
   log.debug('relay', `HLS segments of ${session.id} kept for ${seconds}s`);
 }
 
-/** Attach an HTTP response (VLC, the Duo2, a browser) to a session. */
-export function attachClient(session, req, res, { onFinish } = {}) {
+/**
+ * Reasons the relay itself drops a player (see dropClient). Any other detach
+ * reason means the player closed its own connection.
+ */
+const RELAY_DROP_REASONS = new Set(['stalled', 'cannot keep up']);
+
+/**
+ * Attach an HTTP response (VLC, the Duo2, a browser) to a session.
+ *
+ * `receiver: true` marks the Enigma2 box (its `.ts.enigma2` URL). A pause keeps
+ * the connection open, so the film simply waits and continues from the same point.
+ * A receiver that closes its connection has changed channel, stopped, or gone off:
+ * nothing is kept for it, and the next play starts at the beginning. A receiver
+ * the relay dropped for stalling was paused, so its place is kept like any pause.
+ */
+export function attachClient(session, req, res, { onFinish, receiver = false } = {}) {
   // The first player back to a session that a player left starts a little earlier.
   if (session.clients.size === 0 && session.pendingRewind > 0 && session.alive && session.kind === 'pipe') {
     const seconds = session.pendingRewind;
@@ -1178,6 +1198,7 @@ export function attachClient(session, req, res, { onFinish } = {}) {
     blockedAt: 0,
     stallTimer: null,
     detach: null,
+    receiver: Boolean(receiver),
   };
   session.clients.add(client);
   session.lastActivity = Date.now();
@@ -1199,9 +1220,25 @@ export function attachClient(session, req, res, { onFinish } = {}) {
       reason, bytes: client.bytes, sec: Math.round((Date.now() - client.startedAt) / 1000), clients: session.clients.size,
       notReading: Boolean(client.blocked), held: Boolean(session.held), pendingRewind: session.pendingRewind || 0,
     });
-    // The last player left: keep the (frozen) session for pauseKeepSeconds, so a
-    // player that comes back continues from the same point.
-    if (session.clients.size === 0) scheduleIdleStop(session, pauseKeepSeconds());
+    // A receiver (the Enigma2 box) that closes its connection has changed channel
+    // or stopped. A pause keeps the connection open, so this is not a pause: the
+    // film is not kept, and the next play starts at the beginning. The relay
+    // dropping a stalled receiver is different (see RELAY_DROP_REASONS).
+    const receiverLeft = Boolean(client.receiver) && !RELAY_DROP_REASONS.has(reason);
+    if (receiverLeft) session.receiverLeft = true;
+    if (session.clients.size === 0 && receiverLeft) {
+      log.info('relay', `receiver left ${session.id}: the film is not kept, the next play starts at the beginning`, { reason });
+      if (sessions.get(session.streamId) === session) stopSession(session.streamId, 'receiver left the movie');
+      onFinish?.(client);
+      return;
+    }
+    if (receiverLeft) {
+      log.info('relay', `receiver left ${session.id} while other players still watch: the film is not kept once they leave`, { clients: session.clients.size });
+    } else if (session.clients.size === 0) {
+      // The last player left: keep the (frozen) session for pauseKeepSeconds, so a
+      // player that comes back continues from the same point.
+      scheduleIdleStop(session, pauseKeepSeconds());
+    }
     applySourceFlow(session);
     onFinish?.(client);
   };
@@ -1282,8 +1319,13 @@ export function publicSession(session) {
   };
 }
 
+/** Stop every running session (web previews included). Returns how many were stopped. */
 export function stopAll(reason = 'shutdown') {
-  for (const streamId of [...sessions.keys()]) stopSession(streamId, reason);
+  let stopped = 0;
+  for (const streamId of [...sessions.keys()]) {
+    if (stopSession(streamId, reason)) stopped += 1;
+  }
+  return stopped;
 }
 
 export default {

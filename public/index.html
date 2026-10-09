@@ -44,6 +44,14 @@
     <section id="p-mobile">
       <h1><span>Mobile <span class="tip" tabindex="0" role="note" aria-label="About the Mobile tab" data-tip="Phone-sized view of the one workflow: find a title, pick a format, put it on the playlist, push it to the box. The five panes start folded — open the step you are on.">i</span></span><button type="button" class="btn sm ghost" id="btn-mob-fold" title="open every pane of this tab">▾ expand all</button></h1>
 
+      <div class="card" id="mob-sessions-card">
+        <div class="cardhead"><h2 style="margin:0">Live sessions <span class="mut" id="mob-sessions-count"></span></h2></div>
+        <div id="mob-sessions" class="mob-sessions"><div class="meta">checking…</div></div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" class="btn danger grow" id="btn-mob-stop-all" disabled>■ stop all sessions</button>
+        </div>
+      </div>
+
       <div class="card">
         <div class="cardhead"><h2 style="margin:0">1 · Search <span class="tip" tabindex="0" role="note" aria-label="About this pane" data-tip="Find a title on the enabled sources. Results come from the same search the Search tab uses.">i</span></h2>
           <button type="button" class="foldbtn" data-fold="mob-search" aria-expanded="false" title="show this pane">▸</button></div>

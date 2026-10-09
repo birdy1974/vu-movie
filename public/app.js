@@ -240,6 +240,7 @@ async function loadHealth() {
 
 function renderSessions(sessions) {
   state.sessions = sessions;
+  state.sessionsKnown = true;
   const host = $('#dash-sessions');
   if (host) {
     // A preview runs as its own session next to a VLC one (a running pipe
@@ -250,6 +251,55 @@ function renderSessions(sessions) {
       : '<div class="meta">none</div>';
   }
   if ($('#st-monitor') && !$('#p-stream')?.classList.contains('hide')) renderStreamMonitor();
+  renderMobileSessions();
+}
+
+/**
+ * The Mobile tab's live sessions. The list is the one renderSessions gets from
+ * /api/events every 4 s, so the card follows the relay without polling of its own.
+ */
+function renderMobileSessions() {
+  const host = $('#mob-sessions');
+  if (!host) return;
+  const count = $('#mob-sessions-count');
+  const button = $('#btn-mob-stop-all');
+  if (!state.sessionsKnown) {
+    host.innerHTML = '<div class="meta">checking…</div>';
+    if (count) count.textContent = '';
+    if (button) button.disabled = true;
+    return;
+  }
+  const sessions = state.sessions || [];
+  if (count) count.textContent = sessions.length ? `· ${sessions.length} running` : '· none running';
+  host.innerHTML = sessions.length
+    ? sessions.map((s) => {
+      const title = VMPlaylist.itemFor(s.streamId)?.title || s.streamId;
+      return `<div class="kv"><span>${escapeHtml(title)}${s.web ? ' <span class="mut">(web preview)</span>' : ''}</span><span class="mut">${Number(s.clients) || 0} client(s)</span></div>`;
+    }).join('')
+    : '<div class="meta">Nothing is playing through the relay.</div>';
+  if (button) button.disabled = sessions.length === 0;
+}
+
+/** Stop every running relay session. Nothing is kept: the next play of each movie starts from the beginning. */
+async function stopAllSessions() {
+  const sessions = state.sessionsKnown ? (state.sessions || []) : [];
+  if (!sessions.length) return;
+  const titles = sessions.map((s) => VMPlaylist.itemFor(s.streamId)?.title || s.streamId);
+  const plural = sessions.length === 1 ? 'session' : 'sessions';
+  if (!window.confirm(`Stop ${sessions.length} running ${plural}?\n\n${titles.join('\n')}\n\nAnyone watching is disconnected. Nothing is kept, so the next play of each movie starts from the beginning.`)) return;
+  const button = $('#btn-mob-stop-all');
+  if (button) button.disabled = true;
+  try {
+    const data = await api('/api/sessions/stop-all', { method: 'POST', body: {}, silent: true });
+    const stopped = Number(data.stopped) || 0;
+    // The server has just stopped everything: show that now, on the card and the
+    // dashboard, rather than waiting for the next /api/events tick.
+    renderSessions([]);
+    toast(`Stopped ${stopped} ${stopped === 1 ? 'session' : 'sessions'}`, 'ok');
+  } catch (error) {
+    renderMobileSessions();
+    toast(`Could not stop the sessions: ${error.message}`, 'err');
+  }
 }
 
 function sourceHomeEntries(source) {
@@ -3351,7 +3401,7 @@ const SETTINGS_LABELS = {
   'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
   'transcode.probeDuration': ['Probe movie length', 'Learn each movie length once with ffprobe, so the relay stops at the real end instead of restarting and repeating the film.'],
   'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session this long after it starts, if no player ever attaches to it.'],
-  'transcode.pauseKeepSeconds': ['Pause window (s)', 'After the last player leaves (a paused or closed VLC), keep the session this long, holding the movie where it was. 0 uses the idle stop.'],
+  'transcode.pauseKeepSeconds': ['Pause window (s)', 'After the last player leaves (a paused or closed VLC), keep the session this long, holding the movie where it was. 0 uses the idle stop. The Enigma2 box is not kept: when it leaves, the next play starts at the beginning.'],
   'transcode.resumeHours': ['Resume memory (h)', 'A movie stopped without anyone choosing it resumes at its play head for this many hours. 0 turns the memory off.'],
   'transcode.clientStallSeconds': ['Stalled player (s)', 'Drop a player that has not read for this long. Its response ends after the data it already has.'],
   'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
@@ -3576,6 +3626,8 @@ async function initMobile() {
   } catch {}
   renderMobileSourceLinks();
   $('#btn-mob-search')?.addEventListener('click', mobileSearch);
+  $('#btn-mob-stop-all')?.addEventListener('click', stopAllSessions);
+  renderMobileSessions();
   $('#btn-mob-discover')?.addEventListener('click', () => openDiscoveryModal('mobile'));
   $('#mob-q')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') mobileSearch(); });
   $('#mob-sources')?.addEventListener('change', () => {
