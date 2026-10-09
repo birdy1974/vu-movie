@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
-import { normaliseProfile } from '../core/media.js';
+import { normaliseProfile, streamKind } from '../core/media.js';
 
 const shortId = () => crypto.randomBytes(5).toString('hex');
 const token = () => crypto.randomBytes(12).toString('base64url');
@@ -114,14 +114,39 @@ export async function createStream({
   return saved;
 }
 
+/**
+ * The expiry that applies to a stream's token, or null when it never expires.
+ * A token lifetime of 0 (the default, "never expires") ignores the date stored
+ * at creation, so streams created under an older 3-day setting stop expiring
+ * too. Ephemeral previews keep their own short TTL either way.
+ */
+export function tokenExpiresAt(rec) {
+  if (!rec?.expires_at) return null;
+  if (rec.payload?.meta?.ephemeral === true) return rec.expires_at;
+  return getConfig().app.tokenTtlMinutes > 0 ? rec.expires_at : null;
+}
+
 export async function getStream(idOrToken) {
   const rec = await repo.getStream(idOrToken);
   if (!rec) return null;
-  if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) {
+  const expiry = tokenExpiresAt(rec);
+  if (expiry && new Date(expiry).getTime() < Date.now()) {
     log.warn('streams', `stream ${rec.id} has expired (token TTL) — still serving, re-resolve for a fresh upstream URL`);
     rec.expired = true;
   }
   return rec;
+}
+
+/** Remember the movie's length on the stream (learned by the relay, see
+ *  relay.learnMovieDuration). Stored beside the upstream, not inside its probe,
+ *  because profile building treats a present probe as a full media analysis. */
+export async function setUpstreamDuration(streamId, durationSec) {
+  const rec = await repo.getStream(streamId);
+  if (!rec || !(Number(durationSec) > 0)) return null;
+  return repo.saveStream({
+    ...rec,
+    upstream: { ...(rec.upstream || {}), durationSec: Math.round(Number(durationSec) * 100) / 100 },
+  });
 }
 
 export async function listStreams() {
@@ -141,7 +166,7 @@ export async function listStreams() {
     sourceId: r.source_id,
     quality: r.upstream?.quality || null,
     createdAt: r.created_at,
-    expiresAt: r.expires_at,
+    expiresAt: tokenExpiresAt(r),
     subtitleId: r.subtitle_id,
     season: r.upstream?.season || null,
     episode: r.upstream?.episode || null,
@@ -183,16 +208,15 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
   const c = container || stream.profile?.container || cfg.transcode.container;
   const ext = c === 'matroska' ? 'mkv' : c === 'hls' ? 'm3u8' : 'ts';
   /**
-   * The `direct` endpoint 302s to the upstream URL, which only works when the
-   * CDN accepts an anonymous fetch. MovieBox (and every signed-cookie source)
-   * needs `Cookie: Edge-Cache-Cookie=…` / `Referer` on *every* request, so a
-   * plain redirect produces a 403 in VLC. The reference client never hands a
-   * raw CDN URL to a player for exactly this reason — it fetches through a
-   * header-injecting proxy. We mirror that: no direct URL is advertised when the
-   * candidate carries credentials, and the relay (which replays the headers) is
-   * the only offer.
+   * The `direct` endpoint 302s to the upstream URL when the CDN accepts an
+   * anonymous fetch. A plain redirect cannot carry the `Cookie` / `Referer` a
+   * signed source needs on *every* request (it would 403 in VLC), so for a
+   * progressive file with such headers the same link is served by the relay,
+   * which replays the headers through its proxy and answers Range requests.
+   * DASH and HLS with headers have no direct link at all.
    */
   const directUsable = directPlaybackAvailable(stream);
+  const directViaRelay = !directUsable && directProxyAvailable(stream);
   const token = stream.token;
   return {
     raw: `${base}/s/${token}/${slug}.${ext}`,
@@ -200,10 +224,12 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
     mkv: `${base}/s/${token}/${slug}.mkv`,
     hls: `${base}/s/${token}/${slug}.m3u8`,
     playlist: `${base}/s/${token}/${slug}.m3u`,
-    direct: directUsable ? `${base}/s/${token}/direct` : null,
+    direct: directUsable || directViaRelay ? `${base}/s/${token}/direct` : null,
     directNote: directUsable
       ? null
-      : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
+      : directViaRelay
+        ? 'is served through the relay, which replays the request headers: players can seek, and the file plays as it is (no transcoding, profile or subtitles)'
+        : 'not offered: this source needs request headers (signed cookie / referer), which a 302 redirect cannot replay — use the .ts relay URL, which does',
     download: `${base}/dl/${token}/${slug}.${ext}`,
     watch: `${base}/watch/${token}`,
     // The URL that tells the relay "this is the browser preview": subtitle-free,
@@ -263,6 +289,18 @@ export function outputTypeForEnigma2Request(req) {
 }
 
 /**
+ * A progressive file can be offered as a direct link even when it needs request
+ * headers: the relay serves it through its own proxy (see serveDirectFile). Only
+ * file sources qualify, and only while the upstream proxy is switched on.
+ */
+export function directProxyAvailable(stream) {
+  const url = String(stream?.upstream?.url || '');
+  if (!/^https?:/i.test(url)) return false;
+  if (getConfig().transcode?.upstreamProxy === false) return false;
+  return (stream?.upstream?.kind || streamKind(url)) === 'file';
+}
+
+/**
  * True when the upstream URL can be played by a client that sends no headers
  * of its own (VLC following a 302): no Cookie/Authorization and not a
  * manifest that is itself signed.
@@ -285,4 +323,4 @@ export function slugify(text) {
     .slice(0, 70) || 'stream';
 }
 
-export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, EPHEMERAL_TTL_MINUTES };
+export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, tokenExpiresAt, setUpstreamDuration, EPHEMERAL_TTL_MINUTES };

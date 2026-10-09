@@ -338,7 +338,7 @@ const OUTPUT_LABELS = {
   m3u8: 'Playlist (.m3u8)',
   m3u: 'Playlist (.m3u)',
   enigma2: 'Enigma2 / Duo2',
-  direct: 'Direct upstream link (302)',
+  direct: 'Direct upstream link',
   download: 'Download to NAS',
   web: 'Web preview (no subtitles)',
 };

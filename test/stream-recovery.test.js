@@ -10,6 +10,9 @@ process.env.LOG_LEVEL = 'error';
 
 const config = await import('../src/core/config.js');
 config.loadConfig();
+// These tests cover renewing a positive token lifetime; 0 (the default) means
+// the token never expires, so the lifetime is pinned explicitly here.
+config.getConfig().app.tokenTtlMinutes = 4320;
 const store = await import('../src/streams/store.js');
 const recovery = await import('../src/streams/recovery.js');
 

@@ -237,9 +237,10 @@ Two relay details the proxy made necessary:
 * **Live output is paced at 1×** (ffmpeg `-re`, injected both into the guided command and into
   an operator template that does not set its own `-re`/`-readrate`). Because the proxy *can*
   serve far faster than the CDN, an unpaced ffmpeg would read the whole movie in about a minute
-  and push it at the player: the client's socket backlog passes `MAX_CLIENT_BACKLOG` within
-  seconds and the relay drops it as "cannot keep up" — the picture dies a few seconds in, while
-  the CDN traffic is wasted too. `transcode.realtime` / `REALTIME_PLAYBACK=false` turns pacing
+  and push it at the player: the client's socket fills within seconds, and the relay's queue for
+  it grows. A player that stops reading now holds the source instead of being dropped, so a paused
+  player continues from the same point. Without pacing the CDN traffic is wasted too.
+  `transcode.realtime` / `REALTIME_PLAYBACK=false` turns pacing
   off; downloads (`/dl/…`, `mode: 'file'`) are never paced.
 * **The proxy is closed only after ffmpeg is gone** (`releaseUpstreamProxy`, 3 s grace).
   Closing it in the same tick as the idle-stop SIGTERM aborted the in-flight ranged transfer

@@ -167,3 +167,39 @@ test('playlist schedule and recovery settings are known options and environment-
     config.loadConfig();
   }
 });
+
+test('pause and resume settings: known options, environment overrides, 0 is a real value, junk falls back', () => {
+  for (const key of ['pauseKeepSeconds', 'resumeHours', 'clientStallSeconds']) {
+    assert.ok(config.knownOptionPaths().includes(`transcode.${key}`), `transcode.${key} is a known option`);
+  }
+  const names = ['PAUSE_KEEP_SECONDS', 'RESUME_HOURS', 'CLIENT_STALL_SECONDS'];
+  try {
+    for (const name of names) process.env[name] = '0';
+    config.loadConfig();
+    assert.equal(config.getConfig().transcode.pauseKeepSeconds, 0, '0 turns the pause window into the idle stop');
+    assert.equal(config.getConfig().transcode.resumeHours, 0, '0 turns the resume memory off');
+    assert.equal(config.getConfig().transcode.clientStallSeconds, 0);
+
+    for (const name of names) process.env[name] = 'soon';
+    config.loadConfig();
+    assert.equal(config.getConfig().transcode.pauseKeepSeconds, 900, 'a non-numeric value is ignored, not NaN');
+    assert.equal(config.getConfig().transcode.resumeHours, 12);
+    assert.equal(config.getConfig().transcode.clientStallSeconds, 1800);
+  } finally {
+    for (const name of names) delete process.env[name];
+    config.loadConfig();
+  }
+  assert.equal(config.getConfig().transcode.pauseKeepSeconds, 900, 'the defaults apply again without the variables');
+});
+
+test('a retired option left in the file by an old Settings save is dropped, not kept or warned about forever', () => {
+  fs.writeFileSync(CONFIG, JSON.stringify({ transcode: { maxClientBacklog: 12582912, idleStopSeconds: 45 } }, null, 2));
+  try {
+    config.loadConfig();
+    assert.equal(config.getConfig().transcode.maxClientBacklog, undefined, 'the retired option no longer exists');
+    assert.equal(config.getConfig().transcode.idleStopSeconds, 45, 'the other options of that section still load');
+  } finally {
+    fs.writeFileSync(CONFIG, JSON.stringify(REAL_WORLD, null, 2));
+    config.loadConfig();
+  }
+});

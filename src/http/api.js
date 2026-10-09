@@ -129,7 +129,7 @@ const OUTPUT_LABELS = {
   m3u8: 'Playlist (.m3u8)',
   m3u: 'Playlist (.m3u)',
   enigma2: 'Enigma2 / Duo2',
-  direct: 'Direct upstream link (302)',
+  direct: 'Direct upstream link',
   download: 'Download to NAS',
   // Not in OUTPUT_TYPES on purpose: the browser preview session is built by the
   // app (no subtitles, codecs from the browser's own report), never from an

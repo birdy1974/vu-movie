@@ -122,7 +122,7 @@ function publicItem(entry, baseUrl) {
     quality: stream.upstream?.quality || null,
     season: stream.upstream?.season || null,
     episode: stream.upstream?.episode || null,
-    expiresAt: stream.expires_at,
+    expiresAt: store.tokenExpiresAt(stream),
     createdAt: stream.created_at,
     container: stream.profile?.container || null,
     profileTemplateId: stream.profile?.ffmpegTemplateId || '',
@@ -244,7 +244,7 @@ router.post('/check', wrap(async (req, res) => {
       url: entry.stream.upstream?.url || '',
       headers: entry.stream.upstream?.headers || {},
       kind: entry.stream.upstream?.kind || entry.stream.kind || null,
-      expiresAt: entry.stream.expires_at || null,
+      expiresAt: store.tokenExpiresAt(entry.stream),
     }));
     // Ids that are not in the playlist are named instead of silently ignored:
     // the UI can then say “that item is gone” rather than showing it as dead.

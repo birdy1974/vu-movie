@@ -2793,7 +2793,7 @@ const STREAM_URL_LABELS = [
   ['hls', 'Playlist (.m3u8)'],
   ['playlist', 'Playlist (.m3u)'],
   ['forBox', 'Enigma2 / Duo2'],
-  ['direct', 'Direct upstream link (302)'],
+  ['direct', 'Direct upstream link'],
   ['download', 'Download to NAS'],
   ['watch', 'Watch in browser'],
 ];
@@ -2860,7 +2860,7 @@ async function streamUrlAction(action) {
     if (action === 'vlc') {
       const url = VMPlaylist.itemFor(id)?.urls?.ts;
       if (!url) return toast('This stream has no .ts URL', 'warn');
-      window.location.href = String(url).replace(/^https?:/, 'vlc:');
+      window.location.href = String(url).replace(/^(https?:\/\/)/i, 'vlc://$1');
       return;
     }
     if (action === 'start' || action === 'stop') {
@@ -2924,7 +2924,7 @@ function initStream() {
     if (vlcPl?.dataset.vlcPl) {
       const u = vlcPl.dataset.vlcPl;
       try {
-        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        const vlc = String(u).replace(/^(https?:\/\/)/i, 'vlc://$1');
         window.location.href = vlc;
         setTimeout(() => toast(`VLC playlist: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
       } catch {
@@ -2957,7 +2957,7 @@ function initStream() {
       const u = vlcBtn.dataset.vlcUrl;
       // Try VLC protocol, fallback to opening URL
       try {
-        const vlc = String(u).replace(/^https?:/, 'vlc:');
+        const vlc = String(u).replace(/^(https?:\/\/)/i, 'vlc://$1');
         window.location.href = vlc;
         // Also copy to clipboard as hint
         setTimeout(() => toast(`VLC URL: ${u} — if VLC did not open, copy the URL`, 'info', 6000), 500);
@@ -3263,8 +3263,9 @@ const SETTINGS_SECTIONS = [
       ['fps', 'select', ['source', '25', '30']],
       ['container', 'select', ['mpegts', 'matroska', 'hls']],
       ['alwaysTranscode', 'bool'], ['hardware', 'bool'], ['maxConcurrent', 'number'],
-      ['device', 'text'], ['idleStopSeconds', 'number'], ['encoderFallback', 'text'],
-      ['realtime', 'bool'],
+      ['device', 'text'], ['idleStopSeconds', 'number'], ['pauseKeepSeconds', 'number'],
+      ['resumeHours', 'number'], ['clientStallSeconds', 'number'], ['encoderFallback', 'text'],
+      ['realtime', 'bool'], ['probeDuration', 'bool'],
     ],
   },
   {
@@ -3348,7 +3349,11 @@ const SETTINGS_LABELS = {
   'transcode.hardware': ['Use hardware (VAAPI)', 'Prefer the iGPU when the box exposes /dev/dri.'],
   'transcode.maxConcurrent': ['Max concurrent jobs', 'How many relay sessions and downloads may run at the same time.'],
   'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
-  'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session when no player has read from it for this long.'],
+  'transcode.probeDuration': ['Probe movie length', 'Learn each movie length once with ffprobe, so the relay stops at the real end instead of restarting and repeating the film.'],
+  'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session this long after it starts, if no player ever attaches to it.'],
+  'transcode.pauseKeepSeconds': ['Pause window (s)', 'After the last player leaves (a paused or closed VLC), keep the session this long, holding the movie where it was. 0 uses the idle stop.'],
+  'transcode.resumeHours': ['Resume memory (h)', 'A movie stopped without anyone choosing it resumes at its play head for this many hours. 0 turns the memory off.'],
+  'transcode.clientStallSeconds': ['Stalled player (s)', 'Drop a player that has not read for this long. Its response ends after the data it already has.'],
   'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
   'transcode.realtime': ['Pace live output', 'Throttle the relay to the source rate so real-time players do not starve.'],
 

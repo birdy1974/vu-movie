@@ -27,7 +27,7 @@ import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
 import { ensureStreamReady } from '../streams/recovery.js';
 import * as exporter from '../streams/export.js';
-import { upstreamProxyMiddleware } from '../streams/upstream.js';
+import { upstreamProxyMiddleware, serveDirectFile } from '../streams/upstream.js';
 import apiRouter from './api.js';
 import playlistApiRouter from '../playlist/api.js';
 import playlistOutputsRouter from '../playlist/outputs.js';
@@ -186,6 +186,19 @@ export function createApp() {
       stream = await prepareStreamForPlayback(stream, res, 'direct-playback-start');
       if (!stream) return;
       if (!store.directPlaybackAvailable(stream)) {
+        // A file that needs headers cannot be redirected (a 302 cannot replay the
+        // signed Cookie/Referer), but the relay's own proxy can replay them, and
+        // it answers Range requests: the player can seek on this link.
+        if (store.directProxyAvailable(stream)) {
+          log.info('http', 'direct link served through the relay (request headers replayed, seekable)', { stream: stream.id });
+          try {
+            return await serveDirectFile(stream, req, res);
+          } catch (err) {
+            logError('http', 'direct link could not be served', err, { stream: stream.id });
+            if (!res.headersSent) return res.status(502).send(`vu-movie: the direct link could not be served (${err.message})`);
+            return res.end();
+          }
+        }
         log.warn('http', 'direct redirect refused — the source needs request headers', { stream: stream.id });
         return res.status(409).json({
           ok: false,
