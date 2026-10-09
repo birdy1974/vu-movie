@@ -997,6 +997,39 @@ export function mappedSourceSubtitleStreams(args = [], trackCount = 0) {
 }
 
 /**
+ * Can the sidecar be muxed AFTER the source's subtitle tracks, and at which
+ * output subtitle index? That needs the number of source subtitle streams in
+ * the output, which is computable only when every subtitle-contributing `-map`
+ * row is a form mappedSourceSubtitleStreams() understands (`0`, `0:s`, `0:s?`,
+ * `0:s:N`) and blanket rows (`0`, `0:s`, `0:s?`) appear only when the probe
+ * vouches for the track count. A row like `0:s:m:language=eng` contributes
+ * subtitles the analysis cannot count — then the sidecar stays first (stream 0)
+ * rather than tagging a source track by mistake.
+ */
+function sourceSubtitleMapAnalysis(args, probeSubtitles) {
+  let blanket = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '');
+    let spec = null;
+    if (arg === '-map') spec = String(args[index + 1] || '');
+    else {
+      const m = /^-map=(.+)$/.exec(arg);
+      if (m) spec = m[1];
+    }
+    if (spec === null) continue;
+    spec = spec.trim().replace(/\?$/, '');
+    if (!spec || spec.startsWith('-')) continue;
+    if (spec === '0' || spec === '0:s') { blanket = true; continue; }
+    if (/^0:s:\d+$/.test(spec)) continue;
+    if (/^0:s:/.test(spec)) return { reliable: false, count: 0 }; // e.g. 0:s:m:language=eng
+    // other rows (0:v…, 0:a…, 0:d?…, 1:…) contribute no source subtitles
+  }
+  if (blanket && !Array.isArray(probeSubtitles)) return { reliable: false, count: 0 };
+  const count = mappedSourceSubtitleStreams(args, Array.isArray(probeSubtitles) ? probeSubtitles.length : 0).length;
+  return { reliable: true, count };
+}
+
+/**
  * Render a template to an argv list. Source URLs and private request headers are
  * inserted as individual argv values, never interpolated into shell text.
  */
@@ -1084,12 +1117,16 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   // .srt the operator attached per item, so the subtitle used to be dropped
   // here: the Matroska (and .ts.enigma2) output carried video + audio only and
   // the box had nothing to show. Insert the sidecar as an input and map it as
-  // subtitle stream 0 — before the template's own -map rows, so the index stays
-  // 0 no matter how many subtitle tracks the source itself has.
+  // a subtitle stream — AFTER the template's own subtitle maps, so it reads as
+  // the operator's extra track, whenever the output's subtitle count is
+  // computable; before them (stream 0) when it is not.
   const sidecarSubtitlePath = profile.subtitles === 'soft' && profile.subtitlePath && fs.existsSync(profile.subtitlePath)
     ? profile.subtitlePath
     : null;
+  const templateProbeSubtitles = Array.isArray(source?.subtitles) ? source.subtitles : null;
   let sidecarMapped = false;
+  let sidecarAfterSources = false;
+  let sidecarSubtitleIndex = 0;
   if (sidecarSubtitlePath) {
     // Any map that reads input 1 (`-map 1`, `-map 1:s:0?`, `-map 1,0`) means
     // the template already owns a second input — inserting ours would shift it.
@@ -1100,7 +1137,6 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     // instead of silently ignoring the attachment.
     const dropsSubs = args.some((arg) => arg === '-sn');
     if (!mapsSecondInput && !dropsSubs && container === 'matroska') {
-      sidecarMapped = true;
       // The URL token sits right behind the '-i' that precedes it; everything
       // the prefix added in front of it is already part of `args`.
       const urlTokenIndex = inputIndex + prefix.length + 1;
@@ -1110,12 +1146,33 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       // subtitle-only file (video and audio gone: the player shows nothing), so
       // a template without its own -map rows gets the main streams mapped next
       // to the sidecar. A template that maps its own streams is left exactly as
-      // it is: only the sidecar row is added in front of them.
+      // it is: only the sidecar row is added to them.
       const mapsOwnStreams = args.some((arg) => arg === '-map' || /^-map[=:]/.test(arg));
-      const sidecarMaps = mapsOwnStreams
-        ? ['-map', '1:s:0?']
-        : ['-map', '0:v:0', '-map', '0:a:0?', '-map', '1:s:0?'];
-      args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath), ...sidecarMaps);
+      const analysis = mapsOwnStreams ? sourceSubtitleMapAnalysis(args, templateProbeSubtitles) : { reliable: true, count: 0 };
+      sidecarAfterSources = mapsOwnStreams && analysis.reliable;
+      sidecarSubtitleIndex = mapsOwnStreams ? analysis.count : 0;
+      sidecarMapped = true;
+      if (!mapsOwnStreams) {
+        args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath),
+          '-map', '0:v:0', '-map', '0:a:0?', '-map', '1:s:0?');
+      } else {
+        args.splice(urlTokenIndex + 1, 0, '-i', String(sidecarSubtitlePath));
+        if (sidecarAfterSources) {
+          // Append the sidecar map behind the template's last -map row: the
+          // order of the -map rows is the output track order.
+          let lastMap = -1;
+          for (let i = 0; i < args.length; i += 1) {
+            if (args[i] === '-map') lastMap = i;
+            else if (/^-map=/.test(String(args[i] || ''))) lastMap = i;
+          }
+          const after = args[lastMap] === '-map' ? lastMap + 2 : lastMap + 1;
+          args.splice(after, 0, '-map', '1:s:0?');
+        } else {
+          // The sidecar stays first: right behind the URL token, in front of
+          // the template's own maps, so it is subtitle stream 0.
+          args.splice(urlTokenIndex + 1, 0, '-map', '1:s:0?');
+        }
+      }
       const outputIndex = args.length - 1;
       const subtitleOutput = [];
       // The sidecar is a text track. A template that codes subtitles to a bitmap
@@ -1125,12 +1182,19 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       // text can be written in (copy, subrip, ass, …).
       const templateSubtitleCodec = templateSubtitleCodecOf(args);
       if (!templateSubtitleCodec || BITMAP_SUBTITLE_CODECS.has(templateSubtitleCodec)) {
-        subtitleOutput.push('-c:s:0', 'srt');
+        subtitleOutput.push(`-c:s:${sidecarSubtitleIndex}`, 'srt');
       }
-      if (!args.some((arg) => arg.startsWith('-disposition'))) subtitleOutput.push('-disposition:s:0', 'default');
+      if (!args.some((arg) => arg.startsWith('-disposition'))) {
+        // The attached subtitle is THE default track: copied source tracks keep
+        // the default flag they carried in the source, which leaves two default
+        // tracks and players pick one — often a partial source track instead of
+        // the attachment. Clear the flag on every subtitle stream, then flag
+        // the sidecar at its own index.
+        subtitleOutput.push('-disposition:s', '-default', `-disposition:s:${sidecarSubtitleIndex}`, 'default');
+      }
       const language = String(profile.subtitleLanguage || '').trim();
       if (language && !args.some((arg) => arg.startsWith('-metadata:s:s'))) {
-        subtitleOutput.push('-metadata:s:s:0', `language=${language}`);
+        subtitleOutput.push(`-metadata:s:s:${sidecarSubtitleIndex}`, `language=${language}`);
       }
       if (subtitleOutput.length) args.splice(outputIndex, 0, ...subtitleOutput);
     }
@@ -1147,7 +1211,6 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   // subtitle codecs, every track the muxer cannot carry gets a per-stream
   // re-encode to srt instead (text→text is legal); every track it CAN carry
   // stays on copy, so ASS styling and PGS bitmaps are untouched.
-  const templateProbeSubtitles = Array.isArray(source?.subtitles) ? source.subtitles : null;
   if (container === 'matroska' && templateProbeSubtitles?.length && genericSubtitleCodecOf(args) === 'copy') {
     let mapped = mappedSourceSubtitleStreams(args, templateProbeSubtitles.length);
     // No -map rows at all: ffmpeg's automatic stream selection takes at most
@@ -1158,7 +1221,9 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
       mapped = [0];
     }
     const inserts = [];
-    let outPos = sidecarMapped ? 1 : 0;
+    // Source tracks keep their output positions: 0… when the sidecar is muxed
+    // last, 1… when it is muxed first.
+    let outPos = sidecarMapped && !sidecarAfterSources ? 1 : 0;
     for (const srcIndex of mapped) {
       const codec = String(templateProbeSubtitles[srcIndex]?.codec || '').toLowerCase();
       // An explicit per-stream setting by the operator always wins.
@@ -1520,10 +1585,16 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // an .srt attached while the stream was set to MPEG-TS. Map it only where it
   // can actually be carried; subtitleSessionNotes() tells the operator why not.
   const probeSubtitles = Array.isArray(source.subtitles) ? source.subtitles : null;
+  // The sidecar is muxed AFTER the source's own subtitle tracks: it is the
+  // operator's extra track, and a player that shows "the first subtitle track"
+  // should find a source track there, not the attachment. That needs the
+  // sidecar's subtitle-stream index — the number of source subtitle tracks in
+  // the output — which is known only when the probe vouches for the list.
+  // Without it the sidecar stays first (stream 0) rather than tagging a source
+  // track by mistake.
+  const sidecarAfterSources = sidecarFitsContainer && Array.isArray(probeSubtitles);
   if (p.softMux) {
-    // The sidecar goes first so it is always subtitle stream 0: the default
-    // disposition and language metadata below then need no index arithmetic.
-    if (sidecarFitsContainer) args.push('-map', '1:s:0?');
+    if (sidecarFitsContainer && !sidecarAfterSources) args.push('-map', '1:s:0?');
     // MPEG-TS/HLS only carry DVB bitmaps: mapping a text track (srt, mov_text,
     // ass, …) next to `-c:s dvbsub` makes ffmpeg refuse the whole command, so
     // a probed source only maps its bitmap tracks there. Without probe info the
@@ -1537,6 +1608,7 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
         }
       });
     }
+    if (sidecarAfterSources) args.push('-map', '1:s:0?');
   }
   args.push('-dn');
   if (!p.softMux) args.push('-sn');
@@ -1620,19 +1692,31 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
       // ("Subtitle codec 94213 is not supported" → "Could not write header").
       // The old blanket `-c:s srt` had the mirror failure: encoding a bitmap
       // source (PGS/VobSub) to text is impossible. The attached sidecar is
-      // text, so it is tagged as srt — stream 0 because it is mapped first.
+      // text, so it is tagged as srt — at its own stream index (the source
+      // track count when it is muxed last, 0 when it is first).
       if (sidecarFitsContainer) {
-        args.push('-c:s', 'copy', '-c:s:0', 'srt');
-        // The VU+ jumps into the movie without a menu: the subtitle must be
-        // marked as the default track or Enigma2/exteplayer3 picks "none" and
-        // shows a picture without subtitles even though the track is present.
-        args.push('-disposition:s:0', 'default');
+        args.push('-c:s', 'copy');
+        const sidecarIndex = sidecarAfterSources ? probeSubtitles.length : 0;
+        // The attached subtitle is THE default track. A copied source track
+        // keeps the default flag it carried in the source, which leaves two
+        // default tracks and players pick one — often a partial source track
+        // (forced signs) instead of the attachment, so the attached subtitle
+        // effectively does not show. Clear the flag on every subtitle stream,
+        // then flag the sidecar. The VU+ jumps into the movie without a menu:
+        // exteplayer3 picks "none" and shows a picture without subtitles even
+        // though the track is present, so the default flag is what makes it
+        // show without pressing anything.
+        args.push('-disposition:s', '-default');
+        args.push(`-c:s:${sidecarIndex}`, 'srt');
+        args.push(`-disposition:s:${sidecarIndex}`, 'default');
         const language = String(p.subtitleLanguage || '').trim();
-        if (language) args.push('-metadata:s:s:0', `language=${language}`);
+        if (language) args.push(`-metadata:s:s:${sidecarIndex}`, `language=${language}`);
       } else {
         args.push('-c:s', 'copy');
       }
-      const offset = sidecarFitsContainer ? 1 : 0;
+      // Source tracks keep their output positions: 0… when the sidecar is muxed
+      // last, 1… when it is muxed first.
+      const offset = sidecarFitsContainer && !sidecarAfterSources ? 1 : 0;
       (probeSubtitles || []).forEach((track, index) => {
         const codec = String(track?.codec || '').toLowerCase();
         if (codec && !MATROSKA_SUBTITLE_CODECS.has(codec)) {

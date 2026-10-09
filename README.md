@@ -178,12 +178,16 @@ permissions, Container Manager project import, firewall, where the data lives).
   of each movie starts at 0:00. Players attached to those sessions are
   disconnected. Download jobs are not touched. The button is disabled while
   nothing is running. The same stop is `POST /api/sessions/stop-all`.
-* **Seeking**: a progressive file's `direct` link (`/s/<token>/direct`) seeks in
-  VLC. For a file that needs no headers it redirects to the CDN; for one that
-  needs a signed cookie or referer, the relay serves it with Range support. The
-  `.ts` relay output is a live stream and cannot seek. The VLC playlist
-  (`/pl/<token>/vlc.m3u`) therefore has a second, `(seekable)` entry for each
-  file movie, next to the `.ts` entry.
+* **Seeking**: a progressive file's `direct` link (`/s/<token>/direct.mp4`) seeks
+  in VLC. The link carries the file's own extension (taken from the source URL,
+  else `mp4`), because IPTV players such as SFVIP and OwnTV classify a URL by
+  its extension and refuse one without it; the bare `/s/<token>/direct`
+  spelling keeps working for playlists saved earlier. For a file that needs no
+  headers the link redirects to the CDN; for one that needs a signed cookie or
+  referer, the relay serves it with Range support. The `.ts` relay output is a
+  live stream and cannot seek. The VLC playlist (`/pl/<token>/vlc.m3u`)
+  therefore has a second, `(seekable)` entry for each file movie, next to the
+  `.ts` entry.
 * **Paced at 1×** (ffmpeg `-re`, on by default for live outputs): the relay
   hands the stream to the player at the source's native rate instead of reading
   the upstream as fast as it can be served. Clients are real-time players that
@@ -196,15 +200,23 @@ permissions, Container Manager project import, firewall, where the data lives).
 
 ### Complete playlist and Xtream IPTV output
 
-The **Stream** tab exposes both the Xtream `player_api.php` server URL and the
-**complete M3U+ playlist** (`get.php?type=m3u_plus`). Both are built from the
-Playlist tab: every **enabled** item is included in playlist order; disabled
-items stay out of all public outputs. The Xtream API also advertises enabled
-movies as VOD and groups enabled series episodes by season. Each catalogue item
-has a token-protected Xtream playback URL that relays through vu-movie rather
-than exposing the upstream source. Use the displayed username/password in
-TiviMate, IPTV Smarters or another Xtream-compatible player; the playlist token
-remains part of the server URL.
+The **Stream** tab exposes the Xtream **server address**, the Xtream
+`player_api.php` API URL and the **complete M3U+ playlist**
+(`get.php?type=m3u_plus`). All are built from the Playlist tab: every
+**enabled** item is included in playlist order; disabled items stay out of all
+public outputs. The Xtream API also advertises enabled movies as VOD and groups
+enabled series episodes by season. Each catalogue item has a token-protected
+Xtream playback URL that relays through vu-movie rather than exposing the
+upstream source.
+
+The **server address** is `http://<nas>:8080/xtream/<token>` — paste that into
+TiviMate, IPTV Smarters, SFVIP, OwnTV or another Xtream-compatible player,
+together with the displayed username/password; the playlist token remains part
+of the address. Most apps append `/player_api.php` (and `/get.php`,
+`/xmltv.php`, `/live/<user>/<pass>/<id>.ts`) themselves, so enter the address
+**without** `/player_api.php`. The server tolerates the other spelling too: an
+address that already ends in `/player_api.php` is collapsed instead of answered
+with "access denied".
 
 The account itself is set in **Settings → Xtream Codes** (or with
 `XTREAM_USERNAME` / `XTREAM_PASSWORD`, which win over a saved value). The
@@ -256,7 +268,7 @@ the box gets it** picks the mode:
 | Mode | NAS cost | What happens | Plays on |
 |---|---|---|---|
 | **copy the .srt to the box** | **none** — no encode, no mux | uploads the `.srt` to the receiver directory (FTP, or a copy into a mounted share), named after the movie | Enigma2/EMC/MediaPlayer auto-load it next to a recording of the same name (e.g. a timer recording of the bouquet entry). It does not appear while zapping a live stream |
-| **soft track** (default) | none — container remux only | a real `subrip` track inside the Matroska `.mkv` (`.srt` attached via the Playlist tab), flagged `default` with its language tag | VLC/Kodi, and Enigma2 **4097** (the track appears in the subtitle menu). gstplayer **5001** shows it when ServiceApp's *embedded subtitles* switch is on. exteplayer3 **5002** plays embedded text tracks itself, but Enigma2's subtitle menu stays empty (external players do not publish their track list) — the `default` flag is what makes it show without pressing anything |
+| **soft track** (default) | none — container remux only | a real `subrip` track inside the Matroska `.mkv` (`.srt` attached via the Playlist tab); when source subtitle tracks are known, the attachment is muxed after them and marked as the only `default` track with its language tag, so players do not auto-select a partial/forced source track instead | VLC/Kodi, and Enigma2 **4097** (the track appears in the subtitle menu). gstplayer **5001** shows it when ServiceApp's *embedded subtitles* switch is on. exteplayer3 **5002** plays embedded text tracks itself, but Enigma2's subtitle menu stays empty (external players do not publish their track list) — the `default` flag is what makes it show without pressing anything |
 | **burn into the picture** | an encode (VAAPI on the DS918+, libx264 otherwise) | `subtitles=filename=…` filter spliced into the video chain | every player, including service type **1** (DVB) and a 5002 box whose player ignores soft tracks. Cannot be switched off during playback |
 | **off** | nothing (the `.srt` stays on the NAS) | — |
 
@@ -357,7 +369,7 @@ the right template per request URL:
 | `m3u8`         | `/s/{token}/{slug}.m3u8`           | Browser HLS                              |
 | `m3u`          | `/s/{token}/{slug}.m3u`            | M3U playlist                             |
 | `enigma2`      | `/s/{token}/{slug}.ts.enigma2`     | VU+ Duo2 (bouquet service-ref)           |
-| `direct`       | `/s/{token}/direct`                | 302 to the upstream URL when safe        |
+| `direct`       | `/s/{token}/direct.{ext}`          | 302 to the upstream URL when safe        |
 | `download`     | `/dl/{token}/{slug}.{ext}`         | Saved-to-disk copy                       |
 
 A stream can also override any individual slot from the Stream tab

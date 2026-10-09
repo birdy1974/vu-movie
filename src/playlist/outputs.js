@@ -29,6 +29,34 @@ import * as playlist from './index.js';
 
 const router = express.Router();
 
+/**
+ * Xtream apps build every URL from the *server address* the operator pastes
+ * into the app, and most append the endpoint themselves: `<server>/player_api.php`,
+ * `<server>/get.php`, `<server>/xmltv.php`, `<server>/live/<user>/<pass>/<id>.ts`.
+ * An address that already ends in one of those endpoints — exactly what the
+ * Stream tab used to hand out — therefore arrives with the endpoint doubled
+ * (`/xtream/<token>/player_api.php/player_api.php`) or wedged in front of the
+ * rest of the path (`/xtream/<token>/player_api.php/live/…`), and the app
+ * reports it as "access denied". Collapse the repetition instead of answering
+ * 404, so every spelling of the server address works: with or without
+ * `/player_api.php`, trailing slash or not.
+ */
+const XTREAM_ENDPOINT_NAMES = ['player_api.php', 'get.php', 'xmltv.php'];
+router.use((req, res, next) => {
+  if (!req.path.startsWith('/xtream/')) return next();
+  const segments = req.path.split('/').filter(Boolean); // ['xtream', '<token>', …rest]
+  const first = segments.length > 3 ? segments[2].toLowerCase() : '';
+  if (XTREAM_ENDPOINT_NAMES.includes(first)) {
+    const collapsed = `/${['xtream', segments[1], ...segments.slice(3)].join('/')}`;
+    const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+    log.info('playlist', 'collapsed a repeated Xtream endpoint in the server address', {
+      from: req.path, to: collapsed,
+    });
+    req.url = collapsed + query;
+  }
+  next();
+});
+
 /** The URL a request arrived on (honours the configured base URL). */
 function baseUrlFrom(req) {
   const configured = getConfig().app.baseUrl;
@@ -206,7 +234,8 @@ li{margin:4px 0}</style></head><body>
 <li>M3U: <code>${escapeHtml(`${root}/playlist.m3u`)}</code></li>
 <li>VLC: <code>${escapeHtml(`${root}/vlc.m3u`)}</code></li>
 <li>Enigma2 bouquet: <code>${escapeHtml(`${root}/userbouquet.tv`)}</code></li>
-<li>Xtream API: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/player_api.php`)}</code> (user <code>${escapeHtml(cfgPlaylist.xtreamUsername || 'vumovie')}</code>)</li>
+<li>Xtream server address (enter this in the app; it appends <code>/player_api.php</code> itself): <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}`)}</code> (user <code>${escapeHtml(cfgPlaylist.xtreamUsername || 'vumovie')}</code>, password <code>${escapeHtml(cfgPlaylist.xtreamPassword || req.params.token)}</code>)</li>
+<li>Xtream API URL: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/player_api.php`)}</code></li>
 <li>Xtream M3U+: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/get.php?username=${encodeURIComponent(cfgPlaylist.xtreamUsername || 'vumovie')}&password=${encodeURIComponent(cfgPlaylist.xtreamPassword || req.params.token)}&type=m3u_plus`)}</code></li>
 </ul>
 <h2>Items</h2>
@@ -421,7 +450,8 @@ router.get('/xtream/:token/', async (req, res) => {
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>vu-movie xtream</title>
 <style>body{background:#0b0f16;color:#e6edf7;font:14px system-ui;padding:22px}a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px;word-break:break-all}</style></head>
 <body><h1>Xtream Codes compatible endpoint</h1>
-<p>Server URL: <code>${escapeHtml(baseUrl)}</code><br>Port: <code>${escapeHtml(new URL(baseUrl).port || (new URL(baseUrl).protocol === 'https:' ? '443' : '80'))}</code><br>
+<p>Server address (enter this in TiviMate, IPTV Smarters, SFVIP, OwnTV or another Xtream app —
+the app appends <code>/player_api.php</code> itself; the full API URL also works as the address): <code>${escapeHtml(root)}</code><br>
 Username: <code>${escapeHtml(getConfig().playlist.xtreamUsername || 'vumovie')}</code><br>
 Password: <code>${escapeHtml(getConfig().playlist.xtreamPassword || req.params.token)}</code></p>
 <p>player_api.php: <code>${escapeHtml(`${root}/player_api.php`)}</code><br>

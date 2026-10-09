@@ -64,6 +64,8 @@ test('a file movie gets a second, seekable entry on its direct link; the .ts ent
 
   assert.ok(urls.includes(fileUrls.ts), 'the .ts entry is there, as before');
   assert.ok(urls.includes(fileUrls.direct), 'the seekable direct entry is there');
+  assert.match(fileUrls.direct, /\/direct\.mp4$/, 'the seekable entry advertises a media extension, so IPTV players that classify by extension (SFVIP, OwnTV) accept it');
+  assert.match(signedUrls.direct, /\/direct\.mp4$/, 'the relay-served seekable entry carries it too');
   assert.ok(urls.includes(signedUrls.direct), 'a signed file is seekable too (the relay serves it)');
   assert.match(text, /#EXTINF:-1 [^\n]*,Open file \(2020\) \(seekable\)/, 'the seekable entry is labelled');
   assert.equal(urls.includes(liveUrls.direct), false, 'a live (HLS) stream gets no seekable entry');

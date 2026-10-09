@@ -119,7 +119,7 @@ function request(method, pathname, headers = {}) {
 
 test('a header-protected file is served on the direct link, and a player can seek on it', async () => {
   const stream = await makeStream('Signed film', { pathname: '/auth/movie.mp4', headers: SIGNED_HEADERS });
-  const direct = `/s/${stream.token}/direct`;
+  const direct = `/s/${stream.token}/direct.mp4`;
 
   const head = await request('HEAD', direct);
   assert.equal(head.status, 200);
@@ -147,9 +147,41 @@ test('a header-protected file is served on the direct link, and a player can see
 
 test('a file that needs no headers keeps its 302 redirect to the CDN', async () => {
   const stream = await makeStream('Open film', { pathname: '/open/movie.mp4' });
-  const res = await request('GET', `/s/${stream.token}/direct`);
+  const res = await request('GET', `/s/${stream.token}/direct.mp4`);
   assert.equal(res.status, 302);
   assert.equal(res.headers.location, `${cdnBase}/open/movie.mp4`);
+});
+
+test('the bare /direct link from playlists saved before the extension was added still works', async () => {
+  const stream = await makeStream('Legacy link film', { pathname: '/auth/movie.mp4', headers: SIGNED_HEADERS });
+  const head = await request('HEAD', `/s/${stream.token}/direct`);
+  assert.equal(head.status, 200);
+  assert.equal(head.headers['accept-ranges'], 'bytes');
+  const seek = await request('GET', `/s/${stream.token}/direct`, { Range: 'bytes=1000000-1000099' });
+  assert.equal(seek.status, 206);
+  assert.ok(seek.body.equals(FILM.subarray(1000000, 1000100)), 'the legacy path serves the film at the offset too');
+
+  const open = await makeStream('Legacy open film', { pathname: '/open/movie.mp4' });
+  const res = await request('GET', `/s/${open.token}/direct`);
+  assert.equal(res.status, 302, 'the legacy path still redirects for a header-less file');
+  assert.equal(res.headers.location, `${cdnBase}/open/movie.mp4`);
+});
+
+test('the direct link advertises the file’s own extension, taken from the URL', async () => {
+  const fromUrl = await makeStream('Extension in URL', { pathname: '/open/movie.mp4' });
+  assert.equal(store.urlsFor(fromUrl, base).direct, `${base}/s/${fromUrl.token}/direct.mp4`);
+
+  const upper = await makeStream('Upper extension', { pathname: '/open/movie.MKV' });
+  assert.equal(store.urlsFor(upper, base).direct, `${base}/s/${upper.token}/direct.mkv`, 'the extension is lowercased');
+
+  const noExtension = await makeStream('Extension-less URL', { pathname: '/open/movie' });
+  assert.equal(store.urlsFor(noExtension, base).direct, `${base}/s/${noExtension.token}/direct.mp4`,
+    'no extension in the URL: the stable default');
+
+  assert.equal(store.directExtension({ upstream: { url: 'https://cdn.example/movie.mkv?x=1#f' } }), 'mkv');
+  assert.equal(store.directExtension({ upstream: { url: 'https://cdn.example/movie.m3u8' } }), 'mp4',
+    'a manifest URL is not a media file extension, so the default applies (and stays stable across a refresh)');
+  assert.equal(store.directExtension({ upstream: {} }), 'mp4', 'no URL: the safe default');
 });
 
 test('a DASH manifest that needs headers is still refused on the direct link', async () => {
@@ -162,7 +194,7 @@ test('a DASH manifest that needs headers is still refused on the direct link', a
 test('the direct link is offered for header-protected files, with a note that the relay serves it', async () => {
   const file = await makeStream('Offered film', { pathname: '/auth/movie.mp4', headers: SIGNED_HEADERS });
   const urls = store.urlsFor(file, base);
-  assert.equal(urls.direct, `${base}/s/${file.token}/direct`);
+  assert.equal(urls.direct, `${base}/s/${file.token}/direct.mp4`);
   assert.match(urls.directNote, /served through the relay/);
   assert.match(urls.directNote, /seek/);
 

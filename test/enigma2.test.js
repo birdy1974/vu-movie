@@ -84,7 +84,7 @@ test('slugify and urlsFor build safe file/URL names', () => {
   const urls = urlsFor({ id: 'abc', token: 'tok123', title: 'Dune Part Two', year: 2024, profile: { container: 'matroska' } }, 'http://nas:8080/');
   assert.equal(urls.raw, 'http://nas:8080/s/tok123/Dune-Part-Two-2024.mkv');
   assert.equal(urls.ts, 'http://nas:8080/s/tok123/Dune-Part-Two-2024.ts');
-  assert.equal(urls.direct, 'http://nas:8080/s/tok123/direct');
+  assert.equal(urls.direct, 'http://nas:8080/s/tok123/direct.mp4');
   assert.equal(urls.watch, 'http://nas:8080/watch/tok123');
 });
 

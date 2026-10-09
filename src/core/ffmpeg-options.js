@@ -327,7 +327,7 @@ export const TEMPLATE_FIELDS = [
     kind: 'decibels', min: -12, max: 12, step: 1,
   }),
   field('subs', 'Subtitles', 'subtitles', {
-    help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed on top of this choice; burn-in needs the full command.',
+    help: 'Drop removes subtitles. DVB copies the source\'s own DVB/PGS bitmap subtitles into an MPEG-TS output — a text .srt cannot be turned into DVB bitmaps by ffmpeg, so use Matroska or burn-in for those. Copy all needs Matroska and keeps text (SRT/ASS) and bitmap tracks. The subtitle an item carries from the Playlist tab is muxed after the source subtitle tracks when their count is known, then made the only default track so players choose the attachment instead of a partial/forced source track. Burn-in needs the full command.',
     kind: 'enum', choices: [...SUB_MODES], custom: false,
     // The stored tokens are terse; the advice pane, the validator and the
     // README all talk about “copy all”, so the box has to say it too.
