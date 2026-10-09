@@ -1319,8 +1319,13 @@ export function publicSession(session) {
   };
 }
 
+/** Stop every running session (web previews included). Returns how many were stopped. */
 export function stopAll(reason = 'shutdown') {
-  for (const streamId of [...sessions.keys()]) stopSession(streamId, reason);
+  let stopped = 0;
+  for (const streamId of [...sessions.keys()]) {
+    if (stopSession(streamId, reason)) stopped += 1;
+  }
+  return stopped;
 }
 
 export default {

@@ -172,6 +172,12 @@ permissions, Container Manager project import, firewall, where the data lives).
   comes back joins it where it is, and the movie is not kept for the box once
   that player leaves too. VLC, browser and Xtream players keep the pause window
   and resume memory described above.
+* **Stop all sessions** (Mobile tab, *Live sessions* card at the top): stops
+  every running relay session, web previews included, after a confirmation that
+  lists the titles. It is a deliberate stop, so nothing is kept and the next play
+  of each movie starts at 0:00. Players attached to those sessions are
+  disconnected. Download jobs are not touched. The button is disabled while
+  nothing is running. The same stop is `POST /api/sessions/stop-all`.
 * **Seeking**: a progressive file's `direct` link (`/s/<token>/direct`) seeks in
   VLC. For a file that needs no headers it redirects to the CDN; for one that
   needs a signed cookie or referer, the relay serves it with Range support. The

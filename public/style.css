@@ -63,6 +63,8 @@ button.btn.pri{background:linear-gradient(135deg,#0ea5e9,#6366f1);border-color:t
 button.btn.ghost{background:transparent}
 button.btn.sm{padding:5px 9px;font-size:12px}
 button.btn:disabled{opacity:.45;cursor:not-allowed}
+button.btn.danger{color:var(--err);border-color:color-mix(in srgb,var(--err) 55%,transparent)}
+button.btn.danger:hover{border-color:var(--err)}
 input,select,textarea{background:var(--bg2);border:1px solid var(--line);color:var(--fg);border-radius:8px;
   padding:7px 9px;font-size:13px;font-family:inherit;width:100%}
 input[type=checkbox],input[type=radio]{width:auto}

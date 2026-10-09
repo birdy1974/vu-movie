@@ -369,6 +369,7 @@ const state = {
   logs: [],
   jobs: [],
   sessions: [],
+  sessionsKnown: false,
   ffmpegTemplates: [],
   ffmpegTemplateSchema: null,
   ffmpegTemplatesLoaded: false,
