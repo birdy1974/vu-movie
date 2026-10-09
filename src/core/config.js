@@ -190,7 +190,8 @@ export const DEFAULTS = {
     idleStopSeconds: Number(process.env.STREAM_IDLE_SECONDS || 45),
     /**
      * How long a session is kept after its last player left (a paused VLC, a
-     * closed tab, a box that switched away). While nobody is attached the source
+     * closed tab). The Enigma2 box is not kept: when it leaves, the next play
+     * starts at the beginning. While nobody is attached the source
      * is frozen in place, so the same stream continues from the same point when
      * a player comes back. After this many seconds the session is stopped and its
      * play head is remembered (see resumeHours). 0 means idleStopSeconds.
@@ -199,8 +200,9 @@ export const DEFAULTS = {
     /**
      * A session that ends without anyone choosing it (the idle stop above, or
      * ffmpeg giving up with nobody attached) leaves its play head behind for
-     * this many hours, so a new play of the movie resumes there. Deliberate stops
-     * leave nothing behind. 0 turns the memory off.
+     * this many hours, so a new play of the movie resumes there. Deliberate stops,
+     * and a receiver (the Enigma2 box) that left the movie, leave nothing behind.
+     * 0 turns the memory off.
      */
     resumeHours: numberFromEnv('RESUME_HOURS', 12),
     /**

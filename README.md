@@ -162,6 +162,16 @@ permissions, Container Manager project import, firewall, where the data lives).
   left, the movie restarts 10 s earlier: the data the relay had sent but the
   player had not shown yet is lost with the connection, so it is sent again
   rather than skipped.
+* **Enigma2 box (receiver)**: the box's bouquet URL (`…/<title>.ts.enigma2`) is
+  handled differently. Pausing the box keeps its connection open, so the movie
+  continues from the same point. Leaving the movie (zapping away, or stopping the
+  stream on the box) closes that connection: the movie stops at once, nothing is
+  kept, and the next play starts at the beginning. A box that the relay drops for
+  stalling after a long pause keeps its place, like any pause. If another player
+  is still watching the same movie, the movie keeps running for it, a box that
+  comes back joins it where it is, and the movie is not kept for the box once
+  that player leaves too. VLC, browser and Xtream players keep the pause window
+  and resume memory described above.
 * **Seeking**: a progressive file's `direct` link (`/s/<token>/direct`) seeks in
   VLC. For a file that needs no headers it redirects to the CDN; for one that
   needs a signed cookie or referer, the relay serves it with Range support. The

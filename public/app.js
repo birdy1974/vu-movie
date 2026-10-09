@@ -3351,7 +3351,7 @@ const SETTINGS_LABELS = {
   'transcode.device': ['VAAPI device', 'Usually /dev/dri/renderD128; renderD129 is the second GPU.'],
   'transcode.probeDuration': ['Probe movie length', 'Learn each movie length once with ffprobe, so the relay stops at the real end instead of restarting and repeating the film.'],
   'transcode.idleStopSeconds': ['Idle stop (s)', 'Stop a relay session this long after it starts, if no player ever attaches to it.'],
-  'transcode.pauseKeepSeconds': ['Pause window (s)', 'After the last player leaves (a paused or closed VLC), keep the session this long, holding the movie where it was. 0 uses the idle stop.'],
+  'transcode.pauseKeepSeconds': ['Pause window (s)', 'After the last player leaves (a paused or closed VLC), keep the session this long, holding the movie where it was. 0 uses the idle stop. The Enigma2 box is not kept: when it leaves, the next play starts at the beginning.'],
   'transcode.resumeHours': ['Resume memory (h)', 'A movie stopped without anyone choosing it resumes at its play head for this many hours. 0 turns the memory off.'],
   'transcode.clientStallSeconds': ['Stalled player (s)', 'Drop a player that has not read for this long. Its response ends after the data it already has.'],
   'transcode.encoderFallback': ['Encoder fallback', 'Encoder chain used when the preferred one is unavailable, e.g. vaapi:x264.'],
