@@ -55,6 +55,13 @@ const VMFfmpegEditor = (() => {
 
   const yesNo = (value) => (value === true || value === 'true' ? 'true' : 'false');
 
+  /** The volume slider's readout: "+6 dB", "-3 dB" or "0 dB (off)". */
+  const decibelText = (value) => {
+    const db = Number(String(value ?? '').trim() || 0);
+    if (!Number.isFinite(db) || db === 0) return '0 dB (off)';
+    return `${db > 0 ? '+' : ''}${db} dB`;
+  };
+
   /* ------------------------------------------------------------------ *
    * which parameters apply right now (mirrors activeParameters() on the
    * server, plus the UI-specific reasons)
@@ -91,6 +98,7 @@ const VMFfmpegEditor = (() => {
       audio_bitrate: { on: audioRateControl, why: options.audio_codec === 'none' ? 'the audio is removed' : 'the audio is copied — its bitrate is the source bitrate' },
       audio_channels: { on: audioRateControl, why: options.audio_codec === 'none' ? 'the audio is removed' : 'the audio is copied — its layout is the source layout' },
       audio_rate: { on: audioRateControl, why: options.audio_codec === 'none' ? 'the audio is removed' : 'the audio is copied — its rate is the source rate' },
+      audio_gain: { on: audioRateControl, why: options.audio_codec === 'none' ? 'the audio is removed' : 'the audio is copied — a level change needs a re-encode (pick AC-3 or AAC)' },
       subs: { on: true },
       extra_input: { on: true },
       extra_output: { on: true },
@@ -286,6 +294,17 @@ const VMFfmpegEditor = (() => {
       return `<div class="param-field" data-field="${key}">
         <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
         <input id="${id}" class="mono" data-param="${key}" value="${escapeHtml(value2)}" placeholder="additional ffmpeg flags" spellcheck="false" autocomplete="off"></div>`;
+    }
+
+    if (def.kind === 'decibels') {
+      // A slider, not a select: the readout next to it says what the value means.
+      const current = value2 === '' ? '0' : value2;
+      return `<div class="param-field" data-field="${key}">
+        <label for="${id}">${escapeHtml(def.label)} ${hint}</label>
+        <div class="param-select-row">
+          <input id="${id}" type="range" data-param="${key}" min="${escapeHtml(String(def.min))}" max="${escapeHtml(String(def.max))}" step="${escapeHtml(String(def.step || 1))}" value="${escapeHtml(current)}">
+          <output data-param-readout="${key}">${escapeHtml(decibelText(current))}</output>
+        </div></div>`;
     }
 
     const choices = Array.isArray(def.choices) ? def.choices : [];
@@ -1125,6 +1144,8 @@ const VMFfmpegEditor = (() => {
         if (input.value === CUSTOM) return;
         const field = input.closest('.param-field');
         $('[data-param-custom]', field)?.classList.add('hide');
+        const readout = $('[data-param-readout]', field);
+        if (readout) readout.textContent = decibelText(input.value);
         applyOption(instance, key, input.value);
         return;
       }

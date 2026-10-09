@@ -428,11 +428,19 @@ back in — an old hand-written template opens editable:
 | ----- | ---------- |
 | Video | `hw_accel` (none/VAAPI/QSV), `device`, `resolution` (source, 360p–4320p, `WIDTHxHEIGHT`, `900p`), `aspect`, `video_codec`, `vf_preset` (17 deinterlace / diagnostics filters) |
 | Rate control & VAAPI tuning | `video_bitrate`, `maxrate`, `bufsize`, `fps`, `gop`, `profile`, `level`, `rc_mode` (AUTO/CQP/CBR/VBR/ICQ/QVBR/AVBR), `global_quality`, `low_power`, `async_depth` |
-| Audio | `audio_codec`, `audio_bitrate`, `audio_channels`, `audio_rate` |
+| Audio | `audio_codec`, `audio_bitrate`, `audio_channels`, `audio_rate`, `audio_gain` (volume change, -12 to +12 dB) |
 | Subtitles | `subs` (drop / DVB bitmap — copies the source's own DVB/PGS bitmaps into TS / copy all — Matroska only) |
 | Output | `output_format` (mpegts / matroska / hls — the template's container) |
 | Extra | `extra_input`, `extra_output` raw flag boxes |
 | Advanced | one row per flag: `-rw_timeout`, `-reconnect*`, `-probesize`, `-analyzeduration`, `-thread_queue_size`, `-fflags`, `-err_detect`, `-user_agent`, `-referer`, `-preset`, `-crf`, `-tune`, `-threads`, `-fps_mode`, `-max_muxing_queue_size`, `-muxdelay`, `-flush_packets`, `-mpegts_flags`, `-hls_time`, `-hls_init_time`, `-hls_list_size`, `-hls_flags`, `-live`, `-metadata`, `-bsf:v`, or any custom flag with its own value |
+
+**Volume change** (`audio_gain`) is a slider in dB for the audio of that
+template: +6 is about twice as loud, -6 about half. It re-encodes the audio, so
+the encoder cannot be `copy` (AC-3 suits the box), and that costs a little CPU
+on the NAS. A boost is followed by a limiter just under full scale, so peaks do
+not clip. With the audio copied or removed the level is not applied, and the
+editor says why. A template whose extra flags already carry an audio filter
+(`-af`) keeps that filter as written, and the level change is not added.
 
 The fields are stored next to the command they produced, and the server renders
 the command from them, so what the editor shows is exactly what the relay runs.
