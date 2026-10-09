@@ -214,6 +214,12 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
    * progressive file with such headers the same link is served by the relay,
    * which replays the headers through its proxy and answers Range requests.
    * DASH and HLS with headers have no direct link at all.
+   *
+   * The link carries the file's own extension (`/s/<token>/direct.mp4`): IPTV
+   * players (SFVIP, OwnTV, …) classify a URL by its extension and refuse one
+   * without, and the relay serves the original file anyway, so the extension
+   * is truthful. The bare `/s/<token>/direct` keeps working for playlists that
+   * were saved before the extension was added.
    */
   const directUsable = directPlaybackAvailable(stream);
   const directViaRelay = !directUsable && directProxyAvailable(stream);
@@ -224,7 +230,7 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
     mkv: `${base}/s/${token}/${slug}.mkv`,
     hls: `${base}/s/${token}/${slug}.m3u8`,
     playlist: `${base}/s/${token}/${slug}.m3u`,
-    direct: directUsable || directViaRelay ? `${base}/s/${token}/direct` : null,
+    direct: directUsable || directViaRelay ? `${base}/s/${token}/direct.${directExtension(stream)}` : null,
     directNote: directUsable
       ? null
       : directViaRelay
@@ -249,6 +255,27 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
   };
 }
 
+/** File extensions a player can be expected to recognise as a media file. */
+const MEDIA_FILE_EXTENSIONS = new Set([
+  'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'mpg', 'mpeg', 'm2ts', 'mts', 'ts',
+  'flv', 'wmv', '3gp', '3g2', 'ogv', 'vob', 'divx', 'asf', 'm1v', 'm2v', 'qt',
+]);
+
+/**
+ * The extension the `/s/<token>/direct…` link advertises: the file's own,
+ * taken from the upstream URL, else `mp4`. Only the URL is consulted — not
+ * the probe — so the link does not change when a dead upstream is refreshed
+ * (every generated URL stays stable; the route serves any `direct.<ext>`
+ * spelling anyway). The relay serves the original bytes with the real
+ * Content-Type, so players that sniff are unaffected either way.
+ */
+export function directExtension(stream) {
+  const path = String(stream?.upstream?.url || '').split('#')[0].split('?')[0];
+  const fromUrl = /\.([a-z0-9]{2,5})$/i.exec(path);
+  if (fromUrl && MEDIA_FILE_EXTENSIONS.has(fromUrl[1].toLowerCase())) return fromUrl[1].toLowerCase();
+  return 'mp4';
+}
+
 /**
  * Resolve which output type an HTTP path corresponds to. Used by the stream
  * endpoints to pick the right FFmpeg template. The Enigma2/Duo2 endpoint is
@@ -258,12 +285,15 @@ export function urlsFor(stream, baseUrl, { container = null, outputType = null }
  */
 export function outputTypeForPath(reqPath) {
   const name = String(reqPath || '').split('?')[0].toLowerCase();
+  // The direct link: `/s/<token>/direct` (saved playlists) or the current
+  // `/s/<token>/direct.<ext>` — the extension makes the link recognisable to
+  // players that classify by it, so both spellings mean "direct".
+  if (/\/direct(\.[a-z0-9]+)?$/.test(name)) return 'direct';
   // Enigma2 receivers cannot carry query strings through their service-ref
   // encoding (the bouquet builder strips them). The bouquet entry therefore
   // uses a `.ts.enigma2` path segment that the relay maps to the `enigma2`
   // output slot. The `?enigma2=1` query parameter is also accepted for callers
   // that do pass headers/queries through (e.g. direct test calls).
-  if (name.endsWith('/direct')) return 'direct';
   if (name.endsWith('.ts.enigma2') || name.endsWith('/enigma2.ts')) return 'enigma2';
   // Browser preview (mpegts.js / MSE). Like the Enigma2 suffix, this is a path
   // segment so the URL survives clients that drop query strings; the browser

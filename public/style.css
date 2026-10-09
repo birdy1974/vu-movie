@@ -660,3 +660,25 @@ p .tip{vertical-align:0}
   .navpin{display:none}
   .nav button .ico{width:auto;flex:0 0 auto}
 }
+
+/* ---- compact, vertically stacked cards across every tab ---- */
+.grid.g2,.grid.g3,.grid.g4,.gl{
+  grid-template-columns:minmax(0,1fr);
+  align-items:start;
+  gap:10px;
+}
+.ffmpeg-page{grid-template-columns:minmax(0,1fr);align-items:start;gap:10px}
+.results-poster,.results-thumbnails,.results-list{grid-template-columns:minmax(0,1fr)}
+.results{padding:10px;gap:8px}
+.card:not(.pad0){padding:10px;border-radius:11px}
+.cardhead{padding:8px 10px;gap:8px}
+.cardbody,.cardhead+.cardbody{padding:9px 10px}
+.pad12{padding:10px}
+.row{gap:7px}
+.field{margin-bottom:8px}
+.f2{gap:8px}
+.set-fields{gap:8px 10px}
+th,td{padding:7px 9px}
+.result-card{padding:8px;gap:9px}
+.result-actions{gap:5px}
+body[data-page="mobile"] .card:not(.pad0){padding:10px}

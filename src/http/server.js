@@ -182,7 +182,10 @@ export function createApp() {
     // Only valid for sources that need no request headers: a 302 cannot carry
     // the signed Cookie/Referer that MovieBox and friends demand, so those URLs
     // are refused with an explanation instead of sending VLC into a 403.
-    if (ext === 'direct' || req.path.endsWith('/direct')) {
+    // The link is published as /s/<token>/direct.<ext> (the file's own
+    // extension, so IPTV players recognise it); the bare /s/<token>/direct
+    // keeps working for playlists saved before the extension was added.
+    if (ext === 'direct' || /\/direct(\.[a-z0-9]+)?$/i.test(req.path)) {
       stream = await prepareStreamForPlayback(stream, res, 'direct-playback-start');
       if (!stream) return;
       if (!store.directPlaybackAvailable(stream)) {

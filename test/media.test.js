@@ -224,12 +224,16 @@ test('burning in subtitles forces the software subtitle filter', () => {
   assert.ok(vf.includes('scale='));
 });
 
-test('a Matroska soft mux maps the sidecar first and marks it as the default track', (t) => {
+test('a Matroska soft mux maps the sidecar first when the source subtitle count is unknown', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-sidecar-test-'));
   const subtitlePath = path.join(dir, 'selected subtitle.nl.srt');
   fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  // The source carries no probe subtitle list, so the number of source subtitle
+  // tracks in the output is unknown and the sidecar cannot be placed after them
+  // safely: it stays first, as subtitle stream 0, where the disposition and
+  // language metadata need no index arithmetic.
   const profile = normaliseProfile(
     { mode: 'copy', container: 'matroska', subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' },
     PROBE_4K_HEVC,
@@ -240,8 +244,6 @@ test('a Matroska soft mux maps the sidecar first and marks it as the default tra
   });
   const secondInput = args.indexOf('-i', args.indexOf('-i') + 1);
   assert.equal(args[secondInput + 1], subtitlePath, 'the sidecar is a second input');
-  // The sidecar is mapped *before* the source's own subtitle tracks, so it is
-  // always subtitle stream 0 — the disposition/metadata below rely on it.
   const maps = [];
   for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
   assert.deepEqual(maps, ['0:v:0', '0:a:0?', '1:s:0?', '0:s?'], 'sidecar before the source tracks');
@@ -250,6 +252,42 @@ test('a Matroska soft mux maps the sidecar first and marks it as the default tra
   assert.equal(args[args.indexOf('-metadata:s:s:0') + 1], 'language=nld');
   assert.equal(args[args.indexOf('-c:s') + 1], 'copy', 'source tracks are copied, never re-encoded');
   assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt');
+});
+
+test('a Matroska soft mux maps the sidecar after the source subtitle tracks and makes it the only default', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-sidecar-order-test-'));
+  const subtitlePath = path.join(dir, 'selected subtitle.nl.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // The probe vouches for two source subtitle tracks (a copyable subrip and a
+  // mov_text the muxer cannot carry), so the sidecar's stream index is known:
+  // it is muxed last, after the source's own tracks.
+  const probe = {
+    ...PROBE_1080P_H264,
+    subtitles: [{ codec: 'mov_text', language: 'eng' }, { codec: 'subrip', language: 'eng' }],
+  };
+  const profile = normaliseProfile(
+    { mode: 'copy', container: 'matroska', subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' },
+    probe,
+  );
+  const args = buildFfmpegArgs({
+    source: { url: 'https://cdn/x.mp4', kind: 'file', subtitles: probe.subtitles },
+    profile, hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
+  });
+  const maps = [];
+  for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '0:s?', '1:s:0?'], 'the sidecar is mapped after the source tracks');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'copy');
+  assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt', 'the mov_text track is re-encoded at position 0');
+  assert.ok(!args.includes('-c:s:1'), 'the subrip track stays on copy at position 1');
+  assert.equal(args[args.indexOf('-c:s:2') + 1], 'srt', 'the sidecar is muxed last, at position 2');
+  // The source tracks keep the default flag they carried in the source — a
+  // second default track makes players pick one, often a partial source track
+  // instead of the attachment. The builder clears it and flags only the sidecar.
+  assert.equal(args[args.indexOf('-disposition:s') + 1], '-default', 'the default flag is cleared on every subtitle stream');
+  assert.equal(args[args.indexOf('-disposition:s:2') + 1], 'default', 'the sidecar is the only default track');
+  assert.equal(args[args.indexOf('-metadata:s:s:2') + 1], 'language=nld');
 });
 
 test('a text sidecar is never forced into MPEG-TS (ffmpeg cannot make DVB bitmaps from it)', (t) => {
@@ -324,7 +362,8 @@ test('matroska re-encodes the mov_text tracks a blanket copy cannot carry', () =
   assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt', 'the mov_text track is re-encoded');
   assert.ok(!args.includes('-c:s:1'), 'the PGS track stays on copy');
 
-  // With an attached sidecar the source tracks shift one position.
+  // With an attached sidecar the source tracks keep their positions and the
+  // sidecar is muxed after them (the operator's extra track).
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-movtext-test-'));
   const subtitlePath = path.join(dir, 'movie.nl.srt');
   fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
@@ -333,10 +372,16 @@ test('matroska re-encodes the mov_text tracks a blanket copy cannot carry', () =
     profile: normaliseProfile({ mode: 'copy', container: 'matroska', subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld' }, probe),
     hw: HW, mode: 'live', output: { container: 'matroska', target: 'pipe:1' },
   });
+  const maps = [];
+  for (let i = 0; i < withSidecar.length; i += 1) if (withSidecar[i] === '-map') maps.push(withSidecar[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '0:s?', '1:s:0?'], 'the sidecar is mapped after the source tracks');
   assert.equal(withSidecar[withSidecar.indexOf('-c:s') + 1], 'copy');
-  assert.equal(withSidecar[withSidecar.indexOf('-c:s:0') + 1], 'srt', 'the sidecar');
-  assert.equal(withSidecar[withSidecar.indexOf('-c:s:1') + 1], 'srt', 'mov_text moves to position 1');
-  assert.ok(!withSidecar.includes('-c:s:2'), 'PGS stays on copy at position 2');
+  assert.equal(withSidecar[withSidecar.indexOf('-c:s:0') + 1], 'srt', 'the mov_text track keeps position 0');
+  assert.ok(!withSidecar.includes('-c:s:1'), 'the PGS track stays on copy at position 1');
+  assert.equal(withSidecar[withSidecar.indexOf('-c:s:2') + 1], 'srt', 'the sidecar is muxed last, at position 2');
+  assert.equal(withSidecar[withSidecar.indexOf('-disposition:s') + 1], '-default', 'the default flag the source tracks carried in is cleared');
+  assert.equal(withSidecar[withSidecar.indexOf('-disposition:s:2') + 1], 'default', 'the sidecar is the only default track');
+  assert.equal(withSidecar[withSidecar.indexOf('-metadata:s:s:2') + 1], 'language=nld');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -420,21 +465,59 @@ test('an FFmpeg template keeps the subtitle attached to the playlist item', (t) 
     template, source: { url: 'https://cdn/movie.mp4', kind: 'file' }, profile, mode: 'live',
     output: { container: 'matroska', target: 'pipe:1' },
   });
-  // The sidecar is a second input right behind the source, and it is mapped
-  // *before* the template's own maps so it is subtitle stream 0.
+  // The sidecar is a second input right behind the source, and its map row goes
+  // behind the template's own maps (the template maps no subtitles here, so the
+  // sidecar is the only subtitle track — stream 0 either way).
   const inputIndex = args.indexOf('-i');
   assert.equal(args[inputIndex + 1], 'https://cdn/movie.mp4');
   assert.equal(args[inputIndex + 2], '-i');
   assert.equal(args[inputIndex + 3], subtitlePath);
-  assert.equal(args[inputIndex + 4], '-map');
-  assert.equal(args[inputIndex + 5], '1:s:0?');
+  const maps = [];
+  for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '1:s:0?'], 'the sidecar map follows the template’s maps');
   assert.ok(args.includes('-c:s:0'), 'the sidecar is encoded (text) instead of copied');
   assert.equal(args[args.indexOf('-c:s:0') + 1], 'srt');
-  assert.equal(args[args.indexOf('-disposition:s:0') + 1], 'default');
+  assert.equal(args[args.indexOf('-disposition:s') + 1], '-default', 'the default flag is cleared on every subtitle stream first');
+  assert.equal(args[args.indexOf('-disposition:s:0') + 1], 'default', 'then the sidecar is the default track');
   assert.equal(args[args.indexOf('-metadata:s:s:0') + 1], 'language=nld');
   // The progress flags and the output target still come last.
   assert.deepEqual(args.slice(-4), ['-progress', 'pipe:2', '-nostats', 'pipe:1']);
   assert.deepEqual(subtitleSessionNotes(profile, 'matroska', args), [], 'nothing to warn about');
+});
+
+test('a copy-all Matroska template puts the attached SRT after source subtitles and selects it as default', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vu-movie-template-copy-all-subs-test-'));
+  const subtitlePath = path.join(dir, 'attached Dutch.srt');
+  fs.writeFileSync(subtitlePath, 'SRT sidecar test fixture');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const probeSubtitles = [
+    { codec: 'subrip', language: 'eng' },
+    { codec: 'mov_text', language: 'eng' },
+  ];
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v copy -c:a copy -c:s copy -f matroska <output>';
+  const profile = {
+    subtitles: 'soft', subtitlePath, subtitleLanguage: 'nld', container: 'matroska',
+    ffmpegTemplate: template,
+  };
+  const args = buildFfmpegTemplateArgs({
+    template,
+    source: { url: 'https://cdn/movie.mkv', kind: 'file', subtitles: probeSubtitles },
+    profile,
+    mode: 'live',
+    output: { container: 'matroska', target: 'pipe:1' },
+  });
+  const maps = [];
+  for (let i = 0; i < args.length; i += 1) if (args[i] === '-map') maps.push(args[i + 1]);
+  assert.deepEqual(maps, ['0:v:0', '0:a:0?', '0:s?', '1:s:0?'], 'source tracks stay in their order; the attached SRT is last');
+  assert.equal(args[args.indexOf('-c:s') + 1], 'copy', 'the template keeps its copy-all codec');
+  assert.ok(!args.includes('-c:s:0'), 'the copyable source SRT track remains a stream copy');
+  assert.equal(args[args.indexOf('-c:s:1') + 1], 'srt', 'the uncopyable source mov_text track is converted at index 1');
+  assert.ok(!args.includes('-c:s:2'), 'the template’s generic copy applies to the SRT sidecar at index 2');
+  assert.equal(args[args.indexOf('-disposition:s') + 1], '-default', 'clear default flags copied from source subtitles');
+  assert.equal(args[args.indexOf('-disposition:s:2') + 1], 'default', 'the attached subtitle is the sole default');
+  assert.equal(args[args.indexOf('-metadata:s:s:2') + 1], 'language=nld');
+  assert.deepEqual(subtitleSessionNotes(profile, 'matroska', args), [], 'the template kept the attached subtitle');
 });
 
 test('a template without -map rows keeps video and audio when the sidecar is muxed', (t) => {

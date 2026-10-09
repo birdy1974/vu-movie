@@ -120,8 +120,8 @@ test('the direct link is withheld from DASH sources that need request headers; t
 
   assert.equal(a.direct, null, 'signed cookie → a 302 would 403');
   assert.match(a.directNote, /signed cookie|request headers/);
-  assert.equal(b.direct, 'http://nas:8080/s/tok2/direct', 'a plain Referer is fine: VLC sends its own and the CDN usually ignores it');
-  assert.equal(c.direct, 'http://nas:8080/s/tok3/direct');
+  assert.equal(b.direct, 'http://nas:8080/s/tok2/direct.mp4', 'a plain Referer is fine: VLC sends its own and the CDN usually ignores it');
+  assert.equal(c.direct, 'http://nas:8080/s/tok3/direct.mp4');
   assert.equal(c.directNote, null);
   // The relay URL is always the answer for header-dependent sources.
   assert.equal(a.ts, 'http://nas:8080/s/tok/MovieBox-film.ts');
@@ -131,7 +131,7 @@ test('the direct link is withheld from DASH sources that need request headers; t
     title: 'Signed file', token: 'tok4',
     upstream: { url: 'https://cdn.example/signed.mp4', kind: 'file', headers: { Cookie: 'sig=abc' } },
   };
-  assert.equal(urlsFor(signedFile, base).direct, 'http://nas:8080/s/tok4/direct');
+  assert.equal(urlsFor(signedFile, base).direct, 'http://nas:8080/s/tok4/direct.mp4');
   assert.match(urlsFor(signedFile, base).directNote, /served through the relay/);
 
   assert.equal(directPlaybackAvailable(signedCookie), false);

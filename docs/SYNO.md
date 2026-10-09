@@ -162,7 +162,7 @@ to 512 MB. On a 4 GB NAS with Plex/Jellyfin also running, lower
   gets it (*Playlist → ▤ subtitle → How the box gets it*). Ordered by NAS cost:
   **copy the `.srt` to the box** (FTP or a mounted share, named after the movie —
   no transcoding at all, picked up next to a recording of the same name),
-  **soft track** in the Matroska `.mkv` (flagged `default`; no re-encode),
+  **soft track** in the Matroska `.mkv` (the attached SRT follows known source subtitle tracks and is the only `default`; no re-encode),
   **burned into the picture** (works on every player but re-encodes the video),
   or **off**. MPEG-TS/HLS cannot carry a text subtitle at all: the relay says so
   in the log instead of failing the stream.

@@ -963,6 +963,7 @@ function resultGroupMarkup(group) {
     </div>
     <div class="result-actions">
       <span class="tag info">${group.entries.length} format(s)</span>
+      <button type="button" class="btn sm ghost" data-preview-group title="Preview in the browser without adding to the playlist">▶ preview</button>
       <button class="btn sm ghost" data-open-meta title="show TMDB/IMDb metadata">ⓘ meta</button>
       <button class="btn sm pri" data-open-formats>formats &amp; metadata</button>
     </div>
@@ -3045,7 +3046,7 @@ async function refreshStream(announce = false) {
     { name: 'VLC playlist', hint: 'VLC preset — complete playlist (all streams defined in Playlist tab, enabled only)', url: urls.vlc, kind: 'm3u', vlc: true, isCompleteVlc: true },
     { name: 'Kodi playlist', hint: 'Kodi preset (.m3u) — complete playlist', url: urls.kodi, kind: 'm3u', vlc: true },
     { name: 'JSON', hint: 'machine-readable catalogue', url: urls.json, kind: 'json', vlc: false },
-    { name: 'Xtream Codes', hint: `player_api.php catalogue · user ${xtream.username || '—'} · complete enabled playlist below`, url: xtream.playerApi, kind: 'xtream', xtream, vlc: false },
+    { name: 'Xtream Codes', hint: `server address for Xtream apps (TiviMate, IPTV Smarters, SFVIP, OwnTV…) — the app appends /player_api.php itself · user ${xtream.username || '—'} · complete enabled playlist below`, url: xtream.base, kind: 'xtream', xtream, vlc: false },
     { name: 'Enigma2 bouquet', hint: urls.bouquetName || 'userbouquet.tv', url: urls.bouquet, kind: 'bouquet', vlc: false },
   ];
   $('#st-outputs').innerHTML = entries.map((entry) => `
@@ -3060,7 +3061,7 @@ async function refreshStream(announce = false) {
         </div>
       </div>
       <div class="mono url-line">${escapeHtml(entry.url || '—')}</div>
-      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Give these credentials to TiviMate, IPTV Smarters or another Xtream-compatible app; the player API URL above is the server address. Xtream catalogue and M3U+ output include every enabled playlist item in order. The account is set in Settings → Xtream Codes.">i</span></div><div class="row" style="gap:6px;margin-top:8px"><a class="btn sm ghost" href="${escapeHtml(entry.xtream.get || '')}" target="_blank" rel="noreferrer">complete M3U+ ↗</a><button class="btn sm ghost" data-copy="${escapeHtml(entry.xtream.get || '')}">copy M3U+</button><button class="btn sm ghost" data-xtream-settings>change account</button></div><div class="mono url-line">${escapeHtml(entry.xtream.get || '—')}</div>` : ''}
+      ${entry.kind === 'xtream' ? `<div class="meta" style="margin-top:6px">Xtream account — username <b>${escapeHtml(entry.xtream.username || '')}</b>, password <b>${escapeHtml(entry.xtream.password || '')}</b> <span class="tip" tabindex="0" role="note" aria-label="About the Xtream account" data-tip="Enter the server address above together with these credentials in TiviMate, IPTV Smarters, SFVIP, OwnTV or another Xtream-compatible app. Most apps append /player_api.php themselves, so paste the server address, not the API URL below it. Xtream catalogue and M3U+ output include every enabled playlist item in order. The account is set in Settings → Xtream Codes.">i</span></div><div class="mono url-line" style="margin-top:4px">API URL (full, for apps that accept it): ${escapeHtml(entry.xtream.playerApi || '—')}</div><div class="row" style="gap:6px;margin-top:8px"><a class="btn sm ghost" href="${escapeHtml(entry.xtream.get || '')}" target="_blank" rel="noreferrer">complete M3U+ ↗</a><button class="btn sm ghost" data-copy="${escapeHtml(entry.xtream.get || '')}">copy M3U+</button><button class="btn sm ghost" data-xtream-settings>change account</button></div><div class="mono url-line">${escapeHtml(entry.xtream.get || '—')}</div>` : ''}
     </div>`).join('');
 
   $('#st-item-count').textContent = `${state.playlist.items.length} item(s)`;
@@ -3925,6 +3926,7 @@ async function mobileSearch() {
               <span class="meta" style="white-space:normal">${providers.map((id) => escapeHtml(sourceName(id))).join(', ')}</span>
             </span>
           </button>
+          <button type="button" class="btn sm ghost" data-mob-preview="${escapeHtml(group.key)}" title="Preview in the browser without adding to the playlist" aria-label="Preview in the browser without adding to the playlist" style="flex-shrink:0">▶</button>
           <button class="btn sm ghost" data-mob-meta="${escapeHtml(group.key)}" title="TMDB/IMDb metadata" style="flex-shrink:0">ⓘ</button>
         </div>
         ${providers.length > 1 ? `<div class="row mob-provider-label">${providerChipsMarkup(group, { attr: 'data-mprovider' })}</div>` : ''}
