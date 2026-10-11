@@ -244,8 +244,30 @@ export function touchSessionByToken(token) {
  * authoritative and the resulting session will use stream copy or a transcode
  * profile as configured by the operator.
  */
+/**
+ * The container the relay will REALLY write for a stream on one output slot
+ * (`vlcTs`, `vlcMkv`, `m3u8`, `enigma2`, `direct`, `download`).
+ *
+ * It is not necessarily the container the caller asked for: the FFmpeg
+ * template bound to that slot wins (see resolveOutputTemplateForSession), and
+ * a Matroska template bound to the `.ts` slot is a legitimate operator choice.
+ * What must never happen is telling the player otherwise — Matroska bytes
+ * labelled `video/mp2t` is what makes VLC sit at 00:00 without ever showing a
+ * frame — so both the HTTP layer (Content-Type) and the playlist (which link
+ * to publish) ask this function instead of guessing from the URL.
+ */
+export function outputContainerFor(stream, outputType = '', { container = null, profile = null } = {}) {
+  const cfgTrans = getConfig().transcode || {};
+  const base = container || profile?.container || stream?.profile?.container || cfgTrans.container || 'mpegts';
+  const profileInput = { ...(stream?.profile || {}), ...(profile || {}), container: base };
+  const template = resolveOutputTemplateForSession(profileInput, outputType);
+  const chosen = template?.container || base;
+  return normaliseProfile({ ...profileInput, container: chosen }, stream?.upstream?.probe || null).container || chosen;
+}
+
 function resolveOutputTemplateForSession(profile = {}, outputType = '') {
   const cfgTrans = getConfig().transcode || {};
+
   const templates = Array.isArray(cfgTrans.ffmpegTemplates) ? cfgTrans.ffmpegTemplates : [];
   const defaults = cfgTrans.ffmpegDefaults && typeof cfgTrans.ffmpegDefaults === 'object' ? cfgTrans.ffmpegDefaults : {};
   const streamOutputTemplates = profile.outputTemplates && typeof profile.outputTemplates === 'object' && !Array.isArray(profile.outputTemplates)
@@ -757,7 +779,15 @@ export async function ensureSession(stream, opts = {}) {
 
   const cfg = getConfig();
   const outputType = web ? 'web' : (opts.outputType || '');
-  const container = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
+  const requested = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
+  const wantsHls = requested === 'hls';
+  // The container the relay will really write: a template bound to this output
+  // slot decides it, not the URL that was asked for (see outputContainerFor).
+  // HLS and the browser preview keep what they were asked for — an HLS session
+  // writes files instead of a pipe, and the preview is always mpegts.
+  const container = (web || wantsHls)
+    ? requested
+    : outputContainerFor(stream, outputType, { container: requested, profile: opts.profile });
   let profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
 
   // The browser preview is not the receiver: the item's template is dropped and
@@ -809,7 +839,6 @@ export async function ensureSession(stream, opts = {}) {
     });
   }
 
-  const wantsHls = container === 'hls';
   // Segment length: 2 s keeps the VU+ zapping latency low, browsers happy and the
   // muxer overhead reasonable on a Celeron. Tunable through CONFIG.
   const hlsTime = Number(cfg.transcode.hlsSegmentSeconds) || 2;
@@ -849,9 +878,12 @@ export async function ensureSession(stream, opts = {}) {
   // HTTP layer says `video/mp2t`, and the Duo2 gets an MKV). Worth one line in
   // the log — the receiver's mis-detection is otherwise blamed on the relay.
   const actualFormat = outputFormatOf(args);
-  const expectedFormat = wantsHls ? 'hls' : (container === 'matroska' ? 'matroska' : 'mpegts');
+  // Compared against what the URL asked for, not against the container above:
+  // that one already follows the template, so a difference left here means the
+  // template's own `-f` disagrees with the container it is stored under.
+  const expectedFormat = wantsHls ? 'hls' : (requested === 'matroska' ? 'matroska' : 'mpegts');
   if (actualFormat && actualFormat !== expectedFormat) {
-    log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || container} URL asked for ${expectedFormat} — players can mis-detect the stream`, {
+    log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || requested} URL asked for ${expectedFormat} — the response is labelled ${actualFormat}, so players are told the truth`, {
       stream: stream.id, templateId: template?.templateId || '', template: template?.name || '',
     });
   }
@@ -875,6 +907,11 @@ export async function ensureSession(stream, opts = {}) {
     stream,
     kind: wantsHls ? 'hls' : 'pipe',
     container: wantsHls ? 'hls' : profile.container,
+    // What ffmpeg actually writes, taken from the finished command rather than
+    // from the URL: a template's own `-f` is the last word. The HTTP layer
+    // labels the response with this, so a player never gets Matroska bytes
+    // announced as MPEG-TS (which is how a stream ends up sitting at 00:00).
+    format: wantsHls ? 'hls' : (actualFormat || profile.container),
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     encoder: profile.ffmpegTemplate ? 'custom template' : profile.transcode ? (hw.available && profile.encoder === 'vaapi' ? 'h264_vaapi' : profile.encoder || 'libx264') : 'copy',
     outputType,
@@ -1292,6 +1329,9 @@ export function publicSession(session) {
     streamId: session.streamId,
     kind: session.kind,
     container: session.container,
+    // What the relay is really writing (a template can override the container
+    // the URL asked for) — the same value the HTTP response is labelled with.
+    format: session.format || session.container || '',
     mode: session.mode,
     encoder: session.encoder,
     outputType: session.outputType || '',

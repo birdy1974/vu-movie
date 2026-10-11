@@ -21,7 +21,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv, probeSubtitleList } from '../core/media.js';
+import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv, probeSubtitleList, outputFormatOf } from '../core/media.js';
 import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -283,15 +283,21 @@ export function createApp() {
       return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
     }
 
-    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    // The player is told what ffmpeg REALLY writes, not what the URL asked
+    // for: the template bound to this output slot decides the container (see
+    // relay.outputContainerFor). Matroska bytes announced as `video/mp2t` is
+    // the one that costs the most to diagnose — VLC reads the label, fails to
+    // demux, sweeps the seek bar and then sits at 00:00 without a frame.
+    const served = session.format || session.container || container;
+    res.setHeader('Content-Type', mediaTypeForContainer(served));
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
     if (req.method === 'HEAD') return res.end();
 
     log.info('http', `client is playing "${stream.title}"`, {
       ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
-      mode: session.mode, encoder: session.encoder, container, hw: hw.available ? 'vaapi' : 'software',
-      outputType, isEnigma2,
+      mode: session.mode, encoder: session.encoder, container: served,
+      hw: hw.available ? 'vaapi' : 'software', outputType, isEnigma2,
     });
     // The Enigma2 box is a receiver: when it leaves the movie, the movie is not kept.
     const { finish } = relay.attachClient(session, req, res, { receiver: isEnigma2 });
@@ -319,8 +325,13 @@ export function createApp() {
       profile, hw, mode: 'file', output: { container, target: 'pipe:1' },
     });
     log.info('http', `download started for "${stream.title}"`, { container, command: truncate(argsToCommand(args), 300) });
-    res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${ext}"`);
-    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    // Same rule as the stream endpoint: a per-stream template can make ffmpeg
+    // write a container the URL did not ask for, and a downloaded file that is
+    // named .ts but is really Matroska is a puzzle for whoever opens it.
+    const served = outputFormatOf(args) || container;
+    const servedExt = served === 'matroska' ? 'mkv' : served === 'mp4' ? 'mp4' : ext;
+    res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${servedExt}"`);
+    res.setHeader('Content-Type', mediaTypeForContainer(served));
     const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
     child.stdout.pipe(res);
     child.stderr.on('data', (d) => log.debug('http', `download ffmpeg: ${truncate(String(d).trim(), 160)}`));
@@ -412,6 +423,18 @@ export function authState(cfg) {
   if (!cfg.app.username) return { login: false, text: 'open on the LAN (no username set)' };
   if (!cfg.app.password) return { login: false, text: 'open on the LAN (a username is set but no password, so no login is asked for)' };
   return { login: true, text: 'basic auth enabled' };
+}
+
+/**
+ * The MIME type a player is told. It describes the bytes ffmpeg really writes
+ * — never the container the URL happened to end in, because a template bound
+ * to an output slot is allowed to write another one.
+ */
+function mediaTypeForContainer(container) {
+  if (container === 'matroska' || container === 'mkv') return 'video/x-matroska';
+  if (container === 'mp4') return 'video/mp4';
+  if (container === 'hls' || container === 'm3u8') return 'application/vnd.apple.mpegurl';
+  return 'video/mp2t';
 }
 
 function baseUrlFrom(req) {

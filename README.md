@@ -372,6 +372,23 @@ the right template per request URL:
 | `direct`       | `/s/{token}/direct.{ext}`          | 302 to the upstream URL when safe        |
 | `download`     | `/dl/{token}/{slug}.{ext}`         | Saved-to-disk copy                       |
 
+**The template decides the container, and the server follows it.** A Matroska
+template (`-f matroska`) bound to the `vlcTs` slot makes `/s/{token}/{slug}.ts`
+deliver Matroska — that is a supported choice, not a mistake. Two things keep
+players honest about it:
+
+- the response is labelled with what FFmpeg really writes, so a `.ts` link you
+  already saved in VLC keeps working (`Content-Type: video/x-matroska`);
+- the **complete playlist** publishes the matching extension — the entry is
+  `…/{slug}.mkv` when the VLC output writes Matroska — because IPTV apps (and
+  VLC itself, when it sniffs) trust the extension more than the header.
+
+The same rule applies to the direct/seekable link and to downloads: their
+`Content-Type` comes from the file's own magic bytes (or from the finished
+FFmpeg command), never from the extension in the URL. A Matroska file announced
+as MPEG-TS is the failure that looks like "VLC loads the playlist, sweeps its
+seek bar for ten seconds and then sits at 00:00 without ever showing a frame".
+
 A stream can also override any individual slot from the Stream tab
 ("FFmpeg template per output") without changing the others. The bouquet builder
 writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
