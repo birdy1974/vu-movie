@@ -297,3 +297,53 @@ test('the seekable link is typed from the file, not from the CDN label', async (
     stopAll();
   }
 });
+
+/**
+ * The Xtream end point hands an IPTV app a URL and a `container_extension`,
+ * and those apps build the playback URL from the extension — before a single
+ * byte arrives and before any redirect is followed. The complete playlist was
+ * fixed to publish the extension the relay really writes; this is the same
+ * promise for the Xtream catalogue.
+ */
+async function xtreamCatalogue(creds = '') {
+  const token = playlist.token();
+  const res = await fetch(`${base}/xtream/${token}/player_api.php?action=get_live_streams${creds}`);
+  assert.equal(res.status, 200, 'the catalogue is served');
+  return (await res.json()).filter((item) => item.name?.startsWith('Xtream Movie'));
+}
+
+test('the Xtream catalogue names the container the relay really writes', async (t) => {
+  t.after(stopAll);
+  setTemplates();
+  await newStream('Xtream Movie'); // created while nothing was bound …
+  // … and the Matroska template is bound to the VLC output afterwards, which
+  // is what Settings → per-output templates does to streams that already
+  // exist. The stream's own profile still says mpegts, so only the slot knows.
+  setTemplates({ templates: [MKV_TEMPLATE], defaults: { vlcTs: MKV_TEMPLATE.id } });
+
+  const [item] = await xtreamCatalogue();
+  assert.ok(item, 'the stream is in the catalogue');
+  assert.equal(item.container_extension, 'mkv', 'apps build the playback URL from this field');
+  assert.match(item.direct_source, /\.mkv$/, 'and play the link it is given');
+  assert.match(item.vu_movie_url, /\.mkv$/);
+
+  // Following that link really does hand out Matroska.
+  const id = item.stream_id;
+  const got = await open(`${base}/xtream/${playlist.token()}/live/vumovie/${playlist.token()}/${id}.mkv`);
+  assert.equal(got.status, 200);
+  assert.equal(got.contentType, 'video/x-matroska');
+  assert.ok(isMatroska(got.head), `expected EBML/Matroska magic, got ${got.head.toString('hex')}`);
+});
+
+test('without a template the Xtream catalogue stays on .ts', async (t) => {
+  t.after(stopAll);
+  setTemplates();
+  await newStream('Xtream Movie');
+
+  const [item] = await xtreamCatalogue();
+  assert.equal(item.container_extension, 'ts');
+  assert.match(item.direct_source, /\.ts$/);
+  const got = await open(`${base}/xtream/${playlist.token()}/live/vumovie/${playlist.token()}/${item.stream_id}.ts`);
+  assert.equal(got.contentType, 'video/mp2t');
+  assert.ok(isMpegTs(got.head));
+});

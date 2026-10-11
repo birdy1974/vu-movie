@@ -218,6 +218,20 @@ of the address. Most apps append `/player_api.php` (and `/get.php`,
 address that already ends in `/player_api.php` is collapsed instead of answered
 with "access denied".
 
+An IPTV app builds its playback URL from the `container_extension` field of the
+catalogue and picks its demuxer from that extension **before** it follows a
+redirect or reads a header — so the extension follows the same rule as the
+complete playlist: it names what the VLC output slot really writes (`.mkv` when
+a bound template writes Matroska, `.ts` otherwise). A `.ts` Xtream link saved
+in an app before that switch keeps working: it relays to the `.ts` URL, which
+is labelled with the container it really delivers.
+
+The `enigma2` slot is the one exception by design: the Duo2 expects a
+`.ts.enigma2` service reference, so that link cannot be renamed to match. A
+Matroska template bound to the `enigma2` slot is therefore a
+misconfiguration — the relay logs a warning naming the template when it
+happens.
+
 The account itself is set in **Settings → Xtream Codes** (or with
 `XTREAM_USERNAME` / `XTREAM_PASSWORD`, which win over a saved value). The
 password may be left empty: the playlist token then doubles as the password,

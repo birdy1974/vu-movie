@@ -124,8 +124,18 @@ function xtreamStreamId(stream) {
   return crypto.createHash('sha256').update(value).digest().readUIntBE(0, 6) || 1;
 }
 
+/**
+ * The extension for `/live/<user>/<pass>/<id>.<ext>` and for the
+ * `container_extension` field of the catalogue.
+ *
+ * IPTV apps build the playback URL from `container_extension` and choose their
+ * demuxer from the extension, both before a single byte arrives — so it has to
+ * name what the relay really writes, which a template bound to the VLC output
+ * decides (playlist.vlcExtensionFor()). Reading `profile.container` here used
+ * to be the same guess the complete playlist made before it was fixed.
+ */
 function xtreamExtension(stream) {
-  return stream.profile?.container === 'matroska' ? 'mkv' : 'ts';
+  return playlist.vlcExtensionFor(stream);
 }
 
 function xtreamStreamUrl(baseUrl, token, stream, type = 'live') {
@@ -154,7 +164,7 @@ function xtreamItem(entry, index, baseUrl, token, type = 'live') {
     tv_archive_duration: 0,
     // Extra fields (ignored by strict clients, useful in the info page):
     vu_movie_id: stream.id,
-    vu_movie_url: urls.ts,
+    vu_movie_url: ext === 'mkv' ? urls.mkv : urls.ts,
     container_extension: ext,
   };
 }
@@ -256,6 +266,7 @@ router.get('/pl/:token/:file', async (req, res) => {
       generatedAt: new Date().toISOString(),
       items: items.filter((item) => item.enabled).map((entry) => {
         const urls = store.urlsFor(entry.stream, baseUrl);
+        const ext = playlist.vlcExtensionFor(entry.stream);
         return {
           streamId: entry.stream.id,
           title: entry.stream.title,
@@ -264,7 +275,7 @@ router.get('/pl/:token/:file', async (req, res) => {
           template: entry.templateId || entry.stream.profile?.ffmpegTemplateName || null,
           subtitle: entry.stream.profile?.subtitlePath || null,
           poster: entry.stream.poster || null,
-          url: urls.ts,
+          url: ext === 'mkv' ? urls.mkv : urls.ts,
           urls: { ts: urls.ts, web: urls.web, mkv: urls.mkv, hls: urls.hls, playlist: urls.playlist, watch: urls.watch },
         };
       }),
