@@ -92,8 +92,14 @@ export function createApp() {
     // real after a container restart is a password nobody trusts. getConfig()
     // returns the current object, so turning the login on, changing it or
     // clearing it takes effect on the very next request.
-    const { username, password } = getConfig().app;
-    if (!username) return next();
+    const cfgNow = getConfig();
+    // Both fields are needed; see authState(). A username without a password
+    // is *not* a half-login — an empty password cannot be typed, so enforcing
+    // it would lock everybody out of the only screen that can undo it. That
+    // state is simply “no login”: the UI stays open on the LAN, and the boot
+    // log and the Settings save both say so.
+    if (!authState(cfgNow).login) return next();
+    const { username, password } = cfgNow.app;
     // The stream endpoints and the playlist outputs are token-protected
     // (/s/<token>/…, /pl/<token>/…, /xtream/<token>/…): VLC, the VU+ and IPTV
     // apps cannot send a password, so they carry an unguessable path instead.
@@ -394,6 +400,20 @@ if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.create
   return app;
 }
 
+/**
+ * Is the UI behind a login, and what does the boot log call it?
+ *
+ * Kept in one place because the answer is not “is a username set”: a username
+ * with an empty password is no login at all (nobody can type an empty
+ * password), so treating it as one would lock the operator out of the only
+ * screen that can undo it. The middleware asks per request, the boot log once.
+ */
+export function authState(cfg) {
+  if (!cfg.app.username) return { login: false, text: 'open on the LAN (no username set)' };
+  if (!cfg.app.password) return { login: false, text: 'open on the LAN (a username is set but no password, so no login is asked for)' };
+  return { login: true, text: 'basic auth enabled' };
+}
+
 function baseUrlFrom(req) {
   // Same rule as the auth middleware: the LAN base URL is editable from
   // Settings → Application, so links handed out to VLC and the receiver are
@@ -428,17 +448,15 @@ export function startServer() {
       log.info('http', `vu-movie listening on http://${cfg.app.host}:${addr.port}`, {
         publicDir: PUBLIC_DIR,
         baseUrl: cfg.app.baseUrl || '(derived from the request Host header)',
-        auth: !cfg.app.username ? 'open on the LAN (no username set)'
-          : cfg.app.password ? 'basic auth enabled'
-            : 'INCOMPLETE — a username is set but no password, so nobody can log in',
+        auth: authState(cfg).text,
       });
-      // A login nobody can complete is only ever a typo (APP_USERNAME without
-      // APP_PASSWORD in .env, or a hand-edited config file), and the symptom —
-      // every page asking for a password that is never accepted — gives no
-      // hint where to look. Say it at boot, next to the port.
+      // A half-finished login (APP_USERNAME without APP_PASSWORD in .env, or a
+      // hand-edited config file) is usually a typo, and the symptom gives no
+      // hint where to look: the UI simply never asks for a password. Say it at
+      // boot, next to the port.
       if (cfg.app.username && !cfg.app.password) {
-        log.warn('http', 'the web interface asks for a login, but no password is configured — set APP_PASSWORD (or Settings → Application) or clear the username',
-          { hint: 'an empty password cannot be typed in the browser, so the UI stays locked' });
+        log.warn('http', 'the web interface is open — a username is set but no password, and an empty password cannot be typed',
+          { username: cfg.app.username, hint: 'set APP_PASSWORD (or Settings → Application) to switch the login on, or clear the username' });
       }
       resolve(server);
     });

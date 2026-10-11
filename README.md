@@ -549,12 +549,14 @@ password, so they carry an unguessable token in the path instead
   `docker compose restart` between entering a password and being asked for it —
   the browser's own login dialog appears on the next request. (The *port* on the
   same card does need a restart; nothing can re-bind the listening socket.)
-* **A username needs a password.** Saving a username with an empty password is
-  refused by Settings, and a login that arrives incomplete from the environment
-  is called out in the boot log: an empty password cannot be typed, so the UI
-  would be locked behind a password nobody knows.
-* Clearing the username switches the login off again and leaves the stored
-  password alone, so the two fields can be changed independently.
+* **Both fields are needed.** A username with an empty password is treated as
+  *no login* rather than as a locked one: an empty password cannot be typed, so
+  enforcing it would lock everybody out of the only screen that can undo it.
+  The same goes for a password without a username. Either field empty leaves
+  the UI open — and because the browser then never asks for a password, both
+  the boot log and the Settings save point that out.
+* Clearing the username switches the login off and leaves the stored password
+  alone; emptying the password does the same and keeps the username.
 
 The ones that matter most on a DS918+:
 

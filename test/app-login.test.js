@@ -111,31 +111,47 @@ test('clearing the username opens the UI again', async () => {
   assert.equal(config.getConfig().app.password, 'n3w-pass', 'the stored password is untouched');
 });
 
-test('a username without a password is refused instead of locking the UI', async () => {
-  // The lock only happens when there is no password to fall back on: from a
-  // fresh install the operator types a username into an empty password field,
-  // and the form has no mask to send back.
-  const cleared = await putConfig({ app: { username: '', password: '' } }, null);
-  assert.equal(cleared.status, 200, 'clearing both switches the login off — that is not a lock');
-  assert.equal(config.getConfig().app.password, '', 'an emptied password field really clears it');
+test('a username without a password is “no login”, not a locked one', async () => {
+  // From a fresh install the operator types a username into an empty password
+  // field. Enforcing that would lock the UI behind a password nobody can type,
+  // so the pair is saved as entered and simply stays switched off.
+  await putConfig({ app: { username: '', password: '' } }, null);
 
-  const rejected = await putConfig({ app: { username: 'birdy' } }, null);
-  assert.equal(rejected.status, 400, 'the Settings tab has to report it, not save it');
-  assert.match((await rejected.json()).error, /password/i);
-  assert.equal(config.getConfig().app.username, '', 'the half-login was not applied');
-  assert.equal(await status('/api/config', null), 200, 'and the UI stayed reachable');
+  const saved = await putConfig({ app: { username: 'birdy' } }, null);
+  assert.equal(saved.status, 200, 'the save is accepted — nothing is wrong with it');
+  assert.deepEqual(config.validateConfigPatch({ app: { username: 'birdy' } }), [], 'and it is not reported as a problem');
+  assert.equal(config.getConfig().app.username, 'birdy', 'the username is kept as typed');
+  assert.equal(config.getConfig().app.password, '');
+  assert.equal(await status('/api/config', null), 200, 'the UI stays open instead of locking everybody out');
+  assert.equal(await status('/', null), 200, 'including the web interface itself');
 
-  // The same rule through the flat dotted spelling an API client may use.
-  assert.deepEqual(config.validateConfigPatch({ 'app.username': 'birdy' }), [
-    'Application password: a username without a password locks the web interface for everybody, including you — enter a password as well, or clear the username to leave the UI open on the LAN.',
-  ]);
-  // Both fields together is fine, and so is a username that keeps the stored
-  // password — the mask the form sends back means “unchanged”.
-  config.saveConfig({ app: { username: 'birdy', password: 's3cret' } });
-  assert.deepEqual(config.validateConfigPatch({ app: { username: 'other' } }), []);
-  assert.deepEqual(config.validateConfigPatch({ app: { username: 'other', password: '••••••••' } }), []);
-  assert.equal(config.validateConfigPatch({ app: { password: '' } }).length, 1, 'emptying the password is a lock too');
-  assert.deepEqual(config.validateConfigPatch({ app: { username: '' } }), [], 'clearing the username is always allowed — it switches the login off');
-  // …and a login saved directly (an operator's own script) still protects the UI.
+  // Adding the password is what switches the same username on.
+  const on = await putConfig({ app: { username: 'birdy', password: 's3cret' } }, null);
+  assert.equal(on.status, 200);
   assert.equal(await status('/api/config', null), 401);
+  login = 'birdy:s3cret';
+  assert.equal(await status('/api/config'), 200);
+
+  // …and emptying it switches the login off again, keeping the username.
+  const off = await putConfig({ app: { username: 'birdy', password: '' } });
+  assert.equal(off.status, 200);
+  assert.equal(config.getConfig().app.username, 'birdy', 'the username survives');
+  assert.equal(await status('/api/config', null), 200, 'no password, no login');
+
+  // The same rule through the flat dotted spelling an API client may use, and
+  // for a password that has no username to go with it.
+  assert.deepEqual(config.validateConfigPatch({ 'app.username': 'birdy' }), []);
+  assert.deepEqual(config.validateConfigPatch({ app: { password: 'orphan' } }), []);
+  assert.equal(await status('/api/config', null), 200, 'a password without a username is no login either');
+});
+
+test('authState() is the single rule the middleware and the boot log share', async () => {
+  const { authState } = await import('../src/http/server.js');
+  const of = (username, password) => authState({ app: { username, password } });
+
+  assert.deepEqual(of('', ''), { login: false, text: 'open on the LAN (no username set)' });
+  assert.deepEqual(of('birdy', ''), { login: false, text: 'open on the LAN (a username is set but no password, so no login is asked for)' });
+  assert.deepEqual(of('', 's3cret'), { login: false, text: 'open on the LAN (no username set)' });
+  assert.equal(of('birdy', 's3cret').login, true);
+  assert.match(of('birdy', 's3cret').text, /basic auth enabled/);
 });
