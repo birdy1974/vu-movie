@@ -611,6 +611,20 @@ export async function detachSubtitle(streamId) {
  * ------------------------------------------------------------------ */
 
 /**
+ * The extension the VLC/IPTV output slot really produces for a stream: `mkv`
+ * when a template bound to the `vlcTs` slot writes Matroska, `ts` otherwise.
+ *
+ * One decision, shared by the complete playlist and the Xtream catalogue —
+ * both hand a client a URL, and clients (IPTV apps most of all) pick their
+ * demuxer from the extension *before* they follow a redirect or read the
+ * Content-Type. `relay.outputContainerFor()` asks the template, which is the
+ * only place the answer is genuinely known.
+ */
+export function vlcExtensionFor(stream) {
+  return relay.outputContainerFor(stream, 'vlcTs', { container: 'mpegts' }) === 'matroska' ? 'mkv' : 'ts';
+}
+
+/**
  * The .m3u / .m3u8 output of the playlist. `hls` picks the `.m3u8` (HLS) relay
  * URL for streams whose profile actually produces HLS segments; every other
  * stream gets its .ts URL, which is what VLC, Kodi and IPTV apps play.
@@ -619,12 +633,23 @@ export async function detachSubtitle(streamId) {
  * .ts relay output is a live stream and VLC cannot seek in it; the direct link
  * is the file itself (or the relay serving it with Range), so VLC can seek.
  * `count` is the number of entries, which is what the receiver sees.
+ *
+ * The link is chosen from the container the relay will really write, not from
+ * the `.ts` habit: a Matroska template bound to the VLC output makes the `.ts`
+ * URL deliver Matroska, and players that trust the extension (IPTV apps, and
+ * VLC itself when it sniffs) then mis-detect it. The relay labels such a
+ * response correctly, so an old `.ts` link keeps working — a new playlist
+ * simply publishes the `.mkv` one. `vlcExtensionFor()` is where that decision
+ * is made; the Xtream catalogue asks the same question.
  */
 export async function playlistText(baseUrl, { name: playlistName = null, hls = false } = {}) {
   const streams = await enabledStreams();
   const items = [];
   for (const stream of streams) {
     const urls = store.urlsFor(stream, baseUrl);
+    // HLS only when the stream itself is an HLS stream: the /s/<slug>.m3u8
+    // route redirects on exactly this condition, so the playlist must agree
+    // with it or the entry would point at a URL that bounces.
     const useHls = hls && stream.profile?.container === 'hls';
     const subtitle = stream.profile?.subtitlePath || '';
     const title = `${stream.title}${stream.year ? ` (${stream.year})` : ''}`;
@@ -634,7 +659,7 @@ export async function playlistText(baseUrl, { name: playlistName = null, hls = f
       group: playlistName || name(),
       subtitle: subtitle || undefined,
     };
-    items.push({ ...common, title, url: useHls ? urls.hls : urls.ts });
+    items.push({ ...common, title, url: useHls ? urls.hls : (vlcExtensionFor(stream) === 'mkv' ? urls.mkv : urls.ts) });
     if (urls.direct && streamKind(stream.upstream?.url) === 'file') {
       items.push({ ...common, title: `${title} (seekable)`, url: urls.direct });
     }

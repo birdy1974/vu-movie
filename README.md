@@ -218,6 +218,20 @@ of the address. Most apps append `/player_api.php` (and `/get.php`,
 address that already ends in `/player_api.php` is collapsed instead of answered
 with "access denied".
 
+An IPTV app builds its playback URL from the `container_extension` field of the
+catalogue and picks its demuxer from that extension **before** it follows a
+redirect or reads a header — so the extension follows the same rule as the
+complete playlist: it names what the VLC output slot really writes (`.mkv` when
+a bound template writes Matroska, `.ts` otherwise). A `.ts` Xtream link saved
+in an app before that switch keeps working: it relays to the `.ts` URL, which
+is labelled with the container it really delivers.
+
+The `enigma2` slot is the one exception by design: the Duo2 expects a
+`.ts.enigma2` service reference, so that link cannot be renamed to match. A
+Matroska template bound to the `enigma2` slot is therefore a
+misconfiguration — the relay logs a warning naming the template when it
+happens.
+
 The account itself is set in **Settings → Xtream Codes** (or with
 `XTREAM_USERNAME` / `XTREAM_PASSWORD`, which win over a saved value). The
 password may be left empty: the playlist token then doubles as the password,
@@ -371,6 +385,23 @@ the right template per request URL:
 | `enigma2`      | `/s/{token}/{slug}.ts.enigma2`     | VU+ Duo2 (bouquet service-ref)           |
 | `direct`       | `/s/{token}/direct.{ext}`          | 302 to the upstream URL when safe        |
 | `download`     | `/dl/{token}/{slug}.{ext}`         | Saved-to-disk copy                       |
+
+**The template decides the container, and the server follows it.** A Matroska
+template (`-f matroska`) bound to the `vlcTs` slot makes `/s/{token}/{slug}.ts`
+deliver Matroska — that is a supported choice, not a mistake. Two things keep
+players honest about it:
+
+- the response is labelled with what FFmpeg really writes, so a `.ts` link you
+  already saved in VLC keeps working (`Content-Type: video/x-matroska`);
+- the **complete playlist** publishes the matching extension — the entry is
+  `…/{slug}.mkv` when the VLC output writes Matroska — because IPTV apps (and
+  VLC itself, when it sniffs) trust the extension more than the header.
+
+The same rule applies to the direct/seekable link and to downloads: their
+`Content-Type` comes from the file's own magic bytes (or from the finished
+FFmpeg command), never from the extension in the URL. A Matroska file announced
+as MPEG-TS is the failure that looks like "VLC loads the playlist, sweeps its
+seek bar for ten seconds and then sits at 00:00 without ever showing a frame".
 
 A stream can also override any individual slot from the Stream tab
 ("FFmpeg template per output") without changing the others. The bouquet builder
@@ -534,6 +565,29 @@ docs for each knob are in [.env.example](.env.example) and
   to the type the option's default has, so they cannot end up compared or added
   as strings.
 * A broken file never stops the container: it is logged and defaults + env win.
+
+### Password-protecting the UI (Settings → Application)
+
+`APP_USERNAME` + `APP_PASSWORD` — or the *Application* card in Settings — put the
+web interface and every `/api/…` call behind HTTP basic auth. The playable
+endpoints stay open on purpose: VLC, the Duo2 and IPTV apps cannot send a
+password, so they carry an unguessable token in the path instead
+(`/s/<token>/…`, `/hls/…`, `/dl/…`, `/pl/<token>/…`, `/xtream/<token>/…`, and
+`/api/health` for the container healthcheck).
+
+* **The login applies the moment it is saved.** The server reads the credentials
+  from the live configuration on every request, so there is no
+  `docker compose restart` between entering a password and being asked for it —
+  the browser's own login dialog appears on the next request. (The *port* on the
+  same card does need a restart; nothing can re-bind the listening socket.)
+* **Both fields are needed.** A username with an empty password is treated as
+  *no login* rather than as a locked one: an empty password cannot be typed, so
+  enforcing it would lock everybody out of the only screen that can undo it.
+  The same goes for a password without a username. Either field empty leaves
+  the UI open — and because the browser then never asks for a password, both
+  the boot log and the Settings save point that out.
+* Clearing the username switches the login off and leaves the stored password
+  alone; emptying the password does the same and keeps the username.
 
 The ones that matter most on a DS918+:
 

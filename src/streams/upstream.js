@@ -45,7 +45,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { headerObject, streamKind } from '../core/media.js';
+import { headerObject, sniffMediaType, streamKind } from '../core/media.js';
 
 /* ------------------------------------------------------------------ tunables */
 
@@ -719,7 +719,14 @@ async function serveFile(session, req, res) {
   const end = range && Number.isFinite(range.end) ? range.end : (total != null ? total - 1 : Infinity);
 
   res.setHeader('Accept-Ranges', 'bytes');
-  if (session.meta.contentType) res.setHeader('Content-Type', session.meta.contentType);
+  // The bytes decide, not the CDN's label. A player reads the Content-Type and
+  // never recovers from a wrong one (VLC sweeps its seek bar and then sits at
+  // 00:00): the file's own magic is the truth here, and the declared type is
+  // only kept for containers we do not recognise.
+  const declared = String(session.meta.contentType || '').trim();
+  const sniffed = sniffMediaType(session.store.get(0, 189));
+  const type = sniffed || declared;
+  if (type) res.setHeader('Content-Type', type);
   res.setHeader('Cache-Control', 'no-store');
   if (total != null) {
     const len = Math.max(0, Math.min(end, total - 1) - start + 1);

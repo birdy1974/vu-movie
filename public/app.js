@@ -3384,7 +3384,7 @@ const SETTINGS_NOTES = {
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
   storage: 'Folders inside the container, and how much disk the cache may use.',
-  app: 'The web server itself — port, login and token lifetime.',
+  app: 'The web server itself — port, login and token lifetime. The login applies as soon as it is saved (the browser asks for it on the next request) and needs both fields: a username without a password, or a password without a username, leaves the UI open on the LAN. The port needs a container restart.',
 };
 
 const SETTINGS_LABELS = {
@@ -3452,8 +3452,8 @@ const SETTINGS_LABELS = {
 
   'app.port': ['HTTP port', 'Port the web interface listens on (restart required).'],
   'app.baseUrl': ['Public base URL', 'Address used in every output URL — set it when the box sits behind a proxy.'],
-  'app.username': ['Username', 'Login for the web interface.'],
-  'app.password': ['Password', 'Shown masked; leave it untouched to keep the current one.'],
+  'app.username': ['Username', 'Login for the web interface. Applied immediately — the browser asks for it on the next request. Needs a password to have any effect: either field left empty leaves the UI open on the LAN.'],
+  'app.password': ['Password', 'Shown masked; leave it untouched to keep the current one. Applied immediately. Empty means no login at all, even with a username filled in — an empty password cannot be typed.'],
   'app.logLevel': ['Log level', 'debug for troubleshooting, info for normal use.'],
   'app.tokenTtlMinutes': ['Token lifetime (min)', 'How long a stream token stays valid. 0 = never expires.'],
 };
@@ -3547,8 +3547,26 @@ async function saveSettings() {
       target[key] = value;
     }
   }
-  await api('/api/config', { method: 'PUT', body: patch });
+  // The login is enforced by the very next request (the server reads it from
+  // the live configuration), so say what the browser is about to ask for —
+  // otherwise the first sign of the change is a 401 and a bare password
+  // dialog. `password` only appears in the patch when it was retyped: the
+  // form skips a field it could only show as a mask, and a mask (or an empty
+  // field) in the loaded config is how we know whether one is stored.
+  const loginBefore = String(state.config?.app?.username || '');
+  const loginAfter = String(patch.app?.username || '');
+  const passwordAfter = patch.app?.password === undefined
+    ? Boolean(state.config?.app?.password)
+    : Boolean(patch.app?.password);
+  const loginTouched = loginAfter !== loginBefore || patch.app?.password !== undefined;
+  const saved = await api('/api/config', { method: 'PUT', body: patch });
+  if (saved?.config) state.config = saved.config;
   toast('Settings saved to /config/vumovie.json', 'ok');
+  if (loginTouched) {
+    if (loginAfter && passwordAfter) toast(`Login “${loginAfter}” is active now — the browser asks for it on the next request`, 'warn', 10000);
+    else if (loginAfter) toast(`No password set, so the login stays off — the UI is open on the LAN. Add a password to switch “${loginAfter}” on.`, 'warn', 10000);
+    else toast('Login switched off — the web interface is open on the LAN again', 'info', 8000);
+  }
   loadHealth();
   // The Stream tab prints the Xtream account and every URL that carries it, so
   // a new username/password has to show up there without a page reload.

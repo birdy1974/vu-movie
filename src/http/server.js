@@ -21,7 +21,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv, probeSubtitleList } from '../core/media.js';
+import { buildFfmpegArgs, normaliseProfile, hardware, argsToCommand, ffmpegPath, ffmpegEnv, probeSubtitleList, outputFormatOf } from '../core/media.js';
 import { spawn } from 'node:child_process';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
@@ -61,7 +61,13 @@ function extensionOf(reqPath) {
 
 export function createApp() {
   const app = express();
-  const cfg = getConfig();
+  // NB: no `const cfg = getConfig()` here on purpose. createApp() runs once at
+  // boot, while Settings → Application can change the login, the LAN base URL
+  // and the log level while the container is up. Holding on to the boot object
+  // meant a username/password entered in Settings only applied after a restart
+  // (and clearing it never switched the login off again). Every per-request
+  // decision below asks getConfig() — the one exception is the listening
+  // socket in startServer(), which cannot change without a restart anyway.
   app.disable('x-powered-by');
   app.set('trust proxy', true);
   app.use(express.json({ limit: '2mb' }));
@@ -81,8 +87,19 @@ export function createApp() {
 
   // ---- optional password on the UI/API (stream endpoints stay token-only) ----
   app.use((req, res, next) => {
-    const { username, password } = cfg.app;
-    if (!username) return next();
+    // Read the credentials *per request*, not once at boot: the login is
+    // edited from Settings → Application, and a password that only becomes
+    // real after a container restart is a password nobody trusts. getConfig()
+    // returns the current object, so turning the login on, changing it or
+    // clearing it takes effect on the very next request.
+    const cfgNow = getConfig();
+    // Both fields are needed; see authState(). A username without a password
+    // is *not* a half-login — an empty password cannot be typed, so enforcing
+    // it would lock everybody out of the only screen that can undo it. That
+    // state is simply “no login”: the UI stays open on the LAN, and the boot
+    // log and the Settings save both say so.
+    if (!authState(cfgNow).login) return next();
+    const { username, password } = cfgNow.app;
     // The stream endpoints and the playlist outputs are token-protected
     // (/s/<token>/…, /pl/<token>/…, /xtream/<token>/…): VLC, the VU+ and IPTV
     // apps cannot send a password, so they carry an unguessable path instead.
@@ -206,7 +223,7 @@ export function createApp() {
         return res.status(409).json({
           ok: false,
           error: 'this source needs request headers (signed cookie / referer) that a 302 redirect cannot replay',
-          hint: `use ${store.urlsFor(stream, baseUrlFrom(req, cfg)).ts} — the relay replays the headers`,
+          hint: `use ${store.urlsFor(stream, baseUrlFrom(req)).ts} — the relay replays the headers`,
         });
       }
       log.info('http', `redirecting to upstream (direct mode)`, { stream: stream.id });
@@ -215,7 +232,7 @@ export function createApp() {
 
     // playlist files
     if (ext === 'm3u' || ext === 'm3u8') {
-      const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+      const urls = store.urlsFor(stream, baseUrlFrom(req));
       if (ext === 'm3u8' && (stream.profile?.container === 'hls')) {
         stream = await prepareStreamForPlayback(stream, res, 'hls-playback-start');
         if (!stream) return;
@@ -266,15 +283,21 @@ export function createApp() {
       return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
     }
 
-    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    // The player is told what ffmpeg REALLY writes, not what the URL asked
+    // for: the template bound to this output slot decides the container (see
+    // relay.outputContainerFor). Matroska bytes announced as `video/mp2t` is
+    // the one that costs the most to diagnose — VLC reads the label, fails to
+    // demux, sweeps the seek bar and then sits at 00:00 without a frame.
+    const served = session.format || session.container || container;
+    res.setHeader('Content-Type', mediaTypeForContainer(served));
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
     if (req.method === 'HEAD') return res.end();
 
     log.info('http', `client is playing "${stream.title}"`, {
       ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
-      mode: session.mode, encoder: session.encoder, container, hw: hw.available ? 'vaapi' : 'software',
-      outputType, isEnigma2,
+      mode: session.mode, encoder: session.encoder, container: served,
+      hw: hw.available ? 'vaapi' : 'software', outputType, isEnigma2,
     });
     // The Enigma2 box is a receiver: when it leaves the movie, the movie is not kept.
     const { finish } = relay.attachClient(session, req, res, { receiver: isEnigma2 });
@@ -302,8 +325,13 @@ export function createApp() {
       profile, hw, mode: 'file', output: { container, target: 'pipe:1' },
     });
     log.info('http', `download started for "${stream.title}"`, { container, command: truncate(argsToCommand(args), 300) });
-    res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${ext}"`);
-    res.setHeader('Content-Type', container === 'matroska' ? 'video/x-matroska' : 'video/mp2t');
+    // Same rule as the stream endpoint: a per-stream template can make ffmpeg
+    // write a container the URL did not ask for, and a downloaded file that is
+    // named .ts but is really Matroska is a puzzle for whoever opens it.
+    const served = outputFormatOf(args) || container;
+    const servedExt = served === 'matroska' ? 'mkv' : served === 'mp4' ? 'mp4' : ext;
+    res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${servedExt}"`);
+    res.setHeader('Content-Type', mediaTypeForContainer(served));
     const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
     child.stdout.pipe(res);
     child.stderr.on('data', (d) => log.debug('http', `download ffmpeg: ${truncate(String(d).trim(), 160)}`));
@@ -326,7 +354,7 @@ export function createApp() {
   app.get('/watch/:token', async (req, res) => {
     const stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
-    const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+    const urls = store.urlsFor(stream, baseUrlFrom(req));
     const tsUrlJson = JSON.stringify(urls.ts).replace(/</g, '\\u003c');
     const webUrlJson = JSON.stringify(urls.web).replace(/</g, '\\u003c');
     res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
@@ -383,8 +411,38 @@ if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.create
   return app;
 }
 
-function baseUrlFrom(req, cfg) {
-  if (cfg.app.baseUrl) return String(cfg.app.baseUrl).replace(/\/$/, '');
+/**
+ * Is the UI behind a login, and what does the boot log call it?
+ *
+ * Kept in one place because the answer is not “is a username set”: a username
+ * with an empty password is no login at all (nobody can type an empty
+ * password), so treating it as one would lock the operator out of the only
+ * screen that can undo it. The middleware asks per request, the boot log once.
+ */
+export function authState(cfg) {
+  if (!cfg.app.username) return { login: false, text: 'open on the LAN (no username set)' };
+  if (!cfg.app.password) return { login: false, text: 'open on the LAN (a username is set but no password, so no login is asked for)' };
+  return { login: true, text: 'basic auth enabled' };
+}
+
+/**
+ * The MIME type a player is told. It describes the bytes ffmpeg really writes
+ * — never the container the URL happened to end in, because a template bound
+ * to an output slot is allowed to write another one.
+ */
+function mediaTypeForContainer(container) {
+  if (container === 'matroska' || container === 'mkv') return 'video/x-matroska';
+  if (container === 'mp4') return 'video/mp4';
+  if (container === 'hls' || container === 'm3u8') return 'application/vnd.apple.mpegurl';
+  return 'video/mp2t';
+}
+
+function baseUrlFrom(req) {
+  // Same rule as the auth middleware: the LAN base URL is editable from
+  // Settings → Application, so links handed out to VLC and the receiver are
+  // built from the configuration as it is *now*, not as it was at boot.
+  const { baseUrl } = getConfig().app;
+  if (baseUrl) return String(baseUrl).replace(/\/$/, '');
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   return `${proto}://${req.get('host')}`;
 }
@@ -413,8 +471,16 @@ export function startServer() {
       log.info('http', `vu-movie listening on http://${cfg.app.host}:${addr.port}`, {
         publicDir: PUBLIC_DIR,
         baseUrl: cfg.app.baseUrl || '(derived from the request Host header)',
-        auth: cfg.app.username ? 'basic auth enabled' : 'open on the LAN (no password set)',
+        auth: authState(cfg).text,
       });
+      // A half-finished login (APP_USERNAME without APP_PASSWORD in .env, or a
+      // hand-edited config file) is usually a typo, and the symptom gives no
+      // hint where to look: the UI simply never asks for a password. Say it at
+      // boot, next to the port.
+      if (cfg.app.username && !cfg.app.password) {
+        log.warn('http', 'the web interface is open — a username is set but no password, and an empty password cannot be typed',
+          { username: cfg.app.username, hint: 'set APP_PASSWORD (or Settings → Application) to switch the login on, or clear the username' });
+      }
       resolve(server);
     });
   });

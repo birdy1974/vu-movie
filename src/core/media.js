@@ -727,6 +727,34 @@ export function streamKind(url) {
 }
 
 /**
+ * What a buffer really is, read from its magic bytes.
+ *
+ * Used for the direct/seekable link, which passes the CDN's file through
+ * untouched: the response used to be typed with whatever the CDN claimed, and
+ * a player believes that label. `application/octet-stream` is the common case
+ * (VLC then falls back to the extension, so it usually survives), but a
+ * Matroska file announced as `video/mp2t` is fatal — the very mis-detection
+ * this file's other helpers exist to prevent.
+ *
+ * Only containers we are confident about are recognised; anything else returns
+ * null so the caller keeps the declared type instead of guessing.
+ *
+ * @param {Buffer} buf first bytes of the file
+ * @returns {string|null} a Content-Type, or null when the bytes are unknown
+ */
+export function sniffMediaType(buf) {
+  if (!buf || buf.length < 8) return null;
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'video/x-matroska';
+  if (buf.subarray(4, 8).toString('latin1') === 'ftyp') return 'video/mp4';
+  // MPEG-TS: 188-byte packets, so the sync byte repeats at 0 and 188. The
+  // second check needs that many bytes; with a shorter buffer the first one
+  // has to be enough.
+  if (buf[0] === 0x47 && (buf.length < 189 || buf[188] === 0x47)) return 'video/mp2t';
+  if (buf.subarray(0, 7).toString('latin1') === '#EXTM3U') return 'application/vnd.apple.mpegurl';
+  return null;
+}
+
+/**
  * Headers must be a name→value map. A bare list of names — the shape
  * /find/resolve used to hand the UI — carries no values and would otherwise
  * become `0: Referer` / `1: User-Agent` ffmpeg arguments, so it is ignored.

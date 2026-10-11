@@ -713,6 +713,15 @@ export function saveConfig(patch) {
       { folded: flattened.join(', '), dropped: dropped.join(', ') });
   }
   current = next;
+  // A username with an empty password is not a lock but it *is* a half-typed
+  // login: the server treats it as “no login” (see authState() in
+  // http/server.js), so the UI stays open while the operator believes he
+  // switched it on. Worth one line next to the save — and it is the only
+  // signal, because the browser never asks for a password.
+  if (next.app?.username && !next.app?.password) {
+    log.warn('config', 'the web interface stays open — a username is set but no password, and an empty password cannot be typed',
+      { username: next.app.username, hint: 'add a password in Settings → Application to switch the login on, or clear the username' });
+  }
   try {
     fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
     const tmp = `${CONFIG_FILE}.tmp`;
