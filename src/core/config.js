@@ -686,7 +686,32 @@ export function validateConfigPatch(patch) {
       problems.push(`${label}: “${forbidden[0]}” cannot be used — IPTV apps put the account in a URL. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe.`);
     }
   }
+  problems.push(...validateAppLogin(config));
   return problems;
+}
+
+/**
+ * Settings → Application guards the whole UI with HTTP basic auth, and the
+ * running server picks the credentials up on the *next* request (see the auth
+ * middleware in http/server.js). That immediacy has one sharp edge: a username
+ * saved without a password is not “half a login”, it is a lock — every /api
+ * call answers 401, the password field is masked, and the only way back is to
+ * edit /config/vumovie.json by hand. So the pair is checked before it is
+ * written.
+ *
+ * Only the effective result is judged: a password left out of the patch (or
+ * sent back as a mask) keeps the stored one, and clearing the username simply
+ * switches the login off, password or not.
+ */
+function validateAppLogin(config) {
+  const app = (config.app && typeof config.app === 'object') ? config.app : {};
+  if (app.username === undefined && app.password === undefined) return [];
+  const stored = current.app || {};
+  const keepPassword = app.password === undefined || app.password === null || isMaskedSecret(app.password);
+  const username = app.username === undefined ? stored.username : app.username;
+  const password = keepPassword ? stored.password : app.password;
+  if (!String(username ?? '').trim() || String(password ?? '') !== '') return [];
+  return ['Application password: a username without a password locks the web interface for everybody, including you — enter a password as well, or clear the username to leave the UI open on the LAN.'];
 }
 
 /** Write the config file atomically (used by PUT /api/config). */

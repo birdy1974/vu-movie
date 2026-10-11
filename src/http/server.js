@@ -61,7 +61,13 @@ function extensionOf(reqPath) {
 
 export function createApp() {
   const app = express();
-  const cfg = getConfig();
+  // NB: no `const cfg = getConfig()` here on purpose. createApp() runs once at
+  // boot, while Settings → Application can change the login, the LAN base URL
+  // and the log level while the container is up. Holding on to the boot object
+  // meant a username/password entered in Settings only applied after a restart
+  // (and clearing it never switched the login off again). Every per-request
+  // decision below asks getConfig() — the one exception is the listening
+  // socket in startServer(), which cannot change without a restart anyway.
   app.disable('x-powered-by');
   app.set('trust proxy', true);
   app.use(express.json({ limit: '2mb' }));
@@ -81,7 +87,12 @@ export function createApp() {
 
   // ---- optional password on the UI/API (stream endpoints stay token-only) ----
   app.use((req, res, next) => {
-    const { username, password } = cfg.app;
+    // Read the credentials *per request*, not once at boot: the login is
+    // edited from Settings → Application, and a password that only becomes
+    // real after a container restart is a password nobody trusts. getConfig()
+    // returns the current object, so turning the login on, changing it or
+    // clearing it takes effect on the very next request.
+    const { username, password } = getConfig().app;
     if (!username) return next();
     // The stream endpoints and the playlist outputs are token-protected
     // (/s/<token>/…, /pl/<token>/…, /xtream/<token>/…): VLC, the VU+ and IPTV
@@ -206,7 +217,7 @@ export function createApp() {
         return res.status(409).json({
           ok: false,
           error: 'this source needs request headers (signed cookie / referer) that a 302 redirect cannot replay',
-          hint: `use ${store.urlsFor(stream, baseUrlFrom(req, cfg)).ts} — the relay replays the headers`,
+          hint: `use ${store.urlsFor(stream, baseUrlFrom(req)).ts} — the relay replays the headers`,
         });
       }
       log.info('http', `redirecting to upstream (direct mode)`, { stream: stream.id });
@@ -215,7 +226,7 @@ export function createApp() {
 
     // playlist files
     if (ext === 'm3u' || ext === 'm3u8') {
-      const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+      const urls = store.urlsFor(stream, baseUrlFrom(req));
       if (ext === 'm3u8' && (stream.profile?.container === 'hls')) {
         stream = await prepareStreamForPlayback(stream, res, 'hls-playback-start');
         if (!stream) return;
@@ -326,7 +337,7 @@ export function createApp() {
   app.get('/watch/:token', async (req, res) => {
     const stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
-    const urls = store.urlsFor(stream, baseUrlFrom(req, cfg));
+    const urls = store.urlsFor(stream, baseUrlFrom(req));
     const tsUrlJson = JSON.stringify(urls.ts).replace(/</g, '\\u003c');
     const webUrlJson = JSON.stringify(urls.web).replace(/</g, '\\u003c');
     res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
@@ -383,8 +394,12 @@ if(window.mpegts&&window.mpegts.isSupported()){const player=window.mpegts.create
   return app;
 }
 
-function baseUrlFrom(req, cfg) {
-  if (cfg.app.baseUrl) return String(cfg.app.baseUrl).replace(/\/$/, '');
+function baseUrlFrom(req) {
+  // Same rule as the auth middleware: the LAN base URL is editable from
+  // Settings → Application, so links handed out to VLC and the receiver are
+  // built from the configuration as it is *now*, not as it was at boot.
+  const { baseUrl } = getConfig().app;
+  if (baseUrl) return String(baseUrl).replace(/\/$/, '');
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   return `${proto}://${req.get('host')}`;
 }
@@ -413,8 +428,18 @@ export function startServer() {
       log.info('http', `vu-movie listening on http://${cfg.app.host}:${addr.port}`, {
         publicDir: PUBLIC_DIR,
         baseUrl: cfg.app.baseUrl || '(derived from the request Host header)',
-        auth: cfg.app.username ? 'basic auth enabled' : 'open on the LAN (no password set)',
+        auth: !cfg.app.username ? 'open on the LAN (no username set)'
+          : cfg.app.password ? 'basic auth enabled'
+            : 'INCOMPLETE — a username is set but no password, so nobody can log in',
       });
+      // A login nobody can complete is only ever a typo (APP_USERNAME without
+      // APP_PASSWORD in .env, or a hand-edited config file), and the symptom —
+      // every page asking for a password that is never accepted — gives no
+      // hint where to look. Say it at boot, next to the port.
+      if (cfg.app.username && !cfg.app.password) {
+        log.warn('http', 'the web interface asks for a login, but no password is configured — set APP_PASSWORD (or Settings → Application) or clear the username',
+          { hint: 'an empty password cannot be typed in the browser, so the UI stays locked' });
+      }
       resolve(server);
     });
   });

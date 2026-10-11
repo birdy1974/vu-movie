@@ -535,6 +535,27 @@ docs for each knob are in [.env.example](.env.example) and
   as strings.
 * A broken file never stops the container: it is logged and defaults + env win.
 
+### Password-protecting the UI (Settings → Application)
+
+`APP_USERNAME` + `APP_PASSWORD` — or the *Application* card in Settings — put the
+web interface and every `/api/…` call behind HTTP basic auth. The playable
+endpoints stay open on purpose: VLC, the Duo2 and IPTV apps cannot send a
+password, so they carry an unguessable token in the path instead
+(`/s/<token>/…`, `/hls/…`, `/dl/…`, `/pl/<token>/…`, `/xtream/<token>/…`, and
+`/api/health` for the container healthcheck).
+
+* **The login applies the moment it is saved.** The server reads the credentials
+  from the live configuration on every request, so there is no
+  `docker compose restart` between entering a password and being asked for it —
+  the browser's own login dialog appears on the next request. (The *port* on the
+  same card does need a restart; nothing can re-bind the listening socket.)
+* **A username needs a password.** Saving a username with an empty password is
+  refused by Settings, and a login that arrives incomplete from the environment
+  is called out in the boot log: an empty password cannot be typed, so the UI
+  would be locked behind a password nobody knows.
+* Clearing the username switches the login off again and leaves the stored
+  password alone, so the two fields can be changed independently.
+
 The ones that matter most on a DS918+:
 
 | Variable | Default | Why |
