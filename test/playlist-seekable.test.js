@@ -1,8 +1,9 @@
 /**
  * The VLC playlist (playlist.m3u / vlc.m3u) gets a seekable entry for each file
- * movie. The .ts relay entry stays as it was: the .ts output is a live stream, so
- * VLC cannot seek in it. The second entry is the direct link, which VLC can seek.
- * Other kinds (HLS, DASH) get only their own entry.
+ * movie. The relay entry is a zap URL (still ending in .ts): zapping away stops
+ * the session, a pause continues. VLC cannot seek in that live output, so the
+ * second entry is the direct link, which VLC can seek. Other kinds (HLS, DASH)
+ * get only their own entry.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,7 +42,7 @@ function entryUrls(text) {
   return urls;
 }
 
-test('a file movie gets a second, seekable entry on its direct link; the .ts entry is unchanged', async () => {
+test('a file movie gets a second, seekable entry on its direct link; the relay entry zaps', async () => {
   const file = await store.createStream({
     title: 'Open file', year: 2020,
     candidate: { url: 'https://cdn.example/open.mp4', kind: 'file', headers: {}, probe },
@@ -62,14 +63,15 @@ test('a file movie gets a second, seekable entry on its direct link; the .ts ent
   const signedUrls = store.urlsFor(signed, BASE);
   const liveUrls = store.urlsFor(live, BASE);
 
-  assert.ok(urls.includes(fileUrls.ts), 'the .ts entry is there, as before');
+  assert.ok(urls.includes(store.zapPlaybackUrl(fileUrls.ts, 'playlist')), 'the playlist entry zaps like the box, and still ends in .ts');
+  assert.equal(urls.includes(fileUrls.ts), false, 'the plain VLC link is not what the playlist hands an IPTV app');
   assert.ok(urls.includes(fileUrls.direct), 'the seekable direct entry is there');
   assert.match(fileUrls.direct, /\/direct\.mp4$/, 'the seekable entry advertises a media extension, so IPTV players that classify by extension (SFVIP, OwnTV) accept it');
   assert.match(signedUrls.direct, /\/direct\.mp4$/, 'the relay-served seekable entry carries it too');
   assert.ok(urls.includes(signedUrls.direct), 'a signed file is seekable too (the relay serves it)');
   assert.match(text, /#EXTINF:-1 [^\n]*,Open file \(2020\) \(seekable\)/, 'the seekable entry is labelled');
   assert.equal(urls.includes(liveUrls.direct), false, 'a live (HLS) stream gets no seekable entry');
-  assert.ok(urls.includes(liveUrls.ts), 'but keeps its own entry');
+  assert.ok(urls.includes(store.zapPlaybackUrl(liveUrls.ts, 'playlist')), 'but keeps its own entry');
   assert.equal(count, urls.length, 'the count is the number of entries');
   assert.equal(urls.length, 5, 'two file movies with two entries each, plus the HLS entry');
 });

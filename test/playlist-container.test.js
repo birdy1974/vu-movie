@@ -161,7 +161,7 @@ test('without a template the .ts link is MPEG-TS and the playlist publishes .ts'
   assert.equal(got.status, 200);
   assert.equal(got.contentType, 'video/mp2t');
   assert.ok(isMpegTs(got.head), `expected an MPEG-TS sync byte, got ${got.head.toString('hex')}`);
-  assert.equal(await playlistEntryFor('Plain Movie (2026)'), `http://nas:8080/s/${stream.token}/Plain-Movie-2026.ts`);
+  assert.equal(await playlistEntryFor('Plain Movie (2026)'), `http://nas:8080/s/${stream.token}/Plain-Movie-2026.playlist.ts`);
 });
 
 test('a Matroska template on the VLC output is served as Matroska — never as MPEG-TS', async (t) => {
@@ -194,8 +194,8 @@ test('the playlist publishes the .mkv link when the VLC output writes Matroska',
   const stream = await newStream('Matroska Movie');
   assert.equal(
     await playlistEntryFor('Matroska Movie (2026)'),
-    `http://nas:8080/s/${stream.token}/Matroska-Movie-2026.mkv`,
-    'the extension matches the bytes',
+    `http://nas:8080/s/${stream.token}/Matroska-Movie-2026.playlist.mkv`,
+    'the extension matches the bytes, and the playlist marker sits in front of it',
   );
   // The seekable entry is the file itself, untouched by the template.
   assert.equal(await playlistEntryFor('Matroska Movie (2026) (seekable)'), `http://nas:8080/s/${stream.token}/direct.mp4`);

@@ -162,16 +162,22 @@ permissions, Container Manager project import, firewall, where the data lives).
   left, the movie restarts 10 s earlier: the data the relay had sent but the
   player had not shown yet is lost with the connection, so it is sent again
   rather than skipped.
-* **Enigma2 box (receiver)**: the box's bouquet URL (`…/<title>.ts.enigma2`) is
-  handled differently. Pausing the box keeps its connection open, so the movie
-  continues from the same point. Leaving the movie (zapping away, or stopping the
-  stream on the box) closes that connection: the movie stops at once, nothing is
-  kept, and the next play starts at the beginning. A box that the relay drops for
-  stalling after a long pause keeps its place, like any pause. If another player
-  is still watching the same movie, the movie keeps running for it, a box that
-  comes back joins it where it is, and the movie is not kept for the box once
-  that player leaves too. VLC, browser and Xtream players keep the pause window
-  and resume memory described above.
+* **Enigma2 box, playlist and Xtream** zap between titles, and are handled the
+  same way. Pausing keeps the connection open, so the movie continues from the
+  same point. Zapping to another stream (or stopping) closes that connection:
+  the session stops at once, nothing is kept, and zapping back starts at the
+  beginning. If the next title starts before the previous connection has closed,
+  the previous session is stopped as soon as the new one starts, so a fast zap
+  back still starts at 0:00. A client the relay drops for stalling after a long
+  pause keeps its place, like any pause. If another player is still watching the
+  same movie, the movie keeps running for it, and nothing is kept once that
+  player leaves too. A direct VLC or browser link (`/s/<token>/<title>.ts`, the
+  web preview) keeps the pause window and resume memory described above.
+  Playlist and Xtream links are that same stream with `.playlist.` or `.xtream.`
+  before the media extension (`…/Title.playlist.ts`), so IPTV apps still see a
+  `.ts` or `.mkv` URL. Refresh the playlist or Xtream catalogue so the app picks
+  up the new links; an Xtream app that plays `/xtream/…/<id>.ts` follows the
+  redirect and gets the behaviour without a catalogue refresh.
 * **Stop all sessions** (Mobile tab, *Live sessions* card at the top): stops
   every running relay session, web previews included, after a confirmation that
   lists the titles. It is a deliberate stop, so nothing is kept and the next play

@@ -306,6 +306,38 @@ export function outputTypeForPath(reqPath) {
   return '';
 }
 
+const ZAP_KINDS = new Set(['playlist', 'xtream']);
+
+/**
+ * Playback URL for a client that zaps between titles (the playlist M3U, an
+ * Xtream app). The marker sits *before* the media extension so the link still
+ * ends in `.ts` or `.mkv`: IPTV apps choose a demuxer from that extension
+ * before they read a byte, and a `.ts.playlist` suffix is what they refuse.
+ *
+ * The relay treats this URL like the Enigma2 box (`zapKindForPath`): zapping
+ * away stops the session and the next play starts at the beginning; a pause
+ * that keeps the connection continues from the same point. The plain `.ts`
+ * link stays a VLC link, with the pause window and the resume memory.
+ *
+ * @param {string} mediaUrl  a `/s/<token>/<slug>.ts` or `.mkv` URL
+ * @param {'playlist'|'xtream'} [kind]
+ */
+export function zapPlaybackUrl(mediaUrl, kind = 'playlist') {
+  const marker = ZAP_KINDS.has(kind) ? kind : 'playlist';
+  return String(mediaUrl || '').replace(/\.([a-z0-9]+)([?#].*)?$/i, `.${marker}.$1$2`);
+}
+
+/**
+ * `'playlist'` | `'xtream'` | `''`. Set on the playback path a zapping client
+ * uses. The media extension stays last, so this is not an output-type slot —
+ * the template is still the VLC one (`outputTypeForPath`).
+ */
+export function zapKindForPath(reqPath) {
+  const name = String(reqPath || '').split('?')[0].toLowerCase();
+  const match = name.match(/\.(playlist|xtream)\.(ts|mkv|mp4|mpegts|matroska)$/);
+  return match ? match[1] : '';
+}
+
 /**
  * True when the request URL is one an Enigma2 receiver would fetch (the
  * user-bouquet `forBox` slot). The path uses the .ts extension today, so the

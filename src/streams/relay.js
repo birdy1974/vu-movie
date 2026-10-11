@@ -24,9 +24,11 @@
  * session is stopped after `transcode.pauseKeepSeconds` without a player
  * (`idleStopSeconds` when nobody ever attached), because the DS918+ GPU can only
  * handle one 1080p encode at a time. An unchosen stop leaves its play head for
- * `transcode.resumeHours`, so the next play of the movie resumes there. The Enigma2
- * box is a receiver: when it leaves the movie (a channel change, a stop) nothing is
- * kept and the next play starts at the beginning (see attachClient). Sessions
+ * `transcode.resumeHours`, so the next play of the movie resumes there. A receiver — the Enigma2
+ * box, a playlist client, an Xtream app — is different: when it leaves the movie
+ * (a channel change, a stop) nothing is kept and the next play starts at the
+ * beginning. A pause keeps the connection open, so the movie continues from the
+ * same point (see attachClient). Sessions
  * started by a preflight/HEAD request or the session API get an idle lease
  * immediately; HLS HTTP requests renew it while being polled.
  */
@@ -593,7 +595,8 @@ function resumeHoursLimit() {
  */
 export function rememberResumePoint(session, { now = Date.now() } = {}) {
   if (!session || session.kind !== 'pipe' || !session.streamId) return 0;
-  // A receiver (the Enigma2 box) left this movie on purpose: nothing is kept.
+  // A receiver (the Enigma2 box, a playlist or Xtream client) left this movie
+  // on purpose: nothing is kept, so zapping back starts at the beginning.
   if (session.receiverLeft) { resumePoints.delete(session.streamId); return 0; }
   if (resumeHoursLimit() <= 0) return 0;
   const playhead = playheadSeconds(session);
@@ -939,7 +942,8 @@ export async function ensureSession(stream, opts = {}) {
     resumeSeconds: wantsHls ? 0 : takeResumePoint(stream.id),
     held: false,
     pendingRewind: 0,
-    // Set when a receiver (the Enigma2 box) has left: this movie is not kept.
+    // Set when a receiver (the Enigma2 box, playlist, Xtream) has left: this
+    // movie is not kept. A pause does not set it — the connection stays open.
     receiverLeft: false,
     child: null,
     hw,
@@ -1207,14 +1211,43 @@ function scheduleHlsCleanup(session) {
  */
 const RELAY_DROP_REASONS = new Set(['stalled', 'cannot keep up']);
 
+/** `::ffff:127.0.0.1` and `127.0.0.1` are the same viewer. Empty means unknown. */
+function viewerIp(ip) {
+  const text = String(ip || '').trim();
+  if (!text || text === 'unknown') return '';
+  return text.startsWith('::ffff:') ? text.slice('::ffff:'.length) : text;
+}
+
 /**
- * Attach an HTTP response (VLC, the Duo2, a browser) to a session.
+ * A receiver that opens another movie has zapped. Stop the movies that viewer
+ * left, even if the old connection has not closed yet — otherwise zapping back
+ * would rejoin the still-running session instead of starting at the beginning.
+ * A different address, or a non-receiver player still watching, is left alone;
+ * once that player leaves too, nothing is kept (the dropped client sets
+ * `receiverLeft`). A pause does not come through here: it keeps its connection
+ * and does not open another stream.
+ */
+function releaseZappedSessions(current, client) {
+  const ip = viewerIp(client?.ip);
+  if (!client?.receiver || !ip) return;
+  for (const streamId of [...sessions.keys()]) {
+    const other = sessions.get(streamId);
+    if (!other || other === current) continue;
+    const mine = [...other.clients].filter((otherClient) => otherClient.receiver && viewerIp(otherClient.ip) === ip);
+    for (const left of mine) dropClient(other, left, 'zapped to another stream');
+  }
+}
+
+/**
+ * Attach an HTTP response (VLC, the Duo2, a browser, an IPTV app) to a session.
  *
- * `receiver: true` marks the Enigma2 box (its `.ts.enigma2` URL). A pause keeps
- * the connection open, so the film simply waits and continues from the same point.
- * A receiver that closes its connection has changed channel, stopped, or gone off:
- * nothing is kept for it, and the next play starts at the beginning. A receiver
- * the relay dropped for stalling was paused, so its place is kept like any pause.
+ * `receiver: true` marks a client that zaps between titles: the Enigma2 box
+ * (its `.ts.enigma2` URL), a playlist entry (`.playlist.ts`) and an Xtream app
+ * (`.xtream.ts`). A pause keeps the connection open, so the film simply waits
+ * and continues from the same point. A receiver that closes its connection —
+ * or opens another movie — has changed channel, stopped, or gone off: nothing
+ * is kept for it, and the next play starts at the beginning. A receiver the
+ * relay dropped for stalling was paused, so its place is kept like any pause.
  */
 export function attachClient(session, req, res, { onFinish, receiver = false } = {}) {
   // The first player back to a session that a player left starts a little earlier.
@@ -1244,6 +1277,7 @@ export function attachClient(session, req, res, { onFinish, receiver = false } =
 
   log.info('relay', `client attached to ${session.id}`, {
     clients: session.clients.size, ip: client.ip, ua: truncate(client.userAgent, 70), mode: session.mode,
+    ...(client.receiver ? { receiver: true } : {}),
   });
 
   const finish = (reason) => {
@@ -1257,10 +1291,11 @@ export function attachClient(session, req, res, { onFinish, receiver = false } =
       reason, bytes: client.bytes, sec: Math.round((Date.now() - client.startedAt) / 1000), clients: session.clients.size,
       notReading: Boolean(client.blocked), held: Boolean(session.held), pendingRewind: session.pendingRewind || 0,
     });
-    // A receiver (the Enigma2 box) that closes its connection has changed channel
-    // or stopped. A pause keeps the connection open, so this is not a pause: the
-    // film is not kept, and the next play starts at the beginning. The relay
-    // dropping a stalled receiver is different (see RELAY_DROP_REASONS).
+    // A receiver (the Enigma2 box, a playlist or Xtream client) that closes its
+    // connection has changed channel or stopped. A pause keeps the connection
+    // open, so this is not a pause: the film is not kept, and the next play
+    // starts at the beginning. The relay dropping a stalled receiver is
+    // different (see RELAY_DROP_REASONS).
     const receiverLeft = Boolean(client.receiver) && !RELAY_DROP_REASONS.has(reason);
     if (receiverLeft) session.receiverLeft = true;
     if (session.clients.size === 0 && receiverLeft) {
@@ -1284,6 +1319,9 @@ export function attachClient(session, req, res, { onFinish, receiver = false } =
   req.on('close', () => finish('client closed'));
   req.on('aborted', () => finish('client aborted'));
   res.on('error', () => finish('response error'));
+  // After this client is wired, so a zap cannot stop the movie it just opened.
+  // The previous movie stops now, even if its socket has not closed yet.
+  if (client.receiver) releaseZappedSessions(session, client);
   return { client, finish };
 }
 

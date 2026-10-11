@@ -64,7 +64,7 @@ test('the playback URL an app builds from that server address plays', async () =
   // server address ending in player_api.php, the endpoint segment sits in front.
   const playback = await fetch(`${base}/xtream/${token}/player_api.php/movie/vumovie/${token}/${id}.ts`, { redirect: 'manual' });
   assert.equal(playback.status, 302);
-  assert.equal(playback.headers.get('location'), `${base}/s/${stream.token}/Arrival-2026.ts`);
+  assert.equal(playback.headers.get('location'), `${base}/s/${stream.token}/Arrival-2026.xtream.ts`);
 });
 
 test('the M3U+ link an app builds from that server address downloads the playlist', async () => {
@@ -73,7 +73,7 @@ test('the M3U+ link an app builds from that server address downloads the playlis
   const text = await res.text();
   assert.match(text, /#EXTM3U/);
   assert.ok(text.includes('Arrival (2026)'), 'the catalogue entry is in the playlist');
-  assert.ok(text.includes(`/s/${stream.token}/Arrival-2026.ts`), 'its relay URL is in the playlist');
+  assert.ok(text.includes(`/s/${stream.token}/Arrival-2026.xtream.ts`), 'its relay URL is in the playlist');
 });
 
 test('a wrong token is still rejected, doubled path or not', async () => {
