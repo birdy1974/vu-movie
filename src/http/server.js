@@ -180,6 +180,12 @@ export function createApp() {
     const baseOutputType = pathOutputType === 'enigma2' ? 'vlcTs' : pathOutputType;
     const isEnigma2 = pathOutputType === 'enigma2' || queryIsEnigma2;
     const outputType = isEnigma2 ? 'enigma2' : baseOutputType;
+    // Playlist and Xtream links keep a media extension last (`.playlist.ts`,
+    // `.xtream.mkv`) so IPTV apps accept them, and the marker tells the relay
+    // this client zaps like the Enigma2 box. The template slot stays the VLC
+    // one — the marker is not an output type.
+    const zapKind = store.zapKindForPath(req.path);
+    const receiver = isEnigma2 || Boolean(zapKind);
 
     // The browser preview (`{slug}.ts.web`, plus `?web=1` for the mini player's
     // fallback) is its own output slot: no subtitles, no per-item template, and
@@ -298,9 +304,11 @@ export function createApp() {
       ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
       mode: session.mode, encoder: session.encoder, container: served,
       hw: hw.available ? 'vaapi' : 'software', outputType, isEnigma2,
+      ...(zapKind ? { zap: zapKind } : {}),
     });
-    // The Enigma2 box is a receiver: when it leaves the movie, the movie is not kept.
-    const { finish } = relay.attachClient(session, req, res, { receiver: isEnigma2 });
+    // A receiver (the Enigma2 box, a playlist or Xtream client) is not kept when
+    // it leaves the movie. A pause keeps the connection, so playback continues.
+    const { finish } = relay.attachClient(session, req, res, { receiver });
     res.on('close', () => finish('socket closed'));
     return undefined;
   });

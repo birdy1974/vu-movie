@@ -94,7 +94,7 @@ test('Xtream exposes the full enabled playlist, series, and usable playback path
   const playback = await fetch(vod[0].direct_source, { redirect: 'manual' });
   assert.equal(playback.status, 302);
   assert.match(playback.headers.get('location'), new RegExp(`/s/${second.token}/`));
-  assert.equal(playback.headers.get('location').endsWith('.ts'), true);
+  assert.equal(playback.headers.get('location').endsWith('.xtream.ts'), true, 'zapping away stops the session, same as the Enigma2 box');
 
   const wrongPassword = await fetch(vod[0].direct_source.replace(`/vumovie/${token}/`, '/vumovie/wrong-password/'), { redirect: 'manual' });
   assert.equal(wrongPassword.status, 401, 'playback links enforce the configured Xtream account password');

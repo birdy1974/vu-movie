@@ -146,7 +146,6 @@ function xtreamStreamUrl(baseUrl, token, stream, type = 'live') {
 
 function xtreamItem(entry, index, baseUrl, token, type = 'live') {
   const stream = entry.stream;
-  const urls = store.urlsFor(stream, baseUrl);
   const ext = xtreamExtension(stream);
   const streamUrl = xtreamStreamUrl(baseUrl, token, stream, type);
   return {
@@ -164,7 +163,7 @@ function xtreamItem(entry, index, baseUrl, token, type = 'live') {
     tv_archive_duration: 0,
     // Extra fields (ignored by strict clients, useful in the info page):
     vu_movie_id: stream.id,
-    vu_movie_url: ext === 'mkv' ? urls.mkv : urls.ts,
+    vu_movie_url: playlist.zapRelayUrl(stream, baseUrl, 'xtream'),
     container_extension: ext,
   };
 }
@@ -266,7 +265,6 @@ router.get('/pl/:token/:file', async (req, res) => {
       generatedAt: new Date().toISOString(),
       items: items.filter((item) => item.enabled).map((entry) => {
         const urls = store.urlsFor(entry.stream, baseUrl);
-        const ext = playlist.vlcExtensionFor(entry.stream);
         return {
           streamId: entry.stream.id,
           title: entry.stream.title,
@@ -275,7 +273,7 @@ router.get('/pl/:token/:file', async (req, res) => {
           template: entry.templateId || entry.stream.profile?.ffmpegTemplateName || null,
           subtitle: entry.stream.profile?.subtitlePath || null,
           poster: entry.stream.poster || null,
-          url: ext === 'mkv' ? urls.mkv : urls.ts,
+          url: playlist.zapRelayUrl(entry.stream, baseUrl, 'playlist'),
           urls: { ts: urls.ts, web: urls.web, mkv: urls.mkv, hls: urls.hls, playlist: urls.playlist, watch: urls.watch },
         };
       }),
@@ -434,7 +432,10 @@ router.get('/xtream/:token/:type/:username/:password/:streamId.:ext', async (req
     return res.status(404).type('text/plain').send('Unknown Xtream stream');
   }
   const urls = store.urlsFor(entry.stream, baseUrl);
-  const target = ext === 'mkv' ? urls.mkv : ext === 'm3u8' ? urls.hls : urls.ts;
+  const plain = ext === 'mkv' ? urls.mkv : ext === 'm3u8' ? urls.hls : urls.ts;
+  // HLS has no resume memory. A pipe stream is marked so zapping away stops
+  // the session (same as the Enigma2 box) while a pause keeps its connection.
+  const target = ext === 'm3u8' ? plain : store.zapPlaybackUrl(plain, 'xtream');
   return res.redirect(302, target);
 });
 
@@ -442,7 +443,10 @@ router.all('/xtream/:token/get.php', async (req, res) => {
   if (!requireToken(req, res)) return;
   if (!xtreamAuthorised(req)) return res.status(401).type('text/plain').send('Invalid credentials');
   const baseUrl = baseUrlFrom(req);
-  const built = await playlist.playlistText(baseUrl, { hls: String(req.query.type || '').includes('m3u8') });
+  const built = await playlist.playlistText(baseUrl, {
+    hls: String(req.query.type || '').includes('m3u8'),
+    zapKind: 'xtream',
+  });
   log.info('playlist', `xtream m3u download by ${req.ip}`, { items: built.count, type: req.query.type || 'm3u_plus' });
   res.setHeader('Content-Type', 'audio/x-mpegurl');
   res.setHeader('Content-Disposition', `attachment; filename="${playlist.name()}.m3u"`);

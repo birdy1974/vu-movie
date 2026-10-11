@@ -625,6 +625,17 @@ export function vlcExtensionFor(stream) {
 }
 
 /**
+ * The relay URL a zapping client should play. Same bytes as the VLC `.ts`/`.mkv`
+ * link, with `.playlist.` or `.xtream.` before the extension so the relay stops
+ * the session when this client changes title (see store.zapPlaybackUrl).
+ */
+export function zapRelayUrl(stream, baseUrl, kind = 'playlist') {
+  const urls = store.urlsFor(stream, baseUrl);
+  const plain = vlcExtensionFor(stream) === 'mkv' ? urls.mkv : urls.ts;
+  return store.zapPlaybackUrl(plain, kind);
+}
+
+/**
  * The .m3u / .m3u8 output of the playlist. `hls` picks the `.m3u8` (HLS) relay
  * URL for streams whose profile actually produces HLS segments; every other
  * stream gets its .ts URL, which is what VLC, Kodi and IPTV apps play.
@@ -641,8 +652,14 @@ export function vlcExtensionFor(stream) {
  * response correctly, so an old `.ts` link keeps working — a new playlist
  * simply publishes the `.mkv` one. `vlcExtensionFor()` is where that decision
  * is made; the Xtream catalogue asks the same question.
+ *
+ * The published relay link is a zap URL (`.playlist.ts`, or `.xtream.ts` when
+ * `zapKind` is `'xtream'`). Zapping to another title stops the session, so
+ * coming back starts at the beginning; a pause that keeps the connection
+ * continues. The seekable direct entry is not a relay session and is unchanged.
+ * HLS entries stay on the plain `.m3u8` link: that session has no resume memory.
  */
-export async function playlistText(baseUrl, { name: playlistName = null, hls = false } = {}) {
+export async function playlistText(baseUrl, { name: playlistName = null, hls = false, zapKind = 'playlist' } = {}) {
   const streams = await enabledStreams();
   const items = [];
   for (const stream of streams) {
@@ -659,7 +676,7 @@ export async function playlistText(baseUrl, { name: playlistName = null, hls = f
       group: playlistName || name(),
       subtitle: subtitle || undefined,
     };
-    items.push({ ...common, title, url: useHls ? urls.hls : (vlcExtensionFor(stream) === 'mkv' ? urls.mkv : urls.ts) });
+    items.push({ ...common, title, url: useHls ? urls.hls : zapRelayUrl(stream, baseUrl, zapKind) });
     if (urls.direct && streamKind(stream.upstream?.url) === 'file') {
       items.push({ ...common, title: `${title} (seekable)`, url: urls.direct });
     }
@@ -700,6 +717,6 @@ export async function summary() {
 
 export default {
   name, token, tokenMatches, saveItems, sync, entries, enabledStreams, addItems, removeItem, additionHistory,
-  updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, pushSubtitle, playlistText, bouquet, summary,
+  updateItem, reorder, assignTemplate, attachSubtitle, detachSubtitle, pushSubtitle, playlistText, zapRelayUrl, bouquet, summary,
   configWritableNow,
 };
