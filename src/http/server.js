@@ -59,6 +59,14 @@ function extensionOf(reqPath) {
   return m ? m[1].toLowerCase() : '';
 }
 
+function requestClosed(req, res) {
+  return Boolean(
+    req?.destroyed || req?.closed || req?.aborted
+    || res?.destroyed || res?.writableEnded || res?.closed
+    || req?.socket?.destroyed || res?.socket?.destroyed
+  );
+}
+
 export function createApp() {
   const app = express();
   // NB: no `const cfg = getConfig()` here on purpose. createApp() runs once at
@@ -75,11 +83,15 @@ export function createApp() {
   // ---- request logging (debug level: keeps the log page usable at info) ----
   app.use((req, res, next) => {
     const started = Date.now();
+    // Capture the viewer's address before any async preflight runs: if the
+    // socket closes during an await, Node clears req.socket.remoteAddress and
+    // Express's lazy req.ip getter returns undefined.
+    req.clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
     res.on('finish', () => {
       const ms = Date.now() - started;
       const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'debug';
       log[level]('http', `${req.method} ${req.originalUrl} → ${res.statusCode}`, {
-        ms, ip: req.ip, bytes: res.getHeader('content-length') || undefined,
+        ms, ip: req.ip || req.clientIp, bytes: res.getHeader('content-length') || undefined,
       });
     });
     next();
@@ -163,8 +175,15 @@ export function createApp() {
   /* ---------------- playable endpoints ---------------- */
 
   app.get('/s/:token/:name', async (req, res) => {
+    let closed = requestClosed(req, res);
+    const markClosed = () => { closed = true; };
+    req.once('close', markClosed);
+    req.once('aborted', markClosed);
+    res.once('close', markClosed);
+
     let stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
+    if (closed || requestClosed(req, res)) return undefined;
     const ext = extensionOf(req.params.name);
 
     // The Enigma2 / Duo2 receiver hits a `.ts` URL by way of its service-ref,
@@ -278,15 +297,25 @@ export function createApp() {
     // web-preview profile pins mpegts anyway.
     const container = isWeb ? 'mpegts' : (effectiveExt === 'mkv' || effectiveExt === 'matroska' ? 'matroska' : 'mpegts');
     stream = await prepareStreamForPlayback(stream, res, 'media-playback-start');
-    if (!stream) return;
+    if (!stream || closed || requestClosed(req, res)) return undefined;
     // Bounded wait so a slow GPU self-test cannot hold a playback request open.
     const hw = await hardware({ waitMs: 15000 });
+    if (closed || requestClosed(req, res)) return undefined;
     let session;
     try {
       session = await relay.ensureSession(stream, { container, outputType: isWeb ? 'web' : outputType, web: webOpts });
     } catch (err) {
       logError('http', 'could not start the stream session', err, { stream: stream.id });
-      return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
+      if (!res.headersSent && !requestClosed(req, res)) {
+        return res.status(500).send(`vu-movie: could not start ffmpeg (${err.message})`);
+      }
+      return undefined;
+    }
+    if (closed || requestClosed(req, res)) {
+      if (session.clients.size === 0 && receiver) {
+        relay.stopSession(stream.id, 'receiver left before playback started');
+      }
+      return undefined;
     }
 
     // The player is told what ffmpeg REALLY writes, not what the URL asked
@@ -301,7 +330,7 @@ export function createApp() {
     if (req.method === 'HEAD') return res.end();
 
     log.info('http', `client is playing "${stream.title}"`, {
-      ip: req.ip, ua: truncate(req.headers['user-agent'], 60),
+      ip: req.clientIp || req.ip, ua: truncate(req.headers['user-agent'], 60),
       mode: session.mode, encoder: session.encoder, container: served,
       hw: hw.available ? 'vaapi' : 'software', outputType, isEnigma2,
       ...(zapKind ? { zap: zapKind } : {}),

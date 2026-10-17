@@ -182,6 +182,13 @@ test('a Matroska template on the VLC output is served as Matroska — never as M
   assert.equal(asMkv.contentType, 'video/x-matroska');
   assert.ok(isMatroska(asMkv.head));
 
+  // Re-opening a live Matroska session without stopping it first must also
+  // restart ffmpeg so the new connection receives the EBML/Tracks header at
+  // byte 0 instead of mid-stream cluster bytes.
+  const reused = await open(`${base}/s/${stream.token}/The-Odyssey-2026.playlist.mkv`);
+  assert.equal(reused.contentType, 'video/x-matroska');
+  assert.ok(isMatroska(reused.head), `reused Matroska session must still start with EBML magic, got ${reused.head.toString('hex')}`);
+
   // The session records the same truth the response is labelled with.
   const session = relay.getSession(stream.id);
   assert.equal(session.format, 'matroska');

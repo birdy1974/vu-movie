@@ -1123,6 +1123,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     addInputOption('-reconnect_streamed', '1');
     addInputOption('-reconnect_delay_max', '5');
     addInputOption('-rw_timeout', '10000000');
+    addInputOption('-allowed_segment_extensions', 'ALL', isDisguisedManifestUrl(source.url));
     if (mode === 'live') {
       addInputOption('-analyzeduration', '1000000');
       addInputOption('-probesize', '1000000');

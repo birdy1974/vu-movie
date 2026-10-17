@@ -267,3 +267,55 @@ test('a plain .ts player is still kept for the pause window', async () => {
     relay.stopSession(stream.id, 'test done');
   }
 });
+
+test('a receiver that opens a second connection to the same movie replaces its probe connection and starts at the beginning', async () => {
+  const stream = await makeStream('Zip Wire');
+  const urlPath = zapPath(stream, 'playlist');
+  try {
+    const first = await openPlayer(port, urlPath);
+    await until(() => first.length >= 16 * 50, 'the first connection to read past the header');
+
+    // The player opens its second (playback) connection before closing the first.
+    const second = await openPlayer(port, urlPath);
+    await until(() => second.length >= 16 * 10, 'the second connection to receive the film');
+    assert.ok(isTheFilmFromStart(second.bytes()), 'the second connection gets the film from byte 0');
+
+    // Closing the old probe socket must not mark the session as left while the
+    // second connection watches, nor leave a zombie client behind.
+    first.req.destroy();
+    await settle(100);
+    const session = relay.getSession(stream.id);
+    assert.ok(session && session.alive, 'the playback session is still running');
+    assert.equal(session.clients.size, 1, 'only the active playback connection remains');
+
+    // When the receiver finally leaves the movie, the session stops at once.
+    second.req.destroy();
+    await until(() => relay.getSession(stream.id) === null, 'the session to stop when the receiver leaves');
+  } finally {
+    relay.stopSession(stream.id, 'test done');
+  }
+});
+
+test('an already-closed socket never lingers as a ghost viewer blocking future receiver playback', async () => {
+  const stream = await makeStream('Ghost viewer');
+  const urlPath = zapPath(stream, 'playlist');
+  try {
+    const session = await relay.ensureSession(stream, { container: 'mpegts', outputType: 'vlcTs' });
+    // Simulate a request whose socket closed during preflight before attachClient ran.
+    const deadReq = { destroyed: true, closed: true, headers: {}, on() {}, once() {} };
+    const deadRes = { destroyed: true, writableEnded: true, closed: true, on() {}, once() {}, write() { return false; }, end() {} };
+    const attached = relay.attachClient(session, deadReq, deadRes, { receiver: false });
+    assert.equal(attached.client, null, 'a closed socket is not added to session.clients');
+    assert.equal(session.clients.size, 0);
+
+    // A receiver that now opens the movie plays from the start and stops cleanly on exit.
+    const player = await openPlayer(port, urlPath);
+    await until(() => player.length >= 16 * 20, 'the receiver to receive the film');
+    assert.ok(isTheFilmFromStart(player.bytes()), 'the receiver gets the film from byte 0');
+    player.req.destroy();
+    await until(() => relay.getSession(stream.id) === null, 'the session to stop without a ghost viewer keeping it');
+  } finally {
+    relay.stopSession(stream.id, 'test done');
+  }
+});
+

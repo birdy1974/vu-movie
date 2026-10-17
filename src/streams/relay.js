@@ -149,7 +149,7 @@ export async function runTemplateTest({ template, stream, container = null, dura
       const lines = stderrBuffer.split('\n');
       stderrBuffer = lines.pop() || '';
       for (const line of lines) {
-        if (/^[a-z_]+=/.test(line)) {
+        if (/^[a-z0-9_]+=/.test(line)) {
           const parsed = parseProgressLine(line, progress);
           Object.assign(progress, parsed);
           lastProgressAt = Date.now();
@@ -691,12 +691,36 @@ function restartBack(session, seconds) {
   spawnFfmpeg(session);
 }
 
+/** True when a client's HTTP request or response can no longer accept bytes. */
+function clientClosed(req, res) {
+  return Boolean(
+    !res || req?.destroyed || req?.closed || req?.aborted
+    || res.destroyed || res.writableEnded || res.closed
+    || req?.socket?.destroyed || res.socket?.destroyed
+  );
+}
+
+/** Drop any attached clients whose sockets closed before their detach fired. */
+function pruneDeadClients(session, reason = 'socket closed') {
+  if (!session?.clients) return;
+  for (const existing of [...session.clients]) {
+    if (clientClosed(existing.req, existing.res)) {
+      if (existing.receiver && RELAY_DROP_REASONS.has(reason)) session.receiverLeft = true;
+      dropClient(session, existing, reason);
+    }
+  }
+}
+
 /**
  * A player whose socket is full. The source is held unless another player is
  * still reading (sourceFlowsFor); a stall timer drops a player that never reads
  * again.
  */
 function blockClient(session, client) {
+  if (clientClosed(client.req, client.res)) {
+    dropClient(session, client, 'socket closed');
+    return;
+  }
   client.blocked = true;
   client.blockedAt = Date.now();
   const seconds = Math.max(5, Number(getConfig().transcode.clientStallSeconds) || 1800);
@@ -767,20 +791,8 @@ function cleanupHlsDir(session) {
  * and the idle stop closes both again when nobody is watching.
  */
 export async function ensureSession(stream, opts = {}) {
-  const web = opts.web ? { ...opts.web } : null;
-  const existing = sessions.get(stream.id);
-  if (existing && existing.alive) {
-    if (existing.web === Boolean(web)) {
-      log.debug('relay', `reusing session for stream ${stream.id}`, { clients: existing.clients.size, outputType: existing.outputType });
-      return existing;
-    }
-    log.info('relay', `starting a separate ${web ? 'web preview' : 'player'} session for stream ${stream.id} (the running ${existing.outputType || 'default'} session cannot change its output)`, {
-      existingOutput: existing.outputType || '', existingClients: existing.clients.size,
-    });
-    stopSession(stream.id, web ? 'replaced by web preview' : 'replaced by a non-preview output');
-  }
-
   const cfg = getConfig();
+  const web = opts.web ? { ...opts.web } : null;
   const outputType = web ? 'web' : (opts.outputType || '');
   const requested = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
   const wantsHls = requested === 'hls';
@@ -791,6 +803,21 @@ export async function ensureSession(stream, opts = {}) {
   const container = (web || wantsHls)
     ? requested
     : outputContainerFor(stream, outputType, { container: requested, profile: opts.profile });
+
+  const existing = sessions.get(stream.id);
+  if (existing) pruneDeadClients(existing);
+  const active = sessions.get(stream.id);
+  if (active && active.alive) {
+    if (active.web === Boolean(web) && active.kind === (wantsHls ? 'hls' : 'pipe') && active.container === container) {
+      log.debug('relay', `reusing session for stream ${stream.id}`, { clients: active.clients.size, outputType: active.outputType });
+      return active;
+    }
+    log.info('relay', `starting a separate ${web ? 'web preview' : 'player'} session for stream ${stream.id} (the running ${active.outputType || 'default'} session cannot change its output)`, {
+      existingOutput: active.outputType || '', existingClients: active.clients.size,
+    });
+    stopSession(stream.id, web ? 'replaced by web preview' : 'replaced by a non-preview output');
+  }
+
   let profileInput = { ...(stream.profile || {}), ...(opts.profile || {}), container };
 
   // The browser preview is not the receiver: the item's template is dropped and
@@ -1053,10 +1080,12 @@ function spawnFfmpeg(session) {
   session.child = child;
   session.alive = true;
   session.held = false;
+  session.runBytesOut = 0;
 
   child.stdout.on('data', (chunk) => {
     if (session.child !== child) return; // replaced by a restart (restartBack)
     session.bytesOut += chunk.length;
+    session.runBytesOut = (session.runBytesOut || 0) + chunk.length;
     session.lastActivity = Date.now();
     for (const client of [...session.clients]) writeToClient(session, client, chunk);
   });
@@ -1071,7 +1100,7 @@ function spawnFfmpeg(session) {
     const lines = stderrBuffer.split('\n');
     stderrBuffer = lines.pop() || '';
     for (const line of lines) {
-      if (/^[a-z_]+=/.test(line)) {
+      if (/^[a-z0-9_]+=/.test(line)) {
         session.stats = parseProgressLine(line, session.stats);
         continue;
       }
@@ -1209,7 +1238,7 @@ function scheduleHlsCleanup(session) {
  * Reasons the relay itself drops a player (see dropClient). Any other detach
  * reason means the player closed its own connection.
  */
-const RELAY_DROP_REASONS = new Set(['stalled', 'cannot keep up']);
+const RELAY_DROP_REASONS = new Set(['stalled', 'cannot keep up', 'reconnected']);
 
 /** `::ffff:127.0.0.1` and `127.0.0.1` are the same viewer. Empty means unknown. */
 function viewerIp(ip) {
@@ -1250,25 +1279,66 @@ function releaseZappedSessions(current, client) {
  * relay dropped for stalling was paused, so its place is kept like any pause.
  */
 export function attachClient(session, req, res, { onFinish, receiver = false } = {}) {
-  // The first player back to a session that a player left starts a little earlier.
-  if (session.clients.size === 0 && session.pendingRewind > 0 && session.alive && session.kind === 'pipe') {
-    const seconds = session.pendingRewind;
+  const clientIp = req?.clientIp || req?.ip || req?.socket?.remoteAddress || 'unknown';
+  const ip = viewerIp(clientIp);
+  const isReceiver = Boolean(receiver);
+
+  // Sweep sockets that already died without firing detach, and supersede older
+  // connections that cannot coexist with the incoming player:
+  //   - an earlier receiver connection from the same viewer on this stream
+  //     (probe-then-play or a reconnect before the old TCP close arrived);
+  //   - a stalled ghost connection with an unknown IP or a stalled receiver;
+  //   - any prior connection on a non-MPEG-TS pipe (Matroska/MP4) after the
+  //     one-time EBML/ftyp header has already been flushed from stdout.
+  const needsHeaderRestart = session.kind === 'pipe'
+    && (session.format || session.container) !== 'mpegts'
+    && (session.runBytesOut || 0) > 0;
+  let resetToStart = false;
+  for (const existing of [...session.clients]) {
+    const dead = clientClosed(existing.req, existing.res);
+    const sameReceiver = isReceiver && existing.receiver && ip && viewerIp(existing.ip) === ip;
+    const stalledGhost = isReceiver && existing.blocked && (!viewerIp(existing.ip) || existing.receiver);
+    if (dead || sameReceiver || stalledGhost || needsHeaderRestart) {
+      if (existing.receiver && !isReceiver) session.receiverLeft = true;
+      if (sameReceiver || stalledGhost || (dead && isReceiver)) resetToStart = true;
+      dropClient(session, existing, 'reconnected');
+    }
+  }
+
+  // If the incoming request already closed during preflight, do not register it
+  // in session.clients where it would sit blocked for clientStallSeconds.
+  if (clientClosed(req, res)) {
+    if (session.clients.size === 0 && isReceiver) {
+      if (sessions.get(session.streamId) === session) stopSession(session.streamId, 'receiver left the movie');
+    } else if (session.clients.size === 0) {
+      scheduleIdleStop(session);
+    }
+    return { client: null, finish: () => {} };
+  }
+
+  // The first player back to a session that a player left starts a little earlier
+  // (or from byte 0 if a receiver reconnected / a Matroska header was already consumed).
+  if (session.clients.size === 0 && (session.pendingRewind > 0 || (session.runBytesOut || 0) > 0) && session.alive && session.kind === 'pipe') {
+    const seconds = resetToStart
+      ? Math.ceil(playheadSeconds(session)) + RECONNECT_REWIND_SECONDS
+      : (session.pendingRewind || RECONNECT_REWIND_SECONDS);
     session.pendingRewind = 0;
     restartBack(session, seconds);
   }
   const client = {
     id: `c${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
-    ip: req.ip || req.socket?.remoteAddress || 'unknown',
+    ip: clientIp,
     userAgent: req.headers['user-agent'] || '',
     bytes: 0,
     startedAt: Date.now(),
+    req,
     res,
     // Flow control: `blocked` while the socket is full (see blockClient).
     blocked: false,
     blockedAt: 0,
     stallTimer: null,
     detach: null,
-    receiver: Boolean(receiver),
+    receiver: isReceiver,
   };
   session.clients.add(client);
   session.lastActivity = Date.now();
@@ -1326,12 +1396,20 @@ export function attachClient(session, req, res, { onFinish, receiver = false } =
 }
 
 function writeToClient(session, client, chunk) {
+  if (clientClosed(client.req, client.res)) {
+    dropClient(session, client, 'socket closed');
+    return;
+  }
   let flushed;
   try {
     flushed = client.res.write(chunk);
   } catch (err) {
     log.warn('relay', 'write to client failed — dropping it', { error: String(err?.message || err), ip: client.ip });
     dropClient(session, client, 'write failed');
+    return;
+  }
+  if (clientClosed(client.req, client.res)) {
+    dropClient(session, client, 'socket closed');
     return;
   }
   client.bytes += chunk.length;
