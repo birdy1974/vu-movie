@@ -8,7 +8,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveTarget, listSources, matchSourceByUrl, getSource } from '../src/scrapers/registry.js';
-import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates, headerOnlyReason, MIN_MOVIE_BYTES } from '../src/scrapers/registry.js';
+import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates, headerOnlyReason, MIN_MOVIE_BYTES, manifestDurationSec } from '../src/scrapers/registry.js';
+import http from 'node:http';
 
 test('the built-in catalog includes the requested URLs and keeps unverified Flixer domains separate', () => {
   const sources = listSources();
@@ -165,5 +166,28 @@ test('an fMP4 init segment is rejected by the probe without any network access',
   ]);
   assert.equal(probed.ok, false);
   assert.match(probed.error, /init segment/);
+});
+
+test('the length is read from the manifest a candidate points at, over local HTTP', async () => {
+  const bodies = {
+    '/vod.m3u8': '#EXTM3U\n#EXTINF:10,\na.jpg\n#EXTINF:5,\nb.jpg\n#EXT-X-ENDLIST\n',
+    '/live.m3u8': '#EXTM3U\n#EXTINF:10,\na.jpg\n',
+    '/movie.mpd': '<MPD type="static" mediaPresentationDuration="PT1H"></MPD>',
+  };
+  const server = http.createServer((req, res) => {
+    const body = bodies[req.url];
+    res.writeHead(body ? 200 : 404, { 'Content-Type': 'text/plain' });
+    res.end(body || 'nope');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.equal(await manifestDurationSec(`${base}/vod.m3u8`, {}, 'hls'), 15);
+    assert.equal(await manifestDurationSec(`${base}/live.m3u8`, {}, 'hls'), null);
+    assert.equal(await manifestDurationSec(`${base}/movie.mpd`, {}, 'dash'), 3600);
+    assert.equal(await manifestDurationSec(`${base}/missing.m3u8`, {}, 'hls'), null, 'unreachable is a null, not a throw');
+  } finally {
+    server.close();
+  }
 });
 

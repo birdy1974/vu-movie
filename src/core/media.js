@@ -1438,6 +1438,43 @@ export function parseHlsMaster(text, baseUrl = '') {
   return variants.sort((a, b) => (b.height || 0) - (a.height || 0));
 }
 
+/**
+ * Length of a VOD HLS media playlist: the sum of its #EXTINF durations. Only a
+ * playlist that ends with #EXT-X-ENDLIST is complete — a live window is not a
+ * length, so it yields null. A master playlist has no segments and yields null.
+ */
+export function parseHlsMediaDuration(text) {
+  const body = String(text || '');
+  if (!/^#EXT-X-ENDLIST/m.test(body)) return null;
+  let total = 0;
+  let segments = 0;
+  for (const m of body.matchAll(/^#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)/gm)) {
+    total += Number(m[1]);
+    segments += 1;
+  }
+  return segments > 0 && total > 0 ? Math.round(total * 100) / 100 : null;
+}
+
+/** ISO-8601 duration (`PT1H30M15.5S`, `P1DT2H`) to seconds, or null. */
+export function parseIsoDuration(value) {
+  const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/.exec(String(value || '').trim());
+  if (!m) return null;
+  const num = (i) => Number(m[i] || 0);
+  const total = num(1) * 86400 + num(2) * 3600 + num(3) * 60 + num(4);
+  return total > 0 ? Math.round(total * 100) / 100 : null;
+}
+
+/**
+ * Length of a static DASH MPD from its `mediaPresentationDuration`. A dynamic
+ * (live) MPD has no fixed length and yields null.
+ */
+export function parseDashMediaDuration(text) {
+  const tag = /<MPD\b[^>]*>/i.exec(String(text || ''))?.[0] || '';
+  if (!tag || /\btype\s*=\s*["']dynamic["']/i.test(tag)) return null;
+  const attr = /\bmediaPresentationDuration\s*=\s*["']([^"']+)["']/i.exec(tag);
+  return attr ? parseIsoDuration(attr[1]) : null;
+}
+
 /* ------------------------------------------------------------------ *
  * profile + ffmpeg command construction
  * ------------------------------------------------------------------ */
@@ -1930,5 +1967,6 @@ export default {
   runCommand, classifyBinaryFailure, parseVainfoOutput,
   probe, parseProbeJson, parseHlsMaster, streamKind, buildFfmpegArgs, buildFfprobeArgs,
   isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
+  parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
   normaliseProfile, targetDimensions, argsToCommand, parseProgressLine,
 };

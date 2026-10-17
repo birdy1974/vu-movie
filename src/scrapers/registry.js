@@ -17,7 +17,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { probe, parseHlsMaster, streamKind, checkBinaries, isInitSegmentUrl } from '../core/media.js';
+import {
+  probe, parseHlsMaster, streamKind, checkBinaries, isInitSegmentUrl,
+  parseHlsMediaDuration, parseDashMediaDuration,
+} from '../core/media.js';
 import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 import * as browser from './browser.js';
@@ -1043,6 +1046,20 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       let info = await probe(probeUrl, { headers: cand.headers || {}, timeoutMs: probeTimeoutMs });
       if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
+      // ffprobe often reports no length for a chunked or header-capable input,
+      // and without one the relay restarts a clean EOF and may repeat the film.
+      // The manifest knows the length: a VOD HLS playlist (fetched in
+      // expandHlsVariants) or a static DASH MPD (read here, only when needed).
+      if (info && !(Number(info.durationSec) > 0)) {
+        const manifestSec = isHls
+          ? variants[0]?.durationSec
+          : (streamKind(cand.url) === 'dash' ? await manifestDurationSec(cand.url, cand.headers || {}, 'dash') : null);
+        if (manifestSec > 0) {
+          info = { ...info, durationSec: manifestSec };
+          log.debug('scraper', 'length taken from the manifest (ffprobe reported none)', { url: truncate(cand.url, 120), seconds: manifestSec });
+        }
+      }
+
       // Only a plain file can be judged by its size. A DASH manifest or an HLS
       // playlist is small by design, so those kinds are never size-checked.
       const headerOnly = info && streamKind(cand.url) === 'file' ? headerOnlyReason(info) : null;
@@ -1109,18 +1126,40 @@ export function heightFromQuality(q) {
   return m ? Number(m[1]) : null;
 }
 
+/**
+ * Length in seconds from a manifest the candidate points at: a VOD HLS media
+ * playlist or a static DASH MPD. Null when unknown (live, unreachable, or no
+ * length in it). Never throws — the length is a hint, not a requirement.
+ */
+export async function manifestDurationSec(url, headers = {}, kind = null) {
+  try {
+    const res = await request(url, { headers, allowFailure: true, retries: 0, timeoutMs: 12000 });
+    if (!res.ok) return null;
+    return kind === 'dash' ? parseDashMediaDuration(res.text) : parseHlsMediaDuration(res.text);
+  } catch {
+    return null;
+  }
+}
+
 async function expandHlsVariants(url, headers) {
   try {
     const res = await request(url, { headers, allowFailure: true, retries: 0, timeoutMs: 12000 });
     if (!res.ok) return [];
     const variants = parseHlsMaster(res.text, url);
-    if (variants.length) return variants;
-    // A media playlist (segment list, no variant list) is a single variant of
-    // itself, which is how a disguised 1080p `playlist.jpg` arrives.
-    if (/#EXTINF/.test(String(res.text || ''))) {
-      return [{ url, bandwidth: 0, width: null, height: null, codecs: null, name: null, frameRate: null }];
+    if (!variants.length) {
+      // A media playlist (segment list, no variant list) is a single variant of
+      // itself, which is how a disguised 1080p `playlist.jpg` arrives.
+      if (/#EXTINF/.test(String(res.text || ''))) {
+        return [{
+          url, bandwidth: 0, width: null, height: null, codecs: null, name: null, frameRate: null,
+          durationSec: parseHlsMediaDuration(res.text),
+        }];
+      }
+      return [];
     }
-    return [];
+    // A master: the top variant is the one probed, so its length is read too.
+    variants[0].durationSec = await manifestDurationSec(variants[0].url, headers, 'hls');
+    return variants;
   } catch (err) {
     log.warn('scraper', 'could not read HLS master playlist', { error: String(err?.message || err) });
     return [];

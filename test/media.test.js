@@ -17,6 +17,7 @@ import {
   parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf, subtitleSessionNotes,
   buildFfmpegTemplateArgs,
   buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
+  parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -879,5 +880,23 @@ test('a disguised HLS playlist is allowed its .jpg segments in ffprobe and ffmpe
     output: { container: 'mpegts', target: 'pipe:1' },
   });
   assert.equal(plain.includes('-allowed_segment_extensions'), false, 'ordinary HLS keeps the demuxer defaults');
+});
+
+test('a VOD HLS media playlist gives its length; a live window does not', () => {
+  const vod = '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nseg0.jpg\n#EXTINF:4.5,\nseg1.jpg\n#EXT-X-ENDLIST\n';
+  assert.equal(parseHlsMediaDuration(vod), 14.5);
+  assert.equal(parseHlsMediaDuration('#EXTM3U\n#EXTINF:10,\nseg0.ts\n'), null, 'no ENDLIST: still live, no length');
+  assert.equal(parseHlsMediaDuration('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n#EXT-X-ENDLIST\n'), null, 'a master has no segments');
+  assert.equal(parseHlsMediaDuration(''), null);
+});
+
+test('ISO-8601 durations and static DASH MPDs give their length', () => {
+  assert.equal(parseIsoDuration('PT1H30M15.5S'), 5415.5);
+  assert.equal(parseIsoDuration('P1DT2H'), 93600);
+  assert.equal(parseIsoDuration('PT'), null);
+  assert.equal(parseIsoDuration('soon'), null);
+  assert.equal(parseDashMediaDuration('<MPD type="static" mediaPresentationDuration="PT2H0M0S"></MPD>'), 7200);
+  assert.equal(parseDashMediaDuration('<MPD type="dynamic" mediaPresentationDuration="PT2H"></MPD>'), null, 'live MPD');
+  assert.equal(parseDashMediaDuration('<MPD></MPD>'), null);
 });
 
