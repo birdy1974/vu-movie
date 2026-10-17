@@ -8,7 +8,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveTarget, listSources, matchSourceByUrl, getSource } from '../src/scrapers/registry.js';
-import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates } from '../src/scrapers/registry.js';
+import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates, headerOnlyReason, MIN_MOVIE_BYTES, manifestDurationSec } from '../src/scrapers/registry.js';
+import http from 'node:http';
 
 test('the built-in catalog includes the requested URLs and keeps unverified Flixer domains separate', () => {
   const sources = listSources();
@@ -148,3 +149,45 @@ test('sortResultsForDisplay groups same movies from different sources contiguous
   // Overlook (rank 0) comes first among Unabomber entries.
   assert.equal(sorted[unabomberIdxs[0]].sourceId, 'overlook', 'best source preferred within group');
 });
+
+test('a header-only file is not a movie, whatever ffprobe says about its codecs', () => {
+  // The 1080p init.mp4 probed as h264 1920x1080 and was 1417 bytes long.
+  assert.ok(headerOnlyReason({ sizeBytes: 1417, video: { codec: 'h264', width: 1920, height: 1080 } }));
+  assert.equal(headerOnlyReason({ sizeBytes: MIN_MOVIE_BYTES - 1 }) !== null, true);
+  assert.equal(headerOnlyReason({ sizeBytes: 700 * 1024 * 1024 }), null, 'a real movie passes');
+  assert.equal(headerOnlyReason({ durationSec: 5400 }), null, 'no size reported: not judged here');
+  assert.equal(headerOnlyReason(null), null);
+});
+
+test('an fMP4 init segment is rejected by the probe without any network access', async () => {
+  // Rejected before ffprobe runs, so it fails the same way with or without ffprobe installed.
+  const [probed] = await probeCandidates([
+    { url: 'https://cdn.example.invalid/hls/x/1080p/init.mp4', kind: 'file', label: '1080p' },
+  ]);
+  assert.equal(probed.ok, false);
+  assert.match(probed.error, /init segment/);
+});
+
+test('the length is read from the manifest a candidate points at, over local HTTP', async () => {
+  const bodies = {
+    '/vod.m3u8': '#EXTM3U\n#EXTINF:10,\na.jpg\n#EXTINF:5,\nb.jpg\n#EXT-X-ENDLIST\n',
+    '/live.m3u8': '#EXTM3U\n#EXTINF:10,\na.jpg\n',
+    '/movie.mpd': '<MPD type="static" mediaPresentationDuration="PT1H"></MPD>',
+  };
+  const server = http.createServer((req, res) => {
+    const body = bodies[req.url];
+    res.writeHead(body ? 200 : 404, { 'Content-Type': 'text/plain' });
+    res.end(body || 'nope');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.equal(await manifestDurationSec(`${base}/vod.m3u8`, {}, 'hls'), 15);
+    assert.equal(await manifestDurationSec(`${base}/live.m3u8`, {}, 'hls'), null);
+    assert.equal(await manifestDurationSec(`${base}/movie.mpd`, {}, 'dash'), 3600);
+    assert.equal(await manifestDurationSec(`${base}/missing.m3u8`, {}, 'hls'), null, 'unreachable is a null, not a throw');
+  } finally {
+    server.close();
+  }
+});
+

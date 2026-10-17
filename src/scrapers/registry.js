@@ -17,7 +17,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
-import { probe, parseHlsMaster, streamKind, checkBinaries } from '../core/media.js';
+import {
+  probe, parseHlsMaster, streamKind, checkBinaries, isInitSegmentUrl,
+  parseHlsMediaDuration, parseDashMediaDuration,
+} from '../core/media.js';
 import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 import * as browser from './browser.js';
@@ -952,6 +955,15 @@ async function quickConnectProbe(url, { timeoutMs = 5000 } = {}) {
 export async function probeCandidates(candidates, { limit = null, concurrency = 3, signal = null } = {}) {
   const cfg = getConfig();
   const list = limit ? candidates.slice(0, limit) : candidates;
+  // Decided before any early return below, so an init segment is never
+  // offered as playable just because ffprobe is missing or probing is off.
+  for (const cand of list) {
+    if (isInitSegmentUrl(cand.url)) {
+      cand.probe = null;
+      cand.ok = false;
+      cand.error = INIT_SEGMENT_ERROR;
+    }
+  }
   if (!cfg.scraper.probeCandidates) {
     log.warn('scraper', 'candidate probing is disabled in settings — VLC may meet dead mirrors');
     return list.map((c) => ({ ...c, ok: c.ok !== false, unverified: true }));
@@ -968,6 +980,16 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       const myIndex = idx++;
       const cand = list[myIndex];
       const t0 = Date.now();
+
+      // An fMP4 init segment (marked above) is the file header only. Probing it
+      // "succeeds" (ffprobe reads the codecs) and then the movie plays as a few KB.
+      if (cand.error === INIT_SEGMENT_ERROR && cand.ok === false) {
+        cand.probeMs = Date.now() - t0;
+        log.warn('scraper', 'candidate is an fMP4 init segment, not the movie — skipped', {
+          url: truncate(cand.url, 120), source: cand.sourceId,
+        });
+        continue;
+      }
 
       // Quick connectivity preflight — if the CDN hostname doesn't resolve or
       // refuses TCP we fail fast instead of letting ffprobe hang for 20s. For
@@ -1024,9 +1046,26 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       let info = await probe(probeUrl, { headers: cand.headers || {}, timeoutMs: probeTimeoutMs });
       if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
+      // ffprobe often reports no length for a chunked or header-capable input,
+      // and without one the relay restarts a clean EOF and may repeat the film.
+      // The manifest knows the length: a VOD HLS playlist (fetched in
+      // expandHlsVariants) or a static DASH MPD (read here, only when needed).
+      if (info && !(Number(info.durationSec) > 0)) {
+        const manifestSec = isHls
+          ? variants[0]?.durationSec
+          : (streamKind(cand.url) === 'dash' ? await manifestDurationSec(cand.url, cand.headers || {}, 'dash') : null);
+        if (manifestSec > 0) {
+          info = { ...info, durationSec: manifestSec };
+          log.debug('scraper', 'length taken from the manifest (ffprobe reported none)', { url: truncate(cand.url, 120), seconds: manifestSec });
+        }
+      }
+
+      // Only a plain file can be judged by its size. A DASH manifest or an HLS
+      // playlist is small by design, so those kinds are never size-checked.
+      const headerOnly = info && streamKind(cand.url) === 'file' ? headerOnlyReason(info) : null;
       cand.probe = info;
       cand.probeMs = Date.now() - t0;
-      cand.ok = Boolean(info);
+      cand.ok = Boolean(info) && !headerOnly;
       if (info?.video) {
         cand.height = info.video.height || cand.height;
         cand.width = info.video.width || cand.width;
@@ -1037,6 +1076,11 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       if (!info) {
         cand.error = 'probe failed (dead mirror, expired token, geo-block or unsupported container)';
         log.warn('scraper', 'candidate rejected by probe', { url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs });
+      } else if (headerOnly) {
+        cand.error = headerOnly;
+        log.warn('scraper', 'candidate rejected: header only, not the movie', {
+          url: truncate(cand.url, 120), source: cand.sourceId, sizeBytes: info.sizeBytes, ms: cand.probeMs,
+        });
       } else {
         log.debug('scraper', 'candidate probed ok', { url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs });
       }
@@ -1044,6 +1088,24 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
   });
   await Promise.all(workers);
   return rankCandidates(list);
+}
+
+/** Error shown for an fMP4 init segment candidate. */
+const INIT_SEGMENT_ERROR = 'fMP4 init segment — only the file header, not the movie';
+
+/** A complete movie is never this small. */
+export const MIN_MOVIE_BYTES = 1024 * 1024;
+
+/**
+ * Pure: why a probed plain file is not a movie, or null when it may be one.
+ * A header-only fMP4 (ftyp + moov, no samples) probes fine for codecs and
+ * resolution, yet the CDN serves the whole "movie" as a few KB. A missing size
+ * tells us nothing, so it is not rejected here.
+ */
+export function headerOnlyReason(info) {
+  const size = Number(info?.sizeBytes);
+  if (!(size > 0) || size >= MIN_MOVIE_BYTES) return null;
+  return `file is only ${size} bytes — a header or init segment, not the movie`;
 }
 
 /** Best first: playable → higher resolution → higher bitrate → known source. */
@@ -1064,11 +1126,40 @@ export function heightFromQuality(q) {
   return m ? Number(m[1]) : null;
 }
 
+/**
+ * Length in seconds from a manifest the candidate points at: a VOD HLS media
+ * playlist or a static DASH MPD. Null when unknown (live, unreachable, or no
+ * length in it). Never throws — the length is a hint, not a requirement.
+ */
+export async function manifestDurationSec(url, headers = {}, kind = null) {
+  try {
+    const res = await request(url, { headers, allowFailure: true, retries: 0, timeoutMs: 12000 });
+    if (!res.ok) return null;
+    return kind === 'dash' ? parseDashMediaDuration(res.text) : parseHlsMediaDuration(res.text);
+  } catch {
+    return null;
+  }
+}
+
 async function expandHlsVariants(url, headers) {
   try {
     const res = await request(url, { headers, allowFailure: true, retries: 0, timeoutMs: 12000 });
     if (!res.ok) return [];
-    return parseHlsMaster(res.text, url);
+    const variants = parseHlsMaster(res.text, url);
+    if (!variants.length) {
+      // A media playlist (segment list, no variant list) is a single variant of
+      // itself, which is how a disguised 1080p `playlist.jpg` arrives.
+      if (/#EXTINF/.test(String(res.text || ''))) {
+        return [{
+          url, bandwidth: 0, width: null, height: null, codecs: null, name: null, frameRate: null,
+          durationSec: parseHlsMediaDuration(res.text),
+        }];
+      }
+      return [];
+    }
+    // A master: the top variant is the one probed, so its length is read too.
+    variants[0].durationSec = await manifestDurationSec(variants[0].url, headers, 'hls');
+    return variants;
   } catch (err) {
     log.warn('scraper', 'could not read HLS master playlist', { error: String(err?.message || err) });
     return [];
