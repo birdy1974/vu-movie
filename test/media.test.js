@@ -16,6 +16,7 @@ import {
   targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
   parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf, subtitleSessionNotes,
   buildFfmpegTemplateArgs,
+  buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -838,3 +839,45 @@ test('argsToCommand round-trips shell-sensitive values through POSIX sh', () => 
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.stdout.split('\0').slice(0, -1), ['ffmpeg', ...args]);
 });
+
+test('an fMP4 init segment and a disguised HLS playlist are recognised by name', () => {
+  // The 1080p "movie" that played as 1.4 KB was an init segment.
+  assert.equal(isInitSegmentUrl('https://n.example/hls/x/1080p/init.mp4'), true);
+  assert.equal(isInitSegmentUrl('https://n.example/hls/x/720p/init_720.m4s?t=1'), true);
+  assert.equal(isInitSegmentUrl('https://n.example/hls/x/1080p/seg00001.mp4'), false);
+  assert.equal(isInitSegmentUrl('https://n.example/movie.mp4'), false);
+
+  // The real 1080p movie was an HLS playlist named .jpg.
+  assert.equal(isDisguisedManifestUrl('https://n.example/hls/x/1080p/playlist.jpg'), true);
+  assert.equal(isDisguisedManifestUrl('https://n.example/hls/x/1080p/playlist.jpg?sig=1'), true);
+  assert.equal(isDisguisedManifestUrl('https://n.example/hls/x/master.m3u8'), false);
+  assert.equal(isDisguisedManifestUrl('https://n.example/poster.jpg'), false);
+  assert.equal(streamKind('https://n.example/hls/x/1080p/playlist.jpg'), 'hls');
+  assert.equal(streamKind('https://n.example/poster.jpg'), 'file');
+});
+
+test('a disguised HLS playlist is allowed its .jpg segments in ffprobe and ffmpeg only', () => {
+  const url = 'https://n.example/hls/x/1080p/playlist.jpg';
+  assert.deepEqual(hlsSegmentExtensionArgs(url), ['-allowed_segment_extensions', 'ALL']);
+  assert.deepEqual(hlsSegmentExtensionArgs('https://n.example/x/master.m3u8'), []);
+
+  const probeArgs = buildFfprobeArgs(url, {});
+  const at = probeArgs.indexOf('-allowed_segment_extensions');
+  assert.ok(at > 0 && probeArgs[at + 1] === 'ALL', 'ffprobe gets the allowance');
+  assert.equal(probeArgs.at(-1), url, 'the URL stays the last argument');
+  assert.equal(buildFfprobeArgs('https://n.example/movie.mp4', {}).includes('-allowed_segment_extensions'), false);
+
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts' }, PROBE_1080P_H264);
+  const args = buildFfmpegArgs({
+    source: { url, kind: 'hls' }, profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  const inAt = args.indexOf('-allowed_segment_extensions');
+  assert.ok(inAt > 0 && args[inAt + 1] === 'ALL' && inAt < args.indexOf('-i'), 'ffmpeg gets it before -i');
+
+  const plain = buildFfmpegArgs({
+    source: { url: 'https://n.example/x/master.m3u8', kind: 'hls' }, profile, hw: HW, mode: 'live',
+    output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.equal(plain.includes('-allowed_segment_extensions'), false, 'ordinary HLS keeps the demuxer defaults');
+});
+

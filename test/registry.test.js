@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveTarget, listSources, matchSourceByUrl, getSource } from '../src/scrapers/registry.js';
-import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates } from '../src/scrapers/registry.js';
+import { probeCandidates, rankCandidates, candidateKey, dedupeCandidates, headerOnlyReason, MIN_MOVIE_BYTES } from '../src/scrapers/registry.js';
 
 test('the built-in catalog includes the requested URLs and keeps unverified Flixer domains separate', () => {
   const sources = listSources();
@@ -148,3 +148,22 @@ test('sortResultsForDisplay groups same movies from different sources contiguous
   // Overlook (rank 0) comes first among Unabomber entries.
   assert.equal(sorted[unabomberIdxs[0]].sourceId, 'overlook', 'best source preferred within group');
 });
+
+test('a header-only file is not a movie, whatever ffprobe says about its codecs', () => {
+  // The 1080p init.mp4 probed as h264 1920x1080 and was 1417 bytes long.
+  assert.ok(headerOnlyReason({ sizeBytes: 1417, video: { codec: 'h264', width: 1920, height: 1080 } }));
+  assert.equal(headerOnlyReason({ sizeBytes: MIN_MOVIE_BYTES - 1 }) !== null, true);
+  assert.equal(headerOnlyReason({ sizeBytes: 700 * 1024 * 1024 }), null, 'a real movie passes');
+  assert.equal(headerOnlyReason({ durationSec: 5400 }), null, 'no size reported: not judged here');
+  assert.equal(headerOnlyReason(null), null);
+});
+
+test('an fMP4 init segment is rejected by the probe without any network access', async () => {
+  // Rejected before ffprobe runs, so it fails the same way with or without ffprobe installed.
+  const [probed] = await probeCandidates([
+    { url: 'https://cdn.example.invalid/hls/x/1080p/init.mp4', kind: 'file', label: '1080p' },
+  ]);
+  assert.equal(probed.ok, false);
+  assert.match(probed.error, /init segment/);
+});
+

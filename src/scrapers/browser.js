@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, logError, errorText, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
+import { isDisguisedManifestUrl, isInitSegmentUrl } from '../core/media.js';
 import { sleep, safeHost, resolveUrl, request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
 
@@ -243,7 +244,7 @@ export function looksLikeMedia(url, contentType, resourceType = '', extraPattern
 
 function kindOf(url, contentType) {
   const ct = String(contentType || '').toLowerCase();
-  if (/mpegurl/.test(ct) || /\.m3u8/i.test(url)) return 'hls';
+  if (/mpegurl/.test(ct) || /\.m3u8/i.test(url) || isDisguisedManifestUrl(url)) return 'hls';
   if (/dash\+xml/.test(ct) || /\.mpd/i.test(url)) return 'dash';
   if (/mp2t/.test(ct) || /\.ts(\?|#|$)/i.test(url)) return 'segment';
   if (/video\/mp4|video\/webm/i.test(ct)) return 'file';
@@ -427,7 +428,12 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
       const ct = res.headers()['content-type'] || '';
       const req = res.request();
       const sitePatterns = req.resourceType() === 'media' ? [] : compiledPatternsFor(opts.session, opts.mediaPatterns);
-      if (looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns)) {
+      // An fMP4 init segment (`init.mp4`) is only the file header: a few KB with
+      // no samples. Recording it made the 1080p "movie" a 1.4 KB file.
+      const isMedia = looksLikeMedia(u, ct, req.resourceType()) || looksLikeMedia(u, ct, req.resourceType(), sitePatterns);
+      if (isMedia && isInitSegmentUrl(u)) {
+        log.debug('browser', `skipped fMP4 init segment (header only, not a movie): ${u.slice(0, 160)}`);
+      } else if (isMedia) {
         if (!media.has(u)) {
           let reqHeaders;
           try { reqHeaders = await req.allHeaders(); } catch { reqHeaders = req.headers(); }

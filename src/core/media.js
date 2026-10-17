@@ -718,10 +718,31 @@ export async function diagnoseFfmpeg({ device = null } = {}) {
  * source classification + probing
  * ------------------------------------------------------------------ */
 
+/**
+ * An HLS playlist served under a non-media name (`…/1080p/playlist.jpg`). Some
+ * CDNs disguise their manifests this way; ffmpeg still reads them as HLS, but
+ * its HLS demuxer refuses the matching `.jpg` segments unless told otherwise.
+ */
+const DISGUISED_MANIFEST_RE = /\/(?:playlist|master|manifest)\.(?:jpe?g|png|gif|webp|bmp|txt|css|js|bin|dat)$/i;
+
+/** fMP4 initialisation segment (`init.mp4`, `init_720.mp4`, `init-1080p.m4s`): header only, never a movie. */
+const INIT_SEGMENT_RE = /(?:^|\/)init(?:[-_.][^/]*)?\.(?:mp4|m4s|m4a|m4v|cmfv|cmfa)$/i;
+
+/** True when the URL (query and fragment ignored) names a disguised HLS playlist. */
+export function isDisguisedManifestUrl(url) {
+  return DISGUISED_MANIFEST_RE.test(String(url || '').split(/[?#]/)[0]);
+}
+
+/** True when the URL names an fMP4 init segment — a header that cannot play on its own. */
+export function isInitSegmentUrl(url) {
+  return INIT_SEGMENT_RE.test(String(url || '').split(/[?#]/)[0]);
+}
+
 /** 'hls' | 'dash' | 'file' — determines how ffmpeg is fed. */
 export function streamKind(url) {
   const clean = String(url || '').split('?')[0].toLowerCase();
   if (clean.endsWith('.m3u8') || clean.includes('.m3u8')) return 'hls';
+  if (isDisguisedManifestUrl(clean)) return 'hls';
   if (clean.endsWith('.mpd')) return 'dash';
   return 'file';
 }
@@ -1282,8 +1303,18 @@ export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000 } = {}) 
     '-rw_timeout', String(timeoutMs * 1000),
     '-user_agent', h['User-Agent'] || getConfig().scraper.userAgent,
     ...headerArgs(h),
+    ...hlsSegmentExtensionArgs(url),
     url,
   ];
+}
+
+/**
+ * Input option for a disguised HLS playlist (see isDisguisedManifestUrl): lets
+ * the HLS demuxer accept segments whatever their extension. Empty for every
+ * other input, so ordinary HLS sources keep the demuxer's default checks.
+ */
+export function hlsSegmentExtensionArgs(url) {
+  return isDisguisedManifestUrl(url) ? ['-allowed_segment_extensions', 'ALL'] : [];
 }
 
 export function parseFps(value) {
@@ -1570,6 +1601,7 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // command the DUO2 test ran with).
   if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
   if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
+  if (kind === 'hls') args.push(...hlsSegmentExtensionArgs(source.url));
 
   args.push('-i', source.url);
   if (sidecarFitsContainer) args.push('-i', sidecarSubtitlePath);
@@ -1897,5 +1929,6 @@ export default {
   ffmpegPath, ffprobePath, ffmpegEnv, libvaDriverCandidates, cacheUsable,
   runCommand, classifyBinaryFailure, parseVainfoOutput,
   probe, parseProbeJson, parseHlsMaster, streamKind, buildFfmpegArgs, buildFfprobeArgs,
+  isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
   normaliseProfile, targetDimensions, argsToCommand, parseProgressLine,
 };
