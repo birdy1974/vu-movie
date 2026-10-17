@@ -880,6 +880,17 @@ test('a disguised HLS playlist is allowed its .jpg segments in ffprobe and ffmpe
     output: { container: 'mpegts', target: 'pipe:1' },
   });
   assert.equal(plain.includes('-allowed_segment_extensions'), false, 'ordinary HLS keeps the demuxer defaults');
+
+  const tplArgs = buildFfmpegTemplateArgs({
+    template: 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -f matroska pipe:1',
+    source: { url, kind: 'hls' },
+    profile: { container: 'matroska' },
+    mode: 'live',
+    output: { container: 'matroska', target: 'pipe:1' },
+  });
+  const tplAt = tplArgs.indexOf('-allowed_segment_extensions');
+  assert.ok(tplAt > 0 && tplArgs[tplAt + 1] === 'ALL' && tplAt < tplArgs.indexOf('-i'),
+    'template-driven ffmpeg also gets -allowed_segment_extensions ALL before -i');
 });
 
 test('a VOD HLS media playlist gives its length; a live window does not', () => {
