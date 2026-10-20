@@ -525,7 +525,7 @@ const VMFfmpegEditor = (() => {
       case 'vlcMkv': return '.mkv URL · desktop player';
       case 'm3u8': return 'HLS playlist URL';
       case 'm3u': return 'M3U playlist file';
-      case 'enigma2': return 'Bouquet entry for VU+ / Duo2';
+      case 'enigma2': return 'Bouquet entry for VU+ / Duo2 — always a .ts reference, so Matroska needs service type 5002';
       case 'direct': return 'Direct 302 redirect';
       case 'download': return 'Saved-to-disk copy';
       default: return '';
@@ -831,6 +831,11 @@ const VMFfmpegEditor = (() => {
     if (instance.mode === 'library') loadTemplate(instance, saved);
     App.onTemplatesChanged?.();
     toast(makeDefault ? 'Template saved and set as default' : 'Template saved', 'ok');
+    // Binding this template to the Enigma2 output can put a container on the
+    // box that its player cannot demux (Matroska through a .ts service
+    // reference is a black screen on GStreamer). The server says so here, while
+    // the operator is still looking at the checkbox that caused it.
+    for (const warning of res.warnings || []) toast(warning, 'warn', 14000);
     return saved;
   }
 

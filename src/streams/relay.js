@@ -37,7 +37,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { log, logError, errorText, truncate } from '../core/log.js';
-import { getConfig } from '../core/config.js';
+import { getConfig, describeEnigma2ServiceType, normaliseEnigma2ServiceType } from '../core/config.js';
+import { matroskaOnBoxAdvice } from '../enigma2/index.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
   validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes, probeSubtitleList,
@@ -266,6 +267,79 @@ export function outputContainerFor(stream, outputType = '', { container = null, 
   const template = resolveOutputTemplateForSession(profileInput, outputType);
   const chosen = template?.container || base;
   return normaliseProfile({ ...profileInput, container: chosen }, stream?.upstream?.probe || null).container || chosen;
+}
+
+/**
+ * What to say when the bytes ffmpeg is about to write are not the container the
+ * request URL promised — `null` when there is nothing to say.
+ *
+ * Two very different situations share one shape, so the note is built here
+ * instead of inline at the spawn site:
+ *
+ *   • a desktop/playlist slot (`vlcTs`, `download`, …) whose template writes
+ *     Matroska. Legitimate and supported: the response is labelled with what
+ *     ffmpeg really writes and the playlist publishes the matching `.mkv` link,
+ *     so the only thing worth logging is the label change.
+ *
+ *   • the `enigma2` slot, which cannot be renamed — the bouquet hands the box a
+ *     `.ts.enigma2` service reference because the service-ref encoding strips
+ *     query strings. Here the outcome depends on the *player* the configured
+ *     service type selects: exteplayer3 (5002) carries its own demuxers and
+ *     plays Matroska happily (it is the only way to show a soft subtitle track
+ *     on the box), while GStreamer (4097 / 5001) shows a black screen and drops
+ *     the movie seconds later — which reads as "receiver left" in the log and
+ *     looks like the relay's fault.
+ *
+ * The template is named in the message itself, not only in the fields: the Logs
+ * page shows the message, and a warning that does not say which template to
+ * unbind is a warning the operator has to go and look up.
+ *
+ * Pure on purpose (the service type is a parameter, defaulted from the live
+ * config) so the wording is testable without spawning ffmpeg.
+ */
+export function containerMismatchNote({
+  actualFormat = '', expectedFormat = '', outputType = '', requested = '',
+  templateName = '', templateId = '', serviceType = null,
+} = {}) {
+  const actual = String(actualFormat || '').trim().toLowerCase();
+  const expected = String(expectedFormat || '').trim().toLowerCase();
+  if (!actual || actual === expected) return null;
+
+  const by = templateName ? ` (template “${templateName}”)` : '';
+  const fields = {
+    writes: actual, askedFor: expected, outputType: outputType || requested || '',
+    templateId: templateId || '', template: templateName || '',
+  };
+
+  if (outputType === 'enigma2') {
+    const type = serviceType === null || serviceType === undefined || serviceType === ''
+      ? getConfig().enigma2.serviceType
+      : serviceType;
+    const service = describeEnigma2ServiceType(normaliseEnigma2ServiceType(type, 4097));
+    fields.serviceType = service.type;
+    fields.player = service.short;
+    const advice = matroskaOnBoxAdvice({ container: actual, serviceType: service.type });
+    if (advice) {
+      return {
+        level: 'warn',
+        message: `the box gets ${actual}${by} on a URL that asked for ${expected} — ${advice}`,
+        fields,
+      };
+    }
+    if (service.matroska) {
+      return {
+        level: 'info',
+        message: `the box gets ${actual}${by} on its .ts.enigma2 reference — service type ${service.type} (${service.short}) demuxes it, so this plays`,
+        fields,
+      };
+    }
+  }
+
+  return {
+    level: 'warn',
+    message: `the ffmpeg command${by} writes ${actual} but the ${outputType || requested || expected} URL asked for ${expected} — the response is labelled ${actual}, so players are told the truth`,
+    fields,
+  };
 }
 
 function resolveOutputTemplateForSession(profile = {}, outputType = '') {
@@ -907,16 +981,23 @@ export async function ensureSession(stream, opts = {}) {
   // A template can write a container the URL did not promise (e.g. a Matroska
   // template bound to the `enigma2` slot: the bouquet serves `.ts.enigma2`, the
   // HTTP layer says `video/mp2t`, and the Duo2 gets an MKV). Worth one line in
-  // the log — the receiver's mis-detection is otherwise blamed on the relay.
+  // the log — the receiver's mis-detection is otherwise blamed on the relay, and
+  // on the box that line is the difference between "plays" and "black screen".
   const actualFormat = outputFormatOf(args);
   // Compared against what the URL asked for, not against the container above:
   // that one already follows the template, so a difference left here means the
   // template's own `-f` disagrees with the container it is stored under.
   const expectedFormat = wantsHls ? 'hls' : (requested === 'matroska' ? 'matroska' : 'mpegts');
-  if (actualFormat && actualFormat !== expectedFormat) {
-    log.warn('relay', `the ffmpeg command writes ${actualFormat} but the ${outputType || requested} URL asked for ${expectedFormat} — the response is labelled ${actualFormat}, so players are told the truth`, {
-      stream: stream.id, templateId: template?.templateId || '', template: template?.name || '',
-    });
+  const mismatch = containerMismatchNote({
+    actualFormat,
+    expectedFormat,
+    outputType,
+    requested,
+    templateName: template?.name || '',
+    templateId: template?.templateId || '',
+  });
+  if (mismatch) {
+    log[mismatch.level]('relay', mismatch.message, { stream: stream.id, ...mismatch.fields });
   }
 
   // "Subtitles never show on the box" is otherwise indistinguishable from "the

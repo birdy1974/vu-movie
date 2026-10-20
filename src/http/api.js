@@ -387,7 +387,19 @@ router.put('/ffmpeg/templates', wrap(async (req, res) => {
     hasDefault: Boolean(defaultFfmpegTemplateId),
     perOutputDefaults: Object.values(ffmpegDefaults || {}).filter(Boolean).length,
   });
-  res.json({ ok: true, templates, defaultFfmpegTemplateId, ffmpegDefaults });
+  // Every stream without its own Enigma2 binding runs what this library says,
+  // so the same advice given per stream belongs here too: which template the
+  // box's slot ends up on (its own default, else the global default) and
+  // whether the container it writes plays on the configured service type.
+  const boxId = (ffmpegDefaults && ffmpegDefaults.enigma2) || defaultFfmpegTemplateId || '';
+  const boxTemplate = templates.find((item) => item?.id === boxId);
+  // No template on that slot means the guided profile decides, which follows
+  // `transcode.container` and is advised when a stream is saved.
+  const warnings = enigma2SlotWarnings({
+    container: boxTemplate?.container || '',
+    templateName: boxTemplate?.name || '',
+  });
+  res.json({ ok: true, templates, defaultFfmpegTemplateId, ffmpegDefaults, warnings });
 }));
 
 /**
@@ -868,6 +880,35 @@ router.delete('/streams/:id', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/**
+ * What the operator should be told when a template makes the **Enigma2 output
+ * slot** write a container the box's player cannot demux.
+ *
+ * The bouquet cannot rename its link: the service-ref encoding strips query
+ * strings, so the receiver always fetches `{slug}.ts.enigma2`. Whether Matroska
+ * bytes on that reference play at all is decided by the service type in
+ * Settings → Enigma2, i.e. by which player the box uses — exteplayer3 (5002)
+ * carries its own demuxers and is the only way to show a soft subtitle track on
+ * the TV, while GStreamer (4097 / 5001) shows a black screen and leaves the
+ * movie after a few seconds. That failure reads as "receiver left" in the log
+ * and looks like a relay bug, so it is worth a sentence at *save* time, when
+ * the operator is still looking at the screen.
+ *
+ * Advisory, never a refusal: ServiceApp can be configured to hand 4097
+ * references to exteplayer3, and vu-movie cannot see that setting on the box.
+ * Returns a list of sentences (empty = nothing to say); the API answers it as
+ * `warnings` and the UI shows it.
+ */
+function enigma2SlotWarnings({ container = '', templateName = '' } = {}) {
+  const advice = enigma2.matroskaOnBoxAdvice({ container });
+  if (!advice) return [];
+  const sentence = templateName ? `Template “${templateName}” on the Enigma2 / Duo2 output: ${advice}` : advice;
+  log.warn('api', 'the Enigma2 output writes a container the box’s player may not demux', {
+    container, template: templateName || '', serviceType: getConfig().enigma2.serviceType,
+  });
+  return [sentence];
+}
+
 router.post('/streams/:id/profile', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
@@ -899,12 +940,18 @@ router.post('/streams/:id/profile', wrap(async (req, res) => {
     profile, title: stream.title, year: stream.year, kind: stream.kind,
   });
   relay.stopSession(stream.id, 'profile changed');
+  // The container this profile really puts on the box's output slot — asked of
+  // the relay, which is the only place the template precedence is known.
+  const warnings = enigma2SlotWarnings({
+    container: relay.outputContainerFor(stream, 'enigma2', { profile }),
+    templateName: resolveOutputTemplate(profile, 'enigma2')?.name || '',
+  });
   log.info('api', `profile updated for stream ${stream.id}`, {
     mode: profile.ffmpegTemplate ? 'template' : profile.transcode ? 'transcode' : 'copy',
     resolution: profile.resolution, container: profile.container,
     perOutputTemplates: Object.values(profile.outputTemplates || {}).filter(Boolean).length,
   });
-  res.json({ ok: true, profile, urls: store.urlsFor(stream, baseUrlFrom(req)) });
+  res.json({ ok: true, profile, urls: store.urlsFor(stream, baseUrlFrom(req)), warnings });
 }));
 
 /**

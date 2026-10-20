@@ -16,9 +16,15 @@
  * Every file is staged under a temporary name and renamed in-place, and the
  * previous bouquets.tv is kept as one restore point.
  *
- * Service type 4097 (GStreamer/exteplayer3) is the safe default for IPTV on a
- * Duo2. The service reference numbers must be unique per entry or Enigma2 will
- * silently drop duplicates, which is why we generate them from the stream token.
+ * The service type at the front of every reference picks the player that opens
+ * the stream on the box — 4097 is Enigma2's own servicemp3 (GStreamer), 5001
+ * ServiceApp's gstplayer, 5002 ServiceApp's exteplayer3 (see
+ * ENIGMA2_SERVICE_TYPES in core/config.js). It is a setting, not a constant,
+ * because that player decides which container the `enigma2` output slot may
+ * write: GStreamer shows a black screen on Matroska arriving through a `.ts`
+ * reference, exteplayer3 demuxes it itself. The service reference numbers must
+ * be unique per entry or Enigma2 will silently drop duplicates, which is why we
+ * generate them from the stream token.
  */
 
 import fs from 'node:fs';
@@ -27,7 +33,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { log, truncate } from '../core/log.js';
-import { getConfig } from '../core/config.js';
+import {
+  getConfig, describeEnigma2ServiceType, normaliseEnigma2ServiceType, ENIGMA2_SERVICE_TYPE_VALUES,
+} from '../core/config.js';
 import { repo } from '../core/db.js';
 
 /** Enigma2 expects the URL percent-encoded, but with the slashes readable. */
@@ -43,7 +51,10 @@ export function serviceRef({ url, name, type = 4097, sid = null, tsid = 0, onid 
   const cleanName = String(name || 'vu-movie').replace(/:/g, '-').replace(/\s+/g, ' ').trim().slice(0, 60);
   const id = sid || hashCode(url);
   const sidHex = (id % 0xffff).toString(16).padStart(4, '0').toUpperCase();
-  return `#SERVICE ${type}:0:1:${sidHex}:${tsid.toString(16).padStart(4, '0')}:${onid.toString(16).padStart(4, '0')}:0:0:0:0:${encodeE2Url(url)}:${cleanName}`;
+  // Normalised, not taken verbatim: a type Enigma2 does not know produces an
+  // entry that zaps to a black screen and logs nothing on this side.
+  const serviceType = normaliseEnigma2ServiceType(type, 4097);
+  return `#SERVICE ${serviceType}:0:1:${sidHex}:${tsid.toString(16).padStart(4, '0')}:${onid.toString(16).padStart(4, '0')}:0:0:0:0:${encodeE2Url(url)}:${cleanName}`;
 }
 
 function hashCode(text) {
@@ -58,10 +69,17 @@ function hashCode(text) {
  * Build the bouquet file content.
  * @param {object} o
  * @param {string} o.name      bouquet name ("vu-movie")
- * @param {number} o.serviceType
+ * @param {number} o.serviceType  4097 | 5001 | 5002 | 1 — picks the box's player
  * @param {object[]} o.entries [{ title, url, description, poster, subtitle, season }]
+ *
+ * The result carries `serviceType` and `player` next to the text, so the
+ * preview and the push log can say *which player on the box* these entries
+ * open — that is the half of the story the container warning on the relay
+ * needs to be readable ("Matroska + GStreamer" is a black screen, "Matroska +
+ * exteplayer3" is the combination that shows a soft subtitle track).
  */
 export function buildBouquet({ name = 'vu-movie', serviceType = 4097, entries = [] }) {
+  const service = describeEnigma2ServiceType(normaliseEnigma2ServiceType(serviceType, 4097));
   const lines = [`#NAME ${name} (TV)`];
   const used = new Set();
   let count = 0;
@@ -75,7 +93,7 @@ export function buildBouquet({ name = 'vu-movie', serviceType = 4097, entries = 
       lines.push(`#NAME ── ${entry.series || entry.title} · Season ${entry.season} ──`);
     }
     const label = entry.label || `${entry.title}${entry.year ? ` (${entry.year})` : ''}${entry.subtitle ? ` [${entry.subtitle}]` : ''}`;
-    let ref = serviceRef({ url: entry.url, name: label, type: serviceType });
+    let ref = serviceRef({ url: entry.url, name: label, type: service.type });
     // Duplicate service references are dropped by Enigma2 → disambiguate.
     if (used.has(ref)) ref = `${ref}${count}`;
     used.add(ref);
@@ -90,7 +108,39 @@ export function buildBouquet({ name = 'vu-movie', serviceType = 4097, entries = 
     entries: count,
     fileName: `userbouquet.${name.replace(/[^A-Za-z0-9._-]/g, '')}.tv`,
     bouquetsLine: `#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.${name.replace(/[^A-Za-z0-9._-]/g, '')}.tv" ORDER BY bouquet`,
+    serviceType: service.type,
+    player: service.short,
   };
+}
+
+/**
+ * Whether a Matroska output can be played by the box at all — one sentence
+ * when it cannot, `null` when it can (or when the container is not Matroska).
+ *
+ * The bouquet has to hand the receiver a `.ts.enigma2` service reference (the
+ * service-ref encoding strips query strings, so the slot cannot be renamed to
+ * `.mkv` the way the VLC and playlist slots are). What the box then does with
+ * Matroska bytes on that reference depends entirely on the player the service
+ * type selects:
+ *
+ *   5002 exteplayer3  demuxes Matroska itself — this is the supported way to
+ *                     give the box a soft subtitle track;
+ *   4097 / 5001       GStreamer, which shows a black screen and leaves the
+ *                     movie (the relay logs "receiver left …" seconds later);
+ *   1 DVB             does not play an HTTP stream at all.
+ *
+ * Pure on purpose: the relay, the Settings save and the playlist's template
+ * picker all ask the same question and must give the same answer.
+ */
+export function matroskaOnBoxAdvice({ container = '', serviceType = null } = {}) {
+  const written = String(container || '').trim().toLowerCase();
+  if (written !== 'matroska' && written !== 'mkv') return null;
+  const type = serviceType === null || serviceType === undefined || serviceType === ''
+    ? getConfig().enigma2.serviceType
+    : serviceType;
+  const service = describeEnigma2ServiceType(normaliseEnigma2ServiceType(type, 4097));
+  if (service.matroska) return null;
+  return `Matroska on the Enigma2 output cannot be played by service type ${service.type} (${service.short}): the bouquet hands the box a .ts service reference and ${service.player === 'dvb' ? 'a DVB service does not play an HTTP stream' : 'GStreamer shows a black screen on Matroska bytes arriving through it'}. Either bind an MPEG-TS template to the Enigma2 / Duo2 output, or set Settings → Enigma2 → Service type to 5002 (ServiceApp exteplayer3), which demuxes Matroska itself.`;
 }
 
 /** Add our bouquet to bouquets.tv exactly once (idempotent). */
@@ -491,7 +541,17 @@ export async function pushBouquet(entries, { name = null, dryRun = false } = {},
   const cfg = getConfig().enigma2;
   const bouquetName = name || cfg.bouquetName;
   const bouquet = buildBouquet({ name: bouquetName, serviceType: cfg.serviceType, entries });
-  log.info('enigma2', `preparing bouquet "${bouquetName}"`, { entries: bouquet.entries, file: bouquet.fileName, dryRun });
+  // The service type is the player the box will use, so it belongs in the line
+  // that says a bouquet went out: a zap to a black screen is answered by
+  // reading which player these entries were written for.
+  log.info('enigma2', `preparing bouquet "${bouquetName}"`, {
+    entries: bouquet.entries, file: bouquet.fileName, dryRun,
+    serviceType: bouquet.serviceType, player: bouquet.player,
+  });
+  if (Number(cfg.serviceType) !== bouquet.serviceType) {
+    log.warn('enigma2', `service type ${cfg.serviceType} is not one Enigma2 plays — the bouquet was written with ${bouquet.serviceType} (${bouquet.player})`,
+      { configured: cfg.serviceType, used: bouquet.serviceType, known: ENIGMA2_SERVICE_TYPE_VALUES.join(', ') });
+  }
 
   if (bouquet.entries === 0) {
     return { ok: false, error: 'nothing to push — no streams selected', bouquet };
@@ -595,11 +655,18 @@ function bouquetsLineRef(fileName) {
 export function previewBouquet(entries, { name = null } = {}) {
   const cfg = getConfig().enigma2;
   const bouquet = buildBouquet({ name: name || cfg.bouquetName, serviceType: cfg.serviceType, entries });
+  const service = describeEnigma2ServiceType(bouquet.serviceType);
   return {
     ...bouquet,
     bouquetsLine: bouquet.bouquetsLine,
     rootDir: cfg.rootDir,
+    // Shown next to the preview text: which player opens these entries, and
+    // what that player can demux (the reason 5002 exists as an option).
+    serviceNote: service.note,
   };
 }
 
-export default { buildBouquet, patchBouquetsTv, pushBouquet, previewBouquet, status, encodeE2Url, serviceRef };
+export default {
+  buildBouquet, patchBouquetsTv, pushBouquet, previewBouquet, status, encodeE2Url, serviceRef,
+  matroskaOnBoxAdvice,
+};

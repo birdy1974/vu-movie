@@ -38,6 +38,94 @@ function numberFromEnv(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * The Enigma2 service types vu-movie writes into a bouquet, and what each one
+ * means for playback.
+ *
+ * The number at the front of a service reference picks the player that opens
+ * the stream, and that player decides which container the box can actually
+ * demux — which is why this table exists instead of a bare number in Settings:
+ *
+ *   4097  Enigma2's own `servicemp3` (GStreamer). ServiceApp takes these over
+ *         when it is configured to, but on a stock image it is GStreamer.
+ *   5001  ServiceApp → gstplayer (GStreamer).
+ *   5002  ServiceApp → exteplayer3, which carries its own ffmpeg demuxers.
+ *   1     A DVB service. Needs a tuner and cannot play an HTTP stream, so it is
+ *         only useful for a box that records first and plays the file later.
+ *
+ * `matroska` is the part that costs an afternoon when it is wrong: GStreamer
+ * handed Matroska bytes on a `.ts` service reference shows a black screen and
+ * leaves the movie again (the relay then logs "receiver left …"), while
+ * exteplayer3 demuxes the same bytes itself and also shows a `default`-flagged
+ * soft subtitle track. MPEG-TS plays on all of them.
+ */
+export const ENIGMA2_SERVICE_TYPES = {
+  4097: {
+    label: '4097 — Enigma2 built-in player (servicemp3 / GStreamer)',
+    short: 'Enigma2 built-in (GStreamer)',
+    player: 'gstreamer',
+    matroska: false,
+    note: 'MPEG-TS only: GStreamer does not demux Matroska arriving on a .ts service reference (black screen).',
+  },
+  5001: {
+    label: '5001 — ServiceApp: gstplayer (GStreamer)',
+    short: 'ServiceApp gstplayer',
+    player: 'gstreamer',
+    matroska: false,
+    note: 'MPEG-TS only, like 4097. Shows a soft subtitle track when ServiceApp’s embedded-subtitles switch is on.',
+  },
+  5002: {
+    label: '5002 — ServiceApp: exteplayer3 (own demuxers)',
+    short: 'ServiceApp exteplayer3',
+    player: 'exteplayer3',
+    matroska: true,
+    note: 'Plays MPEG-TS and Matroska; the player that shows a default-flagged soft subtitle track.',
+  },
+  1: {
+    label: '1 — DVB service (tuner; recordings only)',
+    short: 'DVB service',
+    player: 'dvb',
+    matroska: false,
+    note: 'An HTTP stream does not play on a DVB service reference — only useful for burned-in subtitles on a recording.',
+  },
+};
+
+/** The known service types, in the order the UI lists them. */
+export const ENIGMA2_SERVICE_TYPE_VALUES = [4097, 5001, 5002, 1];
+
+/**
+ * What the box will play a bouquet entry with.
+ *
+ * An unknown number (a hand-edited config, or a service type from an image
+ * this table has not seen) is reported as the 4097 default it falls back to,
+ * with `unknown: true` so a caller can say so instead of guessing.
+ */
+export function describeEnigma2ServiceType(value) {
+  const type = Number(String(value ?? '').trim());
+  const known = ENIGMA2_SERVICE_TYPES[type];
+  if (known) return { type, ...known, unknown: false };
+  // Described as the fallback it will be written as (see
+  // normaliseEnigma2ServiceType), with the raw number kept out of `type` so a
+  // caller cannot log a service type the bouquet does not contain. `unknown`
+  // is what says the configured value was not one of ours.
+  return { type: 4097, ...ENIGMA2_SERVICE_TYPES[4097], unknown: true, configured: Number.isFinite(type) ? type : null };
+}
+
+/**
+ * The service type to write into a bouquet: a known one, or the fallback.
+ *
+ * Settings, the environment and the API all funnel through here, so the number
+ * that reaches `serviceRef()` is always one the box's image can be expected to
+ * understand — an unparseable value would otherwise produce a bouquet whose
+ * entries Enigma2 silently refuses to play.
+ */
+export function normaliseEnigma2ServiceType(value, fallback = 4097) {
+  const type = Number(String(value ?? '').trim());
+  if (ENIGMA2_SERVICE_TYPES[type]) return type;
+  const base = Number(fallback);
+  return ENIGMA2_SERVICE_TYPES[base] ? base : 4097;
+}
+
 export const DEFAULTS = {
   app: {
     /** Port the web UI + stream endpoints listen on. */
@@ -300,8 +388,15 @@ export const DEFAULTS = {
     /** Name of the bouquet folder on the box (no spaces!). */
     bouquetName: process.env.ENIGMA2_BOUQUET || 'vu-movie',
     rootDir: process.env.ENIGMA2_ROOT || '/etc/enigma2',
-    /** 4097 = GStreamer/exteplayer3 (safest for IPTV on a Duo2). */
-    serviceType: Number(process.env.ENIGMA2_SERVICE_TYPE || 4097),
+    /**
+     * The service type written into every bouquet entry, i.e. *which player on
+     * the box* opens the stream: 4097 = Enigma2's own servicemp3 (GStreamer),
+     * 5001 = ServiceApp's gstplayer, 5002 = ServiceApp's exteplayer3, 1 = DVB.
+     * See ENIGMA2_SERVICE_TYPES — the choice decides which container the
+     * `enigma2` output slot may write (exteplayer3 demuxes Matroska itself,
+     * GStreamer on a `.ts` service reference does not).
+     */
+    serviceType: normaliseEnigma2ServiceType(process.env.ENIGMA2_SERVICE_TYPE, 4097),
     /** FTP file transport for bouquet/subtitle uploads; OpenWebif only reloads/queries. */
     ftpEnabled: String(process.env.ENIGMA2_FTP || 'true').toLowerCase() === 'true',
     ftpPort: Number(process.env.ENIGMA2_FTP_PORT || 21),
@@ -547,6 +642,12 @@ function envOverrides() {
   if (process.env.ENIGMA2_USER) set('enigma2.username', process.env.ENIGMA2_USER);
   if (process.env.ENIGMA2_PASSWORD) set('enigma2.password', process.env.ENIGMA2_PASSWORD);
   if (process.env.ENIGMA2_BOUQUET) set('enigma2.bouquetName', process.env.ENIGMA2_BOUQUET);
+  // Read in DEFAULTS too, but that only applies when the file says nothing:
+  // without this line a service type saved from Settings outranked the
+  // documented ENIGMA2_SERVICE_TYPE, unlike every other receiver option here.
+  if (process.env.ENIGMA2_SERVICE_TYPE !== undefined && String(process.env.ENIGMA2_SERVICE_TYPE).trim() !== '') {
+    set('enigma2.serviceType', normaliseEnigma2ServiceType(process.env.ENIGMA2_SERVICE_TYPE, 4097));
+  }
   if (process.env.OPENSUBTITLES_API_KEY) set('subtitles.keys.opensubtitlesCom', process.env.OPENSUBTITLES_API_KEY);
   if (process.env.SUBDL_API_KEY) set('subtitles.keys.subdl', process.env.SUBDL_API_KEY);
   if (process.env.FLARESOLVERR_URL) set('scraper.flaresolverrUrl', process.env.FLARESOLVERR_URL);
@@ -702,6 +803,19 @@ export function validateConfigPatch(patch) {
     const forbidden = value.match(XTREAM_ACCOUNT_FORBIDDEN);
     if (forbidden) {
       problems.push(`${label}: “${forbidden[0]}” cannot be used — IPTV apps put the account in a URL. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe.`);
+    }
+  }
+
+  // The bouquet's service type decides which player on the box opens the
+  // stream, and an unknown number produces entries Enigma2 refuses to play —
+  // a black screen on the TV with nothing in this log to explain it. The list
+  // is small and stable, so the Settings save rejects anything outside it and
+  // names the four choices instead of storing a typo.
+  const receiver = (config.enigma2 && typeof config.enigma2 === 'object') ? config.enigma2 : {};
+  if (receiver.serviceType !== undefined && receiver.serviceType !== null && receiver.serviceType !== '') {
+    const type = Number(String(receiver.serviceType).trim());
+    if (!ENIGMA2_SERVICE_TYPES[type]) {
+      problems.push(`Receiver service type: ${ENIGMA2_SERVICE_TYPE_VALUES.join(', ')} are the service types a bouquet entry can use (4097 = Enigma2’s own player, 5001 = ServiceApp gstplayer, 5002 = ServiceApp exteplayer3, 1 = DVB).`);
     }
   }
   return problems;

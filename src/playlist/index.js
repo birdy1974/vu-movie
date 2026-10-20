@@ -696,12 +696,35 @@ export async function bouquet(baseUrl, { serviceType = null } = {}) {
     season: stream.upstream?.season || null,
     series: stream.title,
   }));
-  const built = enigma2.buildBouquet({
-    name: name(),
-    serviceType: serviceType || getConfig().enigma2.serviceType || 4097,
-    entries,
-  });
-  return { ...built, count: entries.length };
+  const type = serviceType || getConfig().enigma2.serviceType || 4097;
+  const built = enigma2.buildBouquet({ name: name(), serviceType: type, entries });
+  return { ...built, count: entries.length, warnings: bouquetContainerWarnings(streams, built.serviceType) };
+}
+
+/**
+ * Which of these entries the box's player may not be able to open.
+ *
+ * Every entry points at the same `.ts.enigma2` slot, so this is one question
+ * asked per item: what container does that slot really write (the template
+ * bound to it decides, see relay.outputContainerFor), and can the player the
+ * service type selects demux it? GStreamer (4097 / 5001) cannot take Matroska
+ * through a `.ts` reference — the TV shows a black screen and the box leaves
+ * the movie again, which the relay logs as "receiver left". exteplayer3 (5002)
+ * demuxes it itself.
+ *
+ * One sentence for the whole bouquet, naming a few titles, because a push
+ * answers once and a warning per item would be unreadable in a toast.
+ */
+function bouquetContainerWarnings(streams, serviceType) {
+  const advice = enigma2.matroskaOnBoxAdvice({ container: 'matroska', serviceType });
+  if (!advice) return [];
+  const affected = (streams || []).filter((stream) => relay.outputContainerFor(stream, 'enigma2') === 'matroska');
+  if (!affected.length) return [];
+  const names = affected.slice(0, 3).map((stream) => `“${stream.title}”`).join(', ');
+  const more = affected.length > 3 ? ` and ${affected.length - 3} more` : '';
+  log.warn('playlist', `the bouquet hands ${affected.length} Matroska item(s) to a player that cannot demux them`,
+    { items: affected.length, serviceType, titles: affected.map((stream) => stream.title).join(', ') });
+  return [`${affected.length} bouquet item${affected.length === 1 ? '' : 's'} (${names}${more}) would deliver Matroska on a .ts service reference. ${advice}`];
 }
 
 /** Short summary used by the Stream tab's header and by the log page. */
