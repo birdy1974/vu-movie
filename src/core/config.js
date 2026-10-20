@@ -335,6 +335,16 @@ export const DEFAULTS = {
     autoCheckEnabled: String(process.env.PLAYLIST_AUTO_CHECK || 'true').toLowerCase() !== 'false',
     autoCheckIntervalMinutes: Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES || 360),
     autoRepairEnabled: String(process.env.PLAYLIST_AUTO_REPAIR || 'true').toLowerCase() !== 'false',
+    /**
+     * Keep-warm: keep every *enabled* playlist item proved-playable in the
+     * background (see streams/readiness.js), so zapping to it on the box
+     * starts playback at once instead of probing/repairing at play time.
+     * `prewarmTrustMinutes` is how long one successful probe is trusted at
+     * playback without a re-probe (capped by a signed URL's own expiry);
+     * keep-warm re-proves shortly before that trust runs out.
+     */
+    prewarmEnabled: String(process.env.PLAYLIST_PREWARM || 'true').toLowerCase() !== 'false',
+    prewarmTrustMinutes: Number(process.env.PLAYLIST_PREWARM_TRUST_MINUTES || 30),
     token: '',
     /**
      * Username/password an Xtream Codes client sends (an empty password means
@@ -498,9 +508,14 @@ function envOverrides() {
   if (process.env.LOG_LEVEL) set('app.logLevel', process.env.LOG_LEVEL);
   if (process.env.APP_USERNAME) set('app.username', process.env.APP_USERNAME);
   if (process.env.APP_PASSWORD) set('app.password', process.env.APP_PASSWORD);
-  if (process.env.PLAYLIST_AUTO_CHECK !== undefined) set('playlist.autoCheckEnabled', String(process.env.PLAYLIST_AUTO_CHECK).toLowerCase() !== 'false');
-  if (process.env.PLAYLIST_CHECK_INTERVAL_MINUTES !== undefined) set('playlist.autoCheckIntervalMinutes', Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES));
-  if (process.env.PLAYLIST_AUTO_REPAIR !== undefined) set('playlist.autoRepairEnabled', String(process.env.PLAYLIST_AUTO_REPAIR).toLowerCase() !== 'false');
+  // The playlist toggles use a non-empty test, not `!== undefined`: compose
+  // forwards these names with an empty default, and an empty value must mean
+  // "not set" (Settings wins), not "true".
+  if (process.env.PLAYLIST_AUTO_CHECK) set('playlist.autoCheckEnabled', String(process.env.PLAYLIST_AUTO_CHECK).toLowerCase() !== 'false');
+  if (process.env.PLAYLIST_CHECK_INTERVAL_MINUTES && Number.isFinite(Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES))) set('playlist.autoCheckIntervalMinutes', Number(process.env.PLAYLIST_CHECK_INTERVAL_MINUTES));
+  if (process.env.PLAYLIST_AUTO_REPAIR) set('playlist.autoRepairEnabled', String(process.env.PLAYLIST_AUTO_REPAIR).toLowerCase() !== 'false');
+  if (process.env.PLAYLIST_PREWARM) set('playlist.prewarmEnabled', String(process.env.PLAYLIST_PREWARM).toLowerCase() !== 'false');
+  if (process.env.PLAYLIST_PREWARM_TRUST_MINUTES !== undefined && process.env.PLAYLIST_PREWARM_TRUST_MINUTES.trim() !== '' && Number.isFinite(Number(process.env.PLAYLIST_PREWARM_TRUST_MINUTES))) set('playlist.prewarmTrustMinutes', Number(process.env.PLAYLIST_PREWARM_TRUST_MINUTES));
   // Environment wins over a value saved from Settings, like PORT. Blank and
   // non-numeric values are ignored rather than read as 0 (= never expires).
   const ttlEnv = process.env.TOKEN_TTL_MINUTES;

@@ -347,6 +347,31 @@ page instead of from guesswork.
   adjust it. API: `POST /api/playlist/check` accepts optional
   `{ "streamIds": ["…"], "autoRepair": false }`; omit `streamIds` to check the
   whole list. `GET /api/playlist/check/schedule` reports schedule state.
+* **Ready before you press play (keep-warm + Prepare):** an availability check
+  that only runs at zap time makes the box wait out the probe — and, for a
+  rotted link, the whole multi-provider re-resolve — before the first frame.
+  So every successful check is remembered as a proof, trusted for
+  `PLAYLIST_PREWARM_TRUST_MINUTES` (default 30, capped by the signed URL's own
+  `exp` when it carries one, nested bridge URLs included), and two things
+  keep those proofs fresh *ahead* of playback: the **keep-warm** loop
+  re-proves every enabled playlist item shortly before its trust runs out
+  (serially, never against a stream somebody is watching, with exponential
+  backoff after failed repairs), and the Playlist/Mobile **🔥 prepare**
+  buttons start that proof on demand — tap prepare on your phone, walk to
+  the TV, zap, and a row tagged **ready ▶ instant** starts without any
+  re-probe. Preparing also happens automatically when a title is added to
+  the playlist, when a bouquet is pushed, and for a just-created stream
+  (its resolve-time probe is the first proof). If a trusted link dies
+  mid-window anyway, the failed relay session forgets the proof, so the
+  next play re-checks instead of repeating the failure. Toggle with
+  **Settings → Playlist availability** or `PLAYLIST_PREWARM` /
+  `PLAYLIST_PREWARM_TRUST_MINUTES` (2–240). API: `POST /api/playlist/prepare`
+  and `POST /api/playlist/items/<id>/prepare` (plus
+  `POST /api/streams/<id>/prepare`) answer `202` immediately and work in the
+  background (`{"wait":true}` blocks until ready);
+  `GET /api/playlist/readiness` reports each item's
+  `ready | preparing | stale | failed` state, when it was proved, and how
+  long it stays trusted.
 * **Live log view** in the UI (`/api/events`, SSE) with level/component filters —
   made for "why is this film not playing" debugging.
 * **Detailed, levelled, component-tagged logging** in the container log too

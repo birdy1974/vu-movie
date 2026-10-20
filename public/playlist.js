@@ -36,6 +36,11 @@ const VMPlaylist = (() => {
     state.playlist = {
       ...state.playlist,
       items: data.items || [],
+      // Per-item "ready to play instantly?" proofs, as last reported by the
+      // server (GET /api/playlist embeds them; /readiness refreshes them).
+      readiness: Object.fromEntries((data.items || [])
+        .filter((item) => item.readiness)
+        .map((item) => [String(item.streamId), item.readiness])),
       available: data.available || [],
       summary: data.summary || null,
       urls: data.urls || null,
@@ -185,6 +190,17 @@ const VMPlaylist = (() => {
   const healthOf = (streamId) => (state.playlist.health || {})[String(streamId)] || null;
   const isChecking = (streamId) => (state.playlist.checkingIds || new Set()).has(String(streamId));
 
+  /**
+   * Server-side readiness ("proved within the trust window, so a zap on the
+   * box starts without a re-probe"). The keep-warm loop maintains it in the
+   * background; the Prepare buttons ask for it now. Distinct from `health`
+   * above, which is this tab's own last ⚡ check run.
+   */
+  const readinessOf = (streamId) => (state.playlist.readiness || {})[String(streamId)]
+    || itemFor(streamId)?.readiness || null;
+  const isPreparing = (streamId) => readinessOf(streamId)?.preparing === true
+    || (state.playlist.preparingIds || new Set()).has(String(streamId));
+
   /** What ffprobe found, in one line: “1920×1080 h264 · 1h 32m”. */
   function probeLine(health) {
     const probe = health?.probe;
@@ -243,8 +259,26 @@ const VMPlaylist = (() => {
     const health = healthOf(item.streamId);
     const checking = isChecking(item.streamId);
     if (checking) return tag('checking…', 'info');
-    if (!health) return '';
-    return `<span class="pl-health-tag" title="${escapeHtml(healthTitle(health))}">${healthTag(health)}</span>`;
+    if (isPreparing(item.streamId)) return tag('preparing…', 'info');
+    if (health) {
+      return `<span class="pl-health-tag" title="${escapeHtml(healthTitle(health))}">${healthTag(health)}</span>`;
+    }
+    const readiness = readinessOf(item.streamId);
+    if (readiness?.ready) {
+      const title = [
+        readiness.verified
+          ? (readiness.checkedAt ? `proved working ${fmtTime(readiness.checkedAt)}` : 'proved working')
+          : 'not proven here (ffprobe is off or missing) — playback will simply try it',
+        readiness.trustedUntil ? `trusted until ${fmtTime(readiness.trustedUntil)} — playback starts without a re-probe` : '',
+        readiness.upstreamExpiresAt ? `the signed link itself expires ${fmtTime(readiness.upstreamExpiresAt)} (keep-warm refreshes it before then)` : '',
+      ].filter(Boolean).join(' · ');
+      return `<span class="pl-health-tag" title="${escapeHtml(title)}">${tag(readiness.verified ? 'ready ▶ instant' : 'ready (unverified)', readiness.verified ? 'ok' : 'warn')}</span>`;
+    }
+    if (readiness?.state === 'failed') {
+      const title = `${readiness.error || 'the last check/repair failed'}${readiness.nextRetryAt ? ` · keep-warm retries after ${fmtTime(readiness.nextRetryAt)}; 🔥 prepare retries now` : ''}`;
+      return `<span class="pl-health-tag" title="${escapeHtml(title)}">${tag('not working', 'err')}</span>`;
+    }
+    return '';
   }
 
   /** Repaint one row's health without re-rendering the list under the user. */
@@ -261,6 +295,16 @@ const VMPlaylist = (() => {
       button.disabled = isChecking(streamId);
       button.textContent = isChecking(streamId) ? '…' : '⚡';
     }
+    const prepareButton = $(`[data-pl-prepare="${String(streamId).replace(/"/g, '')}"]`);
+    if (prepareButton) {
+      prepareButton.disabled = isPreparing(streamId);
+      prepareButton.textContent = isPreparing(streamId) ? '…' : '🔥';
+    }
+    $$('[data-pl-row]').forEach((row) => {
+      if (String(row.dataset.plRow) !== String(streamId)) return;
+      row.classList.toggle('bad', ['dead', 'expired'].includes(healthOf(streamId)?.state)
+        || readinessOf(streamId)?.state === 'failed');
+    });
   }
 
   function renderCheckNote() {
@@ -301,16 +345,21 @@ const VMPlaylist = (() => {
     if (!note) return;
     const schedule = state.playlist.maintenance;
     if (!schedule) { note.textContent = ''; return; }
+    const prewarm = schedule.prewarm;
+    const warm = !prewarm ? ''
+      : prewarm.enabled
+        ? ` · keep-warm on: enabled links are kept “ready ▶ instant” (one check trusted ${prewarm.trustMinutes} min)`
+        : ' · keep-warm off (Settings → Playlist availability)';
     if (!schedule.enabled) {
-      note.textContent = 'Automatic Playlist checks are off; streams are still checked before playback starts.';
+      note.textContent = `Automatic Playlist checks are off; streams are still checked before playback starts.${warm}`;
       return;
     }
     const last = schedule.lastSummary
       ? ` · last: ${schedule.lastSummary.checked} checked, ${schedule.lastSummary.repaired || 0} refreshed`
       : '';
     note.textContent = schedule.running
-      ? `Automatic Playlist check is running${last}`
-      : `Automatic check every ${schedule.intervalMinutes} min${schedule.nextRunAt ? ` · next ${fmtTime(schedule.nextRunAt)}` : ''}${last}`;
+      ? `Automatic Playlist check is running${last}${warm}`
+      : `Automatic check every ${schedule.intervalMinutes} min${schedule.nextRunAt ? ` · next ${fmtTime(schedule.nextRunAt)}` : ''}${last}${warm}`;
   }
 
   /**
@@ -368,6 +417,9 @@ const VMPlaylist = (() => {
 
     state.playlist.checkingIds = new Set();
     renderCheckNote();
+    // The server records a good check as a trusted proof; mirror that here
+    // so the rows keep saying "ready" after the tab re-renders.
+    syncReadiness().catch(() => {});
     const health = list.map((item) => healthOf(item.streamId)).filter(Boolean);
     const refreshedCount = health.filter((result) => result.repaired).length;
     if (refreshedCount) await refresh();
@@ -382,6 +434,124 @@ const VMPlaylist = (() => {
       toast(refreshedCount ? `${refreshedCount} stream(s) refreshed; all ${health.length} answered` : `All ${health.length} stream(s) answered`, 'ok');
     }
     return { health };
+  }
+
+  /* ---------------- prepare: proved links, before you press play ---------------- */
+
+  /** The note + button state next to "🔥 prepare for playback". */
+  function renderPrepareNote() {
+    const note = $('#list-prepare-note');
+    const button = $('#btn-list-prepare');
+    const enabled = enabledItems();
+    const preparing = enabled.filter((item) => isPreparing(item.streamId)).length;
+    const ready = enabled.filter((item) => readinessOf(item.streamId)?.ready).length;
+    if (button) button.disabled = preparing > 0 || !enabled.length;
+    if (!note) return;
+    note.textContent = preparing
+      ? `preparing ${preparing} stream(s)…`
+      : enabled.length && ready ? `${ready}/${enabled.length} ready ▶ instant` : '';
+  }
+
+  /** Refresh every row's readiness from the server (one light request). */
+  async function syncReadiness() {
+    const data = await api('/api/playlist/readiness', { silent: true });
+    state.playlist.readiness = data.items || {};
+    if (data.prewarm && state.playlist.maintenance) state.playlist.maintenance.prewarm = data.prewarm;
+    for (const [streamId, readiness] of Object.entries(state.playlist.readiness)) {
+      if (!readiness?.preparing) state.playlist.preparingIds?.delete(String(streamId));
+      renderRowHealth(streamId);
+    }
+    renderPrepareNote();
+    renderCheckSchedule();
+    return data;
+  }
+
+  let readinessPoll = null;
+
+  function finishPrepare() {
+    const enabled = enabledItems();
+    const ready = enabled.filter((item) => readinessOf(item.streamId)?.ready);
+    const failed = enabled.filter((item) => readinessOf(item.streamId)?.state === 'failed');
+    const repaired = enabled.filter((item) => readinessOf(item.streamId)?.repaired);
+    state.playlist.preparingIds = new Set();
+    for (const item of enabled) renderRowHealth(item.streamId);
+    renderPrepareNote();
+    // The Mobile tab shows the same readiness tags; repaint it once, now
+    // that the prepare has settled (app.js owns that renderer).
+    try { if (typeof refreshMobile === 'function') refreshMobile(); } catch { /* Mobile tab not wired */ }
+    if (repaired.length) refresh().catch(() => {});
+    if (failed.length) {
+      toast(`${ready.length}/${enabled.length} ready; ${failed.length} could not be made playable: ${failed.slice(0, 3).map((item) => item.title || item.streamId).join(', ')} — the Logs tab says why`, 'err', 12000);
+    } else if (ready.length) {
+      toast(`${ready.length}/${enabled.length} stream(s) ready — zap on the box and playback starts at once`, 'ok', 6000);
+    }
+  }
+
+  /** Poll readiness while a prepare runs; stops by itself (5 min cap). */
+  function pollReadiness() {
+    if (readinessPoll) return;
+    const started = Date.now();
+    const tick = async () => {
+      readinessPoll = null;
+      try {
+        const data = await syncReadiness();
+        const anyPreparing = Object.values(data.items || {}).some((entry) => entry?.preparing)
+          || (state.playlist.preparingIds || new Set()).size > 0;
+        if (anyPreparing && Date.now() - started < 5 * 60_000) {
+          readinessPoll = setTimeout(tick, 4000);
+          return;
+        }
+        finishPrepare();
+      } catch {
+        if (Date.now() - started < 60_000) readinessPoll = setTimeout(tick, 5000);
+        else renderPrepareNote();
+      }
+    };
+    readinessPoll = setTimeout(tick, 1500);
+  }
+
+  /**
+   * Prove (or repair) the links in the background *now* — the whole enabled
+   * playlist, or the given items — so the next zap on the box takes the
+   * trusted-proof fast path instead of probing/repairing while it waits.
+   */
+  async function prepareStreams(streamIds = null, { force = false } = {}) {
+    const wanted = streamIds ? streamIds.map(String) : null;
+    const list = wanted ? items().filter((item) => wanted.includes(String(item.streamId))) : enabledItems();
+    if (!list.length) {
+      toast('Nothing to prepare — no enabled items in the playlist', 'warn');
+      return null;
+    }
+    state.playlist.preparingIds = new Set([
+      ...(state.playlist.preparingIds || []),
+      ...list.map((item) => String(item.streamId)),
+    ]);
+    for (const item of list) renderRowHealth(item.streamId);
+    renderPrepareNote();
+    try {
+      const data = await api('/api/playlist/prepare', {
+        method: 'POST', silent: true,
+        body: { ...(wanted ? { streamIds: list.map((item) => String(item.streamId)) } : {}), force },
+      });
+      // Items the server already trusts need no marker; the first poll
+      // confirms the rest.
+      for (const [streamId, outcome] of Object.entries(data.preparing || {})) {
+        if (outcome?.alreadyReady) state.playlist.preparingIds.delete(String(streamId));
+        if (outcome?.readiness) {
+          state.playlist.readiness = { ...(state.playlist.readiness || {}), [String(streamId)]: outcome.readiness };
+        }
+      }
+      for (const item of list) renderRowHealth(item.streamId);
+      toast(`Preparing ${list.length} stream(s) in the background — watch for “ready ▶ instant”, then zap on the box`, 'info', 6000);
+    } catch (error) {
+      state.playlist.preparingIds = new Set();
+      for (const item of list) renderRowHealth(item.streamId);
+      renderPrepareNote();
+      toast(`Prepare failed: ${error.message}`, 'err');
+      return null;
+    }
+    pollReadiness();
+    return true;
   }
 
   function rowMarkup(item, index) {
@@ -399,8 +569,10 @@ const VMPlaylist = (() => {
     const templateTag = item.hasTemplate ? tag(templateLabel(item), 'alt') : tag(templateLabel(item));
     const session = item.session ? tag(`${item.session.clients || 0} client(s)`, 'info') : '';
     const health = healthOf(item.streamId);
-    const broken = ['dead', 'expired'].includes(health?.state);
+    const broken = ['dead', 'expired'].includes(health?.state)
+      || readinessOf(item.streamId)?.state === 'failed';
     const checking = isChecking(item.streamId);
+    const preparing = isPreparing(item.streamId);
     return `<article class="pl-row${item.enabled ? '' : ' off'}${broken ? ' bad' : ''}" data-pl-row="${escapeHtml(item.streamId)}" data-pl-index="${index}">
       <div class="pl-handle" title="drag to change the order" aria-hidden="true">⠿</div>
       <div class="pl-order">${index + 1}</div>
@@ -416,7 +588,8 @@ const VMPlaylist = (() => {
       </div>
       ${templateSelect(item)}
       <div class="pl-actions">
-        <button class="btn sm ghost" data-pl-check="${escapeHtml(item.streamId)}" ${checking ? 'disabled' : ''} title="check whether this stream still works (ffprobe on the upstream URL)">${checking ? '…' : '⚡'}</button>
+        <button class="btn sm ghost" data-pl-prepare="${escapeHtml(item.streamId)}" ${preparing ? 'disabled' : ''} title="prepare now: prove (or repair) this link in the background, so it starts instantly on the box">${preparing ? '…' : '🔥'}</button>
+        <button class="btn sm ghost" data-pl-check="${escapeHtml(item.streamId)}" ${checking ? 'disabled' : ''} title="check whether this stream still works (ffprobe on the upstream URL); a good check also prepares it">${checking ? '…' : '⚡'}</button>
         <button class="btn sm" data-pl-play="${escapeHtml(item.streamId)}" title="start the preview web player">▶ preview</button>
         <button class="btn sm ghost" data-pl-meta="${escapeHtml(item.streamId)}" title="show all metadata">ⓘ meta</button>
         <button class="btn sm ghost" data-pl-sub="${escapeHtml(item.streamId)}" title="assign a subtitle file">▤ subtitle</button>
@@ -450,6 +623,7 @@ const VMPlaylist = (() => {
     const openStreamBtn = $('#btn-list-open-stream');
     if (openStreamBtn) openStreamBtn.disabled = !list.length;
     renderCheckNote();
+    renderPrepareNote();
     renderCheckSchedule();
 
     if (!list.length) {
@@ -468,6 +642,7 @@ const VMPlaylist = (() => {
       assignTemplate(select.dataset.plTemplate, select.value);
     }));
     $$('[data-pl-check]', host).forEach((button) => button.addEventListener('click', () => checkStreams([button.dataset.plCheck])));
+    $$('[data-pl-prepare]', host).forEach((button) => button.addEventListener('click', () => prepareStreams([button.dataset.plPrepare])));
     $$('[data-pl-play]', host).forEach((button) => button.addEventListener('click', () => openPlayer(button.dataset.plPlay)));
     $$('[data-pl-meta]', host).forEach((button) => button.addEventListener('click', () => openMetadata(button.dataset.plMeta)));
     $$('[data-pl-sub]', host).forEach((button) => button.addEventListener('click', () => openSubtitlePicker(button.dataset.plSub)));
@@ -1113,6 +1288,7 @@ const VMPlaylist = (() => {
   function wire() {
     $('#btn-list-refresh')?.addEventListener('click', () => refresh().then(() => toast('Playlist reloaded', 'ok', 2500)));
     $('#btn-list-check')?.addEventListener('click', () => checkStreams());
+    $('#btn-list-prepare')?.addEventListener('click', () => prepareStreams());
     $('#btn-list-enable-all')?.addEventListener('click', () => setAllEnabled(true));
     $('#btn-list-disable-all')?.addEventListener('click', () => setAllEnabled(false));
     $('#btn-list-add')?.addEventListener('click', async () => {
@@ -1136,6 +1312,7 @@ const VMPlaylist = (() => {
     removeItem, removeStream, reorder, setAllEnabled, openMetadata, openPlayer, openSubtitlePicker,
     items, enabledItems, itemFor, templates, urls, templateLabel, thumbMarkup,
     checkStreams, healthOf, renderRowHealth, renderCheckNote,
+    prepareStreams, readinessOf, isPreparing, syncReadiness, renderPrepareNote,
   };
 })();
 

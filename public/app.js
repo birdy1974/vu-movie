@@ -3336,6 +3336,7 @@ const SETTINGS_SECTIONS = [
     key: 'playlist', title: 'Playlist availability',
     fields: [
       ['autoCheckEnabled', 'bool'], ['autoCheckIntervalMinutes', 'number'], ['autoRepairEnabled', 'bool'],
+      ['prewarmEnabled', 'bool'], ['prewarmTrustMinutes', 'number'],
     ],
   },
   {
@@ -3379,7 +3380,7 @@ const SETTINGS_NOTES = {
   transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
   metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
-  playlist: 'Scheduled stream health checks and automatic recovery. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
+  playlist: 'Stream health checks, automatic recovery and keep-warm: enabled items are kept proved-playable in the background, so zapping to a film on the box starts it at once instead of checking (or repairing) its link while the box waits. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
   xtream: 'The account an Xtream Codes app (TiviMate, IPTV Smarters, …) logs in with. The server address and the ready-to-paste credentials are on the Stream tab; the playlist token stays part of that address.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
@@ -3421,6 +3422,8 @@ const SETTINGS_LABELS = {
   'playlist.autoCheckEnabled': ['Scheduled checks', 'Check every stream in the Playlist after startup and repeat on the interval below.'],
   'playlist.autoCheckIntervalMinutes': ['Check interval (min)', '15–10080 minutes; default is every 6 hours. The first scheduled check starts shortly after boot.'],
   'playlist.autoRepairEnabled': ['Auto-refresh inactive streams', 'When a check fails, resolve the same title on its current provider first, then try other enabled providers. The stream token and output URLs stay the same.'],
+  'playlist.prewarmEnabled': ['Keep-warm (prepare before playback)', 'Continuously prove every enabled playlist item in the background — and repair it before you watch — so playback on the Enigma2 box or in VLC starts instantly instead of probing (or re-resolving for minutes) after you press play. The Playlist tab also has a manual “prepare for playback” button; that works either way.'],
+  'playlist.prewarmTrustMinutes': ['Ready-trust window (min)', 'How long one successful check is trusted at playback without re-probing (2–240; default 30). Keep-warm re-proves shortly before the window — or a signed link’s own expiry — runs out. If a trusted link dies mid-window anyway, the failed session forgets the proof and the next play re-checks.'],
 
   'playlist.xtreamUsername': ['Username', 'Account name for the Xtream catalogue, “vumovie” by default. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe — the account is part of the playback URL.'],
   'playlist.xtreamPassword': ['Password', 'Password the Xtream app sends. Leave it empty to keep using the playlist token as the password. Shown masked; leave it untouched to keep the current one. Changing it invalidates the links already saved in your IPTV app.'],
@@ -3506,7 +3509,9 @@ async function loadSettings() {
             return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" value="${escapeHtml(list.join(', '))}" placeholder="comma separated"></div>`;
           }
           const inputType = type === 'password' ? 'password' : type === 'number' ? 'number' : 'text';
-          const constraints = section.key === 'playlist' && key === 'autoCheckIntervalMinutes' ? ' min="15" max="10080" step="15"' : '';
+          const constraints = section.key !== 'playlist' ? ''
+            : key === 'autoCheckIntervalMinutes' ? ' min="15" max="10080" step="15"'
+            : key === 'prewarmTrustMinutes' ? ' min="2" max="240" step="1"' : '';
           return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}"${constraints} value="${escapeHtml(value ?? '')}"></div>`;
         }).join('')}
         </div>
@@ -3820,6 +3825,14 @@ async function initMobile() {
     if (play) {
       const url = play.dataset.mobPlay;
       if (url) window.open(url, '_blank');
+      return;
+    }
+    const prep = event.target.closest('[data-mob-prepare]');
+    if (prep) {
+      // Phone in hand, TV across the room: prove the link now, zap when the
+      // tag says "ready ▶ instant" and the film starts at once.
+      VMPlaylist.prepareStreams([prep.dataset.mobPrepare])
+        .then(() => setTimeout(refreshMobile, 1600));
       return;
     }
     const rem = event.target.closest('[data-mob-remove]');
@@ -4532,9 +4545,10 @@ function refreshMobile() {
         ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:48px;height:72px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:48px;height:72px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
         <div class="mob-item-main">
           <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
-          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'}</div>
+          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'} ${(() => { const r = VMPlaylist.readinessOf?.(item.streamId); return r?.preparing ? tag('preparing…', 'info') : r?.ready ? tag('ready ▶ instant', 'ok') : r?.state === 'failed' ? tag('not working', 'err') : ''; })()}</div>
           <div class="row" style="margin-top:6px;gap:6px">
             <button class="btn sm pri" data-mob-play="${escapeHtml(watchUrl || tsUrl)}" title="stream on your mobile">▶ stream</button>
+            <button class="btn sm" data-mob-prepare="${escapeHtml(item.streamId)}" title="prepare now: prove (or repair) this link in the background, so it starts instantly on the box">🔥 prepare</button>
             <button class="btn sm ghost" data-mob-remove="${escapeHtml(item.streamId)}" title="remove from playlist">⊖</button>
           </div>
         </div>

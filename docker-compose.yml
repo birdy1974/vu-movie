@@ -105,6 +105,16 @@ services:
       # auto (default) = mobile BFF, fall back to the web (H5) BFF when the
       # api*.aoneroom.com edge never answers; h5 = web BFF first; mobile = never.
       MOVIEBOX_TRANSPORT: "${MOVIEBOX_TRANSPORT:-auto}"
+      # --- playlist availability / keep-warm ---
+      # Empty default on purpose: unset here lets Settings → Playlist
+      # availability decide; a value in .env wins over the saved settings.
+      PLAYLIST_AUTO_CHECK: "${PLAYLIST_AUTO_CHECK:-}"
+      PLAYLIST_CHECK_INTERVAL_MINUTES: "${PLAYLIST_CHECK_INTERVAL_MINUTES:-}"
+      PLAYLIST_AUTO_REPAIR: "${PLAYLIST_AUTO_REPAIR:-}"
+      # Keep enabled items proved-playable in the background (re-proved just
+      # before the trust window ends), so a zap on the box starts instantly.
+      PLAYLIST_PREWARM: "${PLAYLIST_PREWARM:-}"
+      PLAYLIST_PREWARM_TRUST_MINUTES: "${PLAYLIST_PREWARM_TRUST_MINUTES:-}"
       # --- UI password (recommended; VLC/Enigma2 stream URLs use tokens instead) ---
       APP_USERNAME: "${APP_USERNAME:-}"
       APP_PASSWORD: "${APP_PASSWORD:-}"
