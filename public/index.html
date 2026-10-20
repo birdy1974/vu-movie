@@ -477,9 +477,13 @@
           <div class="cardhead"><h2 style="margin:0">Enigma2 bouquet preview</h2>
             <div class="row"><span class="tag info" id="e2-file">userbouquet.vu-movie.tv</span>
               <span class="tag" id="e2-count">0 entries</span>
+              <span class="tag" id="e2-player">service type —</span>
               <button class="btn sm ghost" id="btn-e2-copy">copy</button>
               <button class="btn sm ghost" id="btn-e2-download">download .tv</button></div></div>
           <pre id="e2-preview" style="margin:0;border:0;border-radius:0;min-height:80px;max-height:320px">—</pre>
+          <!-- which player on the box opens these entries, and anything it will
+               not be able to play (Settings → Enigma2 → Service type) -->
+          <div id="e2-note" class="meta hide" style="padding:10px 12px;border-top:1px solid var(--line,#2a2f3a)"></div>
         </div>
         <div>
           <div class="card" style="margin-bottom:14px">

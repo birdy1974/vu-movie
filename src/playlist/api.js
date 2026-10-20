@@ -437,12 +437,40 @@ router.delete('/items/:id', wrap(async (req, res) => {
   res.json({ ok: true, removed: result.removed, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
 }));
 
+/**
+ * One sentence when the template just bound to this item makes the **Enigma2
+ * output** write a container the box's player cannot demux.
+ *
+ * The Playlist tab is where a template is bound per output, so this is the
+ * moment the operator can still act on it: the bouquet always hands the box a
+ * `.ts.enigma2` reference (the service-ref encoding strips query strings, so
+ * the slot cannot be renamed to `.mkv`), and whether Matroska bytes on that
+ * reference play at all is decided by Settings → Enigma2 → Service type —
+ * 5002 (ServiceApp exteplayer3) demuxes them itself, GStreamer (4097 / 5001)
+ * shows a black screen and leaves the movie seconds later. Advisory, never a
+ * refusal: ServiceApp can hand 4097 references to exteplayer3, which vu-movie
+ * cannot see from here.
+ *
+ * `outputType` empty means the template was bound to the stream itself, which
+ * the Enigma2 slot falls back to — so it is checked too.
+ */
+function enigma2SlotWarnings(stream, outputType = '') {
+  if (!stream || (outputType && outputType !== 'enigma2')) return [];
+  const advice = enigma2.matroskaOnBoxAdvice({ container: relay.outputContainerFor(stream, 'enigma2') });
+  if (!advice) return [];
+  log.warn('playlist', `the Enigma2 output of "${stream.title}" writes a container the box's player may not demux`, {
+    stream: stream.id, serviceType: getConfig().enigma2.serviceType,
+  });
+  return [advice];
+}
+
 /** Assign one of the saved FFmpeg templates (empty id = guided profile builder). */
 router.post('/items/:id/template', wrap(async (req, res) => {
-  const stream = await playlist.assignTemplate(req.params.id, req.body?.templateId, { outputType: req.body?.outputType || '' });
+  const outputType = req.body?.outputType || '';
+  const stream = await playlist.assignTemplate(req.params.id, req.body?.templateId, { outputType });
   const baseUrl = baseUrlFrom(req);
   const all = (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl));
-  res.json({ ok: true, streamId: stream.id, items: all, ...storageMeta() });
+  res.json({ ok: true, streamId: stream.id, items: all, ...storageMeta(), warnings: enigma2SlotWarnings(stream, outputType) });
 }));
 
 /** Attach a subtitle: a provider result, or the contents of a local .srt file. */
@@ -510,17 +538,21 @@ router.get('/m3u', wrap(async (req, res) => {
 router.post('/enigma2', wrap(async (req, res) => {
   const baseUrl = baseUrlFrom(req);
   const built = await playlist.bouquet(baseUrl, { serviceType: Number(req.body?.serviceType) || null });
+  // Lifted out of the bouquet so the UI can toast it without digging: these
+  // entries are written for a player that may not be able to open them.
+  const warnings = built.warnings || [];
   if (req.body?.action !== 'push') {
-    return res.json({ ok: true, mode: 'preview', bouquet: built, ...enigma2.previewBouquet(await bouquetEntries(baseUrl), { name: playlist.name() }) });
+    return res.json({ ok: true, mode: 'preview', warnings, bouquet: built, ...enigma2.previewBouquet(await bouquetEntries(baseUrl), { name: playlist.name() }) });
   }
   const result = await enigma2.pushBouquet(await bouquetEntries(baseUrl), { name: playlist.name(), dryRun: Boolean(req.body?.dryRun) });
   log.info('playlist', `bouquet ${result.ok ? 'pushed' : 'push failed'} from the playlist`, {
     entries: built.count, dryRun: Boolean(req.body?.dryRun), via: result.transport?.via || result.transport || null,
+    serviceType: built.serviceType, player: built.player,
   });
   // The bouquet just landed on the box — the viewer is about to zap. Prove
   // (and if needed repair) the enabled links now, in the background.
   if (result.ok && !req.body?.dryRun) kickPlaylistPrewarm({ reason: 'bouquet-push' });
-  res.status(result.ok ? 200 : 502).json({ ok: result.ok, mode: 'push', bouquet: built, ...result });
+  res.status(result.ok ? 200 : 502).json({ ok: result.ok, mode: 'push', warnings, bouquet: built, ...result });
 }));
 
 /** The bouquet entries of the enabled playlist items (shared by preview and push). */

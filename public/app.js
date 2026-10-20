@@ -3101,6 +3101,19 @@ async function refreshBouquetPreview() {
     $('#e2-preview').textContent = bouquet.text || '—';
     $('#e2-file').textContent = bouquet.fileName || 'userbouquet.vu-movie.tv';
     $('#e2-count').textContent = `${bouquet.entries ?? 0} entries`;
+    // Which player on the box these entries open — the half of the story that
+    // decides whether a Matroska output plays or shows a black screen.
+    const player = $('#e2-player');
+    if (player) {
+      player.textContent = `service type ${bouquet.serviceType ?? '—'} · ${bouquet.player || 'unknown player'}`;
+      player.className = `tag ${(data.warnings || []).length ? 'warn' : ''}`.trim();
+    }
+    const note = $('#e2-note');
+    if (note) {
+      const lines = [...(data.warnings || []), bouquet.serviceNote ? `Service type ${bouquet.serviceType}: ${bouquet.serviceNote}` : ''].filter(Boolean);
+      note.innerHTML = lines.map((line, index) => `<div${index === 0 && (data.warnings || []).length ? ' style="color:var(--warn,#e0a33e)"' : ''}>${escapeHtml(line)}</div>`).join('');
+      note.classList.toggle('hide', lines.length === 0);
+    }
   } catch (error) {
     $('#e2-preview').textContent = `// could not build the bouquet: ${error.message}`;
   }
@@ -3130,12 +3143,19 @@ async function pushBouquet({ dryRun = false } = {}) {
     const lines = [
       dryRun ? '✓ dry run — nothing was written to the receiver' : (data.ok ? '✓ bouquet pushed to the receiver' : '✗ push failed'),
       `entries: ${data.bouquet?.entries ?? '—'} · file: ${data.bouquet?.fileName || '—'}`,
+      `service type: ${data.bouquet?.serviceType ?? '—'} · player: ${data.bouquet?.player || 'unknown'}`,
+      // A container the box's player cannot demux is worth more than the
+      // "pushed" line: the entries are on the receiver and will not play.
+      ...(data.warnings || []).map((warning) => `⚠ ${warning}`),
       data.transport ? `transport: ${data.transport.via || JSON.stringify(data.transport)}` : '',
       data.error ? `error: ${data.error}` : '',
       data.reload ? `reload: ${data.reload.ok ? 'ok' : data.reload.error || 'failed'}` : '',
     ].filter(Boolean);
     if (log) log.textContent = lines.join('\n') + (data.bouquet?.text ? `\n\n${data.bouquet.text.slice(0, 4000)}` : '');
-    toast(dryRun ? 'Dry run finished' : (data.ok ? 'Bouquet pushed' : `Push failed: ${data.error || 'unknown error'}`), data.ok ? 'ok' : 'err');
+    const warned = (data.warnings || []).length;
+    toast(dryRun ? 'Dry run finished' : (data.ok ? 'Bouquet pushed' : `Push failed: ${data.error || 'unknown error'}`),
+      warned ? 'warn' : (data.ok ? 'ok' : 'err'), warned ? 12000 : 6000);
+    if (warned) toast(data.warnings[0], 'warn', 14000);
     await refreshStream();
   } catch (error) {
     if (log) log.textContent = `✗ ${error.message}`;
@@ -3313,6 +3333,24 @@ function subscribeToEvents() {
  * settings (same sections and behaviour as before)
  * ====================================================================== */
 
+/**
+ * The service types a bouquet entry can carry, as Settings lists them.
+ *
+ * A labelled choice rather than a number to type, because the value picks the
+ * player that opens the stream on the box and that player decides which
+ * container the `enigma2` output may write: 5002 (ServiceApp exteplayer3)
+ * demuxes Matroska itself — the only way to get a soft subtitle track on the
+ * TV — while 4097/5001 (GStreamer) show a black screen on Matroska arriving
+ * through the bouquet's `.ts.enigma2` reference. The server knows the same four
+ * (ENIGMA2_SERVICE_TYPES in src/core/config.js) and rejects anything else.
+ */
+const ENIGMA2_SERVICE_TYPE_OPTIONS = [
+  { value: 4097, label: '4097 — Enigma2’s own player (servicemp3 / GStreamer) · MPEG-TS only' },
+  { value: 5001, label: '5001 — ServiceApp: gstplayer (GStreamer) · MPEG-TS only' },
+  { value: 5002, label: '5002 — ServiceApp: exteplayer3 · also plays the .mkv output' },
+  { value: 1, label: '1 — DVB service (tuner; recordings only)' },
+];
+
 const SETTINGS_SECTIONS = [
   {
     key: 'transcode', title: 'Transcode',
@@ -3358,7 +3396,7 @@ const SETTINGS_SECTIONS = [
     key: 'enigma2', title: 'Enigma2',
     fields: [
       ['host', 'text'], ['port', 'number'], ['username', 'text'], ['password', 'password'],
-      ['bouquetName', 'text'], ['rootDir', 'text'], ['serviceType', 'number'],
+      ['bouquetName', 'text'], ['rootDir', 'text'], ['serviceType', 'select', ENIGMA2_SERVICE_TYPE_OPTIONS],
       ['ftpEnabled', 'bool'], ['ftpPort', 'number'], ['autoPush', 'bool'],
     ],
   },
@@ -3443,7 +3481,7 @@ const SETTINGS_LABELS = {
   'enigma2.password': ['Password', 'Stored in /config/vumovie.json; shown masked after a reload.'],
   'enigma2.bouquetName': ['Bouquet name', 'Name the playlist gets in the receiver bouquet list.'],
   'enigma2.rootDir': ['Root directory', 'Folder on the box for the bouquet and the subtitle files.'],
-  'enigma2.serviceType': ['Service type', 'Enigma2 service type for the bouquet entries: 4097 = GStreamer (non-TS stream, the default), 1 = DVB.'],
+  'enigma2.serviceType': ['Service type', 'Which player on the box opens a bouquet entry: 4097 = Enigma2’s own servicemp3 (GStreamer), 5001 = ServiceApp gstplayer, 5002 = ServiceApp exteplayer3, 1 = DVB (tuner). This decides what the Enigma2 output may write — GStreamer shows a black screen on Matroska arriving through the bouquet’s .ts reference, while exteplayer3 (5002) demuxes Matroska itself and is the only player that shows a soft subtitle track. MPEG-TS plays on all of them. 5001/5002 need the ServiceApp plugin on the box; re-push the bouquet after changing this.'],
   'enigma2.ftpEnabled': ['FTP upload', 'Upload the bouquet and subtitles over FTP instead of HTTP.'],
   'enigma2.ftpPort': ['FTP port', '21 by default.'],
   'enigma2.autoPush': ['Auto push', 'Push the bouquet after every playlist change.'],
@@ -3511,7 +3549,13 @@ async function loadSettings() {
             return `<div class="field" data-set-field="${id}"><label class="check-row" style="margin:0"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${escapeHtml(label)} ${tip(hint)}</label></div>`;
           }
           if (type === 'select') {
-            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><select id="${id}">${(options || []).map((option) => `<option value="${escapeHtml(option)}" ${String(value) === String(option) ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}</select></div>`;
+            // An option is either a plain string or a `{ value, label }` pair —
+            // the receiver's service type needs the pair, because the number
+            // that is saved says nothing on its own.
+            const choices = (options || []).map((option) => (option && typeof option === 'object'
+              ? { value: option.value, label: option.label || String(option.value) }
+              : { value: option, label: String(option) }));
+            return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><select id="${id}">${choices.map((choice) => `<option value="${escapeHtml(choice.value)}" ${String(value) === String(choice.value) ? 'selected' : ''}>${escapeHtml(choice.label)}</option>`).join('')}</select></div>`;
           }
           if (type === 'list') {
             const list = Array.isArray(value) ? value : String(value ?? '').split(',').map((part) => part.trim()).filter(Boolean);
@@ -3547,12 +3591,16 @@ async function saveSettings() {
     // what an earlier card collected instead of replacing it.
     const configKey = section.path || section.key;
     const target = patch[configKey] || (patch[configKey] = {});
-    for (const [key, type] of section.fields) {
+    for (const [key, type, options] of section.fields) {
       const el = $(`#set-${section.key}-${key}`);
       if (!el) continue;
       let value;
       if (type === 'bool') value = el.checked;
       else if (type === 'number') value = Number(el.value);
+      // A select whose options carry numbers (the receiver's service type)
+      // saves the number, not the string the DOM hands back — the server
+      // validates it against the same four types.
+      else if (type === 'select' && (options || []).some((option) => typeof option === 'number' || typeof option?.value === 'number')) value = Number(el.value);
       else if (type === 'list') value = el.value.split(',').map((part) => part.trim()).filter(Boolean);
       else value = el.value;
       // A masked password field the operator did not touch means "keep it" —

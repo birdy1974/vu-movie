@@ -98,13 +98,18 @@ const VMPlaylist = (() => {
     return data;
   }
 
-  async function assignTemplate(streamId, templateId) {
-    notePersisted(await api(`/api/playlist/items/${encodeURIComponent(streamId)}/template`, {
-      method: 'POST', body: { templateId }, silent: true,
+  async function assignTemplate(streamId, templateId, outputType = '') {
+    const data = notePersisted(await api(`/api/playlist/items/${encodeURIComponent(streamId)}/template`, {
+      method: 'POST', body: { templateId, ...(outputType ? { outputType } : {}) }, silent: true,
     }));
     await refresh();
     const label = templateId ? (templates().find((tpl) => tpl.id === templateId)?.name || templateId) : 'guided profile builder';
     toast(`FFmpeg template → ${label}`, 'ok', 4000);
+    // The server says when this binding puts a container on the Enigma2 output
+    // that the box's player cannot demux (Matroska + GStreamer = black screen).
+    // Told here, while the operator is looking at the item, instead of at zap
+    // time when the only symptom is a receiver that leaves the movie again.
+    for (const warning of data?.warnings || []) toast(warning, 'warn', 14000);
   }
 
   async function removeItem(streamId) {

@@ -34,7 +34,7 @@ preview and a settings editor — no build step, no CDN, everything served from 
                                                       ▼
                                    http://nas:8080/s/<token>/<title>.ts
                                      ├─ VLC · browser · M3U playlist
-                                     ├─ Enigma2 bouquet entry (4097)
+                                     ├─ Enigma2 bouquet entry (4097 / 5001 / 5002)
                                      └─ /dl/… download · subtitles
 ```
 
@@ -233,10 +233,12 @@ in an app before that switch keeps working: it relays to the `.ts` URL, which
 is labelled with the container it really delivers.
 
 The `enigma2` slot is the one exception by design: the Duo2 expects a
-`.ts.enigma2` service reference, so that link cannot be renamed to match. A
-Matroska template bound to the `enigma2` slot is therefore a
-misconfiguration — the relay logs a warning naming the template when it
-happens.
+`.ts.enigma2` service reference, so that link cannot be renamed to match.
+Whether a Matroska template bound to that slot plays at all is decided by the
+box's **service type** — see [Enigma2 bouquet](#enigma2-bouquet). With
+GStreamer (4097 / 5001) it is a misconfiguration and the relay logs a warning
+naming the template; with exteplayer3 (5002) it is the supported way to give
+the box a soft subtitle track, and the same line is logged as information.
 
 The account itself is set in **Settings → Xtream Codes** (or with
 `XTREAM_USERNAME` / `XTREAM_PASSWORD`, which win over a saved value). The
@@ -341,9 +343,36 @@ warning when it cannot, so "the box shows nothing" is answerable from the Logs
 page instead of from guesswork.
 
 ### Enigma2 bouquet
-* Generates `userbouquet.<name>.tv` with `#SERVICE 4097:…` entries (GStreamer
-  service type, so no tuner is used), `#DESCRIPTION` lines, and per-season
-  separators for series.
+* Generates `userbouquet.<name>.tv` with `#SERVICE <type>:…` entries,
+  `#DESCRIPTION` lines, and per-season separators for series.
+
+**The service type picks the player that opens the stream on the box**, and
+that player decides what the `enigma2` output may write. Set it in **Settings →
+Enigma2 → Service type** (or `ENIGMA2_SERVICE_TYPE`), then re-push the bouquet —
+the entries already on the box keep the old number:
+
+| Service type | Player on the box | Containers it plays from the bouquet |
+|---|---|---|
+| **4097** (default) | Enigma2's own `servicemp3` (GStreamer) | **MPEG-TS.** Matroska arriving on the `.ts.enigma2` reference is a black screen: the box leaves the movie after a few seconds, which the relay logs as `receiver left …` |
+| **5001** | ServiceApp → `gstplayer` (GStreamer) | MPEG-TS, like 4097. Shows a soft subtitle track when ServiceApp's *embedded subtitles* switch is on |
+| **5002** | ServiceApp → `exteplayer3` | **MPEG-TS and Matroska** — exteplayer3 carries its own ffmpeg demuxers. This is the player to choose for a Matroska `enigma2` template, and the only one that shows a `default`-flagged soft subtitle track |
+| **1** | DVB service (tuner) | Nothing over HTTP — only useful for a recording played back later |
+
+5001/5002 need the **ServiceApp** plugin installed on the receiver. An unknown
+number is refused by the Settings save (and falls back to 4097 anywhere else),
+because a service type no player answers to produces entries that zap to a
+black screen with nothing in the log to explain it.
+
+vu-movie keeps the two settings honest instead of guessing:
+
+* the bouquet preview and the push report say which player the entries were
+  written for, and warn when an enabled item's `enigma2` output writes a
+  container that player cannot demux;
+* binding a Matroska template to the Enigma2 output — per stream, per item or as
+  the global output default — answers the same warning at save time, while the
+  operator is still looking at the checkbox that caused it. It is advice, not a
+  refusal: ServiceApp can be configured to hand 4097 references to exteplayer3,
+  which vu-movie cannot see from the NAS.
 * Writes bouquet files over **FTP** (OpenWebif has no portable file-upload API),
   using a temporary file + same-directory rename. Before changing `bouquets.tv`
   it saves one restore point and patches the existing index without removing
@@ -468,6 +497,13 @@ A stream can also override any individual slot from the Stream tab
 writes `.ts.enigma2` URLs (not a query parameter) because `encodeE2Url` strips
 the query string when it builds the service reference — a 720p H.264 template
 bound to the `enigma2` slot is what actually runs on the Duo2.
+
+That slot is also the one whose **container must suit the box's player**, since
+it cannot be renamed to `.mkv` the way the slots above can: a Matroska template
+plays on service type 5002 (exteplayer3, which demuxes it itself) and shows a
+black screen on 4097/5001 (GStreamer). Both the template editor and the
+Settings save say so when it happens — see
+[Enigma2 bouquet](#enigma2-bouquet).
 
 The **browser preview is an eighth output** (`web`, URL `/s/{token}/{slug}.ts.web`).
 It is the one slot no template can be assigned to — see below.
