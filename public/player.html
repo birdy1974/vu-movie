@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web player — vu-movie</title>
+<style>
+  :root{color-scheme:dark;--bg:#0b0f16;--card:#111a29;--card2:#151d2c;--border:#243149;--fg:#e6edf7;--mut:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0}
+  a{color:var(--acc)}
+  header{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(11,15,22,.92);backdrop-filter:blur(6px);z-index:5}
+  .wrap{max-width:1240px;margin:0 auto;padding:0 16px}
+  .head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;flex-wrap:wrap}
+  .brand{font-size:17px;font-weight:700;color:var(--fg);text-decoration:none}
+  .brand small{color:var(--mut);font-weight:400;font-size:12px;display:block}
+  .btn{background:var(--card2);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px}
+  .btn:hover{border-color:var(--acc)}
+  .btn:disabled{opacity:.45;cursor:default}
+  .btn.pri{background:#0c4a6e;border-color:#075985}
+  .btn.sm{padding:4px 9px;font-size:12px}
+  .btn.ghost{background:transparent}
+  main{padding:16px 0 40px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px}
+  .video-frame{background:#000;border-radius:10px;overflow:hidden}
+  video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;background:#000}
+  .now{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  .now img{width:40px;height:60px;object-fit:cover;border-radius:6px;background:var(--card2)}
+  .now h1{font-size:17px;margin:0}
+  .mut{color:var(--mut)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  .controls .spacer{flex:1}
+  #status{color:var(--mut);margin-top:8px;min-height:20px}
+  #status.err{color:var(--err)} #status.ok{color:var(--ok)}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--border);background:var(--card2);color:var(--mut);white-space:nowrap}
+  .tag.ok{color:var(--ok);border-color:#14532d}.tag.warn{color:var(--warn);border-color:#713f12}
+  .tag.err{color:var(--err);border-color:#7f1d1d}.tag.info{color:var(--acc);border-color:#0c4a6e}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .toolbar input[type=search]{background:var(--card2);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:7px 10px;font:inherit;min-width:210px}
+  .toolbar select{background:var(--card2);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:7px 8px;font:inherit}
+  .pill{border:1px solid var(--border);background:var(--card2);color:var(--mut);border-radius:999px;padding:4px 12px;cursor:pointer;font-size:12.5px}
+  .pill.on{background:#0c4a6e;color:#fff;border-color:#075985}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:12px}
+  .item{text-align:left;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0;overflow:hidden;cursor:pointer;color:var(--fg);font:inherit;display:flex;flex-direction:column}
+  .item:hover,.item:focus-visible{border-color:var(--acc);outline:none}
+  .item.playing{border-color:var(--acc);box-shadow:0 0 0 2px rgba(56,189,248,.45)}
+  .poster{position:relative;aspect-ratio:2/3;background:var(--card2);display:grid;place-items:center;overflow:hidden}
+  .poster img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .poster .initials{font-size:26px;font-weight:700;color:#33507a}
+  .poster .playhint{position:absolute;inset:0;display:grid;place-items:center;font-size:34px;color:#fff;text-shadow:0 2px 10px #000;opacity:0;background:rgba(2,6,16,.35);transition:opacity .15s}
+  .item:hover .playhint,.item:focus-visible .playhint{opacity:1}
+  .item.playing .playhint{opacity:1;font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+  .badge{position:absolute;font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:999px;background:rgba(2,6,16,.82);color:#dbeafe;border:1px solid rgba(147,197,253,.35)}
+  .badge.kind{top:7px;left:7px;text-transform:uppercase;letter-spacing:.05em}
+  .badge.res{top:7px;right:7px;font-family:ui-monospace,monospace}
+  .badge.ep{bottom:7px;left:7px}
+  .item .body{padding:8px 10px 10px;display:flex;flex-direction:column;gap:3px}
+  .item .title{font-weight:600;font-size:13.5px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .item .meta{color:var(--mut);font-size:12px}
+  .item .chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+  .empty{border:1px dashed var(--border);border-radius:12px;padding:28px;text-align:center;color:var(--mut)}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--acc);border-radius:50%;animation:sp 0.9s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  footer{color:var(--mut);font-size:12.5px;padding:6px 0 26px}
+  @media (max-width:560px){.grid{grid-template-columns:repeat(auto-fill,minmax(112px,1fr))}}
+</style>
+</head>
+<body>
+<header><div class="wrap head">
+  <a class="brand" href="/player">vu-movie <small>web player — the complete playlist in the browser</small></a>
+  <div class="row">
+    <button class="btn sm" id="btn-prepare" type="button" hidden title="prove (or repair) every link in the background, so the next titles start instantly">🔥 prepare all</button>
+    <button class="btn sm ghost" id="btn-reload" type="button">⟳ reload playlist</button>
+    <a class="btn sm ghost" href="/" title="the administration UI">admin UI ↗</a>
+  </div>
+</div></header>
+
+<main class="wrap">
+  <section class="card" aria-label="Player">
+    <div class="video-frame"><video id="video" controls playsinline></video></div>
+    <div class="now">
+      <img id="now-poster" alt="" hidden>
+      <div style="flex:1;min-width:220px">
+        <h1 id="now-title">Pick a title below</h1>
+        <div class="mut" id="now-meta">Every enabled title of the playlist is one click away — no dropdown to dig through.</div>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="btn" id="btn-prev" type="button" title="previous title in the playlist">⏮ prev</button>
+      <button class="btn" id="btn-next" type="button" title="next title in the playlist">next ⏭</button>
+      <button class="btn" id="btn-sound" type="button">🔊 enable sound</button>
+      <button class="btn" id="btn-fullscreen" type="button">⛶ fullscreen</button>
+      <button class="btn" id="btn-stop" type="button">⏹ stop</button>
+      <span class="spacer"></span>
+      <label class="mut" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="opt-autonext" checked> auto-play next</label>
+      <button class="btn sm ghost" id="btn-copy-vlc" type="button" hidden>copy VLC link (keeps subtitles)</button>
+    </div>
+    <div id="status" role="status" aria-live="polite"><span class="spin"></span> loading the playlist…</div>
+  </section>
+
+  <div class="toolbar" aria-label="Filter the titles">
+    <button type="button" class="pill on" data-kind="all">All</button>
+    <button type="button" class="pill" data-kind="movie">🎬 Movies</button>
+    <button type="button" class="pill" data-kind="series">📺 Series</button>
+    <input type="search" id="q" placeholder="Search titles…  ( / )" aria-label="Search titles">
+    <select id="sort" aria-label="Sort titles">
+      <option value="playlist">Playlist order</option>
+      <option value="title">Title A–Z</option>
+      <option value="year">Newest first</option>
+    </select>
+    <span class="mut" id="count"></span>
+    <span class="mut" id="prepare-note" role="status" aria-live="polite"></span>
+  </div>
+
+  <section id="grid" class="grid" aria-label="All titles"></section>
+  <div id="empty" class="empty" hidden></div>
+
+  <footer id="foot"></footer>
+</main>
+
+<script src="/vendor/mpegts.js"></script>
+<script src="/web-codecs.js"></script>
+<script src="/player.js"></script>
+</body>
+</html>

@@ -674,6 +674,9 @@ router.post('/find/resolve', wrap(async (req, res) => {
         index: i,
         url: c.url,
         quality: c.quality,
+        width: Number(c.width) || null,
+        height: Number(c.height) || null,
+        resolution: c.resolution || null,
         label: c.label,
         sourceId: c.sourceId,
         kind: c.kind,
@@ -838,7 +841,7 @@ function bouquetEntries(streams, baseUrl) {
     const url = store.urlsFor(s, baseUrl).forBox;
     return {
       title: s.title, year: s.year, url,
-      description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${s.upstream?.quality || s.quality || 'source'}`,
+      description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${store.resolutionFor(s) || s.upstream?.quality || s.quality || 'source'}`,
       subtitle: s.profile?.subtitles && s.profile.subtitles !== 'none' ? (s.profile.subtitleLanguage || '').slice(0, 3) : null,
       season: s.upstream?.season || null,
       series: s.title,
@@ -1128,7 +1131,7 @@ router.post('/streams/:id/playlist', wrap(async (req, res) => {
       title: `${s.title}${s.year ? ` (${s.year})` : ''}`,
       url: u.ts,
       logo: s.poster,
-      quality: s.upstream?.quality,
+      quality: store.resolutionFor(s) || s.upstream?.quality,
       group: 'vu-movie',
       subtitle: req.body?.subtitlePath || undefined,
     };

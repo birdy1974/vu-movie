@@ -117,6 +117,14 @@ export function createApp() {
     // apps cannot send a password, so they carry an unguessable path instead.
     if (req.path.startsWith('/s/') || req.path.startsWith('/hls/') || req.path.startsWith('/dl/') || req.path.startsWith('/up/')
       || req.path.startsWith('/pl/') || req.path.startsWith('/xtream/') || req.path === '/api/health') return next();
+    // The playlist web player (/pl/<token>/player) is token-guarded like the
+    // outputs above, but its shell assets live at the root. They are plain
+    // client code with nothing secret in them (the data endpoints stay
+    // token/login-guarded), and /api/poster is authorised by its per-image
+    // HMAC signature — without these three, a token-only visitor with the
+    // app login enabled would get the player page but a 401 for its script,
+    // the transmuxer and every poster.
+    if (['/player.js', '/web-codecs.js', '/vendor/mpegts.js', '/api/poster'].includes(req.path)) return next();
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -276,7 +284,7 @@ export function createApp() {
         title: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
         url: innerUrl,
         logo: stream.poster,
-        quality: stream.upstream?.quality,
+        quality: store.resolutionFor(stream) || stream.upstream?.quality,
         group: 'vu-movie',
         subtitle: stream.profile?.subtitlePath && fs.existsSync(stream.profile.subtitlePath) ? stream.profile.subtitlePath : undefined,
       }], { name: stream.title });
@@ -392,6 +400,11 @@ export function createApp() {
     const stream = await streamByToken(req.params.token);
     if (!stream) return res.status(404).send('vu-movie: unknown or expired stream token');
     const urls = store.urlsFor(stream, baseUrlFrom(req));
+    const resolution = store.resolutionFor(stream);
+    const videoCodec = stream.upstream?.probe?.video?.codec || '';
+    const durationSec = Number(stream.upstream?.probe?.durationSec) || Number(stream.upstream?.durationSec) || 0;
+    const metaLine = [resolution, videoCodec, durationSec ? `${Math.round(durationSec / 60)} min` : '']
+      .filter(Boolean).join(' · ');
     const tsUrlJson = JSON.stringify(urls.ts).replace(/</g, '\\u003c');
     const webUrlJson = JSON.stringify(urls.web).replace(/</g, '\\u003c');
     res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
@@ -401,6 +414,7 @@ video{width:100%;max-width:1100px;background:#000;border-radius:12px}#status{col
 a{color:#38bdf8}code{background:#151d2c;padding:2px 6px;border-radius:6px}</style>
 <script src="/vendor/mpegts.js"></script><script src="/web-codecs.js"></script></head>
 <body><h1>${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}</h1>
+${metaLine ? `<div id="meta" style="color:#94a3b8;margin:-6px 0 10px">${escapeHtml(metaLine)}</div>` : ''}
 <video id="video" controls autoplay playsinline></video><div id="status">starting the MPEG-TS relay…</div>
 <p>Preview link (no subtitles, browser codecs): <code id="weburl"></code><br>
 VLC link (keeps subtitles): <code>${escapeHtml(urls.ts)}</code> · <a href="${urls.playlist}">.m3u playlist</a> · <a href="${urls.download}">download</a></p>

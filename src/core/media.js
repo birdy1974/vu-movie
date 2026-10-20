@@ -1440,6 +1440,29 @@ export function parseHlsMaster(text, baseUrl = '') {
 }
 
 /**
+ * The display form of a resolution: "1920×1080" when both dimensions are
+ * known, else the vertical shorthand "1080p", else null. `quality` (the
+ * "1080p" string) stays the canonical key for grouping/sorting, but a
+ * vertical-only indication hides whether a "1080p" is 1920×1080, a narrow
+ * 1440×1080 or a scope-cropped 1920×800 — so everywhere a resolution is
+ * *shown* it goes through this (the browser twin is fmtResolution in
+ * public/core.js; keep the two in agreement).
+ *
+ * Accepts a candidate, a probe, a probe's `video`, or a plain
+ * `{ width, height, quality }` — the shapes callers actually hold.
+ */
+export function formatResolution(source) {
+  const video = source?.probe?.video || source?.video || source || {};
+  const width = Number(video.width) || Number(source?.width) || 0;
+  const height = Number(video.height) || Number(source?.height) || 0;
+  if (width > 0 && height > 0) return `${width}×${height}`;
+  if (typeof source?.resolution === 'string' && source.resolution.includes('×')) return source.resolution;
+  if (height > 0) return `${height}p`;
+  const quality = String(source?.quality || '').trim();
+  return quality || null;
+}
+
+/**
  * Length of a VOD HLS media playlist: the sum of its #EXTINF durations. Only a
  * playlist that ends with #EXT-X-ENDLIST is complete — a live window is not a
  * length, so it yields null. A master playlist has no segments and yields null.

@@ -246,6 +246,35 @@ space, `/`, `?`, `#`, `%`, `&` — are refused on save, because an IPTV app woul
 store a link it cannot fetch. Changing the account invalidates the links already
 saved in your IPTV app; the Stream tab always shows the current credentials.
 
+### Web player — the complete playlist in the browser
+
+The **Web player** entry in the menu (or **▶ web player** on the Playlist tab)
+opens `/player`: the whole enabled playlist as a grid of poster cards — every
+title on one page, one click to play or switch, no dropdown. It is modelled on
+the browser player of stalker-proxy-manager and reuses the existing browser
+slot: the browser reports which codecs it can decode (Media Source
+Extensions), the relay copies what it can and transcodes the rest, exactly
+like the per-title `/watch/<token>` page. Search, Movies/Series filters,
+prev/next, auto-play-next, fullscreen and a "copy VLC link" button (the VLC
+`.ts` keeps the subtitles the browser slot drops) are built in; opened from
+the admin UI it also offers **🔥 prepare all** so the next titles start
+instantly.
+
+The same page answers on the shareable playlist link at
+`/pl/<token>/player` (data: `/pl/<token>/player.json`), so a household member
+with the playlist link can watch in a browser without the admin login — the
+token guards the data, and only the player's plain script assets and the
+signed poster images are reachable without credentials. Deep links work too:
+`/pl/<token>/player#<streamId>` opens straight on a title.
+
+Widths travel with every title: resolutions are shown as **width×height**
+(`1920×1080`, `1440×1080`, a cropped `1920×800`) wherever they are known — the
+player cards, Search formats, Playlist, Stream and Mobile tabs, the public
+playlist page/JSON and the `[…]` tag in `.m3u` titles — instead of the
+vertical-only `1080p` shorthand, which now only appears when no probe or HLS
+master ever revealed the width. The `1080p` value itself is unchanged and
+still drives grouping and sorting.
+
 ### Hardware transcoding that respects the J3455
 * VAAPI via `/dev/dri/renderD128` with the exact command family from the
   requirements (`-init_hw_device vaapi=intel:… -hwaccel vaapi -hwaccel_output_format

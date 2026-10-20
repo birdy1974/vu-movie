@@ -159,6 +159,26 @@ function fmtDuration(seconds) {
   return h ? `${h}h ${String(m).padStart(2, '0')}m` : m ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`;
 }
 
+/**
+ * The display form of a resolution: "1920×1080" when both dimensions are
+ * known, else the vertical shorthand "1080p", else the fallback. A
+ * vertical-only indication hides whether a "1080p" is 1920×1080, 1440×1080
+ * or a cropped 1920×800, so every surface shows both dimensions where they
+ * are known. Server twin: formatResolution in src/core/media.js (the web
+ * player carries its own copy in public/player.js). `quality` ("1080p")
+ * remains the canonical grouping/sorting key — this formats it, never
+ * replaces it. Accepts a candidate, a stream/playlist item, or a probe.
+ */
+const fmtResolution = (source, fallback = '') => {
+  const video = source?.probe?.video || source?.video || source || {};
+  const width = Number(video.width) || Number(source?.width) || 0;
+  const height = Number(video.height) || Number(source?.height) || 0;
+  if (width > 0 && height > 0) return `${width}×${height}`;
+  if (typeof source?.resolution === 'string' && source.resolution.includes('×')) return source.resolution;
+  if (height > 0) return `${height}p`;
+  return String(source?.quality || '').trim() || fallback;
+};
+
 const tag = (text, kind = '') => `<span class="tag ${kind}">${escapeHtml(text)}</span>`;
 
 /* ---------------- API + toasts ---------------- */

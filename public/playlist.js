@@ -205,8 +205,9 @@ const VMPlaylist = (() => {
   function probeLine(health) {
     const probe = health?.probe;
     if (!probe) return '';
-    const video = probe.video && probe.video.height
-      ? ` ${probe.video.width ? `${probe.video.width}×` : ''}${probe.video.height}${probe.video.codec ? ` ${probe.video.codec}` : ''}`
+    const resolution = fmtResolution(probe);
+    const video = probe.video && resolution
+      ? ` ${resolution}${probe.video.codec ? ` ${probe.video.codec}` : ''}`
       : '';
     const duration = probe.durationSec ? ` · ${fmtDuration(probe.durationSec)}` : '';
     return `${video}${duration}`;
@@ -557,7 +558,7 @@ const VMPlaylist = (() => {
   function rowMarkup(item, index) {
     const meta = [
       item.year ? String(item.year) : '',
-      item.quality || '',
+      fmtResolution(item),
       item.sourceId || '',
       item.kind === 'series' && item.season ? `S${item.season}E${item.episode || '?'}` : '',
     ].filter(Boolean).join(' · ');
@@ -734,7 +735,7 @@ const VMPlaylist = (() => {
     const available = state.playlist.available || [];
     select.innerHTML = available.length
       ? `<option value="">(pick a stream…)</option>${available.map((stream) =>
-        `<option value="${escapeHtml(stream.streamId)}">${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}${stream.quality ? ` · ${escapeHtml(stream.quality)}` : ''}</option>`).join('')}`
+        `<option value="${escapeHtml(stream.streamId)}">${escapeHtml(stream.title)}${stream.year ? ` (${stream.year})` : ''}${fmtResolution(stream) ? ` · ${escapeHtml(fmtResolution(stream))}` : ''}</option>`).join('')}`
       : '<option value="">(every stream is already in the playlist)</option>';
     if (button) button.disabled = !available.length;
   }
@@ -810,15 +811,17 @@ const VMPlaylist = (() => {
       const probe = stream.upstream?.probe || {};
       const video = probe.video || {};
       const meta = stream.payload?.meta || {};
+      const resolution = fmtResolution(stream.upstream || {});
+      const qualityLabel = stream.upstream?.quality || '';
       const rows = [
         ['Title', `${stream.title}${stream.year ? ` (${stream.year})` : ''}`],
         ['Kind', stream.kind || '—'],
         ['Year', stream.year || '—'],
         ['Source', stream.source_id || meta.sourceId || '—'],
-        ['Quality', stream.upstream?.quality || '—'],
+        ['Resolution', resolution ? (qualityLabel && qualityLabel !== resolution ? `${resolution} (${qualityLabel})` : resolution) : (qualityLabel || '—')],
         ['Duration', probe.durationSec ? fmtDuration(probe.durationSec) : '—'],
         ['Container', probe.container || stream.profile?.container || '—'],
-        ['Video', video.codec ? `${video.codec} ${video.width || '?'}x${video.height || '?'} @${video.fps || '?'}` : '—'],
+        ['Video', video.codec ? `${video.codec} ${video.width || '?'}×${video.height || '?'} @${video.fps || '?'}` : '—'],
         ['Audio', (probe.audio || []).map((a) => `${a.codec}${a.channels ? ` ${a.channels}ch` : ''}`).join(', ') || '—'],
         ['Subtitle tracks (source)', String((probe.subtitles || []).length)],
         ['Bitrate', probe.bitrate ? `${Math.round(probe.bitrate / 1000)} kbps` : '—'],

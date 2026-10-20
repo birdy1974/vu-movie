@@ -19,7 +19,7 @@ import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   probe, parseHlsMaster, streamKind, checkBinaries, isInitSegmentUrl,
-  parseHlsMediaDuration, parseDashMediaDuration,
+  parseHlsMediaDuration, parseDashMediaDuration, formatResolution,
 } from '../core/media.js';
 import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
@@ -1016,8 +1016,9 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
           quality: v.height ? `${v.height}p` : cand.quality,
           width: v.width || null,
           height: v.height || null,
+          resolution: formatResolution(v),
           bandwidth: v.bandwidth || null,
-          label: v.name || (v.height ? `${v.height}p` : 'variant'),
+          label: v.name || formatResolution(v) || 'variant',
         }));
         log.info('scraper', `expanded HLS master into ${variants.length} variant(s)`, { url: truncate(cand.url, 100) });
       } else {
@@ -1072,6 +1073,9 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
         cand.fps = info.video.fps;
         cand.codec = info.video.codec;
         cand.quality = cand.height ? `${cand.height}p` : cand.quality;
+        // Display form with both dimensions (UI, playlist, web player).
+        // `quality` stays the "1080p" key grouping and sorting rely on.
+        cand.resolution = formatResolution(cand);
       }
       if (!info) {
         cand.error = 'probe failed (dead mirror, expired token, geo-block or unsupported container)';
