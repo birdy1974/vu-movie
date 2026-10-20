@@ -13,6 +13,9 @@
  *   POST   /api/playlist/items        add streams by id
  *   POST   /api/playlist/check        check upstreams and automatically refresh inactive ones
  *   GET    /api/playlist/check/schedule  scheduled availability-check status
+ *   POST   /api/playlist/prepare      pre-warm items in the background so playback starts instantly
+ *   POST   /api/playlist/items/:id/prepare  pre-warm one item (`{wait:true}` to block until ready)
+ *   GET    /api/playlist/readiness    per-item "ready to play instantly?" state + keep-warm status
  *   PATCH  /api/playlist/items/:id    enable/disable, assign template, language
  *   DELETE /api/playlist/items/:id    remove from the playlist
  *   POST   /api/playlist/items/:id/template   assign a saved FFmpeg template
@@ -34,8 +37,9 @@ import { publicPosterUrl } from '../http/poster-proxy.js';
 import { OUTPUT_LABELS, OUTPUT_TYPES, requestAbortSignal } from '../http/api.js';
 import * as playlist from './index.js';
 import { checkStreams, summariseCheck, BROKEN_STATES } from './check.js';
-import { ensureStreamReady } from '../streams/recovery.js';
-import { getPlaylistMaintenanceStatus } from './maintenance.js';
+import { ensureStreamReady, prewarmStream, markStreamVerified } from '../streams/recovery.js';
+import { getReadiness } from '../streams/readiness.js';
+import { getPlaylistMaintenanceStatus, getPlaylistPrewarmStatus, kickPlaylistPrewarm } from './maintenance.js';
 
 /**
  * How many upstreams are probed at once by POST /api/playlist/check when the
@@ -85,6 +89,7 @@ export function outputUrls(baseUrl) {
   return {
     token,
     page: `${root}/`,
+    player: `${root}/player`,
     m3u: `${root}/playlist.m3u`,
     m3uPlus: `${root}/playlist.m3u8`,
     vlc: `${root}/vlc.m3u`,
@@ -120,6 +125,9 @@ function publicItem(entry, baseUrl) {
     poster: stream.poster ? publicPosterUrl(stream.poster, stream.payload?.meta?.posterReferer || '') : '',
     description: stream.description,
     quality: stream.upstream?.quality || null,
+    width: Number(stream.upstream?.width) || Number(stream.upstream?.probe?.video?.width) || null,
+    height: Number(stream.upstream?.height) || Number(stream.upstream?.probe?.video?.height) || null,
+    resolution: store.resolutionFor(stream),
     season: stream.upstream?.season || null,
     episode: stream.upstream?.episode || null,
     expiresAt: store.tokenExpiresAt(stream),
@@ -139,6 +147,9 @@ function publicItem(entry, baseUrl) {
     upstream: { url: stream.upstream?.url || '', kind: stream.upstream?.kind || null, via: stream.upstream?.via || null },
     urls: store.urlsFor(stream, baseUrl),
     session: entry.session,
+    // "Will this start the moment the box zaps to it?" — a trusted proof
+    // (ready), a check/repair in flight (preparing), or neither yet.
+    readiness: getReadiness(stream),
   };
 }
 
@@ -166,6 +177,7 @@ router.get('/', wrap(async (req, res) => {
         title: stream.title,
         year: stream.year,
         quality: stream.quality,
+        resolution: stream.resolution || null,
         sourceId: stream.sourceId,
         createdAt: stream.createdAt,
       })),
@@ -282,6 +294,19 @@ router.post('/check', wrap(async (req, res) => {
       }));
       if (request.signal.aborted) return;
     }
+    // A "working" answer here is a proof playback can trust, exactly like one
+    // from ensureStreamReady — record it, so pressing ⚡ check streams (or
+    // preparing from another client) also makes the next zap on the box
+    // start without a re-probe. Repaired items were already recorded by
+    // ensureStreamReady against their *new* upstream URL; re-recording them
+    // here would store the proof against the dead URL being replaced.
+    const streamsById = new Map(chosen.map((entry) => [String(entry.stream.id), entry.stream]));
+    for (const result of results) {
+      if (result.repaired) continue;
+      if (!['working', 'unverified'].includes(result.state)) continue;
+      const stream = streamsById.get(String(result.streamId));
+      if (stream) markStreamVerified(stream, result);
+    }
     const summary = summariseCheck(results, {
       ms: Date.now() - checkStartedAt,
       checkedAt: checked.summary.checkedAt,
@@ -300,10 +325,92 @@ router.post('/check', wrap(async (req, res) => {
   }
 }));
 
+/* ---------- pre-warm: be ready before play is pressed ---------- */
+
+/**
+ * "Get working links now, so playback starts the moment I zap to it."
+ *
+ * Body: `{ streamIds?: string[], force?: boolean }`. Without `streamIds`
+ * every enabled item that is due is warmed; with ids exactly those. The
+ * response is immediate (202) — proving a link can take seconds and
+ * repairing a dead one minutes, so the work runs in the background and the
+ * caller watches GET /readiness (or the `readiness` field of GET /) until
+ * nothing is `preparing` any more. `force` re-proves even items whose
+ * proof is still trusted.
+ */
+router.post('/prepare', wrap(async (req, res) => {
+  const body = req.body || {};
+  const wanted = Array.isArray(body.streamIds) && body.streamIds.length
+    ? body.streamIds.map((id) => String(id))
+    : null;
+  const force = body.force === true;
+  if (wanted) {
+    const outcomes = {};
+    for (const id of wanted) {
+      const stream = await store.getStream(id);
+      if (!stream) { outcomes[id] = { started: false, error: 'stream not found' }; continue; }
+      const outcome = await prewarmStream(stream, { reason: 'manual-prepare', force });
+      outcomes[id] = {
+        started: outcome.started,
+        alreadyReady: outcome.alreadyReady === true,
+        alreadyPreparing: outcome.alreadyPreparing === true,
+        readiness: outcome.readiness,
+      };
+    }
+    return res.status(202).json({ ok: true, preparing: outcomes, prewarm: getPlaylistPrewarmStatus() });
+  }
+  const kicked = kickPlaylistPrewarm({ reason: 'manual-prepare', force });
+  log.info('playlist', 'manual prepare requested for the playlist', { force, started: kicked.started });
+  return res.status(202).json({ ok: true, ...kicked, prewarm: getPlaylistPrewarmStatus() });
+}));
+
+/** Per-item readiness + keep-warm status — the light poll behind the Prepare button. */
+router.get('/readiness', wrap(async (_req, res) => {
+  const entries = await playlist.entries();
+  const items = {};
+  for (const entry of entries) items[String(entry.stream.id)] = getReadiness(entry.stream);
+  res.json({
+    ok: true,
+    prewarm: getPlaylistPrewarmStatus(),
+    items,
+    results: Object.values(items),
+  });
+}));
+
+/**
+ * Pre-warm one playlist item. Default: background, 202 at once. With
+ * `{ "wait": true }` the request blocks until the link is proved (or the
+ * repair fails) — for scripts that want to know, not guess.
+ */
+router.post('/items/:id/prepare', wrap(async (req, res) => {
+  const stream = await store.getStream(req.params.id);
+  if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
+  const force = req.body?.force === true;
+  if (req.body?.wait === true) {
+    const ready = await ensureStreamReady(stream, { reason: 'manual-prepare', forceCheck: force });
+    return res.status(ready.ok ? 200 : 503).json({
+      ok: ready.ok,
+      repaired: ready.repaired === true,
+      ...(ready.ok ? {} : { error: ready.error || ready.result?.error || 'upstream is not available' }),
+      check: ready.result,
+      readiness: getReadiness(ready.stream || stream),
+    });
+  }
+  const outcome = await prewarmStream(stream, { reason: 'manual-prepare', force });
+  return res.status(202).json({ ok: true, ...outcome });
+}));
+
 router.post('/items', wrap(async (req, res) => {
   const streamIds = req.body?.streamIds || req.body?.streamId;
   const { added } = await playlist.addItems(streamIds, { enabled: req.body?.enabled !== false });
   log.info('playlist', `added ${added} stream(s) to the playlist`);
+  // A title that was just put on the playlist is a title somebody is about
+  // to watch: prove its link now (a no-op for a just-resolved candidate,
+  // whose proof was recorded at creation) instead of at zap time.
+  if (added > 0 && req.body?.enabled !== false) {
+    const ids = (Array.isArray(streamIds) ? streamIds : [streamIds]).filter(Boolean).map(String);
+    if (ids.length) kickPlaylistPrewarm({ reason: 'playlist-add', streamIds: ids });
+  }
   const baseUrl = baseUrlFrom(req);
   res.json({ ok: true, added, items: (await playlist.entries({ baseUrl })).map((entry) => publicItem(entry, baseUrl)), ...storageMeta() });
 }));
@@ -410,6 +517,9 @@ router.post('/enigma2', wrap(async (req, res) => {
   log.info('playlist', `bouquet ${result.ok ? 'pushed' : 'push failed'} from the playlist`, {
     entries: built.count, dryRun: Boolean(req.body?.dryRun), via: result.transport?.via || result.transport || null,
   });
+  // The bouquet just landed on the box — the viewer is about to zap. Prove
+  // (and if needed repair) the enabled links now, in the background.
+  if (result.ok && !req.body?.dryRun) kickPlaylistPrewarm({ reason: 'bouquet-push' });
   res.status(result.ok ? 200 : 502).json({ ok: result.ok, mode: 'push', bouquet: built, ...result });
 }));
 

@@ -44,6 +44,7 @@ import {
   probe as probeMedia,
 } from '../core/media.js';
 import * as store from './store.js';
+import { forget as forgetStreamReadiness } from './readiness.js';
 import {
   maybeCreateUpstreamProxy, closeUpstreamProxy, proxyStats, pinUpstreamProxy,
 } from './upstream.js';
@@ -1186,6 +1187,12 @@ function spawnFfmpeg(session) {
     const endReason = fatal
       ? `ffmpeg cannot process this source (${truncate(fatal.hint, 160)})`
       : code === 0 ? `stream finished (${decision.reason})` : `ffmpeg exited with code ${code}`;
+    // An unclean end with no restart left means the upstream may have died
+    // inside its trust window (readiness.js): drop the "ready" proof so the
+    // next play re-checks — and repairs — instead of trusting a dead link
+    // into the same failure again. A clean end-of-movie (code 0) proves
+    // nothing either way and keeps the proof.
+    if (code !== 0 && !fatal) forgetStreamReadiness(session.streamId);
     // Nobody was attached when it ended (the CDN gave up on a held source, or
     // ffmpeg crashed while the player was away): keep the play head so the next
     // play resumes there. A fatal startup failure would repeat, so it keeps nothing.

@@ -1,8 +1,22 @@
-/** Background maintenance for the saved Playlist. */
+/**
+ * Background maintenance for the saved Playlist.
+ *
+ * Two loops with different jobs:
+ *   \u2022 the scheduled availability check (default every 6 h) sweeps *every*
+ *     item, disabled ones included, and repairs what it finds broken;
+ *   \u2022 the keep-warm (prewarm) loop below keeps every *enabled* item
+ *     continuously proved-playable, re-proving shortly before a proof's
+ *     trust window (streams/readiness.js) runs out. That is what lets a zap
+ *     on the Enigma2 box start at once: the probe \u2014 and, for a rotted link,
+ *     the minutes-long provider re-resolve \u2014 already happened in the
+ *     background instead of while the box waits for its first byte.
+ */
 import { getConfig } from '../core/config.js';
 import { log, errorText } from '../core/log.js';
 import * as playlist from './index.js';
 import { ensureStreamReady } from '../streams/recovery.js';
+import * as readiness from '../streams/readiness.js';
+import * as relay from '../streams/relay.js';
 import { sweepEphemeralStreams } from '../streams/store.js';
 
 const DEFAULT_INTERVAL_MINUTES = 360;
@@ -138,9 +152,212 @@ export async function runPlaylistAutoCheck({ reason = 'scheduled', autoRepair = 
   }
 }
 
+/* ---------------- keep-warm (prewarm): ready before play is pressed ---------------- */
+
+const PREWARM_TICK_MS = 60_000;
+/** Re-prove this long before a proof stops being trusted, so there is no gap. */
+const PREWARM_LEAD_MS = 60_000;
+
+const prewarmState = {
+  started: false,
+  running: false,
+  timer: null,
+  nextTickAt: null,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastSummary: null,
+  lastError: null,
+};
+
+/** A stream somebody is watching is never re-proved: a repair would stop its session. */
+function isPlaying(streamId) {
+  const session = relay.getSession(streamId);
+  return Boolean(session && (session.alive || (session.clients?.size || 0) > 0));
+}
+
+/**
+ * Prove every enabled playlist item that is due (no proof, proof about to
+ * stop being trusted, or signed URL about to expire) and repair the dead
+ * ones in place. Serial by default: a repair can mean a Chromium provider
+ * search, and background work must never fight a playing movie for the NAS.
+ *
+ * This is the workhorse for the ticker, for the manual "prepare" endpoints
+ * (which pass `force`/`streamIds`) and for tests (which inject
+ * `prober`/`searchSource`/`searchAll`/`resolveTarget`, forwarded to
+ * ensureStreamReady). It deliberately ignores `prewarmEnabled` — that
+ * setting gates the *ticker*, never an explicit prepare.
+ */
+export async function runPlaylistPrewarmOnce({
+  reason = 'prewarm',
+  force = false,
+  streamIds = null,
+  concurrency = 1,
+  now = () => Date.now(),
+  prober, searchSource, searchAll, resolveTarget, signal = null,
+} = {}) {
+  if (prewarmState.running) {
+    return { skipped: true, reason: 'a prewarm run is already in progress', summary: prewarmState.lastSummary };
+  }
+  prewarmState.running = true;
+  prewarmState.lastStartedAt = new Date().toISOString();
+  prewarmState.lastError = null;
+  const startedAt = Date.now();
+  try {
+    const wanted = Array.isArray(streamIds) && streamIds.length ? new Set(streamIds.map(String)) : null;
+    const entries = (await playlist.entries())
+      .filter((entry) => entry.enabled !== false)
+      .filter((entry) => !wanted || wanted.has(String(entry.stream.id)));
+    const at = now();
+    const due = [];
+    let alreadyReady = 0;
+    let skippedPlaying = 0;
+    let skippedBackoff = 0;
+    for (const entry of entries) {
+      const stream = entry.stream;
+      if (isPlaying(stream.id)) { skippedPlaying += 1; continue; }
+      if (!force && readiness.cachedProof(stream, { now: at })
+        && !readiness.isDue(stream, { now: at, leadMs: PREWARM_LEAD_MS })) { alreadyReady += 1; continue; }
+      if (!force && !readiness.isDue(stream, { now: at, leadMs: PREWARM_LEAD_MS })) {
+        // Not due and not trusted-ready: a failed repair inside its backoff.
+        skippedBackoff += 1;
+        continue;
+      }
+      due.push(entry);
+    }
+
+    const results = new Array(due.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(Math.max(1, concurrency), due.length) }, async () => {
+      while (true) {
+        const index = next++;
+        if (index >= due.length) return;
+        const entry = due[index];
+        try {
+          const outcome = await ensureStreamReady(entry.stream, {
+            reason,
+            forceCheck: true,
+            autoRepair: scheduleConfig().autoRepair,
+            prober, searchSource, searchAll, resolveTarget, signal,
+          });
+          results[index] = {
+            streamId: entry.stream.id,
+            title: entry.stream.title || '',
+            ready: outcome.ok === true,
+            repaired: outcome.repaired === true,
+            error: outcome.ok ? null : (outcome.error || outcome.result?.error || 'upstream unavailable'),
+          };
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          results[index] = { streamId: entry.stream.id, title: entry.stream.title || '', ready: false, repaired: false, error: errorText(error) };
+        }
+      }
+    });
+    await Promise.all(workers);
+
+    const summary = {
+      considered: entries.length,
+      due: due.length,
+      ready: results.filter((result) => result?.ready).length + alreadyReady,
+      warmed: results.filter((result) => result?.ready).length,
+      repaired: results.filter((result) => result?.repaired).length,
+      failed: results.filter((result) => result && !result.ready).length,
+      alreadyReady,
+      skippedPlaying,
+      skippedBackoff,
+      ms: Date.now() - startedAt,
+    };
+    prewarmState.lastSummary = summary;
+    prewarmState.lastFinishedAt = new Date().toISOString();
+    if (due.length) {
+      log[summary.failed ? 'warn' : 'info']('playlist',
+        `pre-warm: ${summary.ready}/${summary.considered} enabled stream(s) ready to play instantly`, { ...summary, reason });
+    } else {
+      log.debug('playlist', 'pre-warm: nothing due', { ...summary, reason });
+    }
+    return { skipped: false, summary, results };
+  } catch (error) {
+    prewarmState.lastError = errorText(error);
+    prewarmState.lastFinishedAt = new Date().toISOString();
+    throw error;
+  } finally {
+    prewarmState.running = false;
+  }
+}
+
+/**
+ * Fire a keep-warm pass without waiting for it (a bouquet push, a playlist
+ * addition, the Prepare button). Returns at once; readiness is polled
+ * through GET /api/playlist/readiness.
+ */
+export function kickPlaylistPrewarm(options = {}) {
+  if (prewarmState.running) return { started: false, running: true };
+  runPlaylistPrewarmOnce(options).catch((error) => {
+    log.warn('playlist', 'pre-warm pass failed', { error: errorText(error), reason: options.reason || 'prewarm' });
+  });
+  return { started: true, running: true };
+}
+
+function schedulePrewarmTick(delayMs) {
+  if (prewarmState.timer) clearTimeout(prewarmState.timer);
+  prewarmState.timer = null;
+  prewarmState.nextTickAt = null;
+  if (!prewarmState.started) return;
+  prewarmState.nextTickAt = new Date(Date.now() + delayMs).toISOString();
+  prewarmState.timer = setTimeout(async () => {
+    prewarmState.timer = null;
+    prewarmState.nextTickAt = null;
+    try {
+      // Read live on every tick: switching keep-warm off in Settings stops
+      // the work without a restart (and back on resumes it).
+      if (readiness.prewarmConfig().enabled) await runPlaylistPrewarmOnce({ reason: 'keep-warm' });
+    } catch (error) {
+      prewarmState.lastError = errorText(error);
+      log.warn('playlist', 'keep-warm pass failed', { error: prewarmState.lastError });
+    } finally {
+      schedulePrewarmTick(PREWARM_TICK_MS);
+    }
+  }, Math.max(0, delayMs));
+  prewarmState.timer.unref?.();
+}
+
+/** Start the keep-warm ticker; the first pass shares the scheduled check's startup delay. */
+export function startPlaylistPrewarm() {
+  prewarmState.started = true;
+  schedulePrewarmTick(STARTUP_DELAY_MS);
+  const config = readiness.prewarmConfig();
+  log.info('playlist', config.enabled
+    ? `keep-warm on: enabled streams are kept ready to play (a successful check is trusted for ${config.trustMinutes} min)`
+    : 'keep-warm is disabled; streams are checked at playback (or with the Prepare button)', {
+    enabled: config.enabled, trustMinutes: config.trustMinutes, tickMs: PREWARM_TICK_MS,
+  });
+  return getPlaylistPrewarmStatus();
+}
+
+export function stopPlaylistPrewarm() {
+  prewarmState.started = false;
+  if (prewarmState.timer) clearTimeout(prewarmState.timer);
+  prewarmState.timer = null;
+  prewarmState.nextTickAt = null;
+}
+
+export function getPlaylistPrewarmStatus() {
+  const config = readiness.prewarmConfig();
+  return {
+    enabled: config.enabled,
+    trustMinutes: config.trustMinutes,
+    running: prewarmState.running,
+    nextTickAt: prewarmState.nextTickAt,
+    lastStartedAt: prewarmState.lastStartedAt,
+    lastFinishedAt: prewarmState.lastFinishedAt,
+    lastSummary: prewarmState.lastSummary,
+    lastError: prewarmState.lastError,
+  };
+}
+
 /** Start the repeating timer; first run is delayed so startup remains light. */
 export function startPlaylistMaintenance() {
   state.started = true;
+  startPlaylistPrewarm();
   queueNext(STARTUP_DELAY_MS);
   const config = scheduleConfig();
   log.info('playlist', config.enabled
@@ -157,12 +374,16 @@ export function startPlaylistMaintenance() {
 export function reconfigurePlaylistMaintenance() {
   if (!state.started) return getPlaylistMaintenanceStatus();
   queueNext(STARTUP_DELAY_MS);
+  // A trust/prewarm change can make items due right away; a due-only pass is
+  // cheap when everything is already proved, so kick one.
+  if (readiness.prewarmConfig().enabled) kickPlaylistPrewarm({ reason: 'settings' });
   return getPlaylistMaintenanceStatus();
 }
 
 export function stopPlaylistMaintenance() {
   state.started = false;
   cancelTimer();
+  stopPlaylistPrewarm();
 }
 
 export function getPlaylistMaintenanceStatus() {
@@ -177,6 +398,7 @@ export function getPlaylistMaintenanceStatus() {
     lastFinishedAt: state.lastFinishedAt,
     lastSummary: state.lastSummary,
     lastError: state.lastError,
+    prewarm: getPlaylistPrewarmStatus(),
   };
 }
 
@@ -220,6 +442,11 @@ export function stopEphemeralSweep() {
 
 export default {
   runPlaylistAutoCheck,
+  runPlaylistPrewarmOnce,
+  kickPlaylistPrewarm,
+  startPlaylistPrewarm,
+  stopPlaylistPrewarm,
+  getPlaylistPrewarmStatus,
   startPlaylistMaintenance,
   reconfigurePlaylistMaintenance,
   stopPlaylistMaintenance,

@@ -24,6 +24,7 @@
       <button data-p="tpl" title="Transcode"><span class="ico">⚒</span><span class="lbl">Transcode</span></button>
       <button data-p="list" title="Playlist"><span class="ico">☰</span><span class="lbl">Playlist</span></button>
       <button data-p="stream" title="Stream"><span class="ico">▶</span><span class="lbl">Stream</span></button>
+      <a class="navlink" href="/player" title="Web player — play the complete playlist in the browser"><span class="ico">🎬</span><span class="lbl">Web player</span></a>
       <button data-p="tpl-test" title="Test"><span class="ico">▷</span><span class="lbl">Test</span></button>
       <button data-p="logs" title="Logs"><span class="ico">≡</span><span class="lbl">Logs</span></button>
       <button data-p="set" title="Settings"><span class="ico">⚙</span><span class="lbl">Settings</span></button>
@@ -390,7 +391,7 @@
 
     <!-- ============ PLAYLIST ============ -->
     <section id="p-list" class="hide">
-      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue. “Check streams” probes each upstream and can refresh inactive links without changing the stream token. Checks also run on a schedule and before playback starts.">i</span></h1>
+      <h1>Playlist <span class="tip" tabindex="0" role="note" aria-label="About the Playlist tab" data-tip="The ordered list every output is built from. Drag the handle to change the order, switch items off to keep them out of the playlist, bouquet and Xtream catalogue. “Check streams” probes each upstream and can refresh inactive links without changing the stream token. Checks also run on a schedule and before playback starts. “Prepare for playback” proves (and if needed repairs) the links in the background right now, and keep-warm keeps enabled items proved continuously — so zapping to a film on the box starts at once instead of waiting for the check. A “ready ▶ instant” tag on a row means its link is proved and will be trusted without a re-probe.">i</span></h1>
       <div class="card">
         <div class="spread">
           <div class="row">
@@ -400,8 +401,10 @@
           <div class="row">
             <button class="btn sm ghost" id="btn-list-enable-all">✓ enable all</button>
             <button class="btn sm ghost" id="btn-list-disable-all">✕ disable all</button>
-            <button class="btn sm" id="btn-list-check" title="check and automatically refresh inactive upstream URLs">⚡ check streams <span class="tip" tabindex="0" role="note" aria-label="About checking streams" data-tip="Checks each item's upstream URL. If it is inactive, vu-movie searches the same provider first and then other enabled providers for the same title, and updates the upstream while keeping the stream token and playlist URL stable. Automatic checks also run on the configured schedule and before playback starts.">i</span></button>
+            <button class="btn sm pri" id="btn-list-prepare" title="prove the links now, in the background, so playback on the box starts instantly">🔥 prepare for playback <span class="tip" tabindex="0" role="note" aria-label="About preparing for playback" data-tip="Proves every enabled item's upstream link now — and repairs a dead one — in the background, instead of at the moment you zap to it on the box. Watch the row tags: “preparing…” turns into “ready ▶ instant”. A ready link is trusted for the window set in Settings → Playlist availability, and keep-warm re-proves it before that runs out. Prepare from your phone, walk to the TV, and the film starts at once.">i</span></button>
+            <button class="btn sm" id="btn-list-check" title="check and automatically refresh inactive upstream URLs">⚡ check streams <span class="tip" tabindex="0" role="note" aria-label="About checking streams" data-tip="Checks each item's upstream URL. If it is inactive, vu-movie searches the same provider first and then other enabled providers for the same title, and updates the upstream while keeping the stream token and playlist URL stable. A successful check is also a proof playback trusts, so a checked item starts without re-probing. Automatic checks also run on the configured schedule and before playback starts.">i</span></button>
             <span class="mut" id="list-check-note" role="status" aria-live="polite"></span>
+            <span class="mut" id="list-prepare-note" role="status" aria-live="polite"></span>
             <span class="mut" id="list-check-schedule" role="status" aria-live="polite"></span>
             <button class="btn sm ghost" id="btn-list-refresh">⟳ refresh</button>
           </div>
@@ -412,6 +415,7 @@
             <select id="list-add"><option value="">(no other streams)</option></select>
           </div>
           <button class="btn sm" id="btn-list-add">+ add</button>
+          <a class="btn sm" href="/player" title="play the complete playlist in the browser — every title on one page">▶ web player</a>
           <button class="btn sm ghost" id="btn-list-open-stream">▶ open outputs</button>
         </div>
       </div>

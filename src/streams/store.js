@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { repo } from '../core/db.js';
-import { normaliseProfile, streamKind } from '../core/media.js';
+import { normaliseProfile, streamKind, formatResolution } from '../core/media.js';
 
 const shortId = () => crypto.randomBytes(5).toString('hex');
 const token = () => crypto.randomBytes(12).toString('base64url');
@@ -90,6 +90,13 @@ export async function createStream({
       kind: candidate?.kind || null,
       headers: candidate?.headers || {},
       quality: candidate?.quality || null,
+      // Both dimensions beside the vertical "1080p" shorthand, so every
+      // surface (UI, .m3u, bouquet, web player) can show "1920×1080"
+      // without re-probing. Older records only have them inside `probe`;
+      // resolutionFor() below digs there as a fallback.
+      width: Number(candidate?.width) || Number(candidate?.probe?.video?.width) || null,
+      height: Number(candidate?.height) || Number(candidate?.probe?.video?.height) || null,
+      resolution: formatResolution(candidate),
       label: candidate?.label || null,
       probe: candidate?.probe || null,
       variants: candidate?.variants || null,
@@ -112,6 +119,21 @@ export async function createStream({
     reasons: normalised.reasons?.join('; '),
   });
   return saved;
+}
+
+/**
+ * The "1920×1080" display resolution of a saved stream (falling back to the
+ * vertical "1080p" shorthand, then null), from whichever place recorded the
+ * dimensions: the upstream fields written at creation, or the stored probe
+ * for records that predate them.
+ */
+export function resolutionFor(stream) {
+  const upstream = stream?.upstream || {};
+  return formatResolution({
+    width: upstream.width, height: upstream.height,
+    resolution: upstream.resolution, quality: upstream.quality,
+    probe: upstream.probe,
+  });
 }
 
 /**
@@ -165,6 +187,9 @@ export async function listStreams() {
     description: r.description,
     sourceId: r.source_id,
     quality: r.upstream?.quality || null,
+    width: Number(r.upstream?.width) || Number(r.upstream?.probe?.video?.width) || null,
+    height: Number(r.upstream?.height) || Number(r.upstream?.probe?.video?.height) || null,
+    resolution: resolutionFor(r),
     createdAt: r.created_at,
     expiresAt: tokenExpiresAt(r),
     subtitleId: r.subtitle_id,
@@ -385,4 +410,4 @@ export function slugify(text) {
     .slice(0, 70) || 'stream';
 }
 
-export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, tokenExpiresAt, setUpstreamDuration, EPHEMERAL_TTL_MINUTES };
+export default { createStream, getStream, listStreams, removeStream, sweepEphemeralStreams, urlsFor, slugify, tokenExpiresAt, setUpstreamDuration, resolutionFor, EPHEMERAL_TTL_MINUTES };

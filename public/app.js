@@ -393,10 +393,10 @@ async function loadStreams() {
   const host = $('#dash-streams');
   if (host) {
     host.innerHTML = streams.length ? `<table>
-      <thead><tr><th>Title</th><th>Source</th><th>Quality</th><th>Mode</th><th>Created</th><th></th></tr></thead><tbody>
+      <thead><tr><th>Title</th><th>Source</th><th>Resolution</th><th>Mode</th><th>Created</th><th></th></tr></thead><tbody>
       ${streams.map((stream) => `<tr>
         <td>${escapeHtml(stream.title)}${stream.year ? ` <span class="mut">(${stream.year})</span>` : ''}</td>
-        <td>${tag(stream.sourceId || '—')}</td><td>${tag(stream.quality || '—', 'ok')}</td>
+        <td>${tag(stream.sourceId || '—')}</td><td>${tag(fmtResolution(stream) || '—', 'ok')}</td>
         <td>${tag(stream.transcode ? 'transcode' : 'copy', stream.transcode ? 'alt' : 'ok')}</td>
         <td class="mut">${fmtTime(stream.createdAt)}</td>
         <td><button class="btn sm" data-open-stream="${escapeHtml(stream.id)}">open</button></td>
@@ -1315,6 +1315,9 @@ function expandCandidateQualities(candidates = []) {
         url: variant.url,
         quality: variant.quality || (height ? `${height}p` : candidate.quality),
         label: variant.label || variant.name || (height ? `${height}p` : candidate.label),
+        width: width || Number(variant.width) || null,
+        height,
+        resolution: width && height ? `${width}×${height}` : (variant.resolution || null),
         headers: variant.headers || candidate.headers || {},
         variants: null,
         _entry: candidate._entry,
@@ -1349,13 +1352,15 @@ function expandCandidateQualities(candidates = []) {
 /** One card per provider/file inside a title — the "formats" list. */
 function candidateMarkup(candidate, index, meta = {}) {
   const probe = candidate.probe || null;
-  const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.width ? ` ${probe.video.width}×${probe.video.height}` : ''}` : '';
+  const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.fps ? ` ${probe.video.fps}fps` : ''}` : '';
   const firstAudio = Array.isArray(probe?.audio) ? probe.audio[0] : probe?.audio;
   const audio = firstAudio ? `${firstAudio.codec || '?'}${firstAudio.channels ? ` ${firstAudio.channels}ch` : ''}` : '';
   const bitrate = Number(candidate.bandwidth) || Number(probe?.bitrate) || 0;
   const ok = candidate.ok !== false;
   const error = candidate.error || null;
-  const quality = candidate.quality || candidate.label || 'format';
+  // Both dimensions where known ("1920×1080"); the "1080p" shorthand only
+  // when the width never surfaced.
+  const quality = fmtResolution(candidate) || candidate.quality || candidate.label || 'format';
   return `<div class="cand ${ok ? '' : 'bad'}" data-candidate="${index}">
     <div class="cand-main">
       <div class="cand-title">${escapeHtml(quality)}
@@ -1617,7 +1622,7 @@ async function addQualityToPlaylist(quality) {
   if (!row) return;
   let added = 0;
   let failed = 0;
-  toast(`Adding ${row.episodes.length} episode(s) in ${quality}…`, 'info', 4000);
+  toast(`Adding ${row.episodes.length} episode(s) in ${row.resolution || quality}…`, 'info', 4000);
   for (const { season, episode } of row.episodes) {
     const group = series.episodes.get(seriesKey(season, episode));
     const candidate = (group?.candidates || []).find((c) => seriesQualityKey(c) === quality && c.ok !== false)
@@ -1626,7 +1631,7 @@ async function addQualityToPlaylist(quality) {
     const stream = await addCandidateToPlaylist(-1, { candidate, season, episode });
     if (stream) added += 1; else failed += 1;
   }
-  toast(added ? `Added ${added} episode(s) in ${quality}${failed ? ` (${failed} failed)` : ''}` : `Nothing added in ${quality}`, added ? 'ok' : 'warn');
+  toast(added ? `Added ${added} episode(s) in ${row.resolution || quality}${failed ? ` (${failed} failed)` : ''}` : `Nothing added in ${row.resolution || quality}`, added ? 'ok' : 'warn');
   renderSeriesCandidates();
 }
 
@@ -1742,6 +1747,7 @@ function seriesMatrixRows(loaded = seriesLoadedEpisodes()) {
       if (!rows.has(quality)) {
         rows.set(quality, {
           quality,
+          width: Number(candidate?.width) || Number(candidate?.probe?.video?.width) || null,
           height: Number(candidate?.height) || seriesQualityHeight(quality),
           episodes: [],
           providers: new Set(),
@@ -1750,6 +1756,7 @@ function seriesMatrixRows(loaded = seriesLoadedEpisodes()) {
         });
       }
       const row = rows.get(quality);
+      if (!row.width) row.width = Number(candidate?.width) || Number(candidate?.probe?.video?.width) || null;
       row.providers.add(String(candidate?.sourceId || candidate?._entry?.sourceId || 'unknown'));
       row.total += 1;
       if (candidate?.ok !== false) row.playable += 1;
@@ -1763,6 +1770,7 @@ function seriesMatrixRows(loaded = seriesLoadedEpisodes()) {
   return [...rows.values()]
     .map((row) => ({
       ...row,
+      resolution: fmtResolution(row) || row.quality,
       providers: [...row.providers].sort(),
       episodes: row.episodes.sort((a, b) => a.season - b.season || a.episode - b.episode),
     }))
@@ -2138,16 +2146,16 @@ function seriesMatrixMarkup(rows, totalSelected, loadedCount) {
       <span class="mut">${loadedCount}/${totalSelected} episode(s) loaded</span>
     </div>
     <table>
-      <thead><tr><th>Quality</th><th>Episodes</th><th>Providers</th><th></th></tr></thead>
+      <thead><tr><th>Resolution</th><th>Episodes</th><th>Providers</th><th></th></tr></thead>
       <tbody>
         ${rows.map((row) => {
           const sample = row.episodes.slice(0, 6).map((entry) => seriesLabel(entry.season, entry.episode)).join(', ');
           const more = row.episodes.length > 6 ? ` +${row.episodes.length - 6} more` : '';
           return `<tr>
-            <td><b>${escapeHtml(row.quality)}</b> ${row.playable === row.total && row.total ? tag('all playable', 'ok') : tag(`${row.playable}/${row.total} playable`, row.playable ? '' : 'err')}</td>
+            <td><b>${escapeHtml(row.resolution || row.quality)}</b> ${row.playable === row.total && row.total ? tag('all playable', 'ok') : tag(`${row.playable}/${row.total} playable`, row.playable ? '' : 'err')}</td>
             <td><span class="mut">${row.episodes.length} episode(s)</span> ${escapeHtml(sample)}${escapeHtml(more)}</td>
             <td>${row.providers.map((id) => tag(sourceName(id) === id ? id : sourceName(id))).join('')}</td>
-            <td><button type="button" class="btn sm pri" data-series-add-quality="${escapeHtml(row.quality)}" title="add one playlist item per episode in ${escapeHtml(row.quality)}">+ add all ${escapeHtml(row.quality)}</button></td>
+            <td><button type="button" class="btn sm pri" data-series-add-quality="${escapeHtml(row.quality)}" title="add one playlist item per episode in ${escapeHtml(row.resolution || row.quality)}">+ add all ${escapeHtml(row.resolution || row.quality)}</button></td>
           </tr>`;
         }).join('')}
       </tbody>
@@ -2199,12 +2207,12 @@ function seriesEpisodeGroupMarkup(group, providerCount = null) {
 
 function seriesCandidateMarkup(candidate, key, index) {
   const probe = candidate.probe || null;
-  const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.width ? ` ${probe.video.width}×${probe.video.height}` : ''}` : '';
+  const video = probe?.video ? `${probe.video.codec || '?'}${probe.video.fps ? ` ${probe.video.fps}fps` : ''}` : '';
   const firstAudio = Array.isArray(probe?.audio) ? probe.audio[0] : probe?.audio;
   const audio = firstAudio ? `${firstAudio.codec || '?'}${firstAudio.channels ? ` ${firstAudio.channels}ch` : ''}` : '';
   const bitrate = Number(candidate.bandwidth) || Number(probe?.bitrate) || 0;
   const ok = candidate.ok !== false;
-  const quality = candidate.quality || candidate.label || 'format';
+  const quality = fmtResolution(candidate) || candidate.quality || candidate.label || 'format';
   const [season, episode] = key.split(':').map(Number);
   return `<div class="cand ${ok ? '' : 'bad'}">
     <div class="cand-main">
@@ -2874,7 +2882,7 @@ function renderStreamUrls() {
   }
   const urls = item.urls || {};
   host.innerHTML = `<div class="row" style="margin-bottom:8px">
-      ${tag(item.quality || 'unknown', 'ok')} ${tag(item.kind || 'movie')} ${tag(item.sourceId || '—')}
+      ${tag(fmtResolution(item) || 'unknown', 'ok')} ${tag(item.kind || 'movie')} ${tag(item.sourceId || '—')}
       ${tag(VMPlaylist.templateLabel(item), item.hasTemplate ? 'alt' : '')}
       ${item.enabled ? tag('in the outputs', 'ok') : tag('disabled — not in the outputs', 'warn')}
       <span class="mut">${item.session ? `${item.session.clients || 0} player(s) connected` : 'no relay session running'}</span>
@@ -3040,7 +3048,8 @@ async function refreshStream(announce = false) {
   $('#st-meta').innerHTML = `${escapeHtml(state.playlist.name || 'vu-movie')} · ${summary.enabled}/${summary.total} item(s) enabled · ${escapeHtml(state.playlist.items.filter((item) => item.hasTemplate).length)} with an FFmpeg template`;
   const xtream = urls.xtream || {};
   const entries = [
-    { name: 'Playlist page', hint: 'open in a browser — player + all URLs', url: urls.page, kind: 'link', pri: true, vlc: false },
+    { name: '▶ Web player', hint: 'play the complete playlist in the browser — every title on one page, one click to play or switch', url: urls.player, kind: 'link', pri: true, vlc: false },
+    { name: 'Playlist page', hint: 'open in a browser — links + all URLs', url: urls.page, kind: 'link', pri: true, vlc: false },
     { name: 'M3U — VLC / Kodi', hint: 'plain .m3u for a desktop player (all enabled playlist items)', url: urls.m3u, kind: 'm3u', vlc: true },
     { name: 'M3U+ — IPTV apps', hint: 'with embedded metadata (all enabled)', url: urls.m3uPlus, kind: 'm3u', vlc: true },
     { name: 'VLC playlist', hint: 'VLC preset — complete playlist (all streams defined in Playlist tab, enabled only)', url: urls.vlc, kind: 'm3u', vlc: true, isCompleteVlc: true },
@@ -3066,11 +3075,11 @@ async function refreshStream(announce = false) {
 
   $('#st-item-count').textContent = `${state.playlist.items.length} item(s)`;
   $('#st-items').innerHTML = state.playlist.items.length ? `<table>
-    <thead><tr><th>#</th><th>Title</th><th>Quality</th><th>Template</th><th>Subtitle</th><th>URLs</th></tr></thead><tbody>
+    <thead><tr><th>#</th><th>Title</th><th>Resolution</th><th>Template</th><th>Subtitle</th><th>URLs</th></tr></thead><tbody>
     ${state.playlist.items.map((item, index) => `<tr class="${item.enabled ? '' : 'row-off'}">
       <td class="mut">${index + 1}</td>
       <td>${escapeHtml(item.title)}${item.enabled ? '' : ' <span class="tag warn">off</span>'}</td>
-      <td>${tag(item.quality || '—', 'ok')}</td>
+      <td>${tag(fmtResolution(item) || '—', 'ok')}</td>
       <td>${escapeHtml(VMPlaylist.templateLabel(item))}</td>
       <td>${item.subtitlePath ? tag(item.subtitleLanguage || 'yes', 'ok') : '<span class="mut">—</span>'}</td>
       <td class="row" style="gap:6px">
@@ -3336,6 +3345,7 @@ const SETTINGS_SECTIONS = [
     key: 'playlist', title: 'Playlist availability',
     fields: [
       ['autoCheckEnabled', 'bool'], ['autoCheckIntervalMinutes', 'number'], ['autoRepairEnabled', 'bool'],
+      ['prewarmEnabled', 'bool'], ['prewarmTrustMinutes', 'number'],
     ],
   },
   {
@@ -3379,7 +3389,7 @@ const SETTINGS_NOTES = {
   transcode: 'Guided profile builder: what the relay does when a stream has no FFmpeg template of its own.',
   subtitles: 'Which languages are searched and whether a found subtitle is pushed to the receiver.',
   metadata: 'TMDB / OMDB for rich movie info — ratings, cast, plot, posters. Get a free key at themoviedb.org and omdbapi.com.',
-  playlist: 'Scheduled stream health checks and automatic recovery. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
+  playlist: 'Stream health checks, automatic recovery and keep-warm: enabled items are kept proved-playable in the background, so zapping to a film on the box starts it at once instead of checking (or repairing) its link while the box waits. A refreshed upstream keeps the same stream id/token and existing playlist URLs.',
   xtream: 'The account an Xtream Codes app (TiviMate, IPTV Smarters, …) logs in with. The server address and the ready-to-paste credentials are on the Stream tab; the playlist token stays part of that address.',
   enigma2: 'The VU+ / Enigma2 box that receives the bouquet.',
   scraper: 'Headless-browser and ffprobe behaviour while resolving a stream.',
@@ -3421,6 +3431,8 @@ const SETTINGS_LABELS = {
   'playlist.autoCheckEnabled': ['Scheduled checks', 'Check every stream in the Playlist after startup and repeat on the interval below.'],
   'playlist.autoCheckIntervalMinutes': ['Check interval (min)', '15–10080 minutes; default is every 6 hours. The first scheduled check starts shortly after boot.'],
   'playlist.autoRepairEnabled': ['Auto-refresh inactive streams', 'When a check fails, resolve the same title on its current provider first, then try other enabled providers. The stream token and output URLs stay the same.'],
+  'playlist.prewarmEnabled': ['Keep-warm (prepare before playback)', 'Continuously prove every enabled playlist item in the background — and repair it before you watch — so playback on the Enigma2 box or in VLC starts instantly instead of probing (or re-resolving for minutes) after you press play. The Playlist tab also has a manual “prepare for playback” button; that works either way.'],
+  'playlist.prewarmTrustMinutes': ['Ready-trust window (min)', 'How long one successful check is trusted at playback without re-probing (2–240; default 30). Keep-warm re-proves shortly before the window — or a signed link’s own expiry — runs out. If a trusted link dies mid-window anyway, the failed session forgets the proof and the next play re-checks.'],
 
   'playlist.xtreamUsername': ['Username', 'Account name for the Xtream catalogue, “vumovie” by default. Letters, digits and . _ - ~ ! $ * + , ; : @ are safe — the account is part of the playback URL.'],
   'playlist.xtreamPassword': ['Password', 'Password the Xtream app sends. Leave it empty to keep using the playlist token as the password. Shown masked; leave it untouched to keep the current one. Changing it invalidates the links already saved in your IPTV app.'],
@@ -3506,7 +3518,9 @@ async function loadSettings() {
             return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" value="${escapeHtml(list.join(', '))}" placeholder="comma separated"></div>`;
           }
           const inputType = type === 'password' ? 'password' : type === 'number' ? 'number' : 'text';
-          const constraints = section.key === 'playlist' && key === 'autoCheckIntervalMinutes' ? ' min="15" max="10080" step="15"' : '';
+          const constraints = section.key !== 'playlist' ? ''
+            : key === 'autoCheckIntervalMinutes' ? ' min="15" max="10080" step="15"'
+            : key === 'prewarmTrustMinutes' ? ' min="2" max="240" step="1"' : '';
           return `<div class="field" data-set-field="${id}"><label for="${id}">${escapeHtml(label)} ${tip(hint)}</label><input id="${id}" type="${inputType}"${constraints} value="${escapeHtml(value ?? '')}"></div>`;
         }).join('')}
         </div>
@@ -3822,6 +3836,14 @@ async function initMobile() {
       if (url) window.open(url, '_blank');
       return;
     }
+    const prep = event.target.closest('[data-mob-prepare]');
+    if (prep) {
+      // Phone in hand, TV across the room: prove the link now, zap when the
+      // tag says "ready ▶ instant" and the film starts at once.
+      VMPlaylist.prepareStreams([prep.dataset.mobPrepare])
+        .then(() => setTimeout(refreshMobile, 1600));
+      return;
+    }
     const rem = event.target.closest('[data-mob-remove]');
     if (rem) {
       VMPlaylist.removeItem(rem.dataset.mobRemove).then(() => refreshMobile());
@@ -3994,8 +4016,8 @@ async function mobileSelect(group, { sourceId = '' } = {}) {
     ${state.mobile.candidates.filter((candidate) => candidate.ok !== false).map((candidate) => {
       const index = state.mobile.candidates.indexOf(candidate);
       return `<button class="mob-format" data-madd="${index}">
-        <span>${escapeHtml(candidate.quality || candidate.label || 'format')}</span>
-        <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video ? ` · ${escapeHtml(` ${candidate.probe.video.width}×${candidate.probe.video.height}`)}` : ''}</span>
+        <span>${escapeHtml(fmtResolution(candidate) || candidate.quality || candidate.label || 'format')}</span>
+        <span class="meta">${escapeHtml(sourceName(candidate.sourceId || candidate._entry?.sourceId))}${candidate.probe?.video?.codec ? ` · ${escapeHtml(candidate.probe.video.codec)}` : ''}</span>
       </button>`;
     }).join('') || '<div class="meta">no playable formats</div>'}`;
   host.innerHTML = baseHtml;
@@ -4495,7 +4517,7 @@ async function mobAddQuality(quality, button = null) {
   const row = rows.find((candidate) => candidate.quality === quality);
   if (!row) return;
   if (button) button.disabled = true;
-  toast(`Adding ${row.episodes.length} episode(s) in ${quality}…`, 'info', 4000);
+  toast(`Adding ${row.episodes.length} episode(s) in ${row.resolution || quality}…`, 'info', 4000);
   let added = 0;
   let failed = 0;
   try {
@@ -4510,7 +4532,7 @@ async function mobAddQuality(quality, button = null) {
   } finally {
     if (button) button.disabled = false;
   }
-  toast(added ? `Added ${added} episode(s) in ${quality}${failed ? ` (${failed} failed)` : ''}` : `Nothing added in ${quality}`, added ? 'ok' : 'warn');
+  toast(added ? `Added ${added} episode(s) in ${row.resolution || quality}${failed ? ` (${failed} failed)` : ''}` : `Nothing added in ${row.resolution || quality}`, added ? 'ok' : 'warn');
   mobRenderSeriesCandidates();
 }
 
@@ -4532,9 +4554,10 @@ function refreshMobile() {
         ${poster ? `<img src="${escapeHtml(poster)}" alt="" style="width:48px;height:72px;object-fit:cover;border-radius:6px;flex-shrink:0" loading="lazy" onerror="this.remove()">` : '<div style="width:48px;height:72px;border-radius:6px;background:var(--card2);display:grid;place-items:center;flex-shrink:0">—</div>'}
         <div class="mob-item-main">
           <div class="mob-title">${escapeHtml(item.title)}${item.year ? ` <span class="mut">(${item.year})</span>` : ''}</div>
-          <div class="meta">${escapeHtml(item.quality || '')} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'}</div>
+          <div class="meta">${escapeHtml(fmtResolution(item))} ${item.subtitlePath ? tag(item.subtitleLanguage || 'sub', 'ok') : ''} ${item.enabled ? '' : '<span class="tag warn">off</span>'} ${(() => { const r = VMPlaylist.readinessOf?.(item.streamId); return r?.preparing ? tag('preparing…', 'info') : r?.ready ? tag('ready ▶ instant', 'ok') : r?.state === 'failed' ? tag('not working', 'err') : ''; })()}</div>
           <div class="row" style="margin-top:6px;gap:6px">
             <button class="btn sm pri" data-mob-play="${escapeHtml(watchUrl || tsUrl)}" title="stream on your mobile">▶ stream</button>
+            <button class="btn sm" data-mob-prepare="${escapeHtml(item.streamId)}" title="prepare now: prove (or repair) this link in the background, so it starts instantly on the box">🔥 prepare</button>
             <button class="btn sm ghost" data-mob-remove="${escapeHtml(item.streamId)}" title="remove from playlist">⊖</button>
           </div>
         </div>

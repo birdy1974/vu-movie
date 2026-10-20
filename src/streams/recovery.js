@@ -4,18 +4,25 @@
  * The NAS-issued stream id/token are deliberately kept stable: existing VLC,
  * Enigma2 and playlist URLs continue to work. Recovery replaces only the
  * upstream candidate (URL, headers, probe and source), then renews its lifetime.
+ *
+ * Proofs are remembered in readiness.js: while a proof is inside its trust
+ * window (`playlist.prewarmTrustMinutes`, capped by the signed URL's own
+ * expiry) playback skips the probe completely. That is what makes pre-warming
+ * useful — the keep-warm loop (playlist/maintenance.js) and the manual
+ * "prepare" endpoints run this same check/repair *before* anyone presses
+ * play, so the expensive path (a 20 s probe timeout, then minutes of
+ * Chromium provider searches) no longer happens while the box waits.
  */
 import { getConfig } from '../core/config.js';
 import { log, errorText } from '../core/log.js';
 import * as registry from '../scrapers/registry.js';
 import * as relay from './relay.js';
 import * as store from './store.js';
+import * as readiness from './readiness.js';
 import { BROKEN_STATES, checkStreams } from '../playlist/check.js';
 
-const HEALTH_CACHE_MS = 2 * 60 * 1000;
 const MAX_MATCHES_PER_PROVIDER = 3;
 const MAX_RESOLVE_RESULTS = 18;
-const availabilityCache = new Map();
 const inFlight = new Map();
 
 function mediaKind(value) {
@@ -191,7 +198,7 @@ async function refreshRecord(stream, candidate) {
   // If a session was idling on the dead URL, make the next request build a
   // session from the refreshed candidate. The public stream URL/token is stable.
   relay.stopSession(stream.id, 'upstream refreshed after availability check');
-  availabilityCache.delete(String(stream.id));
+  readiness.forget(String(stream.id));
   return updated;
 }
 
@@ -211,20 +218,22 @@ async function runAvailabilityCheck(stream, {
   const check = initialCheck || (await checkStreams([targetFor(current)], { concurrency: 1, signal, prober })).results[0];
   if (!check) return { ok: false, stream: current, repaired: false, result: null, error: 'availability check returned no result' };
   if (check.state === 'working') {
-    availabilityCache.set(String(current.id), { at: Date.now(), url: current.upstream?.url || '', result: check });
+    readiness.markVerified(current, check);
     return { ok: true, stream: current, repaired: false, verified: true, result: check };
   }
   if (check.state === 'unverified') {
     // Don't treat missing ffprobe / disabled probing as a dead source, and don't
     // block playback solely because this container cannot verify it.
-    availabilityCache.set(String(current.id), { at: Date.now(), url: current.upstream?.url || '', result: check });
+    readiness.markVerified(current, check);
     return { ok: true, stream: current, repaired: false, verified: false, result: check };
   }
   if (!BROKEN_STATES.includes(check.state) && check.state !== 'skipped') {
     return { ok: true, stream: current, repaired: false, verified: false, result: check };
   }
   if (!autoRepair) {
-    return { ok: false, stream: current, repaired: false, verified: false, result: check, error: check.error || 'upstream is not active' };
+    const error = check.error || 'upstream is not active';
+    readiness.markFailed(current, error, { state: check.state });
+    return { ok: false, stream: current, repaired: false, verified: false, result: check, error };
   }
 
   const options = { reason, signal, prober, searchSource, searchAll, resolveTarget };
@@ -232,7 +241,7 @@ async function runAvailabilityCheck(stream, {
   if (!fresh) {
     const detail = `automatic refresh found no playable match for "${current.title}"`;
     const result = { ...check, repairError: detail };
-    availabilityCache.delete(String(current.id));
+    readiness.markFailed(current, detail, { state: check.state });
     log.warn('recovery', detail, { streamId: current.id, previousSource: current.source_id || '', reason });
     return { ok: false, stream: current, repaired: false, verified: false, result, error: detail };
   }
@@ -254,7 +263,7 @@ async function runAvailabilityCheck(stream, {
     probe: fresh.candidate.probe || null,
     probeMs: Number(fresh.candidate.probeMs) || null,
   };
-  availabilityCache.set(String(updated.id), { at: Date.now(), url: updated.upstream?.url || '', result: refreshedCheck });
+  readiness.markVerified(updated, refreshedCheck);
   log.info('recovery', `refreshed upstream for "${updated.title}"`, {
     streamId: updated.id,
     previousSource: current.source_id || '',
@@ -273,40 +282,105 @@ export function ensureStreamReady(streamOrId, options = {}) {
   if (existing) return existing;
 
   if (!options.initialCheck && !options.forceCheck) {
-    const cached = availabilityCache.get(id);
-    if (cached && Date.now() - cached.at < HEALTH_CACHE_MS) {
+    // Fast path: a proof from an earlier check/pre-warm is still trusted, so
+    // playback starts now instead of after an ffprobe run. The gate here is
+    // id-only; the URL is re-compared against the stored stream below, so a
+    // proof for a since-replaced upstream is never reused.
+    if (readiness.getReadiness(id).ready) {
       return store.getStream(id).then((stream) => {
-        if (!stream || (stream.upstream?.url || '') !== cached.url) {
-          availabilityCache.delete(id);
-          return stream
-            ? ensureStreamReady(streamOrId, { ...options, forceCheck: true })
-            : { ok: false, stream: null, repaired: false, verified: false, result: null, error: 'stream not found' };
-        }
+        if (!stream) return { ok: false, stream: null, repaired: false, verified: false, result: null, error: 'stream not found' };
+        const proof = readiness.cachedProof(stream);
+        if (!proof) return ensureStreamReady(stream, { ...options, forceCheck: true });
+        log.debug('recovery', `pre-warmed link for "${stream.title}" is still trusted — starting without a re-probe`, {
+          streamId: id,
+          verifiedSecAgo: Math.max(0, Math.round((Date.now() - proof.at) / 1000)),
+          trustedUntil: new Date(proof.trustUntil).toISOString(),
+          reason: options.reason || 'playback',
+        });
         return {
           ok: true,
           stream,
           repaired: false,
-          verified: cached.result.state === 'working',
-          result: { ...cached.result, cached: true },
+          verified: proof.state === 'working',
+          result: { ...proof.result, cached: true, trustedUntil: new Date(proof.trustUntil).toISOString() },
         };
       });
     }
   }
 
+  readiness.beginCheck(id);
   const operation = runAvailabilityCheck(typeof streamOrId === 'object' ? streamOrId : { id }, options)
     .catch((error) => {
       if (error?.name === 'AbortError') throw error;
       const message = errorText(error);
       log.warn('recovery', `availability/recovery failed for stream ${id}`, { streamId: id, error: message });
+      readiness.markFailed(id, message);
       return { ok: false, stream: null, repaired: false, verified: false, result: null, error: message };
     })
-    .finally(() => { inFlight.delete(id); });
+    .finally(() => { inFlight.delete(id); readiness.endCheck(id); });
   inFlight.set(id, operation);
   return operation;
 }
 
-export function forgetStreamAvailability(streamId) {
-  availabilityCache.delete(String(streamId));
+/**
+ * Start verifying (and, if needed, repairing) a stream *now*, in the
+ * background, and return immediately. This is the manual "prepare" action:
+ * by the time the viewer zaps to the title on the box, a trusted proof is
+ * already stored and playback takes the fast path above.
+ *
+ * A manual prepare always runs — failure backoff only throttles the
+ * background keep-warm loop. With `force: false` (the default) a stream
+ * whose proof is still trusted is reported as already ready instead of
+ * being probed again.
+ */
+export async function prewarmStream(streamOrId, options = {}) {
+  const { reason = 'prewarm', force = false, ...ensureOptions } = options;
+  const id = String(typeof streamOrId === 'object' ? streamOrId?.id || '' : streamOrId || '');
+  const stream = (typeof streamOrId === 'object' && streamOrId?.upstream)
+    ? streamOrId
+    : (id ? await store.getStream(id) : null);
+  if (!stream) {
+    return { started: false, alreadyReady: false, alreadyPreparing: false, readiness: readiness.getReadiness(id), error: 'stream not found' };
+  }
+  if (inFlight.has(String(stream.id)) || readiness.isChecking(stream.id)) {
+    return { started: false, alreadyReady: false, alreadyPreparing: true, readiness: readiness.getReadiness(stream) };
+  }
+  if (!force && readiness.cachedProof(stream)) {
+    return { started: false, alreadyReady: true, alreadyPreparing: false, readiness: readiness.getReadiness(stream) };
+  }
+  const operation = ensureStreamReady(stream, { ...ensureOptions, reason, forceCheck: true });
+  // Fire-and-forget by contract: ensureStreamReady already converts failures
+  // into a result, but an abort (a caller-supplied signal) must not become an
+  // unhandled rejection nobody is awaiting.
+  operation.catch(() => {});
+  log.info('recovery', `pre-warming "${stream.title}" in the background`, { streamId: stream.id, reason, force });
+  return { started: true, alreadyReady: false, alreadyPreparing: false, readiness: readiness.getReadiness(stream) };
 }
 
-export default { ensureStreamReady, forgetStreamAvailability };
+/** Readiness for one stream, loading the record first when only an id is given. */
+export async function getStreamReadiness(streamOrId) {
+  if (typeof streamOrId === 'object' && streamOrId) return readiness.getReadiness(streamOrId);
+  const stream = await store.getStream(String(streamOrId || ''));
+  return readiness.getReadiness(stream || String(streamOrId || ''));
+}
+
+/**
+ * Record a proof obtained outside ensureStreamReady (a Playlist "check
+ * streams" run, or a just-created stream whose candidate was already probed
+ * during resolve) so the next play can take the fast path too.
+ */
+export function markStreamVerified(stream, result) {
+  return readiness.markVerified(stream, result);
+}
+
+export function forgetStreamAvailability(streamId) {
+  readiness.forget(String(streamId));
+}
+
+export default {
+  ensureStreamReady,
+  prewarmStream,
+  getStreamReadiness,
+  markStreamVerified,
+  forgetStreamAvailability,
+};

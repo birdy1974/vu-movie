@@ -13,6 +13,8 @@
  *   GET /pl/<token>/vlc.m3u             same list (what the VLC button copies)
  *   GET /pl/<token>/kodi.m3u            same list, Kodi-friendly naming
  *   GET /pl/<token>/playlist.json       machine-readable list (title/url/logo)
+ *   GET /pl/<token>/player              the browser web player for the whole playlist
+ *   GET /pl/<token>/player.json         the web player's data (posters, resolutions, web URLs)
  *   GET /pl/<token>/userbouquet.tv      the Enigma2 bouquet file
  *   GET /xtream/<token>/player_api.php  Xtream catalogue/API
  *   GET /xtream/<token>/get.php         complete enabled-playlist M3U_plus
@@ -22,10 +24,17 @@
 
 import express from 'express';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { log } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import * as store from '../streams/store.js';
+import { publicPosterUrl } from '../http/poster-proxy.js';
+import { getReadiness } from '../streams/readiness.js';
 import * as playlist from './index.js';
+
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../public');
 
 const router = express.Router();
 
@@ -225,7 +234,7 @@ router.get('/pl/:token', async (req, res) => {
   const rows = enabled.map((entry, index) => {
     const urls = store.urlsFor(entry.stream, baseUrl);
     return `<tr><td>${index + 1}</td><td>${escapeHtml(entry.stream.title)}${entry.stream.year ? ` (${entry.stream.year})` : ''}</td>
-      <td class="mono">${escapeHtml(entry.stream.upstream?.quality || '—')}</td>
+      <td class="mono">${escapeHtml(store.resolutionFor(entry.stream) || entry.stream.upstream?.quality || '—')}</td>
       <td class="mono">${escapeHtml(entry.templateId || entry.stream.profile?.ffmpegTemplateName || 'guided')}</td>
       <td><a href="${escapeHtml(urls.ts)}">.ts</a> · <a href="${escapeHtml(urls.playlist)}">.m3u</a> · <a href="${escapeHtml(urls.watch)}">watch</a> · <a href="${escapeHtml(urls.web)}" title="browser preview: no subtitles, codecs from the browser">browser</a></td></tr>`;
   }).join('');
@@ -240,6 +249,7 @@ li{margin:4px 0}</style></head><body>
 <h1>${escapeHtml(playlist.name())} — playlist</h1>
 <p>${enabled.length} of ${items.length} item(s) enabled.</p>
 <h2>Playlist</h2><ul>
+<li><b><a href="${escapeHtml(`${root}/player`)}">▶ Web player</a></b> — play the complete playlist in the browser, every title one click away: <code>${escapeHtml(`${root}/player`)}</code></li>
 <li>M3U: <code>${escapeHtml(`${root}/playlist.m3u`)}</code></li>
 <li>VLC: <code>${escapeHtml(`${root}/vlc.m3u`)}</code></li>
 <li>Enigma2 bouquet: <code>${escapeHtml(`${root}/userbouquet.tv`)}</code></li>
@@ -248,9 +258,75 @@ li{margin:4px 0}</style></head><body>
 <li>Xtream M3U+: <code>${escapeHtml(`${baseUrl}/xtream/${req.params.token}/get.php?username=${encodeURIComponent(cfgPlaylist.xtreamUsername || 'vumovie')}&password=${encodeURIComponent(cfgPlaylist.xtreamPassword || req.params.token)}&type=m3u_plus`)}</code></li>
 </ul>
 <h2>Items</h2>
-<table><thead><tr><th>#</th><th>Title</th><th>Quality</th><th>FFmpeg template</th><th>Links</th></tr></thead>
+<table><thead><tr><th>#</th><th>Title</th><th>Resolution</th><th>FFmpeg template</th><th>Links</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="5">the playlist is empty</td></tr>'}</tbody></table>
 </body></html>`);
+});
+
+/**
+ * One web-player item: everything the browser player renders or plays.
+ * Posters go through the signed poster proxy (never a raw hotlink), the
+ * play URL is the `.ts.web` browser slot (codecs chosen from the browser's
+ * own report, no subtitles — the VLC `.ts` rides along for players that
+ * keep them), and the resolution carries both dimensions.
+ */
+function playerItem(entry, index, baseUrl) {
+  const stream = entry.stream;
+  const urls = store.urlsFor(stream, baseUrl);
+  const probe = stream.upstream?.probe || null;
+  const readiness = getReadiness(stream);
+  return {
+    index: index + 1,
+    streamId: stream.id,
+    title: stream.title,
+    year: stream.year || null,
+    kind: stream.kind || 'movie',
+    season: stream.upstream?.season || null,
+    episode: stream.upstream?.episode || null,
+    description: stream.description || '',
+    poster: stream.poster ? publicPosterUrl(stream.poster, stream.payload?.meta?.posterReferer || '') : '',
+    sourceId: stream.source_id || '',
+    quality: stream.upstream?.quality || null,
+    width: Number(stream.upstream?.width) || Number(probe?.video?.width) || null,
+    height: Number(stream.upstream?.height) || Number(probe?.video?.height) || null,
+    resolution: store.resolutionFor(stream),
+    videoCodec: probe?.video?.codec || null,
+    audioCodec: (Array.isArray(probe?.audio) ? probe.audio[0]?.codec : probe?.audio?.codec) || null,
+    durationSec: Number(probe?.durationSec) || Number(stream.upstream?.durationSec) || null,
+    subtitle: stream.profile?.subtitlePath
+      ? { attached: true, language: stream.profile?.subtitleLanguage || '' }
+      : { attached: false, language: '' },
+    readiness: { state: readiness.state, ready: readiness.ready, preparing: readiness.preparing },
+    urls: { web: urls.web, ts: urls.ts, mkv: urls.mkv, watch: urls.watch, download: urls.download },
+  };
+}
+
+/** The web player's data: the enabled playlist, in order. */
+router.get('/pl/:token/player.json', async (req, res) => {
+  if (!requireToken(req, res)) return;
+  const baseUrl = baseUrlFrom(req);
+  const entries = (await playlist.entries({ baseUrl })).filter((entry) => entry.enabled);
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    ok: true,
+    name: playlist.name(),
+    generatedAt: new Date().toISOString(),
+    items: entries.map((entry, index) => playerItem(entry, index, baseUrl)),
+  });
+});
+
+/**
+ * The web player page itself (public/player.html + /player.js). The shell
+ * holds no data — it reads ./player.json relative to this URL — so the
+ * same file also serves the login-guarded /player entry of the admin UI.
+ */
+router.get('/pl/:token/player', async (req, res) => {
+  if (!requireToken(req, res)) return;
+  const file = path.join(PUBLIC_DIR, 'player.html');
+  if (!fs.existsSync(file)) return res.status(404).type('text/plain').send('vu-movie: the web player is not installed in this container');
+  res.setHeader('Cache-Control', 'no-store');
+  log.info('playlist', 'web player opened via the playlist link');
+  return res.sendFile(file);
 });
 
 router.get('/pl/:token/:file', async (req, res) => {
@@ -270,6 +346,9 @@ router.get('/pl/:token/:file', async (req, res) => {
           title: entry.stream.title,
           year: entry.stream.year,
           quality: entry.stream.upstream?.quality || null,
+          width: Number(entry.stream.upstream?.width) || Number(entry.stream.upstream?.probe?.video?.width) || null,
+          height: Number(entry.stream.upstream?.height) || Number(entry.stream.upstream?.probe?.video?.height) || null,
+          resolution: store.resolutionFor(entry.stream),
           template: entry.templateId || entry.stream.profile?.ffmpegTemplateName || null,
           subtitle: entry.stream.profile?.subtitlePath || null,
           poster: entry.stream.poster || null,
@@ -293,7 +372,7 @@ router.get('/pl/:token/:file', async (req, res) => {
     log.info('playlist', `playlist served for ${built.count} item(s)`, { file });
     return res.send(built.text);
   }
-  return res.status(404).type('text/plain').send('vu-movie: use playlist.m3u, playlist.m3u8, playlist.json or userbouquet.tv');
+  return res.status(404).type('text/plain').send('vu-movie: use playlist.m3u, playlist.m3u8, playlist.json, player, player.json or userbouquet.tv');
 });
 
 /* ------------------------------------------------------------------ *

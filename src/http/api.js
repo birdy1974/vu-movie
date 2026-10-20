@@ -38,8 +38,9 @@ import { pushSubtitleToReceiver } from '../subtitles/push.js';
 import * as metadata from '../metadata/index.js';
 import * as discovery from '../metadata/discovery.js';
 import * as playlist from '../playlist/index.js';
-import { reconfigurePlaylistMaintenance } from '../playlist/maintenance.js';
-import { ensureStreamReady } from '../streams/recovery.js';
+import { reconfigurePlaylistMaintenance, kickPlaylistPrewarm } from '../playlist/maintenance.js';
+import { ensureStreamReady, prewarmStream, markStreamVerified } from '../streams/recovery.js';
+import { getReadiness } from '../streams/readiness.js';
 
 const router = express.Router();
 const startedAt = Date.now();
@@ -673,6 +674,9 @@ router.post('/find/resolve', wrap(async (req, res) => {
         index: i,
         url: c.url,
         quality: c.quality,
+        width: Number(c.width) || null,
+        height: Number(c.height) || null,
+        resolution: c.resolution || null,
         label: c.label,
         sourceId: c.sourceId,
         kind: c.kind,
@@ -730,6 +734,18 @@ router.post('/streams', wrap(async (req, res) => {
     profile: body.profile || {}, subtitleId: body.subtitleId || null,
     season: body.season || null, episode: body.episode || null, ephemeral,
   });
+  // The candidate was probed during resolve, seconds ago: record that proof
+  // so the very first play (usually the reason the stream was created)
+  // skips a second ffprobe and starts at once. Only an explicit probe
+  // success counts — an unverified candidate keeps the normal check.
+  if (body.candidate?.ok === true && body.candidate?.unverified !== true) {
+    markStreamVerified(stream, {
+      state: 'working',
+      sourceId: stream.source_id || body.candidate.sourceId || '',
+      probe: body.candidate.probe || null,
+      probeMs: Number(body.candidate.probeMs) || null,
+    });
+  }
   const subtitleResult = !ephemeral && body.subtitleResult && typeof body.subtitleResult === 'object' ? body.subtitleResult : null;
   let subtitleError = null;
   if (subtitleResult) {
@@ -825,7 +841,7 @@ function bouquetEntries(streams, baseUrl) {
     const url = store.urlsFor(s, baseUrl).forBox;
     return {
       title: s.title, year: s.year, url,
-      description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${s.upstream?.quality || s.quality || 'source'}`,
+      description: `${s.title}${s.year ? ` (${s.year})` : ''} — ${store.resolutionFor(s) || s.upstream?.quality || s.quality || 'source'}`,
       subtitle: s.profile?.subtitles && s.profile.subtitles !== 'none' ? (s.profile.subtitleLanguage || '').slice(0, 3) : null,
       season: s.upstream?.season || null,
       series: s.title,
@@ -842,6 +858,7 @@ router.get('/streams/:id', wrap(async (req, res) => {
     stream: publicStreamRecord(stream),
     urls: store.urlsFor(stream, baseUrlFrom(req)),
     session: session ? relay.publicSession(session) : null,
+    readiness: getReadiness(stream),
   });
 }));
 
@@ -1053,6 +1070,31 @@ router.get('/streams/:id/session', wrap(async (req, res) => {
   res.json({ ok: true, session: session ? relay.publicSession(session) : null });
 }));
 
+/**
+ * Pre-warm one stream: prove (or repair) its upstream link now, in the
+ * background, so the next play — on the box, in VLC, anywhere — starts
+ * without the probe/repair wait. `{wait:true}` blocks until ready;
+ * `{force:true}` re-proves even a still-trusted link. The Playlist tab's
+ * Prepare buttons use the playlist-scoped twin of this endpoint.
+ */
+router.post('/streams/:id/prepare', wrap(async (req, res) => {
+  const stream = await store.getStream(req.params.id);
+  if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
+  const force = req.body?.force === true;
+  if (req.body?.wait === true) {
+    const ready = await ensureStreamReady(stream, { reason: 'manual-prepare', forceCheck: force });
+    return res.status(ready.ok ? 200 : 503).json({
+      ok: ready.ok,
+      repaired: ready.repaired === true,
+      ...(ready.ok ? {} : { error: ready.error || ready.result?.error || 'upstream is not available' }),
+      check: ready.result,
+      readiness: getReadiness(ready.stream || stream),
+    });
+  }
+  const outcome = await prewarmStream(stream, { reason: 'manual-prepare', force });
+  return res.status(202).json({ ok: true, ...outcome });
+}));
+
 router.post('/streams/:id/session', wrap(async (req, res) => {
   const stream = await store.getStream(req.params.id);
   if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
@@ -1089,7 +1131,7 @@ router.post('/streams/:id/playlist', wrap(async (req, res) => {
       title: `${s.title}${s.year ? ` (${s.year})` : ''}`,
       url: u.ts,
       logo: s.poster,
-      quality: s.upstream?.quality,
+      quality: store.resolutionFor(s) || s.upstream?.quality,
       group: 'vu-movie',
       subtitle: req.body?.subtitlePath || undefined,
     };
@@ -1242,6 +1284,10 @@ router.post('/enigma2/push', wrap(async (req, res) => {
   if (!streams.length) return res.status(400).json({ ok: false, error: 'no streams selected' });
   const entries = bouquetEntries(streams, baseUrlFrom(req));
   const result = await enigma2.pushBouquet(entries, { name: req.body?.name, dryRun: Boolean(req.body?.dryRun) });
+  // Bouquet on the box = somebody is about to zap: prove the links now.
+  // (Keep-warm works from the playlist, which auto-includes library streams;
+  // a stream deliberately removed from it still gets the playback-time check.)
+  if (result.ok && !req.body?.dryRun) kickPlaylistPrewarm({ reason: 'bouquet-push', streamIds: streams.map((stream) => stream.id) });
   res.status(result.ok ? 200 : 502).json(result);
 }));
 

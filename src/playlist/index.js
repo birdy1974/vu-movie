@@ -672,7 +672,7 @@ export async function playlistText(baseUrl, { name: playlistName = null, hls = f
     const title = `${stream.title}${stream.year ? ` (${stream.year})` : ''}`;
     const common = {
       logo: stream.poster,
-      quality: stream.upstream?.quality,
+      quality: store.resolutionFor(stream) || stream.upstream?.quality,
       group: playlistName || name(),
       subtitle: subtitle || undefined,
     };
