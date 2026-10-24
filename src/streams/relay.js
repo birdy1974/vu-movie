@@ -37,6 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { log, logError, errorText, truncate } from '../core/log.js';
+import { memoryLogFields } from '../core/memory.js';
 import { getConfig, describeEnigma2ServiceType, normaliseEnigma2ServiceType } from '../core/config.js';
 import { matroskaOnBoxAdvice } from '../enigma2/index.js';
 import {
@@ -143,6 +144,9 @@ export async function runTemplateTest({ template, stream, container = null, dura
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill('SIGTERM'); } catch { /* gone */ }
+      // A test ffmpeg blocked on a network read can sit on SIGTERM; without
+      // the escalation the child (and this unresolved promise) lived forever.
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 1500).unref?.();
     }, limitMs);
 
     child.stdout.on('data', (chunk) => { stdoutBytes += chunk.length; });
@@ -410,9 +414,14 @@ function resolveOutputTemplateForSession(profile = {}, outputType = '') {
 export function releaseUpstreamProxy(session, reason = 'stopped', { graceMs = 3000 } = {}) {
   if (!session?.upProxy || session.upProxyReleased) return;
   session.upProxyReleased = true;
+  // Capture the proxy and drop the session's reference to it right away: the
+  // session object itself is kept around by timers/closures for a while, and
+  // it must not keep the proxy's (soon-to-be-closed) cache reachable with it.
+  const proxy = session.upProxy;
+  session.upProxy = null;
   const close = () => {
     clearTimeout(timer);
-    closeUpstreamProxy(session.upProxy, reason);
+    closeUpstreamProxy(proxy, reason);
   };
   const timer = setTimeout(close, Math.max(0, Number(graceMs) || 0));
   timer.unref?.();
@@ -437,6 +446,9 @@ export function stopSession(streamId, reason = 'requested', { remember = false }
   log.info('relay', `stopping session ${session.id} (${reason})`, {
     clients: session.clients.size, uptimeSec: Math.round((Date.now() - session.startedAt) / 1000),
     bytesOut: session.bytesOut, ...(keptAt ? { keptAtSec: keptAt } : {}),
+    // Process memory at stop time (see docs/MEMORY.md for how to read these:
+    // heap/external must come back down across stops; rss is a high-water mark).
+    ...memoryLogFields(),
   });
   clearIdleTimer(session);
   endClients(session, `session stopped (${reason})`);
@@ -446,7 +458,9 @@ export function stopSession(streamId, reason = 'requested', { remember = false }
   // not wake a blocked write. Closing the read end makes that write fail, so
   // ffmpeg exits now rather than at the SIGKILL below.
   if (child?.stdout) { try { child.stdout.destroy(); } catch { /* gone */ } }
-  setTimeout(() => { try { session.child?.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
+  // Escalate against the child that was just stopped, captured here — not
+  // `session.child` re-read in 5 s, which a respan/restart may have replaced.
+  setTimeout(() => { try { child?.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
   sessions.delete(streamId);
   releaseUpstreamProxy(session, reason);
   cleanupHlsDir(session);
@@ -682,6 +696,14 @@ export function rememberResumePoint(session, { now = Date.now() } = {}) {
   }
   if (!(playhead >= RESUME_MIN_PLAYHEAD_SECONDS)) return 0;
   const seconds = Math.floor(playhead) - RESUME_REWIND_SECONDS - (session.pendingRewind || 0);
+  // Expired play heads were only ever dropped when the same movie was played
+  // again (takeResumePoint), so a movie never replayed kept its entry for the
+  // life of the process. Tiny per entry, but unbounded across streams — sweep
+  // the expired ones whenever a new one is remembered.
+  const ttlMs = resumeHoursLimit() * 3600e3;
+  for (const [id, entry] of resumePoints) {
+    if (now - entry.at > ttlMs) resumePoints.delete(id);
+  }
   resumePoints.set(session.streamId, { seconds, at: now });
   log.info('relay', `kept the play head of "${session.stream?.title || session.streamId}" at ${seconds}s`, {
     session: session.id, resumeHours: resumeHoursLimit(),
@@ -1202,6 +1224,18 @@ function spawnFfmpeg(session) {
     session.alive = false;
     logError('relay', `ffmpeg could not be started for session ${session.id}`, err, { command: truncate(session.command, 300) });
     endClients(session, 'ffmpeg could not be started');
+    // Node does not guarantee a 'close' event after a spawn 'error' (a
+    // missing/non-executable ffmpeg, EMFILE, …). Without this cleanup the
+    // dead session stayed registered forever — clients already ended, so
+    // no idle stop was armed either — pinning its upstream proxy and the
+    // full 64 MB chunk cache for the life of the process. If 'close' does
+    // still arrive, its `sessions.get() !== session` guard makes it a no-op.
+    if (sessions.get(session.streamId) === session) {
+      clearIdleTimer(session);
+      sessions.delete(session.streamId);
+      releaseUpstreamProxy(session, 'ffmpeg could not be started', { graceMs: 0 });
+      cleanupHlsDir(session);
+    }
   });
 
   child.on('close', async (code, signal) => {
@@ -1572,7 +1606,65 @@ export function stopAll(reason = 'shutdown') {
   return stopped;
 }
 
+/**
+ * Wait until the ffmpeg children of the given sessions have really exited.
+ *
+ * App shutdown used to SIGTERM every ffmpeg and then `process.exit(0)` 500 ms
+ * later: the 5 s SIGKILL escalation in stopSession is an unref'd timer, so a
+ * child that was slow to honour SIGTERM (blocked in a VAAPI ioctl or a
+ * network read) never got it and survived the app as an orphan still holding
+ * the GPU, the upstream connection and its few hundred MB of RAM. Shutdown
+ * now awaits this: resolve when every child closed, or SIGKILL whatever is
+ * left at the deadline and resolve anyway (bounded — Docker's stop grace is
+ * 10 s by default). Pass the children captured *before* stopAll(), since
+ * stopping unregisters the sessions.
+ */
+export function waitForChildrenToExit(children, { timeoutMs = 5000 } = {}) {
+  const running = [...new Set(children || [])].filter(
+    (child) => child && typeof child.once === 'function' && child.exitCode == null && child.signalCode == null,
+  );
+  if (!running.length) return Promise.resolve({ exited: 0, killed: 0 });
+  return new Promise((resolve) => {
+    let exited = 0;
+    let done = false;
+    let deadlineHit = false;
+    const finish = (killed) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ exited, killed });
+    };
+    const timer = setTimeout(() => {
+      // Set before killing: a SIGKILLed child can emit 'close' synchronously
+      // enough that its listener would otherwise win the race and report
+      // "exited on its own" for a child we had to force.
+      deadlineHit = true;
+      let killed = 0;
+      for (const child of running) {
+        if (child.exitCode == null && child.signalCode == null) {
+          try { child.kill('SIGKILL'); killed += 1; } catch { /* gone */ }
+        }
+      }
+      finish(killed);
+    }, Math.max(0, Number(timeoutMs) || 0));
+    // Deliberately NOT unref'd: this deadline is what guarantees the SIGKILL
+    // during shutdown, so it must keep the event loop alive until it fires
+    // (or every child closed and finish() cleared it).
+    for (const child of running) {
+      child.once('close', () => {
+        exited += 1;
+        if (!deadlineHit && exited >= running.length) finish(0);
+      });
+    }
+  });
+}
+
+/** The live ffmpeg child of every registered session (for shutdown waits). */
+export function activeChildren() {
+  return [...sessions.values()].map((s) => s.child).filter(Boolean);
+}
+
 export default {
   ensureSession, attachClient, stopSession, releaseUpstreamProxy, listSessions, getSession,
-  touchSessionByToken, stopAll, publicSession, runTemplateTest,
+  touchSessionByToken, stopAll, waitForChildrenToExit, activeChildren, publicSession, runTemplateTest,
 };

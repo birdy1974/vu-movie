@@ -292,6 +292,34 @@ export function jobStats() {
   return out;
 }
 
+/**
+ * Cancel every queued/running job in every queue (app shutdown). Cancelling
+ * kills the job's child process handle (an export/download ffmpeg), which
+ * shutdown previously never touched: stopping the app left those children
+ * running as orphans. Returns how many jobs were cancelled.
+ */
+export function cancelAllJobs() {
+  let cancelled = 0;
+  for (const q of queues) {
+    for (const job of [...q.jobs.values()]) {
+      if (['done', 'failed', 'cancelled'].includes(job.status)) continue;
+      if (q.cancel(job.id).ok) cancelled += 1;
+    }
+  }
+  return cancelled;
+}
+
+/** Child processes still held by running jobs (for shutdown exit waits). */
+export function activeJobHandles() {
+  const out = [];
+  for (const q of queues) {
+    for (const job of q.jobs.values()) {
+      if (job.handle && !['done', 'failed', 'cancelled'].includes(job.status)) out.push(job.handle);
+    }
+  }
+  return out;
+}
+
 /** Random URL-safe id used for stream tokens and similar. */
 export function shortId(bytes = 6) {
   return crypto.randomBytes(bytes).toString('base64url');

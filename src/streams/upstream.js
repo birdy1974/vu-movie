@@ -385,6 +385,12 @@ class ByteStore {
       this.chunks.delete(oldestKey);
     }
   }
+
+  /** Drop every held byte at once (proxy closed — see closeUpstreamProxy). */
+  clear() {
+    this.chunks.clear();
+    this.size = 0;
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -441,6 +447,12 @@ class SegmentCache {
       this.size -= this.done.get(oldestKey).buf.length;
       this.done.delete(oldestKey);
     }
+  }
+
+  /** Drop every held segment at once (proxy closed — see closeUpstreamProxy). */
+  clear() {
+    this.done.clear();
+    this.size = 0;
   }
 }
 
@@ -600,11 +612,38 @@ export function closeUpstreamProxy(session, reason = 'stopped') {
   try { session.abort.abort(); } catch { /* ignore */ }
   proxies.delete(session.secret);
   removeCaptureFile(session);
+  // Drop the cached bytes NOW, not whenever the GC gets around to it. The
+  // closed session object routinely outlives this call — the relay keeps it
+  // for the SIGKILL timer, HLS cleanup, a `finally` log line — and while any
+  // reference survived, the full 64 MB chunk/segment cache stayed allocated
+  // with it, which is exactly the "memory is not released when the movie
+  // stops" the operator sees in DSM. Measured: without this, cacheBytes is
+  // still 67108864 on the closed session.
+  const freedBytes = session.kind === 'file' ? (session.store?.size || 0) : (session.segments?.size || 0);
+  session.store?.clear();
+  session.segments?.clear();
+  session.refs?.byId?.clear();
+  session.mpd = null;
+  session.metaPromise = null;
   log.info('upstream', `upstream proxy closed (${reason})`, {
     session: session.id, stream: session.streamId,
     cdnRequests: session.stats.cdnRequests, cdnMb: Math.round(session.stats.cdnBytes / 1048576),
     retries: session.stats.retries, truncations: session.stats.truncations,
+    cacheFreedMb: Math.round((freedBytes / 1048576) * 10) / 10,
   });
+}
+
+/**
+ * Close every proxy still alive (app shutdown). Relay-owned proxies are
+ * normally closed by their session first; this is the net for the rest —
+ * above all the direct-link proxies (serveDirectFile), which no relay session
+ * owns and which otherwise kept their cache (and a running range-less
+ * capture) alive until the process died around them.
+ */
+export function closeAllUpstreamProxies(reason = 'shutdown') {
+  const all = [...proxies.values()];
+  for (const session of all) closeUpstreamProxy(session, reason);
+  return all.length;
 }
 
 export function proxyStats(session) {
@@ -805,16 +844,51 @@ async function serveFile(session, req, res) {
  * frontier: every byte before it is in the file.
  */
 function startLinearCapture(session) {
-  if (session.linear) return;
+  if (session.linear) {
+    // A capture paused because its last reader left (see pauseLinearCapture)
+    // resumes on the next read: same file, same frontier — the new GET
+    // re-reads from byte 0 and skips what is already on disk.
+    if (session.linear.paused && !session.linear.done && !session.linear.failed && !session.closed) {
+      session.linear.paused = false;
+      session.linear.abort = new AbortController();
+      linearCaptureLoop(session).catch((err) => {
+        log.warn('upstream', 'range-less capture loop ended', { session: session.id, error: errorText(err) });
+      });
+    }
+    return;
+  }
   const dir = path.join(getConfig().storage?.tmp || '/tmp/vumovie', 'upstream');
   sweepStaleCaptureFiles(dir);
   session.linear = {
     started: true, done: false, failed: false, captured: 0, listeners: new Set(),
     file: path.join(dir, `${session.id}-${session.secret.slice(0, 8)}.part`), fh: null,
+    paused: false, abort: new AbortController(),
   };
   linearCaptureLoop(session).catch((err) => {
     log.warn('upstream', 'range-less capture loop ended', { session: session.id, error: errorText(err) });
   });
+}
+
+/**
+ * Stop a range-less capture's CDN download when nobody is reading any more.
+ *
+ * Without this, pressing stop on a direct link (or ffmpeg finishing a seek
+ * probe) left the background GET running: it downloaded the *entire* movie
+ * at CDN speed into the .part file — disk, page cache and bandwidth spent on
+ * a movie nobody watches, and because each written chunk refreshed the
+ * proxy's activity stamp the idle sweep never closed it either. Only
+ * unpinned (direct-link) proxies pause: a relay session owns its proxy and
+ * may legitimately be frozen mid-movie with the capture running ahead.
+ */
+export function pauseLinearCapture(session, reason = 'no readers') {
+  const linear = session?.linear;
+  if (!linear || linear.done || linear.failed || linear.paused) return false;
+  linear.paused = true;
+  try { linear.abort?.abort(); } catch { /* ignore */ }
+  log.info('upstream', `range-less capture paused (${reason}) — it resumes if a player reads again`, {
+    session: session.id, capturedMb: Math.round(linear.captured / 1048576),
+  });
+  return true;
 }
 
 let captureDirSwept = false;
@@ -845,9 +919,19 @@ function removeCaptureFile(session) {
 }
 
 async function linearCaptureLoop(session) {
+  // This run's abort controller. A pause aborts it; a resume installs a new
+  // one and starts a new loop. If this (old) loop wakes up after that — it
+  // may be sleeping between retries — the identity check below ends it
+  // instead of letting two loops download into the same file.
+  const runAbort = session.linear.abort;
   try {
     await fs.promises.mkdir(path.dirname(session.linear.file), { recursive: true });
-    session.linear.fh = await fs.promises.open(session.linear.file, 'w+');
+    // Only the first run opens (and truncates) the file. A resumed run after
+    // pauseLinearCapture keeps the handle — reopening with 'w+' would erase
+    // the bytes `linear.captured` says are already on disk.
+    if (!session.linear.fh) {
+      session.linear.fh = await fs.promises.open(session.linear.file, 'w+');
+    }
   } catch (err) {
     session.linear.failed = true;
     notifyLinear(session, 0);
@@ -869,7 +953,11 @@ async function linearCaptureLoop(session) {
       session.stats.cdnRequests += 1;
       const res = await fetch(session.upstreamUrl, {
         headers: session.headers,
-        signal: AbortSignal.any([session.abort.signal, AbortSignal.timeout(session.tune.requestTimeoutMs * 10)]),
+        signal: AbortSignal.any([
+          session.abort.signal,
+          ...(runAbort ? [runAbort.signal] : []),
+          AbortSignal.timeout(session.tune.requestTimeoutMs * 10),
+        ]),
       });
       if (!res.ok) throw new ChunkedFetchError(`HTTP ${res.status} from upstream`, { status: res.status });
       for await (const part of res.body) {
@@ -877,7 +965,10 @@ async function linearCaptureLoop(session) {
         const partStart = position;
         position += buf.length;
         session.stats.cdnBytes += buf.length;
-        session.lastActivity = Date.now();
+        // Deliberately NOT session.lastActivity: capture progress is not
+        // reader activity. Stamping it here made the capture its own
+        // keep-alive — the idle sweep could never close a proxy whose
+        // player had left hours ago but whose capture still trickled.
         if (position <= resumeFrom) continue; // all of it is captured already
         const from = Math.max(0, resumeFrom - partStart);
         // Written at its absolute offset; the frontier moves only once it is on disk.
@@ -895,6 +986,10 @@ async function linearCaptureLoop(session) {
       return;
     } catch (err) {
       if (session.closed) return;
+      // Paused on purpose (pauseLinearCapture aborted the fetch): stop here
+      // without the retry/give-up bookkeeping — a later read resumes us.
+      // Also stop when a newer loop has taken over after a resume.
+      if (session.linear.paused || session.linear.abort !== runAbort) return;
       session.stats.retries += 1;
       const at = session.linear.captured;
       // Give up when the capture makes no progress at all — otherwise a CDN
@@ -946,7 +1041,9 @@ function waitForLinearBytes(session, pos, len, signal) {
     };
     timer = setInterval(check, 100);
     timer.unref?.();
-    if (!session.linear) startLinearCapture(session);
+    // Always (re)start: a capture paused while nobody read must resume for
+    // this read, and startLinearCapture is a no-op while one is running.
+    startLinearCapture(session);
     session.linear.listeners.add(check);
     check();
   });
@@ -972,6 +1069,7 @@ function waitForLinearSize(session, signal) {
     };
     timer = setInterval(check, 100);
     timer.unref?.();
+    startLinearCapture(session);
     session.linear.listeners.add(check);
     check();
   });
@@ -1144,6 +1242,12 @@ export async function serveDirectFile(stream, req, res) {
     if (released) return;
     released = true;
     current.openRequests = Math.max(0, current.openRequests - 1);
+    // The last player is gone: stop downloading the rest of a range-less
+    // movie nobody is watching (pauseLinearCapture). The proxy itself stays
+    // for a quick reconnect/seek and is reaped by the idle sweep.
+    if (current.openRequests === 0 && !current.pinned) {
+      pauseLinearCapture(current, 'the direct-link player disconnected');
+    }
   });
   return serveFile(current, req, res);
 }
@@ -1162,6 +1266,7 @@ export function listUpstreamProxies() {
 
 export default {
   createUpstreamProxy, maybeCreateUpstreamProxy, shouldProxyUpstream, closeUpstreamProxy,
+  closeAllUpstreamProxies, pauseLinearCapture,
   proxyStats, upstreamProxyMiddleware, rewriteDashManifest, parseClientRange, listUpstreamProxies,
   pinUpstreamProxy, serveDirectFile,
 };
