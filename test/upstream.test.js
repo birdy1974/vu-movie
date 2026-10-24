@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import express from 'express';
 import { EventEmitter } from 'node:events';
 import {
-  createUpstreamProxy, closeUpstreamProxy, rewriteDashManifest, parseClientRange,
+  createUpstreamProxy, closeUpstreamProxy, rewriteDashManifest, rewriteHlsPlaylist, parseClientRange,
   shouldProxyUpstream, upstreamProxyMiddleware, proxyStats, listUpstreamProxies,
 } from '../src/streams/upstream.js';
 import { decideRestart, argsWithResume, releaseUpstreamProxy, fatalFfmpegFailure } from '../src/streams/relay.js';
@@ -115,12 +115,55 @@ test('a child that never exits cannot keep the upstream proxy alive forever', as
   assert.equal(proxy.closed, true, 'the grace timer is the safety net');
 });
 
-test('shouldProxyUpstream picks files and DASH, leaves HLS direct, honours the switch', () => {
-  const on = { transcode: { upstreamProxy: true } };
+test('releasing a proxy never clears its grace timer across a mocked-clock boundary', async (t) => {
+  // Regression guard. node:test MockTimers.reset() drains its queue but leaves
+  // a stale priority-queue position on the old timer objects, and its mocked
+  // clearTimeout() trusts that field without checking ownership. The old
+  // releaseUpstreamProxy cleared its grace timer from the child 'close' event;
+  // when that event landed in the next test under a fresh mock, the stale
+  // position removed the NEW mock's unrelated timer (a relay idle timer
+  // vanished, so its session was never stopped and receiver-channel-change
+  // failed). The child-close path must close the proxy without clearTimeout().
+  const proxy = await createUpstreamProxy({
+    streamId: 'mock-boundary', url: 'https://cdn.example.com/movie.mp4', headers: {}, kind: 'file',
+  });
+  t.after(() => closeUpstreamProxy(proxy, 'test done'));
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  releaseUpstreamProxy({ streamId: 'mock-boundary', child, upProxy: proxy }, 'idle', { graceMs: 3000 });
+  t.mock.timers.reset(); // test boundary: the grace timer object lingers
+
+  // A second mocked context, like the next test in the same process.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.after(() => t.mock.timers.reset());
+  let idleStandIn = 0;
+  setTimeout(() => { idleStandIn = 1; }, 5000);
+
+  child.emit('close', 0, 'SIGTERM'); // the old proxy's child finally exits
+  assert.equal(proxy.closed, true, 'the child-close path still closes the proxy');
+
+  t.mock.timers.tick(5000);
+  assert.equal(idleStandIn, 1, "the new mock's timer survives the old proxy cleanup");
+});
+
+test('shouldProxyUpstream picks files, DASH and HLS, and honours both switches', () => {
+  const on = { transcode: { upstreamProxy: true, upstreamProxyHls: true } };
   const off = { transcode: { upstreamProxy: false } };
+  const hlsOff = { transcode: { upstreamProxy: true, upstreamProxyHls: false } };
   assert.equal(shouldProxyUpstream({ url: 'https://cdn/movie.mp4', kind: 'file' }, on), true);
   assert.equal(shouldProxyUpstream({ url: 'https://cdn/dash/index.mpd', kind: 'dash' }, on), true);
-  assert.equal(shouldProxyUpstream({ url: 'https://cdn/hls/master.m3u8', kind: 'hls' }, on), false);
+  // HLS now goes through the proxy too: a DASH→HLS bridge in front of a
+  // cutting CDN otherwise leaves ffmpeg reconnecting at the same offset.
+  assert.equal(shouldProxyUpstream({ url: 'https://cdn/hls/master.m3u8', kind: 'hls' }, on), true);
+  // The bridge shape from the field (the real m3u8 is nested in ?url=) is
+  // recognised even when the stored record carries no explicit kind.
+  const bridge = 'https://dash-hls-bridge.example/?url='
+    + encodeURIComponent('https://sacdn.example/dash/123/v3.m3u8?Policy=abc') + '&Policy=abc';
+  assert.equal(shouldProxyUpstream({ url: bridge }, on), true);
+  assert.equal(shouldProxyUpstream({ url: 'https://cdn/hls/master.m3u8', kind: 'hls' }, hlsOff), false);
   assert.equal(shouldProxyUpstream({ url: 'https://cdn/movie.mp4', kind: 'file' }, off), false);
   assert.equal(shouldProxyUpstream({ url: 'not-a-url' }, on), false);
 });
@@ -192,6 +235,128 @@ test('rewriteDashManifest handles absolute media URLs, BaseURL stacks and single
   assert.match(absolute, /initialization="http:\/\/127\.0\.0\.1:8080\/up\/s3\/dash\/u\/r2"/);
   assert.equal(registered2[0].url, 'https://seg.example/a/b-00001.m4s');
   assert.equal(registered2[1].url, 'https://seg.example/a/init.mp4');
+});
+
+/* ------------------------------------------------------------------ *
+ * HLS playlist rewriting
+ * ------------------------------------------------------------------ */
+
+/** Collect register() calls like the DASH tests do. */
+function hlsRegister() {
+  const entries = [];
+  const register = (entry) => {
+    const existing = entries.findIndex((e) => e.type === entry.type && e.url === entry.url);
+    if (existing >= 0) return `r${existing + 1}`;
+    entries.push(entry);
+    return `r${entries.length}`;
+  };
+  return { entries, register };
+}
+
+test('rewriteHlsPlaylist reroutes EXT-X-MAP, keys and every segment URI', () => {
+  const playlist = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:6',
+    '#EXT-X-TARGETDURATION:10',
+    '#EXT-X-MAP:URI="https://cdn.example/dash/m/init-stream3.m4s?Policy=sig"',
+    '#EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example/dash/m/key.bin?Policy=sig"',
+    '#EXTINF:9.96,',
+    'https://cdn.example/dash/m/chunk-stream3-00001.m4s?Policy=sig',
+    '#EXTINF:9.96,',
+    'https://cdn.example/dash/m/chunk-stream3-00002.m4s?Policy=sig',
+    '#EXT-X-ENDLIST',
+  ].join('\n');
+  const { entries, register } = hlsRegister();
+  const out = rewriteHlsPlaylist(playlist, {
+    playlistUrl: 'https://cdn.example/dash/m/v3.m3u8?Policy=sig',
+    localPrefix: 'http://127.0.0.1:8080/up/secret1',
+    register,
+  });
+  const lines = out.split('\n');
+  const bareLines = lines.filter((l) => l && !l.startsWith('#')).join('\n');
+  assert.ok(!/cdn\.example/.test(bareLines), 'no CDN host left on a bare URI line');
+  assert.match(lines[3], /^#EXT-X-MAP:URI="http:\/\/127\.0\.0\.1:8080\/up\/secret1\/hls\/u\/r\d+"$/);
+  assert.match(lines[4], /^#EXT-X-KEY:METHOD=AES-128,URI="http:\/\/127\.0\.0\.1:8080\/up\/secret1\/hls\/u\/r\d+"$/);
+  assert.match(lines[6], /^http:\/\/127\.0\.0\.1:8080\/up\/secret1\/hls\/u\/r\d+$/);
+  // The non-URI attributes on the key tag survive untouched.
+  assert.match(lines[4], /METHOD=AES-128/);
+  // Every registered reference is an absolute CDN URL.
+  assert.ok(entries.every((e) => e.type === 'url' && /^https:\/\//.test(e.url)));
+  assert.equal(entries.length, 4, 'init, key and two segments');
+});
+
+test('rewriteHlsPlaylist handles master playlists, relative URIs and query inheritance', () => {
+  const master = [
+    '#EXTM3U',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a1",NAME="nl",URI="audio/main.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080',
+    'video/1080/main.m3u8',
+    '#EXT-X-I-FRAME-STREAM-INF:URI="iframe/main.m3u8"',
+  ].join('\n');
+  const { entries, register } = hlsRegister();
+  const out = rewriteHlsPlaylist(master, {
+    // A signed playlist: relative references must keep this Policy query.
+    playlistUrl: 'https://cdn.example/dash/m/v3.m3u8?Policy=sig123',
+    localPrefix: 'http://127.0.0.1:8080/up/s2',
+    register,
+  });
+  const registeredUrls = entries.map((e) => e.url);
+  assert.ok(registeredUrls.includes('https://cdn.example/dash/m/audio/main.m3u8?Policy=sig123'), 'relative EXT-X-MEDIA URI inherits the playlist query');
+  assert.ok(registeredUrls.includes('https://cdn.example/dash/m/video/1080/main.m3u8?Policy=sig123'), 'relative variant line inherits the playlist query');
+  assert.ok(registeredUrls.includes('https://cdn.example/dash/m/iframe/main.m3u8?Policy=sig123'));
+  assert.ok(!out.includes('cdn.example'), 'every URI was rerouted');
+});
+
+test('rewriteHlsPlaylist neutralises XML-escaped ampersands emitted by a DASH→HLS bridge', () => {
+  // The field failure: the worker wrote &amp; into the m3u8, so ffmpeg asked
+  // the CDN for amp;Signature and never got a valid signed segment.
+  const playlist = [
+    '#EXTM3U',
+    '#EXT-X-MAP:URI="https://cdn.example/dash/m/init.m4s?Policy=eyJ&amp;Signature=abc&amp;Key-Pair-Id=K1"',
+    '#EXTINF:9.9,',
+    'https://cdn.example/dash/m/chunk-1.m4s?Policy=eyJ&amp;Signature=abc&amp;Key-Pair-Id=K1',
+  ].join('\n');
+  const { entries } = hlsRegister();
+  rewriteHlsPlaylist(playlist, {
+    playlistUrl: 'https://bridge.example/?url=https%3A%2F%2Fcdn.example%2Fv3.m3u8',
+    localPrefix: 'http://127.0.0.1:8080/up/s3',
+    register: (e) => `r${entries.push(e)}`,
+  });
+  for (const entry of entries) {
+    assert.ok(entry.url.includes('&Signature=abc'), `raw & restored in ${entry.url}`);
+    assert.ok(!entry.url.includes('&amp;'), `no XML entity left in ${entry.url}`);
+  }
+});
+
+test('rewriteHlsPlaylist dedupes repeated segment URLs and leaves other tags alone', () => {
+  const playlist = [
+    '#EXTM3U',
+    '#EXT-X-TARGETDURATION:10',
+    '#EXTINF:9.9,',
+    'https://cdn.example/seg-1.m4s',
+    '#EXTINF:9.9,',
+    'https://cdn.example/seg-1.m4s',
+    '#EXT-X-DISCONTINUITY',
+    '#EXTINF:9.9,',
+    'https://cdn.example/seg-2.m4s',
+    '#EXT-X-ENDLIST',
+  ].join('\r\n'); // CRLF must be accepted
+  const seen = new Map();
+  const register = (entry) => {
+    if (seen.has(entry.url)) return seen.get(entry.url);
+    const id = `r${seen.size + 1}`;
+    seen.set(entry.url, id);
+    return id;
+  };
+  const out = rewriteHlsPlaylist(playlist, {
+    playlistUrl: 'https://cdn.example/v3.m3u8',
+    localPrefix: 'http://127.0.0.1:8080/up/s4',
+    register,
+  });
+  const lines = out.split('\n');
+  assert.equal(lines[3], lines[5], 'the repeated segment keeps one local id');
+  assert.equal(lines[6], '#EXT-X-DISCONTINUITY', 'plain tags pass through');
+  assert.equal(seen.size, 2);
 });
 
 /* ------------------------------------------------------------------ *
@@ -720,6 +885,200 @@ test('unknown proxy secrets and wrong routes are refused', async () => {
     const res = await get(`${proxy.base}/up/deadbeef/f`);
     assert.equal(res.status, 404);
   } finally {
+    proxy.server.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * HLS integration — the field failure: ffmpeg reconnects at the same
+ * byte offset forever because every CDN transfer is cut early.
+ * ------------------------------------------------------------------ */
+
+const HLS_MIME = 'application/vnd.apple.mpegurl';
+
+function hlsFiles(cdnPort, { init, seg1, seg2 }) {
+  const root = `http://127.0.0.1:${cdnPort}/hls/movie`;
+  const master = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:6',
+    '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080',
+    `${root}/media.m3u8`,
+    '',
+  ].join('\n');
+  const media = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:6',
+    '#EXT-X-TARGETDURATION:10',
+    `#EXT-X-MAP:URI="${root}/init.m4s"`,
+    '#EXTINF:9.96,',
+    `${root}/chunk-00001.m4s`,
+    '#EXTINF:9.96,',
+    `${root}/chunk-00002.m4s`,
+    '#EXT-X-ENDLIST',
+    '',
+  ].join('\n');
+  return new Map([
+    ['/hls/movie/master.m3u8', { buf: Buffer.from(master), type: HLS_MIME }],
+    ['/hls/movie/media.m3u8', { buf: Buffer.from(media), type: HLS_MIME }],
+    ['/hls/movie/init.m4s', { buf: init, type: 'video/mp4' }],
+    ['/hls/movie/chunk-00001.m4s', { buf: seg1, type: 'video/mp4' }],
+    ['/hls/movie/chunk-00002.m4s', { buf: seg2, type: 'video/mp4' }],
+  ]);
+}
+
+/** Follow the rewritten playlists the way ffmpeg's HLS demuxer would. */
+async function fetchRewrittenHls(session, proxyBase, cdnOrigin) {
+  const root = await get(session.inputUrl);
+  assert.equal(root.status, 200);
+  assert.match(root.headers['content-type'], /mpegurl/);
+  assert.ok(!root.body.toString('utf8').includes(cdnOrigin), 'no direct CDN URL in the master');
+  const variant = root.body.toString('utf8').split(/\r?\n/).find((l) => l && !l.startsWith('#'));
+  assert.ok(variant.startsWith(`${proxyBase}/up/`), 'the variant loops back through the proxy');
+
+  const media = await get(variant);
+  assert.equal(media.status, 200);
+  const text = media.body.toString('utf8');
+  assert.ok(!text.includes(cdnOrigin), 'no direct CDN URL leaks into the media playlist');
+  const lines = text.split(/\r?\n/);
+  const initUrl = /URI="([^"]+)"/.exec(lines.find((l) => l.startsWith('#EXT-X-MAP')))[1];
+  const segmentUrls = lines.filter((l) => l && !l.startsWith('#'));
+  assert.ok(initUrl.startsWith(`${proxyBase}/up/`));
+  assert.ok(segmentUrls.every((u) => u.startsWith(`${proxyBase}/up/`)), 'segments loop back through the proxy');
+  return { initUrl, segmentUrls };
+}
+
+test('hls source: rewritten playlists and chunked fetches deliver every byte despite early cuts', { timeout: 60000 }, async () => {
+  const init = pseudoBytes(120 * 1024, 31);
+  const seg1 = pseudoBytes(400 * 1024, 32);
+  const seg2 = pseudoBytes(400 * 1024, 33);
+  // The CDN binds an ephemeral port: start it on an empty map, then fill the
+  // map with port-absolute playlist URLs (the handler looks the map up per request).
+  const files = new Map();
+  const realCdn = await startTruncatingCdn(files, { cutAfterBytes: 64 * 1024 });
+  for (const [name, value] of hlsFiles(realCdn.port, { init, seg1, seg2 })) files.set(name, value);
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamSegmentChunkBytes = 95 * 1024;
+  cfg.transcode.upstreamParallel = 4;
+  cfg.transcode.upstreamCacheMb = 8;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-hls',
+    url: `http://127.0.0.1:${realCdn.port}/hls/movie/master.m3u8`,
+    headers: { Cookie: 'CloudFront-Policy=abc', Referer: 'https://moviebox.example/' },
+    kind: 'hls',
+    baseOverride: proxy.base,
+  });
+  try {
+    let missingHeaders = 0;
+    const origListeners = realCdn.server.listeners('request');
+    realCdn.server.removeAllListeners('request');
+    realCdn.server.on('request', (req, res) => {
+      if (!req.headers.cookie || !req.headers.referer) missingHeaders += 1;
+      origListeners[0](req, res);
+    });
+
+    const { initUrl, segmentUrls } = await fetchRewrittenHls(session, proxy.base, `http://127.0.0.1:${realCdn.port}`);
+
+    const initRes = await get(initUrl);
+    assert.equal(initRes.status, 200);
+    assert.ok(initRes.body.equals(init), 'init section reassembled byte-exactly');
+
+    const [r1, r2] = await Promise.all(segmentUrls.map((u) => get(u)));
+    assert.ok(r1.body.equals(seg1), 'segment 1 reassembled byte-exactly');
+    assert.ok(r2.body.equals(seg2), 'segment 2 reassembled byte-exactly');
+
+    // The segment cache answers Range requests out of the assembled bytes.
+    const ranged = await get(segmentUrls[0], { headers: { Range: 'bytes=100-199' } });
+    assert.equal(ranged.status, 206);
+    assert.ok(ranged.body.equals(seg1.subarray(100, 200)));
+
+    assert.ok(realCdn.stats.requests >= 10, `expected many small ranged requests, saw ${realCdn.stats.requests}`);
+    assert.equal(missingHeaders, 0, 'the signed headers were replayed on every request');
+    const stats = proxyStats(session);
+    assert.equal(stats.mode, 'hls');
+    assert.ok(stats.truncations >= 3, `the proxy noticed the cuts (${stats.truncations})`);
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    realCdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('hls source: a range-less CDN that cuts every connection still delivers whole objects', { timeout: 60000 }, async () => {
+  // The exact field symptom: plain chunked 200s, each cut after a growing
+  // amount. ffmpeg reconnects at the same offset forever; the proxy's
+  // range-less fallback reopens the GET and keeps the longest prefix until a
+  // clean end. The 1.2 MB segment stays truncated through fetchObjectChunked's
+  // three internal tries (the three earlier playlist/init requests already
+  // advanced the global cut schedule), so fetchLinearObject is what has to
+  // finish it.
+  const init = pseudoBytes(60 * 1024, 41);
+  const seg1 = pseudoBytes(1200 * 1024, 42);
+  const seg2 = pseudoBytes(1200 * 1024, 43);
+  const files = new Map();
+  const realCdn = await startTruncatingCdn(files, {
+    supportRange: false,
+    countResponseSizes: false,
+    cutAfterBytes: (n) => n * 128 * 1024,
+  });
+  for (const [name, value] of hlsFiles(realCdn.port, { init, seg1, seg2 })) files.set(name, value);
+  const proxy = await startProxyApp();
+  const cfg = getConfig();
+  cfg.transcode.upstreamSegmentChunkBytes = 95 * 1024;
+
+  const session = await createUpstreamProxy({
+    streamId: 'test-hls-plain',
+    url: `http://127.0.0.1:${realCdn.port}/hls/movie/master.m3u8`,
+    headers: {},
+    kind: 'hls',
+    baseOverride: proxy.base,
+  });
+  try {
+    const { initUrl, segmentUrls } = await fetchRewrittenHls(session, proxy.base, `http://127.0.0.1:${realCdn.port}`);
+    const initRes = await get(initUrl);
+    assert.ok(initRes.body.equals(init), 'init arrives whole from a range-less cutting CDN');
+    const segRes = await get(segmentUrls[0]);
+    assert.equal(segRes.status, 200);
+    assert.ok(segRes.body.equals(seg1), 'segment reassembled across reopened GETs');
+    assert.ok(realCdn.stats.requests >= 4, `expected reopened GETs, saw ${realCdn.stats.requests}`);
+  } finally {
+    closeUpstreamProxy(session, 'test done');
+    realCdn.server.close();
+    proxy.server.close();
+  }
+});
+
+test('hls routes refuse the wrong proxy kind and unknown references', async () => {
+  const files = new Map();
+  const cdn = await startTruncatingCdn(files, { cutAfterBytes: 64 * 1024 });
+  for (const [name, value] of hlsFiles(cdn.port, {
+    init: pseudoBytes(1024, 1), seg1: pseudoBytes(1024, 2), seg2: pseudoBytes(1024, 3),
+  })) files.set(name, value);
+  const proxy = await startProxyApp();
+  const fileSession = await createUpstreamProxy({
+    streamId: 'test-hls-wrong-kind',
+    url: `http://127.0.0.1:${cdn.port}/hls/movie/master.m3u8`,
+    headers: {},
+    kind: 'file',
+    baseOverride: proxy.base,
+  });
+  const hlsSession = await createUpstreamProxy({
+    streamId: 'test-hls-routes',
+    url: `http://127.0.0.1:${cdn.port}/hls/movie/master.m3u8`,
+    headers: {},
+    kind: 'hls',
+    baseOverride: proxy.base,
+  });
+  try {
+    const wrongKind = await get(`${proxy.base}/up/${fileSession.secret}/h`);
+    assert.equal(wrongKind.status, 404);
+    const unknownRef = await get(`${proxy.base}/up/${hlsSession.secret}/hls/u/r9999`);
+    assert.equal(unknownRef.status, 404);
+  } finally {
+    closeUpstreamProxy(fileSession, 'test done');
+    closeUpstreamProxy(hlsSession, 'test done');
+    cdn.server.close();
     proxy.server.close();
   }
 });

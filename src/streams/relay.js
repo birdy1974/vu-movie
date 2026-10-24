@@ -419,8 +419,17 @@ export function releaseUpstreamProxy(session, reason = 'stopped', { graceMs = 30
   // it must not keep the proxy's (soon-to-be-closed) cache reachable with it.
   const proxy = session.upProxy;
   session.upProxy = null;
+  // Both the child-close path and the safety-net timer call this. It is
+  // idempotent and must not clearTimeout() the safety-net timer from a later
+  // event-loop turn: node:test MockTimers.reset() leaves a stale queue position
+  // on the old timer object, so a clearTimeout() issued under the next test's
+  // mock removes that mock's unrelated timer instead — a session idle timer
+  // vanished that way and its session was never stopped. A late safety-net
+  // firing is a harmless no-op; the timer is unref'd anyway.
+  let closed = false;
   const close = () => {
-    clearTimeout(timer);
+    if (closed) return;
+    closed = true;
     closeUpstreamProxy(proxy, reason);
   };
   const timer = setTimeout(close, Math.max(0, Number(graceMs) || 0));
@@ -977,8 +986,10 @@ export async function ensureSession(stream, opts = {}) {
   // CDNs end a chunked transfer after a few minutes of footage, which is what
   // used to cut playback short. Instead of handing the CDN URL to ffmpeg, we
   // pull the media ourselves in small ranged requests (per-request headers,
-  // per-request retries) and serve ffmpeg from a loopback endpoint. HLS stays
-  // direct — ffmpeg's HLS demuxer already fetches small segments.
+  // per-request retries) and serve ffmpeg from a loopback endpoint. HLS goes
+  // through it too (UPSTREAM_PROXY_HLS=false opts out): against a DASH→HLS
+  // bridge in front of one of these CDNs, ffmpeg's own reconnect loops at the
+  // same byte offset forever instead of playing a frame.
   const upProxy = await maybeCreateUpstreamProxy({ streamId: stream.id, upstream: stream.upstream });
   // The session owns its proxy: a paused, frozen session makes no fetches for
   // minutes, and the proxy's idle sweep must not close it under the session.

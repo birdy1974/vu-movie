@@ -30,8 +30,24 @@
  *     rewritten so every init/segment URL points back at
  *     `/up/<secret>/dash/...`; each segment is assembled from ranged
  *     sub-requests exactly like the TUI does, then cached;
+ *   - `hls` sources get every m3u8 (the root plus nested master/media
+ *     playlists) fetched the same way and rewritten so variant lists,
+ *     EXT-X-MAP init sections, EXT-X-KEY keys and segment URIs all loop back
+ *     through `/up/<secret>/hls/...`, each object fetched in small ranged
+ *     sub-requests (with the range-less capture fallback below) and cached;
  *   - the upstream headers (signed Cookie, Referer, UA) are replayed on
  *     **every** CDN request, never just on the first one.
+ *
+ * Why HLS needs the proxy too (field failure, 2026-10): a DASH→HLS bridge
+ * worker in front of a CDN that ends transfers early handed ffmpeg a playlist
+ * whose first object was always cut at the same byte offset. ffmpeg's
+ * `-reconnect_at_eof` then reconnected at that offset forever ("Will
+ * reconnect at 1125706 … error=End of file", repeated ~100×) without playing
+ * a frame, and the HLS demuxer concluded it could not open the init section.
+ * The proxy never hands ffmpeg one long connection: the object is reassembled
+ * from many small requests, re-opened and resumed (or re-read from byte 0 on a
+ * range-less server) until it is complete, so the cut becomes a retry instead
+ * of a dead session. Set UPSTREAM_PROXY_HLS=false for the old direct path.
  *
  * What is deliberately NOT ported (see docs/MOVIEBOX-TUI-COMPARISON.md):
  * segment *prefetch* (ffmpeg paces its own reads), the max_height filter (the
@@ -191,7 +207,7 @@ async function rangedRequest(session, url, start, end, signal, { maxBytes = Infi
   const buf = all.length > limit ? all.subarray(0, limit) : all;
   session.stats.cdnBytes += received;
   session.lastActivity = Date.now();
-  return { status: res.status, buf, total, contentLength, truncated, cancelled, contentType };
+  return { status: res.status, buf, total, contentLength, truncated, cancelled, contentType, finalUrl: res.url };
 }
 
 /**
@@ -274,11 +290,11 @@ async function fetchObjectChunked(session, url, signal) {
   if (!first.buf.length) throw new ChunkedFetchError('empty segment response');
   if (first.status === 200) {
     if (first.buf.length > MAX_SEGMENT_BYTES) throw new ChunkedFetchError('object too large');
-    return { buf: first.buf, contentType: first.contentType };
+    return { buf: first.buf, contentType: first.contentType, finalUrl: first.finalUrl };
   }
   const total = first.total;
   if (total == null || total <= first.buf.length || total > MAX_SEGMENT_BYTES) {
-    return { buf: first.buf, contentType: first.contentType };
+    return { buf: first.buf, contentType: first.contentType, finalUrl: first.finalUrl };
   }
 
   const ranges = [];
@@ -291,7 +307,60 @@ async function fetchObjectChunked(session, url, signal) {
     const results = await Promise.all(batch.map(([s, e]) => fetchByteWindow(session, url, s, e, signal)));
     for (const r of results) pieces.push(r.buf);
   }
-  return { buf: Buffer.concat(pieces), contentType: first.contentType };
+  return { buf: Buffer.concat(pieces), contentType: first.contentType, finalUrl: first.finalUrl };
+}
+
+/**
+ * Last-resort reassembly for a range-less server that cuts every plain GET.
+ * Each reopened GET starts at byte 0, so we keep the longest prefix until a
+ * response ends cleanly; a no-progress counter stops the loop when the cut
+ * point never moves (the failure ffmpeg calls "Will reconnect at N … End of
+ * file" — its own reconnect cannot make progress on such a server either).
+ * Bounded by `maxBytes`: hitting the cap means the object is too large.
+ */
+async function fetchLinearObject(session, url, maxBytes, signal) {
+  let best = Buffer.alloc(0);
+  let contentType = null;
+  let finalUrl = url;
+  let stuck = 0;
+  const maxAttempts = session.tune.maxAttempts + 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (session.abort.signal.aborted) throw new ChunkedFetchError('proxy session closed');
+    if (signal?.aborted) throw new ChunkedFetchError('client went away');
+    const r = await rangedRequest(session, url, 0, maxBytes - 1, signal, { maxBytes });
+    if (r.contentType) contentType = r.contentType;
+    if (r.finalUrl) finalUrl = r.finalUrl;
+    const previous = best.length;
+    if (r.buf.length > best.length) best = r.buf;
+    if (r.cancelled) throw new ChunkedFetchError('object larger than the proxy limit');
+    // A 200 that ended on its own is the complete object (a cut would have
+    // come back truncated, whether or not the response was chunked).
+    if (r.status === 200 && !r.truncated) {
+      return { buf: best, contentType, finalUrl };
+    }
+    stuck = r.buf.length <= previous ? stuck + 1 : 0;
+    if (stuck >= 4) throw new ChunkedFetchError('the range-less upstream keeps cutting the transfer at the same point');
+    await sleep(backoff(attempt));
+  }
+  throw new ChunkedFetchError('the range-less object never arrived completely');
+}
+
+/**
+ * Fetch one HLS object (playlist, init section, key or media segment) the
+ * resilient way: ranged assembly first, and when the server ignores Range and
+ * keeps truncating, fall back to reopened whole-GET reassembly.
+ */
+async function fetchHlsObject(session, url, signal, { maxBytes = MAX_SEGMENT_BYTES } = {}) {
+  try {
+    return await fetchObjectChunked(session, url, signal);
+  } catch (err) {
+    const truncating = err instanceof ChunkedFetchError && /truncat/i.test(err.message);
+    if (!truncating) throw err;
+    log.info('upstream', 'the HLS upstream ignores Range and cuts transfers — reassembling the object with reopened GETs', {
+      session: session.id, url: truncate(url, 110),
+    });
+    return fetchLinearObject(session, url, maxBytes, signal);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -531,10 +600,87 @@ function baseDirOf(url) {
 }
 
 /* ------------------------------------------------------------------ *
+ * HLS playlist rewriting (m3u8 is line-based, unlike the DASH MPD)
+ * ------------------------------------------------------------------ */
+
+/** Tags whose URI="…" attribute points at an object the proxy must serve. */
+const HLS_URI_TAG_RE = /^#EXT-X-(?:MAP|KEY|SESSION-KEY|MEDIA|I-FRAME-STREAM-INF)\b/;
+
+/**
+ * Reroute one HLS URI to a local proxy reference. Mirrors the DASH rewriter's
+ * handling of signed CDNs and adds two field-specific defences:
+ *   - a relative reference on a playlist that carries a query (the Policy
+ *     signature) inherits that query — RFC 3986 would otherwise drop it;
+ *   - a DASH→HLS bridge that XML-escapes ampersands emits literal `&amp;`
+ *     inside the m3u8 (invalid HLS, observed in the field): unescape first so
+ *     the CDN receives the real parameter names instead of `amp;Signature`.
+ */
+function rerouteHlsUri(rawUri, playlistUrl, localPrefix, register) {
+  const unescaped = String(rawUri).replace(/&amp;/g, '&');
+  let resolved;
+  try {
+    resolved = new URL(unescaped, playlistUrl).toString();
+    if (!unescaped.includes('?') && /\?/.test(playlistUrl)) {
+      const target = new URL(resolved);
+      if (!target.search) target.search = new URL(playlistUrl).search;
+      resolved = target.toString();
+    }
+  } catch {
+    resolved = unescaped;
+  }
+  const id = register({ type: 'url', url: resolved });
+  return `${localPrefix}/hls/u/${id}`;
+}
+
+/**
+ * Rewrite an HLS playlist so every URI it contains — bare segment/variant
+ * lines plus the URI="…" attributes on the tags above — points back at the
+ * local proxy. Pure: the caller supplies register(), exactly like
+ * rewriteDashManifest, so it is unit-testable without a session.
+ */
+export function rewriteHlsPlaylist(text, { playlistUrl, localPrefix, register }) {
+  const base = String(playlistUrl);
+  return String(text).split(/\r?\n/).map((line) => {
+    if (!line.trim()) return line;
+    if (!line.startsWith('#')) {
+      return rerouteHlsUri(line.trim(), base, localPrefix, register);
+    }
+    if (HLS_URI_TAG_RE.test(line)) {
+      return line.replace(/URI="([^"]*)"/, (whole, uri) => `URI="${rerouteHlsUri(uri, base, localPrefix, register)}"`);
+    }
+    return line;
+  }).join('\n');
+}
+
+/** Sniff whether a fetched object is an HLS playlist (content type or #EXTM3U). */
+function looksLikeHlsPlaylist(buf, contentType) {
+  if (/mpegurl|m3u8/i.test(String(contentType || ''))) return true;
+  return Buffer.isBuffer(buf) && buf.subarray(0, 32).toString('latin1').trimStart().startsWith('#EXTM3U');
+}
+
+/* ------------------------------------------------------------------ *
  * sessions
  * ------------------------------------------------------------------ */
 
 let idleSweeper = null;
+
+/**
+ * Register a CDN reference and return its local id. URL refs are deduplicated:
+ * an HLS media playlist repeats hundreds of segment URLs and variant
+ * playlists share them, so without this one long playlist would leak an id
+ * per line even though every segment already had a route.
+ */
+function registerRef(session, entry) {
+  if (entry.type === 'url') {
+    const existing = session.refs.byUrl.get(entry.url);
+    if (existing) return existing;
+  }
+  const id = `r${session.refs.next}`;
+  session.refs.next += 1;
+  session.refs.byId.set(id, entry);
+  if (entry.type === 'url') session.refs.byUrl.set(entry.url, id);
+  return id;
+}
 
 /**
  * Keep a proxy from being swept while its relay session still owns it, or while
@@ -583,9 +729,12 @@ export async function createUpstreamProxy({ streamId, url, headers = {}, kind = 
     meta: { total: null, rangeSupported: null, contentType: null },
     metaPromise: null,
     store: kind === 'file' ? new ByteStore(t.cacheBytes, t.chunkBytes) : null,
-    segments: kind === 'dash' ? new SegmentCache(t.cacheBytes) : null,
-    refs: { byId: new Map(), next: 1 },
+    // Both DASH and HLS assemble whole objects (segments, keys, nested
+    // playlists); file sources instead stream through the byte store.
+    segments: kind === 'file' ? null : new SegmentCache(t.cacheBytes),
+    refs: { byId: new Map(), byUrl: new Map(), next: 1 },
     mpd: null,                             // { rewritten, fetchedAt }
+    hlsPlaylists: kind === 'hls' ? new Map() : null, // source URL → rewritten m3u8
     stats: { cdnRequests: 0, cdnBytes: 0, retries: 0, truncations: 0, timeouts: 0, servedBytes: 0, cacheHits: 0 },
     startedAt: Date.now(),
     lastActivity: Date.now(),
@@ -597,10 +746,15 @@ export async function createUpstreamProxy({ streamId, url, headers = {}, kind = 
   };
   session.inputUrl = kind === 'dash'
     ? `${session.base}/up/${secret}/m`
-    : `${session.base}/up/${secret}/f`;
+    : kind === 'hls'
+      ? `${session.base}/up/${secret}/h`
+      : `${session.base}/up/${secret}/f`;
   proxies.set(secret, session);
   ensureIdleSweeper();
-  log.info('upstream', `upstream proxy ready — fetching in ${kind === 'dash' ? '95 KB ranged sub-requests' : `${Math.round(t.chunkBytes / 1024)} KB ranged chunks`} (MovieBox-TUI style)`, {
+  const fetchStyle = kind === 'file'
+    ? `${Math.round(t.chunkBytes / 1024)} KB ranged chunks`
+    : '95 KB ranged sub-requests';
+  log.info('upstream', `upstream proxy ready — fetching in ${fetchStyle} (MovieBox-TUI style)`, {
     session: session.id, stream: streamId, kind, upstream: truncate(url, 110),
   });
   return session;
@@ -623,6 +777,8 @@ export function closeUpstreamProxy(session, reason = 'stopped') {
   session.store?.clear();
   session.segments?.clear();
   session.refs?.byId?.clear();
+  session.refs?.byUrl?.clear();
+  session.hlsPlaylists?.clear();
   session.mpd = null;
   session.metaPromise = null;
   log.info('upstream', `upstream proxy closed (${reason})`, {
@@ -662,14 +818,18 @@ export function proxyStats(session) {
 
 /**
  * Decide whether a relay session should be served through the chunked proxy.
- * HLS stays on the direct path: ffmpeg's HLS demuxer already fetches small
- * segments on its own, and the relay's improved restart logic covers the rest.
+ * HLS goes through it as well: the assumption that ffmpeg's own HLS demuxer
+ * always copes on the direct path does not hold for a DASH→HLS bridge in front
+ * of a CDN that ends transfers early — ffmpeg then reconnects at the same
+ * byte offset forever instead of playing. UPSTREAM_PROXY_HLS=false restores the
+ * old direct behaviour for HLS while file/DASH keep their own master switch.
  */
 export function shouldProxyUpstream(upstream, cfg = getConfig()) {
   if (cfg.transcode.upstreamProxy === false) return false;
   const url = String(upstream?.url || '');
   if (!/^https?:/i.test(url)) return false;
   const kind = upstream.kind || streamKind(url);
+  if (kind === 'hls') return cfg.transcode.upstreamProxyHls !== false;
   return kind === 'file' || kind === 'dash';
 }
 
@@ -1104,12 +1264,7 @@ async function serveMpd(session, req, res) {
       const rewritten = rewriteDashManifest(original, {
         mpdUrl: session.upstreamUrl,
         localPrefix: `${session.base}/up/${session.secret}`,
-        register: ({ type, url, dir, template, query }) => {
-          const id = `r${session.refs.next}`;
-          session.refs.next += 1;
-          session.refs.byId.set(id, { type, url, dir, template, query });
-          return id;
-        },
+        register: (entry) => registerRef(session, entry),
       });
       session.mpd = { rewritten, fetchedAt: Date.now() };
       log.info('upstream', 'DASH manifest fetched and rewritten — all segments now loop back through the proxy', {
@@ -1142,28 +1297,112 @@ function resolveRef(session, kind, id, rest = '') {
   return null;
 }
 
+/**
+ * Write an assembled object (DASH or HLS segment, key, init section) to the
+ * client, honouring a Range request against the complete in-memory bytes.
+ * Returns how many bytes were written so the caller can keep stats.
+ */
+function sendCachedObject(res, obtained, req) {
+  const { buf, contentType } = obtained;
+  const range = parseClientRange(req.headers.range, buf.length);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-store');
+  if (contentType) res.setHeader('Content-Type', contentType);
+  if (range) {
+    const slice = buf.subarray(range.start, range.end + 1);
+    res.status(206)
+      .setHeader('Content-Range', `bytes ${range.start}-${range.end}/${buf.length}`)
+      .setHeader('Content-Length', slice.length)
+      .end(slice);
+    return slice.length;
+  }
+  res.status(200).setHeader('Content-Length', buf.length).end(buf);
+  return buf.length;
+}
+
 /** Serve one DASH object (segment/init) from cache or the chunked fetcher. */
 async function serveSegment(session, url, req, res) {
   try {
     const obtained = await session.segments.obtain(url, () => fetchObjectChunked(session, url));
-    const { buf, contentType } = obtained;
     if (obtained.cached) session.stats.cacheHits += 1;
-    const range = parseClientRange(req.headers.range, buf.length);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-store');
-    if (contentType) res.setHeader('Content-Type', contentType);
-    if (range) {
-      const slice = buf.subarray(range.start, range.end + 1);
-      res.status(206)
-        .setHeader('Content-Range', `bytes ${range.start}-${range.end}/${buf.length}`)
-        .setHeader('Content-Length', slice.length)
-        .end(slice);
-    } else {
-      res.status(200).setHeader('Content-Length', buf.length).end(buf);
-    }
-    session.stats.servedBytes += range ? range.end - range.start + 1 : buf.length;
+    session.stats.servedBytes += sendCachedObject(res, obtained, req);
   } catch (err) {
     sendError(res, 502, `segment fetch failed: ${err.message}`);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * HLS serving — the m3u8 twin of the DASH path above
+ * ------------------------------------------------------------------ */
+
+const HLS_PLAYLIST_TYPE = 'application/vnd.apple.mpegurl';
+
+/** Send a rewritten playlist with the HLS content type. */
+function sendPlaylist(res, body) {
+  res.status(200)
+    .set('Content-Type', HLS_PLAYLIST_TYPE)
+    .set('Content-Length', Buffer.byteLength(body))
+    .set('Cache-Control', 'no-store')
+    .send(body);
+}
+
+/**
+ * Fetch (and once rewrite) the playlist behind `url`. Root playlists get the
+ * 10 MB manifest bound; nested ones share the segment bound, which is larger.
+ * `prefetch` carries bytes already fetched by the caller so a nested playlist
+ * is not downloaded twice.
+ */
+async function loadHlsPlaylist(session, url, { root = false, prefetch = null } = {}) {
+  const cached = session.hlsPlaylists.get(url);
+  if (cached) return cached;
+  const cap = root ? MAX_MANIFEST_BYTES : MAX_SEGMENT_BYTES;
+  const fetched = prefetch || await fetchHlsObject(session, url, undefined, { maxBytes: cap });
+  const { buf, finalUrl } = fetched;
+  const original = buf.toString('utf8');
+  if (!/^\s*#EXTM3U/.test(original)) throw new ChunkedFetchError('the response is not an HLS playlist (missing #EXTM3U)');
+  const body = rewriteHlsPlaylist(original, {
+    playlistUrl: finalUrl || url,
+    localPrefix: `${session.base}/up/${session.secret}`,
+    register: (entry) => registerRef(session, entry),
+  });
+  session.hlsPlaylists.set(url, body);
+  log.info('upstream', 'HLS playlist fetched and rewritten — variants, keys and segments now loop back through the proxy', {
+    session: session.id, root, refs: session.refs.next - 1, bytes: body.length,
+  });
+  return body;
+}
+
+/** Serve the entry playlist (the upstream URL ffmpeg was pointed at). */
+async function serveHlsRoot(session, req, res) {
+  try {
+    const body = await loadHlsPlaylist(session, session.upstreamUrl, { root: true });
+    sendPlaylist(res, body);
+  } catch (err) {
+    sendError(res, 502, `could not fetch the HLS playlist: ${err.message}`);
+  }
+}
+
+/**
+ * Serve one object referenced by a rewritten playlist. A nested playlist
+ * (master → media playlist) is rewritten in turn; anything else is an init
+ * section, key or media segment and goes out through the object cache.
+ */
+async function serveHlsRef(session, id, req, res) {
+  const url = resolveRef(session, 'url', id);
+  if (!url) return sendError(res, 404, 'unknown HLS reference');
+  try {
+    const cachedPlaylist = session.hlsPlaylists.get(url);
+    if (cachedPlaylist) return sendPlaylist(res, cachedPlaylist);
+    const obtained = await session.segments.obtain(url, () => fetchHlsObject(session, url));
+    if (looksLikeHlsPlaylist(obtained.buf, obtained.contentType)) {
+      const body = await loadHlsPlaylist(session, url, { root: false, prefetch: obtained });
+      return sendPlaylist(res, body);
+    }
+    if (obtained.cached) session.stats.cacheHits += 1;
+    session.stats.servedBytes += sendCachedObject(res, obtained, req);
+    return undefined;
+  } catch (err) {
+    return sendError(res, 502, `HLS object fetch failed: ${err.message}`);
   }
 }
 
@@ -1190,6 +1429,14 @@ export function upstreamProxyMiddleware(req, res, next) {
   if (mode === 'm') {
     if (session.kind !== 'dash') return sendError(res, 404, 'this session is not DASH');
     return serveMpd(session, req, res);
+  }
+  if (mode === 'h') {
+    if (session.kind !== 'hls') return sendError(res, 404, 'this session is not HLS');
+    return serveHlsRoot(session, req, res);
+  }
+  if (mode === 'hls' && tail.length >= 2 && tail[0] === 'u') {
+    if (session.kind !== 'hls') return sendError(res, 404, 'this session is not HLS');
+    return serveHlsRef(session, tail[1], req, res);
   }
   if (mode === 'dash' && tail.length >= 2) {
     const [, id, ...remaining] = tail;
@@ -1267,6 +1514,7 @@ export function listUpstreamProxies() {
 export default {
   createUpstreamProxy, maybeCreateUpstreamProxy, shouldProxyUpstream, closeUpstreamProxy,
   closeAllUpstreamProxies, pauseLinearCapture,
-  proxyStats, upstreamProxyMiddleware, rewriteDashManifest, parseClientRange, listUpstreamProxies,
+  proxyStats, upstreamProxyMiddleware, rewriteDashManifest, rewriteHlsPlaylist, parseClientRange,
+  listUpstreamProxies,
   pinUpstreamProxy, serveDirectFile,
 };
