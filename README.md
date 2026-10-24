@@ -736,7 +736,12 @@ The ones that matter most on a DS918+:
   and a container that restart-loops. `sh scripts/doctor.sh` section 6 checks
   all of that (restart count, `/dev/shm` size, reachable API) for you; to pin a
   known-good image set `FLARESOLVERR_IMAGE=flaresolverr/flaresolverr:v3.3.21`.
-* Health: `GET /api/health` (also wired into the container healthcheck).
+* Health: `GET /api/health` (also wired into the container healthcheck). It
+  also reports process memory (`memory`), live sessions with their upstream
+  cache sizes, and every upstream proxy — see
+  [docs/MEMORY.md](docs/MEMORY.md) for what a movie costs, what is released
+  when it stops, and how to tell a real leak from Linux page cache and the
+  allocator's high-water mark on DSM.
   The receiver is **not** contacted by this endpoint — it reports the last known
   state only. The container healthcheck (every 30 s) and the dashboard (every
   15 s) both read `/api/health`, and a VU+ should not be woken up that often for

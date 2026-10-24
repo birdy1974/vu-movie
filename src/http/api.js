@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import { log, logError, errorText, getRecentLogs, knownComponents, getLogLevel, setLogLevel, subscribeLogs } from '../core/log.js';
 import { getConfig, publicConfig, saveConfig, validateConfigPatch, cfg } from '../core/config.js';
 import { dbState, isPostgres } from '../core/db.js';
+import { memorySnapshot } from '../core/memory.js';
 import {
   hardware, hardwareStatus, hardwarePending, binariesStatus,
   diagnoseFfmpeg, probe, buildFfmpegArgs, normaliseProfile, argsToCommand, validateFfmpegTemplate,
@@ -30,6 +31,7 @@ import * as browser from '../scrapers/browser.js';
 import * as external from '../scrapers/external.js';
 import * as store from '../streams/store.js';
 import * as relay from '../streams/relay.js';
+import { listUpstreamProxies } from '../streams/upstream.js';
 import * as exporter from '../streams/export.js';
 import * as subs from '../subtitles/index.js';
 import * as enigma2 from '../enigma2/index.js';
@@ -246,6 +248,13 @@ router.get('/health', wrap(async (req, res) => {
     flaresolverr: await browser.flaresolverrStatus({ probe: true, maxAgeMs: 300_000 }).catch((e) => ({ configured: false, error: errorText(e) })),
     enigma2: enigma,
     streamSessions: relay.listSessions(),
+    // Memory observability (see docs/MEMORY.md). heapUsed/external are the
+    // numbers that prove or disprove a leak across play/stop cycles; rss is
+    // a high-water mark that normally stays up after a movie stops. The
+    // upstream proxy list makes the per-movie chunk/segment cache visible,
+    // including direct-link proxies that no relay session owns.
+    memory: memorySnapshot(),
+    upstreamProxies: listUpstreamProxies(),
     jobs: jobStats(),
     sources: registry.listSources().map((s) => ({ id: s.id, name: s.name, health: s.health })),
   });

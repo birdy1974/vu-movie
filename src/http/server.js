@@ -54,6 +54,38 @@ async function prepareStreamForPlayback(stream, res, reason = 'stream-start') {
   return null;
 }
 
+/* ------------------------------------------------------------ *
+ * Download-endpoint ffmpeg children (/dl/…)
+ *
+ * They belong to no relay session and no job, so they are tracked here:
+ * app shutdown kills them via stopActiveDownloads() instead of leaving
+ * them running as orphans after the process exits.
+ * ------------------------------------------------------------ */
+const activeDownloadChildren = new Set();
+
+/** SIGTERM now, SIGKILL in 5 s if the child is still there. */
+function killChildEscalating(child) {
+  try { child.kill('SIGTERM'); } catch { /* gone */ }
+  setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 5000).unref?.();
+}
+
+/** The /dl ffmpeg processes currently running (for shutdown waits/tests). */
+export function activeDownloads() {
+  return [...activeDownloadChildren];
+}
+
+/** Stop every /dl download (app shutdown). Returns how many were stopped. */
+export function stopActiveDownloads(reason = 'shutdown') {
+  let stopped = 0;
+  for (const child of [...activeDownloadChildren]) {
+    log.info('http', `stopping a download ffmpeg (${reason})`, { pid: child.pid ?? null });
+    killChildEscalating(child);
+    activeDownloadChildren.delete(child);
+    stopped += 1;
+  }
+  return stopped;
+}
+
 function extensionOf(reqPath) {
   const m = /\.([a-z0-9]+)$/i.exec(reqPath.split('?')[0]);
   return m ? m[1].toLowerCase() : '';
@@ -378,20 +410,31 @@ export function createApp() {
     res.setHeader('Content-Disposition', `attachment; filename="${store.slugify(`${stream.title}-${stream.year || ''}`)}.${servedExt}"`);
     res.setHeader('Content-Type', mediaTypeForContainer(served));
     const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
+    activeDownloadChildren.add(child);
     child.stdout.pipe(res);
     child.stderr.on('data', (d) => log.debug('http', `download ffmpeg: ${truncate(String(d).trim(), 160)}`));
     child.on('error', (err) => {
+      activeDownloadChildren.delete(child);
       logError('http', 'download ffmpeg failed to start', err);
       if (!res.headersSent) res.status(500).end();
     });
     child.on('close', (code) => {
+      activeDownloadChildren.delete(child);
       log.info('http', 'download finished', { stream: stream.id, code });
       res.end();
     });
-    req.on('close', () => {
+    // A download ffmpeg was previously known to nobody: not a relay session,
+    // not a job. Nothing stopped it on app shutdown, and a client disconnect
+    // only ever sent SIGTERM. Track it (stopActiveDownloads) and escalate.
+    let cancelled = false;
+    const cancel = () => {
+      if (cancelled) return;
+      cancelled = true;
       log.warn('http', 'download cancelled by the client', { stream: stream.id });
-      child.kill('SIGTERM');
-    });
+      killChildEscalating(child);
+    };
+    req.on('close', cancel);
+    res.on('close', cancel);
   });
 
   /* ---------------- watch page (tiny player for the browser) ---------------- */

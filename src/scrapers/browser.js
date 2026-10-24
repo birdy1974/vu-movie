@@ -388,9 +388,14 @@ export async function sniff(urlOrOpts, maybeOpts = {}) {
   const blockedNavigations = new Set();
 
   page.on('console', (msg) => {
-    if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 200));
+    // Capped like failedDocumentRequests below: a page that spews console
+    // errors for the whole resolve window must not grow this unboundedly —
+    // the first 50 already say everything a diagnosis needs.
+    if (msg.type() === 'error' && consoleErrors.length < 50) consoleErrors.push(msg.text().slice(0, 200));
   });
-  page.on('pageerror', (err) => consoleErrors.push(String(err.message).slice(0, 200)));
+  page.on('pageerror', (err) => {
+    if (consoleErrors.length < 50) consoleErrors.push(String(err.message).slice(0, 200));
+  });
 
   // Catch pop-ups: many players open the stream in a new tab. Remove this
   // listener after each run so it does not accumulate in the persistent context.

@@ -50,8 +50,34 @@ const mem = {
 };
 
 export function dbState() {
-  return { state, lastError, hasPool: Boolean(pool) };
+  return { state, lastError, hasPool: Boolean(pool), memCacheEntries: mem.cache.size };
 }
+
+/**
+ * The in-memory mirror of api_cache is written on EVERY cacheSet (also in
+ * Postgres mode, as the fallback read path), but entries were only ever
+ * removed when the same key was read again after its TTL — so the map grew
+ * by one entry per distinct search/metadata key for the life of the
+ * process. Bound it: expired entries go first, then the oldest (Map order
+ * is insertion order; a re-set refreshes a key's position via delete+set in
+ * cacheSet). 500 metadata payloads is far beyond any working set here.
+ */
+const MAX_MEM_CACHE_ENTRIES = 500;
+
+function pruneMemCache() {
+  const now = Date.now();
+  for (const [key, hit] of mem.cache) {
+    if (hit.expires && hit.expires < now) mem.cache.delete(key);
+  }
+  while (mem.cache.size > MAX_MEM_CACHE_ENTRIES) {
+    const oldest = mem.cache.keys().next().value;
+    if (oldest === undefined) break;
+    mem.cache.delete(oldest);
+  }
+}
+
+/** cacheSet counter for the throttled Postgres-side expiry sweep below. */
+let cacheSetsSinceSweep = 0;
 
 export function isPostgres() {
   return state === 'postgres';
@@ -437,13 +463,26 @@ export const repo = {
 
   async cacheSet(key, value, ttlSeconds = 3600) {
     const expires = ttlSeconds > 0 ? Date.now() + ttlSeconds * 1000 : null;
+    // delete+set so a refreshed key becomes the newest for pruneMemCache's
+    // oldest-first eviction.
+    mem.cache.delete(key);
     mem.cache.set(key, { value, expires });
+    pruneMemCache();
     if (pool) {
       await query(
         `insert into api_cache (key, payload, expires_at, updated_at) values ($1,$2,$3,now())
          on conflict (key) do update set payload = excluded.payload, expires_at = excluded.expires_at, updated_at = now()`,
         [key, JSON.stringify(value ?? null), expires ? new Date(expires) : null],
       ).catch((err) => logError('db', 'cacheSet failed', err));
+      // The table had the same one-way growth as the memory mirror (rows
+      // were deleted only when the same key was read after expiry). Sweep
+      // expired rows opportunistically, throttled to every 100 writes.
+      cacheSetsSinceSweep += 1;
+      if (cacheSetsSinceSweep >= 100) {
+        cacheSetsSinceSweep = 0;
+        query('delete from api_cache where expires_at is not null and expires_at < now()')
+          .catch((err) => logError('db', 'expired cache sweep failed', err));
+      }
     }
     return value;
   },

@@ -17,8 +17,12 @@ import { log, logError, errorText } from './core/log.js';
 import { loadConfig, getConfig, ensureDirs, publicConfig } from './core/config.js';
 import { initDatabase, closeDatabase } from './core/db.js';
 import { checkBinaries, hardware, hardwarePending, hardwareStatus } from './core/media.js';
-import { startServer } from './http/server.js';
+import { startServer, activeDownloads, stopActiveDownloads } from './http/server.js';
 import relay from './streams/relay.js';
+import { closeAllUpstreamProxies } from './streams/upstream.js';
+import { cancelAllJobs, activeJobHandles } from './core/jobs.js';
+import { activeFfmpegRuns, stopActiveFfmpegRuns } from './playlist/ffmpeg-run.js';
+import { memoryLogFields } from './core/memory.js';
 import browser from './scrapers/browser.js';
 import { loadSources } from './scrapers/registry.js';
 import { startPlaylistMaintenance, stopPlaylistMaintenance, startEphemeralSweep, stopEphemeralSweep } from './playlist/maintenance.js';
@@ -115,14 +119,58 @@ async function main() {
   startPlaylistMaintenance();
 
   // ---- graceful shutdown ----
+  // Every child this process spawned must be dead before we exit. The old
+  // sequence SIGTERM'd the relay's ffmpeg and then exited 500 ms later:
+  // stopSession's SIGKILL escalation (5 s, unref'd) could never fire, and
+  // nothing at all stopped /dl downloads, download-job ffmpeg or live
+  // template tests — outside a container those survived the app as orphans
+  // still holding hundreds of MB (and the GPU). Now: stop everything, wait
+  // (bounded, SIGKILL at the deadline) for the children to actually exit,
+  // then close the rest. Worst case stays inside Docker's 10 s stop grace.
+  let shuttingDown = false;
   const shutdown = async (signal) => {
-    log.info('app', `received ${signal} — shutting down`, { sessions: relay.listSessions().length });
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info('app', `received ${signal} — shutting down`, {
+      sessions: relay.listSessions().length, ...memoryLogFields(),
+    });
+    // Absolute backstop: Docker SIGKILLs the container after its grace
+    // period (10 s default); leave on our own terms just before that.
+    setTimeout(() => process.exit(0), 9000).unref();
     stopPlaylistMaintenance();
-    server.close(() => log.debug('app', 'http server closed'));
+    stopEphemeralSweep();
+    const jobsCancelled = cancelAllJobs();
+    const children = [
+      ...relay.activeChildren(),
+      ...activeJobHandles(),
+      ...activeDownloads(),
+      ...activeFfmpegRuns(),
+    ];
     relay.stopAll('shutdown');
-    await browser.closeBrowser('shutdown').catch(() => {});
+    stopActiveDownloads('shutdown');
+    stopActiveFfmpegRuns('shutdown');
+    // Long-lived stream/SSE responses would keep server.close() (and this
+    // process) hanging forever; their sockets go first.
+    server.closeAllConnections?.();
+    server.close(() => log.debug('app', 'http server closed'));
+    const [childResult] = await Promise.all([
+      relay.waitForChildrenToExit(children, { timeoutMs: 5000 }),
+      // Chromium close can hang on a wedged renderer — race it, don't await it.
+      Promise.race([
+        browser.closeBrowser('shutdown').catch(() => {}),
+        new Promise((resolve) => { setTimeout(resolve, 3000).unref?.(); }),
+      ]),
+    ]);
+    const proxiesClosed = closeAllUpstreamProxies('shutdown');
     await closeDatabase().catch(() => {});
-    setTimeout(() => process.exit(0), 500).unref();
+    log.info('app', 'shutdown complete', {
+      jobsCancelled,
+      childrenExited: childResult.exited,
+      childrenSigkilled: childResult.killed,
+      upstreamProxiesClosed: proxiesClosed,
+      ...memoryLogFields(),
+    });
+    process.exit(0);
   };
   ['SIGINT', 'SIGTERM'].forEach((sig) => process.on(sig, () => { shutdown(sig).catch(() => process.exit(1)); }));
 

@@ -47,6 +47,28 @@ import { parseProgressLine } from '../core/media.js';
 import * as store from '../streams/store.js';
 
 const router = express.Router();
+
+/** Live-test ffmpeg children currently running, so app shutdown can stop
+ *  them instead of leaving a test run transcoding as an orphan. */
+const activeRuns = new Set();
+
+/** The live-test ffmpeg processes currently running (shutdown/tests). */
+export function activeFfmpegRuns() {
+  return [...activeRuns];
+}
+
+/** Stop every running live test (app shutdown). Returns how many. */
+export function stopActiveFfmpegRuns(reason = 'shutdown') {
+  let stopped = 0;
+  for (const child of [...activeRuns]) {
+    log.info('playlist', `stopping a live ffmpeg test (${reason})`, { pid: child.pid ?? null });
+    try { child.kill('SIGTERM'); } catch { /* gone */ }
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 1500).unref?.();
+    stopped += 1;
+  }
+  return stopped;
+}
+
 const MAX_TEST_MS = 30_000;
 const MIN_TEST_MS = 500;
 /** Text stdout a test may print (the panel shows ~400 lines; this is plenty). */
@@ -167,6 +189,9 @@ router.post('/live-test', async (req, res) => {
   });
 
   const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: ffmpegEnv(hw) });
+  activeRuns.add(child);
+  child.once('close', () => activeRuns.delete(child));
+  child.once('error', () => activeRuns.delete(child));
   const startedAt = Date.now();
   let bytesOut = 0;
   let stderrBuffer = '';
@@ -322,6 +347,10 @@ router.post('/live-test', async (req, res) => {
     finished = true;
     clearTimeout(timer);
     try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    // Same escalation as the timeout path: a child that sits on SIGTERM
+    // would otherwise keep transcoding (and growing its output inode, the
+    // file below is already unlinked) until it felt like exiting.
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 1500).unref?.();
     try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
   });
 });
