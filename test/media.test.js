@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildFfmpegArgs, normaliseProfile, parseProbeJson, parseHlsMaster,
-  targetDimensions, parseProgressLine, argsToCommand, streamKind, headerArgs, headerObject, parseFps,
+  targetDimensions, parseProgressLine, argsToCommand, streamKind, nestedManifestKind, headerArgs, headerObject, parseFps,
   parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf, subtitleSessionNotes,
   buildFfmpegTemplateArgs,
   buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
@@ -43,6 +43,23 @@ test('streamKind recognises the source families', () => {
   assert.equal(streamKind('https://x/y/master.m3u8?token=1'), 'hls');
   assert.equal(streamKind('https://x/y/manifest.mpd'), 'dash');
   assert.equal(streamKind('https://x/y/movie.mp4'), 'file');
+});
+
+test('streamKind unwraps DASH→HLS bridge URLs whose manifest sits in a nested param', () => {
+  // The field shape: the worker's own path has no extension; v3.m3u8 is the
+  // percent-encoded value of ?url=, with the signature beside it.
+  const bridge = 'https://dash-hls-bridge.example.workers.dev/?url='
+    + encodeURIComponent('https://sacdn.example/dash/5357535498/v3.m3u8?Policy=eyJ')
+    + '&Policy=eyJ&Signature=abc';
+  assert.equal(nestedManifestKind(bridge), 'hls');
+  assert.equal(streamKind(bridge), 'hls', 'the bridge is fed like any HLS source');
+
+  const dashBridge = 'https://proxy.example/translate?u=' + encodeURIComponent('https://cdn/x/index.mpd');
+  assert.equal(streamKind(dashBridge), 'dash');
+  // A nested plain file does not change the default classification.
+  assert.equal(streamKind('https://proxy.example/fetch?url=' + encodeURIComponent('https://cdn/a/movie.mp4')), 'file');
+  // No nested http(s) value, nothing to unwrap.
+  assert.equal(nestedManifestKind('https://worker.example/?foo=bar'), null);
 });
 
 test('headerArgs turns header objects into one -headers argument', () => {

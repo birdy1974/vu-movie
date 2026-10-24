@@ -738,13 +738,31 @@ export function isInitSegmentUrl(url) {
   return INIT_SEGMENT_RE.test(String(url || '').split(/[?#]/)[0]);
 }
 
+/**
+ * Manifest kind hidden inside a wrapper/proxy query parameter. The field's
+ * DASH→HLS bridge looks like `https://worker/?url=https%3A%2F%2Fcdn%2Fv3.m3u8&Policy=…`:
+ * its own path has no extension, so the URL must be unwrapped one level to see
+ * the real manifest. Null when no nested http(s) URL names a manifest.
+ */
+export function nestedManifestKind(rawUrl) {
+  let parsed;
+  try { parsed = new URL(String(rawUrl || '')); } catch { return null; }
+  for (const value of parsed.searchParams.values()) {
+    if (!/^https?:\/\//i.test(value)) continue;
+    const path = value.split('?')[0].toLowerCase();
+    if (path.endsWith('.m3u8') || path.includes('.m3u8') || isDisguisedManifestUrl(path)) return 'hls';
+    if (path.endsWith('.mpd')) return 'dash';
+  }
+  return null;
+}
+
 /** 'hls' | 'dash' | 'file' — determines how ffmpeg is fed. */
 export function streamKind(url) {
   const clean = String(url || '').split('?')[0].toLowerCase();
   if (clean.endsWith('.m3u8') || clean.includes('.m3u8')) return 'hls';
   if (isDisguisedManifestUrl(clean)) return 'hls';
   if (clean.endsWith('.mpd')) return 'dash';
-  return 'file';
+  return nestedManifestKind(url) || 'file';
 }
 
 /**
@@ -1989,7 +2007,7 @@ export default {
   checkBinaries, binariesStatus, hardware, hardwareStatus, hardwarePending, detectHardware,
   ffmpegPath, ffprobePath, ffmpegEnv, libvaDriverCandidates, cacheUsable,
   runCommand, classifyBinaryFailure, parseVainfoOutput,
-  probe, parseProbeJson, parseHlsMaster, streamKind, buildFfmpegArgs, buildFfprobeArgs,
+  probe, parseProbeJson, parseHlsMaster, streamKind, nestedManifestKind, buildFfmpegArgs, buildFfprobeArgs,
   isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
   parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
   normaliseProfile, targetDimensions, argsToCommand, parseProgressLine,

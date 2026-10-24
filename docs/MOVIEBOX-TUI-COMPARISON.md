@@ -225,7 +225,16 @@ per-session *upstream proxy* on the app's own port, addressed by a random 96-bit
   `UPSTREAM_PARALLEL` at a time) and cached (`UPSTREAM_CACHE_MB`);
 * the signed headers (Cookie / Referer / UA) are replayed on **every** CDN request;
 * CDNs that ignore Range entirely fall back to a resumable linear capture;
-* HLS stays on the direct path (ffmpeg's HLS demuxer already fetches small segments).
+* `hls` sources are proxied the same way (default on): each `.m3u8` — master, media
+  and nested playlists — is fetched with the source headers, sniffed, and **rewritten** so
+  every segment/key/init URL points back at `/up/<secret>/hls/…`; the objects are assembled
+  and cached like DASH segments. The direct path is not safe in front of every CDN: on a
+  DASH→HLS bridge whose CDN ends a transfer at a fixed byte offset, ffmpeg's native HLS
+  demuxer reconnects at the *same* offset dozens of times (`[https] Will reconnect …
+  error=End of file`) and then dies on the first segment/init section. Inside the proxy the
+  same cut only costs one retried 95 KB sub-request. Escaped `&amp;` entities in bridge
+  playlists are neutralised while the URIs are rewritten. `UPSTREAM_PROXY_HLS=false` restores
+  direct ffmpeg fetching for ordinary, healthy HLS sources.
 
 Safety net on top (`src/streams/relay.js`): `decideRestart()` restarts ffmpeg on error exits and
 on *early clean EOFs* while clients watch (up to `STREAM_MAX_RESTARTS`, default 3), resuming at
@@ -245,10 +254,15 @@ Two relay details the proxy made necessary:
 * **The proxy is closed only after ffmpeg is gone** (`releaseUpstreamProxy`, 3 s grace).
   Closing it in the same tick as the idle-stop SIGTERM aborted the in-flight ranged transfer
   under ffmpeg, which then reconnected into a 404 and exited with an I/O error — a clean idle
-  stop looked like a crash in the log.
+  stop looked like a crash in the log. Both close paths (the child's `close` event and the
+  grace timer) call one idempotent closer; the grace timer is deliberately *not* cleared from
+  the child event, because a `clearTimeout` on a timer object that outlived a mocked clock
+  corrupts the next `node:test` mock-timer queue (its stale heap position deletes an unrelated
+  live timer) — a late grace firing is a no-op instead.
 
-Switches: `UPSTREAM_PROXY=false` restores the old direct-fetch behaviour; chunk sizes, cache
-budget and per-request timeout are `UPSTREAM_CHUNK_BYTES`, `UPSTREAM_SEGMENT_CHUNK_BYTES`,
+Switches: `UPSTREAM_PROXY=false` restores the old direct-fetch behaviour for every source,
+`UPSTREAM_PROXY_HLS=false` does it only for HLS while file/DASH stay proxied; chunk sizes,
+cache budget and per-request timeout are `UPSTREAM_CHUNK_BYTES`, `UPSTREAM_SEGMENT_CHUNK_BYTES`,
 `UPSTREAM_CACHE_MB`, `UPSTREAM_REQUEST_TIMEOUT_MS`.
 
 Deliberately not ported from the TUI sidecar: segment *prefetch* (the relay paces ffmpeg with

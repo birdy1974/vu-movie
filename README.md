@@ -10,7 +10,12 @@
    CDNs that end a chunked transfer after a few minutes can't cut the movie
    short: the relay pulls the source itself in small ranged requests (the
    MovieBox-TUI mechanism — headers replayed on every request, every request
-   retried, DASH segments cached) and feeds ffmpeg locally (`UPSTREAM_PROXY`).
+   retried, DASH/HLS objects cached) and feeds ffmpeg locally (`UPSTREAM_PROXY`).
+   HLS playlists go through it too, including DASH→HLS bridges: against a CDN
+   that ends a transfer at a fixed byte offset, ffmpeg's own HLS demuxer
+   reconnects at the same offset forever instead of playing, while the relay
+   turns the cut into a retried ranged request. `UPSTREAM_PROXY_HLS=false`
+   restores direct ffmpeg HLS fetching.
 2. **Transcodes** that stream on the NAS with Intel VAAPI hardware when the source
    is too big for the target (4K HEVC → 1080p H.264, 1 concurrent stream), with a
    full profile editor: resolution, aspect ratio, video/audio bitrate, fps, container.

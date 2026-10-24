@@ -330,6 +330,13 @@ export const DEFAULTS = {
      */
     upstreamProxy: String(process.env.UPSTREAM_PROXY || 'true').toLowerCase() !== 'false',
     /**
+     * HLS (.m3u8) sources, including DASH→HLS bridge workers, go through the
+     * same chunked proxy: ffmpeg alone reconnects forever at the same byte
+     * offset when a CDN/bridge ends a transfer early. Set UPSTREAM_PROXY_HLS=false
+     * to hand HLS URLs directly to ffmpeg again.
+     */
+    upstreamProxyHls: String(process.env.UPSTREAM_PROXY_HLS || 'true').toLowerCase() !== 'false',
+    /**
      * Learn each movie's length once with ffprobe, so the relay can tell the
      * genuine end of a movie from an early cut and stops instead of repeating
      * the film. Set PROBE_DURATION=false to skip the probe.
