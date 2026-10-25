@@ -1097,6 +1097,23 @@ function sourceSubtitleMapAnalysis(args, probeSubtitles) {
 }
 
 /**
+ * The upstream proxy's loopback HLS playlist route (`/up/<secret>/h`). The
+ * objects inside the rewritten playlists use the sibling `/hls/u/<id>` shape,
+ * but ffmpeg is handed the playlist route itself as its input URL.
+ */
+const LOOPBACK_HLS_URL_RE = /\/up\/[\w-]+\/h(?:\?|$)/;
+
+/**
+ * Whether a URL alone marks an input as HLS: a real .m3u8, a `?url=` bridge
+ * whose nested manifest is HLS, a disguised playlist, or the relay's
+ * extensionless loopback proxy route.
+ */
+function isHlsUrl(url) {
+  const clean = String(url || '');
+  return LOOPBACK_HLS_URL_RE.test(clean) || streamKind(clean) === 'hls';
+}
+
+/**
  * Whether ffmpeg will demux this input as HLS. `source.kind` is the reliable
  * signal (every internal caller passes it), but the proxy's loopback input URL
  * has no .m3u8 extension — it ends in `/up/<secret>/h` — so classify that route
@@ -1105,16 +1122,14 @@ function sourceSubtitleMapAnalysis(args, probeSubtitles) {
  */
 function isHlsInput(source) {
   if (source?.kind === 'hls') return true;
-  const url = String(source?.url || '');
-  if (/\/up\/[\w-]+\/h(?:\?|$)/.test(url)) return true;
-  return streamKind(url) === 'hls';
+  return isHlsUrl(source?.url);
 }
 
 /**
  * Render a template to an argv list. Source URLs and private request headers are
  * inserted as individual argv values, never interpolated into shell text.
  */
-export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode = 'live', output = { target: 'pipe:1' } }) {
+export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode = 'live', output = { target: 'pipe:1' }, ffmpegVersion } = {}) {
   const container = output.container || profile.container || 'mpegts';
   const validation = validateFfmpegTemplate(template, { container });
   if (!validation.ok) {
@@ -1163,7 +1178,12 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     addInputOption('-reconnect_streamed', '1');
     addInputOption('-reconnect_delay_max', '5');
     addInputOption('-rw_timeout', '10000000');
-    addInputOption('-allowed_segment_extensions', 'ALL', isDisguisedManifestUrl(source.url));
+    // The proxy rewrites every HLS object to an extensionless /up/<secret>/hls/u/<id>
+    // URL; ffmpeg 5.1's HLS demuxer rejects those unless the extension gate is
+    // opened. The option exists ONLY on 5.1.x and is a fatal unknown option on
+    // 4.x/6.x, so the version check is mandatory (see hlsSegmentExtensionArgs).
+    addInputOption('-allowed_segment_extensions', 'ALL',
+      hlsInput && ffmpegSupportsHlsSegmentAllowlist(ffmpegVersion));
     if (mode === 'live') {
       addInputOption('-analyzeduration', '1000000');
       addInputOption('-probesize', '1000000');
@@ -1335,7 +1355,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   return args;
 }
 
-export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000 } = {}) {
+export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000, ffmpegVersion } = {}) {
   const h = headerObject(headers);
   return [
     '-v', 'error',
@@ -1344,18 +1364,58 @@ export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000 } = {}) 
     '-rw_timeout', String(timeoutMs * 1000),
     '-user_agent', h['User-Agent'] || getConfig().scraper.userAgent,
     ...headerArgs(h),
-    ...hlsSegmentExtensionArgs(url),
+    ...hlsSegmentExtensionArgs(url, ffmpegVersion),
     url,
   ];
 }
 
 /**
- * Input option for a disguised HLS playlist (see isDisguisedManifestUrl): lets
- * the HLS demuxer accept segments whatever their extension. Empty for every
- * other input, so ordinary HLS sources keep the demuxer's default checks.
+ * major/minor from an `ffmpeg -version` banner
+ * (`ffmpeg version 5.1.9-0+deb12u1 Copyright …` → { major: 5, minor: 1 });
+ * null for anything that does not start with a numbered release banner.
  */
-export function hlsSegmentExtensionArgs(url) {
-  return isDisguisedManifestUrl(url) ? ['-allowed_segment_extensions', 'ALL'] : [];
+export function parseFfmpegVersion(banner) {
+  const match = String(banner || '').match(/^ffmpeg version (\d+)\.(\d+)(?:\.(\d+))?/);
+  return match ? { major: Number(match[1]), minor: Number(match[2]) } : null;
+}
+
+/** Banner of the ffmpeg binary the app will actually spawn, once probed. */
+function currentFfmpegBanner() {
+  const ffmpeg = binariesStatus()?.ffmpeg;
+  return ffmpeg?.ok ? ffmpeg.version : null;
+}
+
+/**
+ * Whether this ffmpeg build knows the HLS demuxer's
+ * `allowed_segment_extensions` option. The option — together with
+ * `extension_picky`, whose default rejects every extensionless segment URL
+ * while the playlist is parsed — existed ONLY in the 5.1.x line: it is absent
+ * in 5.0 and earlier and was removed again in 6.0 (verified against the
+ * n5.0/n5.1.9/n6.1.2/n7.0.2 source and 4.2.2/7.0.2 binaries). An unrecognised
+ * private option makes ffmpeg exit with "Unrecognized option" before opening
+ * the input, so it must never be sent to other builds. An unparseable banner
+ * fails closed (omit): the deployed 5.1.9 Debian banner is always parseable,
+ * while the unparseable cases are static/nightly builds that do not have it.
+ */
+export function ffmpegSupportsHlsSegmentAllowlist(banner = currentFfmpegBanner()) {
+  const version = parseFfmpegVersion(banner);
+  return Boolean(version && version.major === 5 && version.minor >= 1);
+}
+
+/**
+ * Input option that lets an ffmpeg 5.1.x HLS demuxer open extensionless
+ * segment URLs. The upstream proxy rewrites every playlist object — variants,
+ * segments, keys, init sections — to `/up/<secret>/hls/u/<id>` names without a
+ * file extension; 5.1's extension_picky gate rejects those while parsing the
+ * playlist ("URL … is not in allowed_segment_extensions") and the whole
+ * playlist fails before a single frame. Disguised `.jpg` playlists hit the same
+ * gate, which is why every HLS input (not only the loopback proxy route) is
+ * covered. Returns [] for non-HLS inputs and for ffmpeg builds without the
+ * option (4.x, 6.x, 7.x), where the gate does not exist either.
+ */
+export function hlsSegmentExtensionArgs(url, banner = currentFfmpegBanner()) {
+  if (!isHlsUrl(url) || !ffmpegSupportsHlsSegmentAllowlist(banner)) return [];
+  return ['-allowed_segment_extensions', 'ALL'];
 }
 
 export function parseFps(value) {
@@ -1633,13 +1693,13 @@ export function normaliseProfile(input = {}, probeInfo = null) {
  * @param {'live'|'file'} o.mode
  * @param {{target:string, container?:string}} o.output
  */
-export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', output = { target: 'pipe:1' } }) {
+export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', output = { target: 'pipe:1' }, ffmpegVersion } = {}) {
   const p = profile || {};
   const container = output.container || p.container || 'mpegts';
   if (mode === 'live' && String(p.ffmpegTemplate || '').trim()) {
     return buildFfmpegTemplateArgs({
       template: p.ffmpegTemplate, source, profile: p, mode,
-      output: { ...output, container },
+      output: { ...output, container }, ffmpegVersion,
     });
   }
   const args = ['-hide_banner', '-nostdin', '-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning'];
@@ -1707,7 +1767,12 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // command the DUO2 test ran with).
   if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
   if (mode === 'live' && hlsInput) args.push('-live_start_index', '-3');
-  if (hlsInput) args.push(...hlsSegmentExtensionArgs(source.url));
+  // Extensionless /up/<secret>/hls/u/<id> segment URLs (and disguised .jpg
+  // playlists) need the gate opened on 5.1.x only — the option is unknown to
+  // 4.x/6.x, where ffmpeg would exit before opening the input.
+  if (hlsInput && ffmpegSupportsHlsSegmentAllowlist(ffmpegVersion)) {
+    args.push('-allowed_segment_extensions', 'ALL');
+  }
 
   args.push('-i', source.url);
   if (sidecarFitsContainer) args.push('-i', sidecarSubtitlePath);
@@ -2036,6 +2101,7 @@ export default {
   runCommand, classifyBinaryFailure, parseVainfoOutput,
   probe, parseProbeJson, parseHlsMaster, streamKind, nestedManifestKind, buildFfmpegArgs, buildFfprobeArgs,
   isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
+  parseFfmpegVersion, ffmpegSupportsHlsSegmentAllowlist,
   parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
   normaliseProfile, targetDimensions, argsToCommand, parseProgressLine,
 };
