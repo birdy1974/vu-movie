@@ -1179,11 +1179,12 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     addInputOption('-reconnect_delay_max', '5');
     addInputOption('-rw_timeout', '10000000');
     // The proxy rewrites every HLS object to an extensionless /up/<secret>/hls/u/<id>
-    // URL; ffmpeg 5.1's HLS demuxer rejects those unless the extension gate is
-    // opened. The option exists ONLY on 5.1.x and is a fatal unknown option on
-    // 4.x/6.x, so the version check is mandatory (see hlsSegmentExtensionArgs).
-    addInputOption('-allowed_segment_extensions', 'ALL',
-      hlsInput && ffmpegSupportsHlsSegmentAllowlist(ffmpegVersion));
+    // URL; ffmpeg 5.1's HLS demuxer rejects those in test_segment() unless its
+    // extension enforcement is switched off. The option exists ONLY on 5.1.x and
+    // is a fatal unknown option on 4.x/6.x, so the version check is mandatory
+    // (see hlsExtensionPickyArgs).
+    addInputOption('-extension_picky', '0',
+      hlsInput && ffmpegSupportsHlsExtensionPicky(ffmpegVersion));
     if (mode === 'live') {
       addInputOption('-analyzeduration', '1000000');
       addInputOption('-probesize', '1000000');
@@ -1364,7 +1365,7 @@ export function buildFfprobeArgs(url, { headers = {}, timeoutMs = 20000, ffmpegV
     '-rw_timeout', String(timeoutMs * 1000),
     '-user_agent', h['User-Agent'] || getConfig().scraper.userAgent,
     ...headerArgs(h),
-    ...hlsSegmentExtensionArgs(url, ffmpegVersion),
+    ...hlsExtensionPickyArgs(url, ffmpegVersion),
     url,
   ];
 }
@@ -1386,18 +1387,17 @@ function currentFfmpegBanner() {
 }
 
 /**
- * Whether this ffmpeg build knows the HLS demuxer's
- * `allowed_segment_extensions` option. The option — together with
- * `extension_picky`, whose default rejects every extensionless segment URL
- * while the playlist is parsed — existed ONLY in the 5.1.x line: it is absent
- * in 5.0 and earlier and was removed again in 6.0 (verified against the
- * n5.0/n5.1.9/n6.1.2/n7.0.2 source and 4.2.2/7.0.2 binaries). An unrecognised
- * private option makes ffmpeg exit with "Unrecognized option" before opening
- * the input, so it must never be sent to other builds. An unparseable banner
- * fails closed (omit): the deployed 5.1.9 Debian banner is always parseable,
- * while the unparseable cases are static/nightly builds that do not have it.
+ * Whether this ffmpeg build's HLS demuxer carries the 5.1-era extension
+ * enforcement (`extension_picky` + `allowed_segment_extensions`). Both
+ * options existed ONLY in the 5.1.x line: they are absent in 5.0 and earlier
+ * and were removed again in 6.0 (verified against the
+ * n5.0/n5.1.9/n6.1.2/n7.0.2 source and 4.2.2/7.0.2 binaries, where either
+ * option exits with "Unrecognized option" before the input is opened). They
+ * must therefore never be sent to other builds. An unparseable banner fails
+ * closed (omit): the deployed 5.1.9 Debian banner is always parseable, while
+ * the unparseable cases are static/nightly builds that do not have them.
  */
-export function ffmpegSupportsHlsSegmentAllowlist(banner = currentFfmpegBanner()) {
+export function ffmpegSupportsHlsExtensionPicky(banner = currentFfmpegBanner()) {
   const version = parseFfmpegVersion(banner);
   return Boolean(version && version.major === 5 && version.minor >= 1);
 }
@@ -1406,16 +1406,26 @@ export function ffmpegSupportsHlsSegmentAllowlist(banner = currentFfmpegBanner()
  * Input option that lets an ffmpeg 5.1.x HLS demuxer open extensionless
  * segment URLs. The upstream proxy rewrites every playlist object — variants,
  * segments, keys, init sections — to `/up/<secret>/hls/u/<id>` names without a
- * file extension; 5.1's extension_picky gate rejects those while parsing the
- * playlist ("URL … is not in allowed_segment_extensions") and the whole
- * playlist fails before a single frame. Disguised `.jpg` playlists hit the same
- * gate, which is why every HLS input (not only the loopback proxy route) is
- * covered. Returns [] for non-HLS inputs and for ffmpeg builds without the
- * option (4.x, 6.x, 7.x), where the gate does not exist either.
+ * file extension. 5.1's test_segment() runs TWO extension checks while a
+ * playlist is opened:
+ *
+ *   1. the segment URL must be in `allowed_segment_extensions`;
+ *   2. once the first segment has been probed, the URL extension must also
+ *      match the *probed format's own* extensions (an fMP4 segment probes as
+ *      mov/mp4, so an extensionless URL fails with "detected format mov,mp4…
+ *      mismatches allowed extensions").
+ *
+ * `-allowed_segment_extensions ALL` only disarms check 1; check 2 still
+ * rejected every proxied fMP4 segment. `-extension_picky 0` is the master
+ * switch at the top of test_segment() and disarms both. Disguised `.jpg`
+ * playlists hit the same code, which is why every HLS input (not only the
+ * loopback proxy route) is covered. Returns [] for non-HLS inputs and for
+ * ffmpeg builds without the option (4.x, 6.x, 7.x), where the checks do not
+ * exist either.
  */
-export function hlsSegmentExtensionArgs(url, banner = currentFfmpegBanner()) {
-  if (!isHlsUrl(url) || !ffmpegSupportsHlsSegmentAllowlist(banner)) return [];
-  return ['-allowed_segment_extensions', 'ALL'];
+export function hlsExtensionPickyArgs(url, banner = currentFfmpegBanner()) {
+  if (!isHlsUrl(url) || !ffmpegSupportsHlsExtensionPicky(banner)) return [];
+  return ['-extension_picky', '0'];
 }
 
 export function parseFps(value) {
@@ -1768,10 +1778,10 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
   if (mode === 'live' && hlsInput) args.push('-live_start_index', '-3');
   // Extensionless /up/<secret>/hls/u/<id> segment URLs (and disguised .jpg
-  // playlists) need the gate opened on 5.1.x only — the option is unknown to
-  // 4.x/6.x, where ffmpeg would exit before opening the input.
-  if (hlsInput && ffmpegSupportsHlsSegmentAllowlist(ffmpegVersion)) {
-    args.push('-allowed_segment_extensions', 'ALL');
+  // playlists) need 5.1's extension enforcement switched off — the option is
+  // unknown to 4.x/6.x, where ffmpeg would exit before opening the input.
+  if (hlsInput && ffmpegSupportsHlsExtensionPicky(ffmpegVersion)) {
+    args.push('-extension_picky', '0');
   }
 
   args.push('-i', source.url);
@@ -2100,8 +2110,8 @@ export default {
   ffmpegPath, ffprobePath, ffmpegEnv, libvaDriverCandidates, cacheUsable,
   runCommand, classifyBinaryFailure, parseVainfoOutput,
   probe, parseProbeJson, parseHlsMaster, streamKind, nestedManifestKind, buildFfmpegArgs, buildFfprobeArgs,
-  isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
-  parseFfmpegVersion, ffmpegSupportsHlsSegmentAllowlist,
+  isDisguisedManifestUrl, isInitSegmentUrl, hlsExtensionPickyArgs,
+  parseFfmpegVersion, ffmpegSupportsHlsExtensionPicky,
   parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
   normaliseProfile, targetDimensions, argsToCommand, parseProgressLine,
 };

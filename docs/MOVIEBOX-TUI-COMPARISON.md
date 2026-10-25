@@ -270,21 +270,28 @@ Two relay details the proxy made necessary:
   `-reconnect_at_eof` for every HLS input (explicit `kind: 'hls'`, an `.m3u8`/bridge URL, or the
   loopback `/up/<secret>/h` route) while keeping `-reconnect`, which only fires on a *premature*
   cut of a known-size response. File/DASH inputs keep all four reconnect flags.
-* **The extensionless proxy routes get `-allowed_segment_extensions ALL`, but only on ffmpeg
-  5.1.x.** The rewriter turns every playlist object — variants, segments, keys, init sections —
-  into `/up/<secret>/hls/u/<id>` URLs without a file extension. ffmpeg 5.1's HLS demuxer runs an
-  `extension_picky` allowlist check on every segment *while parsing the playlist*, so the first
-  extensionless object fails with `URL … is not in allowed_segment_extensions`, the whole
-  playlist parse fails (`Invalid data found when processing input`), every variant is marked
-  `Empty segment`, and ffmpeg exits on `Stream map '0:v:0' matches no streams` — the reason HLS
-  movies died while progressive `/up/<secret>/f` mp4 movies played. `ALL` opens the gate, but the
-  option (and the gate itself) existed **only in the 5.1.x line**: it is absent in 5.0/4.x and was
-  removed in 6.0, and an unrecognised private option makes ffmpeg exit
-  (`Unrecognized option 'allowed_segment_extensions'`) before opening the input — verified
-  against the n4.4/n5.0/n5.1.9/n6.1.2/n7.0.2 source and 4.2.2/7.0.2 binaries. The builders
-  therefore parse the probed ffmpeg banner (`parseFfmpegVersion`) and emit the option solely for
-  5.1.x; an unparseable banner fails closed (omit). The check covers every HLS input shape, not
-  just the loopback route, because disguised `.jpg` playlists hit the same gate.
+* **The extensionless proxy routes get `-extension_picky 0`, but only on ffmpeg 5.1.x.** The
+  rewriter turns every playlist object — variants, segments, keys, init sections — into
+  `/up/<secret>/hls/u/<id>` URLs without a file extension. ffmpeg 5.1's HLS demuxer
+  (`test_segment()` in `hls.c`, enabled by the `extension_picky` option which defaults to 1)
+  applies **two** extension checks while a playlist is opened:
+  (1) the segment URL must appear in `allowed_segment_extensions`, which fails an extensionless
+  object with `URL … is not in allowed_segment_extensions`; and, once the first segment has been
+  probed, (2) the URL extension must also match the *probed format's own* extensions — a bridged
+  fMP4 segment probes as `mov,mp4,…`, so the same extensionless URL then fails with
+  `detected format mov,mp4,… mismatches allowed extensions`. Either failure aborts the playlist
+  (`Invalid data found when processing input`), every variant is marked `Empty segment`, and
+  ffmpeg exits on `Stream map '0:v:0' matches no streams` — the reason HLS movies died while
+  progressive `/up/<secret>/f` mp4 movies played. `-allowed_segment_extensions ALL` disarms only
+  check 1, so the first fix still died on check 2 (seen in production after the 5.1-only `ALL`
+  shipped); `-extension_picky 0` is the master switch at the top of `test_segment()` and disarms
+  both. Both options existed **only in the 5.1.x line** — absent in 5.0/4.x, removed in 6.0 — and
+  an unrecognised private option makes ffmpeg exit (`Unrecognized option 'extension_picky'`)
+  before opening the input, verified against the n4.4/n5.0/n5.1.9/n6.1.2/n7.0.2 source and
+  4.2.2/7.0.2 binaries. The builders therefore parse the probed ffmpeg banner
+  (`parseFfmpegVersion`) and emit `-extension_picky 0` solely for 5.1.x; an unparseable banner
+  fails closed (omit). The check covers every HLS input shape, not just the loopback route,
+  because disguised `.jpg` playlists hit the same code.
 
 Switches: `UPSTREAM_PROXY=false` restores the old direct-fetch behaviour for every source,
 `UPSTREAM_PROXY_HLS=false` does it only for HLS while file/DASH stay proxied; chunk sizes,

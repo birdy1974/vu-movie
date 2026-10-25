@@ -16,8 +16,8 @@ import {
   targetDimensions, parseProgressLine, argsToCommand, streamKind, nestedManifestKind, headerArgs, headerObject, parseFps,
   parseFfmpegTemplateTokens, validateFfmpegTemplate, outputFormatOf, subtitleSessionNotes,
   buildFfmpegTemplateArgs,
-  buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsSegmentExtensionArgs,
-  parseFfmpegVersion, ffmpegSupportsHlsSegmentAllowlist,
+  buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsExtensionPickyArgs,
+  parseFfmpegVersion, ffmpegSupportsHlsExtensionPicky,
   parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
 } from '../src/core/media.js';
 
@@ -931,17 +931,19 @@ test('an fMP4 init segment and a disguised HLS playlist are recognised by name',
 const FF_519 = 'ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2024 the FFmpeg developers';
 const FF_702 = 'ffmpeg version 7.0.2-static https://johnvansickle.com/ffmpeg/  Copyright (c) 2000-2024';
 
-test('the HLS extension-allowlist option exists only on the ffmpeg 5.1.x line', () => {
+test('the HLS extension_picky enforcement exists only on the ffmpeg 5.1.x line', () => {
   // Verified against the n4.4/n5.0/n5.1.9/n6.1.2/n7.0.2 hls.c option tables:
-  // allowed_segment_extensions + extension_picky shipped only in 5.1.x and
-  // were removed in 6.0; an unknown option makes ffmpeg exit before -i opens.
+  // extension_picky + allowed_segment_extensions shipped only in 5.1.x and
+  // were removed in 6.0; an unknown option makes ffmpeg exit before -i opens
+  // (reproduced with 4.2.2 and 7.0.2 binaries: "Unrecognized option
+  // 'extension_picky'").
   for (const banner of [
     'ffmpeg version 5.1 Copyright (c) 2000-2022 the FFmpeg developers',
     'ffmpeg version 5.1.2-static https://johnvansickle.com/ffmpeg/',
     FF_519,
   ]) {
     assert.deepEqual(parseFfmpegVersion(banner).major, 5);
-    assert.equal(ffmpegSupportsHlsSegmentAllowlist(banner), true, banner);
+    assert.equal(ffmpegSupportsHlsExtensionPicky(banner), true, banner);
   }
   for (const banner of [
     'ffmpeg version 4.2.2-static https://johnvansickle.com/ffmpeg/',
@@ -952,16 +954,16 @@ test('the HLS extension-allowlist option exists only on the ffmpeg 5.1.x line', 
     FF_702,
     'ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers',
   ]) {
-    assert.equal(ffmpegSupportsHlsSegmentAllowlist(banner), false, banner);
+    assert.equal(ffmpegSupportsHlsExtensionPicky(banner), false, banner);
   }
   // Unparseable banners (nightly N-builds, missing binary) fail closed: the
   // option must not be sent where its existence cannot be established.
   for (const banner of [null, '', 'ffmpeg version N-118371-g8c2c7f1ac0', 'garbage']) {
-    assert.equal(ffmpegSupportsHlsSegmentAllowlist(banner), false, JSON.stringify(banner));
+    assert.equal(ffmpegSupportsHlsExtensionPicky(banner), false, JSON.stringify(banner));
   }
 });
 
-test('hlsSegmentExtensionArgs covers every HLS URL shape on 5.1.x and stays silent elsewhere', () => {
+test('hlsExtensionPickyArgs switches off 5.1 extension checks for every HLS URL shape', () => {
   const hlsUrls = [
     // Disguised manifest (the original .jpg case).
     'https://n.example/hls/x/1080p/playlist.jpg',
@@ -975,45 +977,48 @@ test('hlsSegmentExtensionArgs covers every HLS URL shape on 5.1.x and stays sile
     'http://127.0.0.1:8080/up/9f3a2b1c/h?fresh=1',
   ];
   for (const url of hlsUrls) {
-    assert.deepEqual(hlsSegmentExtensionArgs(url, FF_519), ['-allowed_segment_extensions', 'ALL'], url);
-    assert.deepEqual(hlsSegmentExtensionArgs(url, FF_702), [], `7.0.2 has no such option: ${url}`);
-    assert.deepEqual(hlsSegmentExtensionArgs(url), [], `no cached banner fails closed: ${url}`);
+    // -extension_picky 0 is the master switch at the top of test_segment():
+    // it disarms BOTH the allowed_segment_extensions check and the
+    // probed-format extension cross-check that ALL alone could not pass.
+    assert.deepEqual(hlsExtensionPickyArgs(url, FF_519), ['-extension_picky', '0'], url);
+    assert.deepEqual(hlsExtensionPickyArgs(url, FF_702), [], `7.0.2 has no such option: ${url}`);
+    assert.deepEqual(hlsExtensionPickyArgs(url), [], `no cached banner fails closed: ${url}`);
   }
   // Non-HLS inputs never get the option, even on a build that supports it.
   for (const url of ['https://n.example/movie.mp4', 'https://n.example/manifest.mpd']) {
-    assert.deepEqual(hlsSegmentExtensionArgs(url, FF_519), [], url);
+    assert.deepEqual(hlsExtensionPickyArgs(url, FF_519), [], url);
   }
 });
 
-test('ffprobe and both ffmpeg builders emit the allowance only for HLS on 5.1.x', () => {
+test('ffprobe and both ffmpeg builders use -extension_picky 0 only for HLS on 5.1.x', () => {
   const loopback = 'http://127.0.0.1:8080/up/9f3a2b1c/h';
   const disguised = 'https://n.example/hls/x/1080p/playlist.jpg';
 
   // ffprobe: present on 5.1.x, before the URL which stays last.
   const probeArgs = buildFfprobeArgs(loopback, { ffmpegVersion: FF_519 });
-  const at = probeArgs.indexOf('-allowed_segment_extensions');
-  assert.ok(at > 0 && probeArgs[at + 1] === 'ALL' && at < probeArgs.length - 1);
+  const at = probeArgs.indexOf('-extension_picky');
+  assert.ok(at > 0 && probeArgs[at + 1] === '0' && at < probeArgs.length - 1);
   assert.equal(probeArgs.at(-1), loopback);
-  assert.equal(buildFfprobeArgs(loopback, { ffmpegVersion: FF_702 }).includes('-allowed_segment_extensions'), false);
+  assert.equal(buildFfprobeArgs(loopback, { ffmpegVersion: FF_702 }).includes('-extension_picky'), false);
   assert.equal(buildFfprobeArgs('https://n.example/movie.mp4', { ffmpegVersion: FF_519 })
-    .includes('-allowed_segment_extensions'), false);
+    .includes('-extension_picky'), false);
 
   const profile = normaliseProfile({ mode: 'copy', container: 'mpegts' }, PROBE_1080P_H264);
   const base = { profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' } };
 
   // Guided builder, proxied HLS (extensionless loopback URL, kind still hls).
   const guided51 = buildFfmpegArgs({ ...base, source: { url: loopback, kind: 'hls' }, ffmpegVersion: FF_519 });
-  const gAt = guided51.indexOf('-allowed_segment_extensions');
-  assert.ok(gAt > 0 && guided51[gAt + 1] === 'ALL' && gAt < guided51.indexOf('-i'));
+  const gAt = guided51.indexOf('-extension_picky');
+  assert.ok(gAt > 0 && guided51[gAt + 1] === '0' && gAt < guided51.indexOf('-i'));
   const guided70 = buildFfmpegArgs({ ...base, source: { url: loopback, kind: 'hls' }, ffmpegVersion: FF_702 });
-  assert.equal(guided70.includes('-allowed_segment_extensions'), false, '7.0.2 would call it an Unrecognized option');
+  assert.equal(guided70.includes('-extension_picky'), false, '7.0.2 would call it an Unrecognized option');
   // No version supplied (binary probe never ran): fail closed rather than risk
   // a fatal unknown option on 6.x/7.x.
   const guidedUnknown = buildFfmpegArgs({ ...base, source: { url: loopback, kind: 'hls' } });
-  assert.equal(guidedUnknown.includes('-allowed_segment_extensions'), false);
+  assert.equal(guidedUnknown.includes('-extension_picky'), false);
   // A progressive file never goes near the HLS demuxer option.
   const fileArgs = buildFfmpegArgs({ ...base, source: { url: 'https://n.example/movie.mp4', kind: 'file' }, ffmpegVersion: FF_519 });
-  assert.equal(fileArgs.includes('-allowed_segment_extensions'), false);
+  assert.equal(fileArgs.includes('-extension_picky'), false);
 
   // Template builder, disguised manifest.
   const tplArgs = buildFfmpegTemplateArgs({
@@ -1024,8 +1029,8 @@ test('ffprobe and both ffmpeg builders emit the allowance only for HLS on 5.1.x'
     output: { container: 'matroska', target: 'pipe:1' },
     ffmpegVersion: FF_519,
   });
-  const tplAt = tplArgs.indexOf('-allowed_segment_extensions');
-  assert.ok(tplAt > 0 && tplArgs[tplAt + 1] === 'ALL' && tplAt < tplArgs.indexOf('-i'));
+  const tplAt = tplArgs.indexOf('-extension_picky');
+  assert.ok(tplAt > 0 && tplArgs[tplAt + 1] === '0' && tplAt < tplArgs.indexOf('-i'));
   const tpl70 = buildFfmpegTemplateArgs({
     template: 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c:v copy -c:a copy -f matroska pipe:1',
     source: { url: disguised, kind: 'hls' },
@@ -1034,7 +1039,7 @@ test('ffprobe and both ffmpeg builders emit the allowance only for HLS on 5.1.x'
     output: { container: 'matroska', target: 'pipe:1' },
     ffmpegVersion: FF_702,
   });
-  assert.equal(tpl70.includes('-allowed_segment_extensions'), false);
+  assert.equal(tpl70.includes('-extension_picky'), false);
 
   // Template routed through the guided builder's ffmpegTemplate branch keeps
   // the version decision consistent.
@@ -1044,7 +1049,15 @@ test('ffprobe and both ffmpeg builders emit the allowance only for HLS on 5.1.x'
     source: { url: loopback, kind: 'hls' },
     ffmpegVersion: FF_519,
   });
-  assert.ok(viaTemplate.includes('-allowed_segment_extensions', 'ALL'));
+  const vAt = viaTemplate.indexOf('-extension_picky');
+  assert.ok(vAt > 0 && viaTemplate[vAt + 1] === '0' && vAt < viaTemplate.indexOf('-i'));
+
+  // The 5.1-only -allowed_segment_extensions ALL from the first attempt is no
+  // longer emitted anywhere: extension_picky 0 disarms that check too, and
+  // sending both would leave a redundant flag in the rendered command.
+  for (const args of [guided51, tplArgs, viaTemplate, probeArgs]) {
+    assert.equal(args.includes('-allowed_segment_extensions'), false);
+  }
 });
 
 test('a VOD HLS media playlist gives its length; a live window does not', () => {
