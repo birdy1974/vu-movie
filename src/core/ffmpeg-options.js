@@ -365,7 +365,7 @@ export const ADVANCED_OPTIONS = [
   /* input side */
   adv('-rw_timeout', 'input', 'Network read timeout (µs)', 'Microseconds waiting for network reads. 10000000 = 10 seconds; 0 disables the timeout. Slow IPTV panels are happy with 60 s.', 'integer', ['0', '5000000', '10000000', '20000000', '30000000', '60000000'], 0, 2147483647),
   adv('-reconnect', 'input', 'Reconnect on disconnect', 'HTTP reconnect after an unexpected disconnect: 0 off, 1 on.', 'integer', ['0', '1'], 0, 1),
-  adv('-reconnect_at_eof', 'input', 'Reconnect at end of input', '1 treats end-of-file as an error and reconnects. Prefer 0 for finite VOD files.', 'integer', ['0', '1'], 0, 1),
+  adv('-reconnect_at_eof', 'input', 'Reconnect at end of input', '1 treats end-of-file as an error and reconnects. Prefer 0 for finite VOD files. The runtime never adds it for HLS inputs: with -reconnect_streamed it makes ffmpeg reconnect at the clean EOF of every playlist/segment response, so the HLS demuxer re-reads the same m3u8 forever instead of playing.', 'integer', ['0', '1'], 0, 1),
   adv('-reconnect_streamed', 'input', 'Reconnect non-seekable input', '1 permits reconnecting streamed/non-seekable HTTP inputs.', 'integer', ['0', '1'], 0, 1),
   adv('-reconnect_on_network_error', 'input', 'Reconnect on network error', '1 retries TCP/TLS network errors.', 'integer', ['0', '1'], 0, 1),
   adv('-reconnect_delay_max', 'input', 'Maximum reconnect delay (s)', 'Longest retry delay in seconds.', 'integer', ['1', '2', '5', '10', '30', '60'], 0, 4294),

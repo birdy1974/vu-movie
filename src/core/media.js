@@ -1097,6 +1097,20 @@ function sourceSubtitleMapAnalysis(args, probeSubtitles) {
 }
 
 /**
+ * Whether ffmpeg will demux this input as HLS. `source.kind` is the reliable
+ * signal (every internal caller passes it), but the proxy's loopback input URL
+ * has no .m3u8 extension — it ends in `/up/<secret>/h` — so classify that route
+ * explicitly, and fall back to URL sniffing (incl. ?url= bridge playlists) for
+ * callers that only have a URL.
+ */
+function isHlsInput(source) {
+  if (source?.kind === 'hls') return true;
+  const url = String(source?.url || '');
+  if (/\/up\/[\w-]+\/h(?:\?|$)/.test(url)) return true;
+  return streamKind(url) === 'hls';
+}
+
+/**
  * Render a template to an argv list. Source URLs and private request headers are
  * inserted as individual argv values, never interpolated into shell text.
  */
@@ -1133,11 +1147,19 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
   addInputOption('-hide_banner');
   addInputOption('-nostdin');
   addInputOption('-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning');
+  // The HLS demuxer owns playlist reloads and reads every playlist/segment
+  // response as a finite body that must end cleanly. -reconnect_at_eof (together
+  // with -reconnect_streamed) makes the HTTP layer reconnect at that normal EOF,
+  // so the demuxer never sees the end of the playlist and re-fetches the same
+  // m3u8 in a tight loop instead of opening one segment. HLS keeps the other
+  // reconnect flags: -reconnect alone only fires on premature cuts, never on a
+  // complete response.
+  const hlsInput = isHlsInput(source);
   if (isHttp) {
     addInputOption('-fflags', '+genpts+discardcorrupt');
     addInputOption('-err_detect', 'ignore_err');
     addInputOption('-reconnect', '1');
-    addInputOption('-reconnect_at_eof', '1');
+    addInputOption('-reconnect_at_eof', '1', !hlsInput);
     addInputOption('-reconnect_streamed', '1');
     addInputOption('-reconnect_delay_max', '5');
     addInputOption('-rw_timeout', '10000000');
@@ -1145,7 +1167,7 @@ export function buildFfmpegTemplateArgs({ template, source, profile = {}, mode =
     if (mode === 'live') {
       addInputOption('-analyzeduration', '1000000');
       addInputOption('-probesize', '1000000');
-      addInputOption('-live_start_index', '-3', streamKind(source.url) === 'hls');
+      addInputOption('-live_start_index', '-3', hlsInput);
       // Live playback is paced to the source's native rate. Without it the
       // relay pushes the movie at many times real time into a player that can
       // only drain 1x, and that player's queue in the relay grows without end.
@@ -1623,6 +1645,9 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   const args = ['-hide_banner', '-nostdin', '-loglevel', process.env.FFMPEG_LOGLEVEL || 'warning'];
   const isHttp = /^https?:/i.test(source.url || '');
   const kind = source.kind || streamKind(source.url);
+  // See buildFfmpegTemplateArgs: -reconnect_at_eof loops the HLS demuxer, so
+  // HLS inputs (including the loopback proxy URL /up/<secret>/h) must not get it.
+  const hlsInput = isHlsInput(source);
 
   // An encoder this box cannot actually run must never reach the command line:
   // a profile that asks for vaapi where the GPU self-test failed used to emit
@@ -1639,9 +1664,11 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
 
   // --- input resilience (keep the supplied command's option order) ---
   if (isHttp) {
+    args.push('-reconnect', '1');
+    // HLS playlists/segments are finite bodies that must end cleanly so the
+    // HLS demuxer can parse them; reconnecting at that EOF spins it forever.
+    if (!hlsInput) args.push('-reconnect_at_eof', '1');
     args.push(
-      '-reconnect', '1',
-      '-reconnect_at_eof', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5',
     );
@@ -1679,8 +1706,8 @@ export function buildFfmpegArgs({ source, profile, hw = {}, mode = 'live', outpu
   // ffmpeg scanning deep into a long VOD manifest (flag from the field-tested
   // command the DUO2 test ran with).
   if (mode === 'live') args.push('-analyzeduration', '1000000', '-probesize', '1000000');
-  if (mode === 'live' && kind === 'hls') args.push('-live_start_index', '-3');
-  if (kind === 'hls') args.push(...hlsSegmentExtensionArgs(source.url));
+  if (mode === 'live' && hlsInput) args.push('-live_start_index', '-3');
+  if (hlsInput) args.push(...hlsSegmentExtensionArgs(source.url));
 
   args.push('-i', source.url);
   if (sidecarFitsContainer) args.push('-i', sidecarSubtitlePath);
