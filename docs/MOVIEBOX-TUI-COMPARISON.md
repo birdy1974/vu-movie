@@ -259,6 +259,17 @@ Two relay details the proxy made necessary:
   the child event, because a `clearTimeout` on a timer object that outlived a mocked clock
   corrupts the next `node:test` mock-timer queue (its stale heap position deletes an unrelated
   live timer) — a late grace firing is a no-op instead.
+* **HLS inputs never get `-reconnect_at_eof`.** The HLS demuxer owns playlist reloads and reads
+  every playlist/segment response as a finite body that must end cleanly. With
+  `-reconnect_at_eof 1` together with `-reconnect_streamed 1` (ffmpeg asks for
+  `Connection: close`, so the handle is "streamed"), the HTTP layer reconnects at that normal
+  EOF: `[http] Will reconnect at <n> in 0 second(s), error=End of file` repeats with no delay,
+  the demuxer never sees the end of the playlist, and the same m3u8 is re-fetched thousands of
+  times while no segment is ever opened (field symptom: a flood of `GET /up/<secret>/h → 200`
+  lines and a black screen). `buildFfmpegArgs`/`buildFfmpegTemplateArgs` therefore withhold
+  `-reconnect_at_eof` for every HLS input (explicit `kind: 'hls'`, an `.m3u8`/bridge URL, or the
+  loopback `/up/<secret>/h` route) while keeping `-reconnect`, which only fires on a *premature*
+  cut of a known-size response. File/DASH inputs keep all four reconnect flags.
 
 Switches: `UPSTREAM_PROXY=false` restores the old direct-fetch behaviour for every source,
 `UPSTREAM_PROXY_HLS=false` does it only for HLS while file/DASH stay proxied; chunk sizes,

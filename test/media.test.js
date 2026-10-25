@@ -100,16 +100,69 @@ test('copy/remux produces a single playable MPEG-TS on stdout', () => {
     profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
   });
 
-  // input resilience flags from the requirements
-  for (const flag of ['-rw_timeout', '-reconnect', '-reconnect_at_eof', '-reconnect_streamed', '-reconnect_delay_max', '-fflags', '-err_detect']) {
+  // Input resilience flags. HLS must NOT get -reconnect_at_eof: together with
+  // -reconnect_streamed it makes ffmpeg's HTTP layer reconnect at the clean EOF
+  // of every playlist/segment response, so the HLS demuxer never sees the end
+  // of the playlist and re-fetches the same m3u8 in a tight loop (no playback).
+  for (const flag of ['-rw_timeout', '-reconnect', '-reconnect_streamed', '-reconnect_delay_max', '-fflags', '-err_detect']) {
     assert.ok(args.includes(flag), `missing ${flag}`);
   }
+  assert.ok(!args.includes('-reconnect_at_eof'), 'HLS inputs never reconnect at clean EOF');
+  assert.ok(args.includes('-live_start_index'), 'HLS inputs keep the live start index');
   assert.ok(args.includes('-headers'));
   assert.equal(args[args.indexOf('-c:v') + 1], 'copy');
   assert.equal(args[args.indexOf('-f') + 1], 'mpegts');
   assert.ok(args.includes('-mpegts_flags') && args.includes('+resend_headers'));
   assert.equal(args[args.length - 1], 'pipe:1');
   assert.ok(!args.includes('h264_vaapi'), 'stream copy must not start an encoder');
+});
+
+test('reconnect_at_eof is withheld from every HLS input shape but kept for file/DASH', () => {
+  // Field failure (ffmpeg 6/7): -reconnect_at_eof + -reconnect_streamed makes
+  // the HTTP layer reconnect at the clean EOF of an m3u8, so the HLS demuxer
+  // re-reads the same playlist in a tight loop and never opens a segment.
+  const profile = normaliseProfile({ mode: 'copy', container: 'mpegts' }, PROBE_1080P_H264);
+  const guided = (source) => buildFfmpegArgs({
+    source, profile, hw: HW, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  const hlsCases = [
+    { name: 'explicit hls kind', source: { url: 'https://cdn/hls/index.m3u8', kind: 'hls' } },
+    { name: 'hls by URL only', source: { url: 'https://cdn/hls/index.m3u8' } },
+    { name: 'DASH→HLS bridge in ?url=', source: { url: 'https://bridge.example/?url=https%3A%2F%2Fcdn%2Fv3.m3u8&Policy=sig' } },
+    { name: 'loopback proxy /h URL, no kind', source: { url: 'http://127.0.0.1:8080/up/39dcb355f86ee1688494dd15/h' } },
+  ];
+  for (const { name, source } of hlsCases) {
+    const args = guided(source);
+    assert.ok(!args.includes('-reconnect_at_eof'), `${name}: no reconnect_at_eof`);
+    for (const flag of ['-reconnect', '-reconnect_streamed', '-reconnect_delay_max', '-rw_timeout']) {
+      assert.ok(args.includes(flag), `${name}: keeps ${flag}`);
+    }
+    assert.ok(args.includes('-live_start_index'), `${name}: keeps the HLS live start index`);
+  }
+
+  // Non-HLS sources keep every resilience flag: a cut transfer must resume.
+  for (const source of [
+    { url: 'https://cdn/movie.mp4', kind: 'file' },
+    { url: 'https://cdn/dash/index.mpd', kind: 'dash' },
+  ]) {
+    const args = guided(source);
+    assert.ok(args.includes('-reconnect_at_eof'), `${source.kind}: keeps reconnect_at_eof`);
+    assert.ok(!args.includes('-live_start_index'), `${source.kind}: no HLS-only flag`);
+  }
+
+  // The template renderer must apply the same rule (its own flag injection).
+  const template = 'ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -c copy -f mpegts pipe:1';
+  const hlsTemplate = buildFfmpegTemplateArgs({
+    template, source: { url: 'http://127.0.0.1:8080/up/abc123/h', kind: 'hls' },
+    profile: { container: 'mpegts' }, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(!hlsTemplate.includes('-reconnect_at_eof'), 'template HLS: no reconnect_at_eof');
+  assert.ok(hlsTemplate.includes('-reconnect_streamed'), 'template HLS: keeps the other reconnect flags');
+  const fileTemplate = buildFfmpegTemplateArgs({
+    template, source: { url: 'https://cdn/movie.mp4', kind: 'file' },
+    profile: { container: 'mpegts' }, mode: 'live', output: { container: 'mpegts', target: 'pipe:1' },
+  });
+  assert.ok(fileTemplate.includes('-reconnect_at_eof'), 'template file: keeps reconnect_at_eof');
 });
 
 test('VAAPI transcoding matches the requested MPEG-TS command shape', () => {
