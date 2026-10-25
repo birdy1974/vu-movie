@@ -18,7 +18,7 @@ import {
   buildFfmpegTemplateArgs,
   buildFfprobeArgs, isDisguisedManifestUrl, isInitSegmentUrl, hlsExtensionPickyArgs,
   parseFfmpegVersion, ffmpegSupportsHlsExtensionPicky,
-  parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration,
+  parseHlsMediaDuration, parseDashMediaDuration, parseIsoDuration, audioOnlyReason,
 } from '../src/core/media.js';
 
 const PROBE_1080P_H264 = {
@@ -788,6 +788,27 @@ test('parseProbeJson normalises codecs, fps, tracks and HDR', () => {
   assert.equal(info.video.fps, 23.976);
   assert.equal(info.audio[0].channels, 6);
   assert.equal(info.subtitles[0].language, 'nld');
+});
+
+test('audioOnlyReason flags a probed rendition that has sound but no picture', () => {
+  // The Kraken/Tenzing failure: a DASH→HLS bridge exposes the audio
+  // AdaptationSet as its only HLS variant, ffprobe succeeds with
+  // video:none/audio:1, and the guided builder then dies on `-map 0:v:0`.
+  const audioOnly = {
+    container: 'hls',
+    durationSec: 6000,
+    video: null,
+    audio: [{ codec: 'aac', channels: 2 }],
+    subtitles: [],
+  };
+  assert.match(audioOnlyReason(audioOnly), /no video stream/);
+  // Subtitles alone prove the input is media without video too.
+  assert.match(audioOnlyReason({ video: null, audio: [], subtitles: [{ codec: 'subrip' }] }), /no video stream/);
+  // A normal movie probe, a missing probe and an ambiguous empty probe all
+  // pass: only a *positive* audio-only finding may reject a candidate.
+  assert.equal(audioOnlyReason({ video: { codec: 'hevc' }, audio: [], subtitles: [] }), null);
+  assert.equal(audioOnlyReason(null), null);
+  assert.equal(audioOnlyReason({ video: null, audio: [], subtitles: [] }), null);
 });
 
 test('parseHlsMaster reads variants and resolves relative URLs', () => {

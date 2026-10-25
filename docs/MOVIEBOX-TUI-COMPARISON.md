@@ -305,6 +305,37 @@ box instead), and a separate process (nothing here needs a second binary).
 
 ---
 
+## 4c. "Stream map '0:v:0' matches no streams" — audio-only DASH→HLS renditions
+
+**Symptom.** Two titles (Kraken, Tenzing) failed every playback attempt ~1 s after the playlist
+fetched, three restarts each, "restart budget exhausted". ffprobe on their stored upstream
+succeeded but reported `video: none, audio: aac` — the `dash-hls-bridge` worker had exposed the
+DASH audio AdaptationSet as its only HLS variant. The resolver's acceptance rule was
+"ffprobe answered and the file is not header-only", so an audio-only rendition counted as a
+healthy movie; keep-warm marked it "working" and the guided builder's mandatory `-map 0:v:0`
+then had nothing to match.
+
+**Fix (three layers).**
+
+* `src/core/media.js` — `audioOnlyReason(info)`: a pure predicate that rejects a *successful*
+  probe carrying audio/subtitle tracks but no video stream. A probe with no tracks at all still
+  fails open (an ambiguous probe is not proof of an audio-only input).
+* `src/scrapers/registry.js` — `probeCandidates` applies the predicate to every kind (HLS, DASH
+  and file), so ranking, the Playlist "check streams" view and stream recovery all see the
+  candidate as unplayable and auto-repair reaches a mirror that carries the picture. When an
+  HLS master's top rendition is video-less but later renditions are not (a resolution-less
+  master, which is the only shape that can put an audio-only STREAM-INF first), up to three
+  further renditions are probed and the first video-bearing one is adopted as the direct
+  upstream instead of condemning the whole master.
+* `src/streams/relay.js` — `ensureSession` refuses to spawn ffmpeg when the stored probe
+  positively describes an audio-only upstream (structured `UPSTREAM_AUDIO_ONLY` error, HTTP
+  500 with an explicit message, readiness proof dropped so the next play repairs), and the
+  `Stream map … matches no streams` exit is now a *fatal* classified upstream failure: no
+  restart storm, and the readiness proof is invalidated so the next playback re-checks instead
+  of repeating the same crash.
+
+---
+
 ## 5. If it still fails on your NAS: identify the layer
 
 The verdict from `diagnoseReachability` tells you which of these you are in:

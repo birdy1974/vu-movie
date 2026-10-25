@@ -1474,6 +1474,27 @@ export function parseProbeJson(json) {
   };
 }
 
+/**
+ * Pure: why a successfully probed input is not a playable movie, or null when
+ * it may be one. ffprobe "succeeds" on an audio-only HLS rendition — a
+ * DASH→HLS bridge that exposes the audio AdaptationSet as its only variant —
+ * and reports audio (or subtitle) tracks with no video stream. Every builder
+ * maps `0:v:0` mandatorily, so such an input can only die at playback with
+ * `Stream map '0:v:0' matches no streams`. Rejecting it at probe time lets
+ * ranking, the playlist check and stream recovery treat it as unplayable, so
+ * auto-repair reaches a mirror that actually carries the picture.
+ *
+ * A probe that found neither video nor audio is left alone: an ambiguous or
+ * partial probe is not proof of an audio-only rendition, and probing being
+ * unable to decide must keep failing open like any other probe miss.
+ */
+export function audioOnlyReason(info) {
+  if (!info || info.video) return null;
+  const tracks = (Array.isArray(info.audio) ? info.audio.length : 0)
+    + (Array.isArray(info.subtitles) ? info.subtitles.length : 0);
+  return tracks > 0 ? 'probe found no video stream — an audio-only rendition, not the movie' : null;
+}
+
 /** Run ffprobe; returns null (and logs why) on failure instead of throwing. */
 export async function probe(url, { headers = {}, timeoutMs = 20000 } = {}) {
   const binaries = await checkBinaries();

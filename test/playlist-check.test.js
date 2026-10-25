@@ -105,6 +105,28 @@ test('every state is reported per item, in playlist order', async () => {
   assert.deepEqual(BROKEN_STATES, ['dead', 'expired']);
 });
 
+test('an audio-only upstream is reported dead, never "working"', async () => {
+  // registry.probeCandidates marks an audio-only rendition ok:false; the
+  // keep-warm check must surface that as a broken stream so auto-repair can
+  // replace it with a video-bearing mirror instead of trusting it into the
+  // relay's mandatory `-map 0:v:0` crash.
+  const target = { streamId: 'k1', title: 'Kraken', sourceId: 'moviebox', url: 'https://bridge.example/audio-only.m3u8', kind: 'movie' };
+  const prober = fakeProber({
+    'https://bridge.example/audio-only.m3u8': {
+      ok: false,
+      probe: { container: 'hls', durationSec: 6000, video: null, audio: [{ codec: 'aac', channels: 2 }], subtitles: [] },
+      probeMs: 640,
+      error: 'probe found no video stream — an audio-only rendition, not the movie',
+    },
+  });
+  const { results, summary } = await checkStreams([target], { prober });
+  assert.equal(results[0].state, 'dead');
+  assert.equal(results[0].ok, false);
+  assert.match(results[0].error, /no video stream/);
+  assert.equal(summary.working, 0);
+  assert.equal(summary.broken, 1);
+});
+
 test('items that need no network never reach the prober', async () => {
   let probed = null;
   const prober = async (candidates) => { probed = candidates; return []; };
