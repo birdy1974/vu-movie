@@ -67,6 +67,20 @@ test('fatalFfmpegFailure: deterministic startup errors stop the restart loop', (
     ['[AVHWDeviceContext] Failed to initialise VAAPI connection: -1 (unknown libva error).', 'Device creation failed: -5.'],
     { bytesOut: 0, code: 1, kind: 'hls' },
   )?.hint, 'a dead VAAPI device cannot recover by restarting');
+  // The audio-only rendition crash: the demuxer opens but the mandatory video
+  // map cannot match. Restarting repeats it, and the proof must be dropped so
+  // the next play re-checks and auto-repairs onto a video-bearing mirror.
+  const mapFailure = fatalFfmpegFailure(
+    ["Stream map '0:v:0' matches no streams.", "To ignore this, add a trailing '?' to the map."],
+    { bytesOut: 0, code: 1, kind: 'hls' },
+  );
+  assert.ok(mapFailure?.hint, 'a missing video stream is a deterministic startup failure');
+  assert.equal(mapFailure.upstream, true, 'it is an upstream-content failure, not a config failure');
+  const configFailure = fatalFfmpegFailure(
+    ['Error initializing output stream 0:1 -- '],
+    { bytesOut: 0, code: 1 },
+  );
+  assert.equal(configFailure.upstream, false, 'muxer/config failures do not invalidate the upstream proof');
 });
 
 test('argsWithResume splices an input-side -ss in front of the first -i', () => {

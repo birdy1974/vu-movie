@@ -19,7 +19,7 @@ import { errorText, log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import {
   probe, parseHlsMaster, streamKind, checkBinaries, isInitSegmentUrl,
-  parseHlsMediaDuration, parseDashMediaDuration, formatResolution,
+  parseHlsMediaDuration, parseDashMediaDuration, formatResolution, audioOnlyReason,
 } from '../core/media.js';
 import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
@@ -1047,6 +1047,32 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       let info = await probe(probeUrl, { headers: cand.headers || {}, timeoutMs: probeTimeoutMs });
       if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
 
+      // A DASH→HLS bridge can expose the audio AdaptationSet as a rendition
+      // with no video. parseHlsMaster sorts resolution-less renditions last, so
+      // an audio-only top variant means the master declares no resolutions at
+      // all and every rendition has to be asked before the master is condemned.
+      // Adopt the first rendition whose probe carries video: its media playlist
+      // becomes the direct upstream, the same shape as a single-variant master.
+      let adoptedVideoVariant = null;
+      if (isHls && info && !info.video && variants.length > 1) {
+        for (const variant of variants.slice(1, 1 + MAX_VIDEOLESS_FALLBACK_PROBES)) {
+          const fallbackInfo = await probe(variant.url, { headers: cand.headers || {}, timeoutMs: probeTimeoutMs });
+          if (signal?.aborted) throw Object.assign(new Error('candidate probing aborted'), { name: 'AbortError' });
+          if (fallbackInfo?.video) {
+            info = fallbackInfo;
+            adoptedVideoVariant = variant;
+            break;
+          }
+        }
+        if (adoptedVideoVariant) {
+          cand.url = adoptedVideoVariant.url;
+          cand.variants = null;
+          log.info('scraper', 'top HLS rendition was audio-only; adopted a video-bearing rendition', {
+            url: truncate(cand.url, 120), source: cand.sourceId,
+          });
+        }
+      }
+
       // ffprobe often reports no length for a chunked or header-capable input,
       // and without one the relay restarts a clean EOF and may repeat the film.
       // The manifest knows the length: a VOD HLS playlist (fetched in
@@ -1064,9 +1090,12 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
       // Only a plain file can be judged by its size. A DASH manifest or an HLS
       // playlist is small by design, so those kinds are never size-checked.
       const headerOnly = info && streamKind(cand.url) === 'file' ? headerOnlyReason(info) : null;
+      // A movie must carry a picture: an audio-only rendition probes "fine"
+      // but can only crash the mandatory `-map 0:v:0` at playback.
+      const audioOnly = audioOnlyReason(info);
       cand.probe = info;
       cand.probeMs = Date.now() - t0;
-      cand.ok = Boolean(info) && !headerOnly;
+      cand.ok = Boolean(info) && !headerOnly && !audioOnly;
       if (info?.video) {
         cand.height = info.video.height || cand.height;
         cand.width = info.video.width || cand.width;
@@ -1085,6 +1114,11 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
         log.warn('scraper', 'candidate rejected: header only, not the movie', {
           url: truncate(cand.url, 120), source: cand.sourceId, sizeBytes: info.sizeBytes, ms: cand.probeMs,
         });
+      } else if (audioOnly) {
+        cand.error = audioOnly;
+        log.warn('scraper', 'candidate rejected: audio-only rendition with no video stream', {
+          url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs,
+        });
       } else {
         log.debug('scraper', 'candidate probed ok', { url: truncate(cand.url, 120), source: cand.sourceId, ms: cand.probeMs });
       }
@@ -1096,6 +1130,13 @@ export async function probeCandidates(candidates, { limit = null, concurrency = 
 
 /** Error shown for an fMP4 init segment candidate. */
 const INIT_SEGMENT_ERROR = 'fMP4 init segment — only the file header, not the movie';
+
+/**
+ * How many further HLS renditions to probe when the top one has no video
+ * (a resolution-less master from a DASH→HLS bridge). Bounded: this loop only
+ * exists for the malformed-master case and every probe can take up to 8 s.
+ */
+const MAX_VIDEOLESS_FALLBACK_PROBES = 3;
 
 /** A complete movie is never this small. */
 export const MIN_MOVIE_BYTES = 1024 * 1024;

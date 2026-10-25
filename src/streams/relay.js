@@ -43,6 +43,7 @@ import { matroskaOnBoxAdvice } from '../enigma2/index.js';
 import {
   hardware, ffmpegPath, ffmpegEnv, buildFfmpegArgs, argsToCommand, parseProgressLine, normaliseProfile,
   validateFfmpegTemplate, buildFfmpegTemplateArgs, outputFormatOf, subtitleSessionNotes, probeSubtitleList,
+  audioOnlyReason,
   probe as probeMedia,
 } from '../core/media.js';
 import * as store from './store.js';
@@ -590,6 +591,15 @@ const FATAL_FFMPEG_PATTERNS = [
     pattern: /failed to initialise vaapi connection|device creation failed|failed to set value 'vaapi=/i,
     hint: 'the VAAPI device is not usable in this container — pass /dev/dri through (docker-compose devices:) and check LIBVA_DRIVER_NAME',
   },
+  {
+    // An audio-only rendition: the demuxer opens fine, so this is an upstream
+    // content problem, not an ffmpeg/config problem. Restarting repeats it
+    // deterministically; `upstream` makes the death handler drop the readiness
+    // proof so the next play re-checks and auto-repairs onto a video mirror.
+    pattern: /stream map .* matches no streams/i,
+    hint: 'the input has no stream satisfying a mandatory -map (typically no video track on an audio-only rendition) — re-resolve the stream so recovery picks a mirror that carries the picture',
+    upstream: true,
+  },
 ];
 
 /**
@@ -605,8 +615,8 @@ export function fatalFfmpegFailure(stderrTail = [], { bytesOut = 0, code = 0, ki
   if (code === 0) return null;
   if (kind !== 'hls' && bytesOut > 0) return null;
   const text = Array.isArray(stderrTail) ? stderrTail.join('\n') : String(stderrTail || '');
-  for (const { pattern, hint } of FATAL_FFMPEG_PATTERNS) {
-    if (pattern.test(text)) return { hint };
+  for (const { pattern, hint, upstream } of FATAL_FFMPEG_PATTERNS) {
+    if (pattern.test(text)) return { hint, upstream: Boolean(upstream) };
   }
   return null;
 }
@@ -898,6 +908,19 @@ function cleanupHlsDir(session) {
  */
 export async function ensureSession(stream, opts = {}) {
   const cfg = getConfig();
+  // Preflight on the stored probe: a positively audio-only upstream can only
+  // die on the mandatory `-map 0:v:0`, three restarts later. Fail here with a
+  // precise, restart-free message instead, and drop the readiness proof so the
+  // next playback runs the availability check and auto-repairs onto a mirror
+  // that carries video. A probe without enough information still fails open.
+  const videoLess = audioOnlyReason(stream?.upstream?.probe || null);
+  if (videoLess) {
+    forgetStreamReadiness(stream.id);
+    log.warn('relay', 'refusing to start a session on an audio-only upstream', {
+      stream: stream.id, title: stream.title, error: videoLess,
+    });
+    throw Object.assign(new Error(videoLess), { code: 'UPSTREAM_AUDIO_ONLY' });
+  }
   const web = opts.web ? { ...opts.web } : null;
   const outputType = web ? 'web' : (opts.outputType || '');
   const requested = opts.container || opts.profile?.container || stream.profile?.container || cfg.transcode.container;
@@ -1317,8 +1340,10 @@ function spawnFfmpeg(session) {
     // inside its trust window (readiness.js): drop the "ready" proof so the
     // next play re-checks — and repairs — instead of trusting a dead link
     // into the same failure again. A clean end-of-movie (code 0) proves
-    // nothing either way and keeps the proof.
-    if (code !== 0 && !fatal) forgetStreamReadiness(session.streamId);
+    // nothing either way and keeps the proof. A fatal *upstream* failure
+    // (an audio-only rendition that cannot satisfy the mandatory video map)
+    // invalidates the proof too: config-level fatals keep it.
+    if (code !== 0 && (!fatal || fatal.upstream)) forgetStreamReadiness(session.streamId);
     // Nobody was attached when it ended (the CDN gave up on a held source, or
     // ffmpeg crashed while the player was away): keep the play head so the next
     // play resumes there. A fatal startup failure would repeat, so it keeps nothing.

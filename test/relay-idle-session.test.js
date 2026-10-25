@@ -85,3 +85,29 @@ test('HLS playlist/segment polls renew the idle lease for a live HLS session', a
   assert.equal(relay.getSession(stream.id), null, 'the session is still stopped after a full idle interval');
   await waitForChildClose(session.child);
 });
+
+test('an audio-only upstream is refused before ffmpeg spawns', async () => {
+  // The stored probe positively describes a rendition without video: spawning
+  // ffmpeg would only repeat the mandatory `-map 0:v:0` crash three times.
+  const stream = await store.createStream({
+    title: 'Audio-only bridge output',
+    profile: { mode: 'copy' },
+    candidate: {
+      url: 'https://cdn.example/audio-only.m3u8',
+      kind: 'hls',
+      headers: {},
+      probe: {
+        container: 'hls',
+        durationSec: 6000,
+        video: null,
+        audio: [{ codec: 'aac', channels: 2 }],
+        subtitles: [],
+      },
+    },
+  });
+  await assert.rejects(
+    () => relay.ensureSession(stream, { container: 'mpegts' }),
+    (err) => err.code === 'UPSTREAM_AUDIO_ONLY' && /no video stream/.test(err.message),
+  );
+  assert.equal(relay.getSession(stream.id), null, 'no ffmpeg session exists for the refused upstream');
+});
