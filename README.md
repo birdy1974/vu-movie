@@ -390,6 +390,53 @@ vu-movie keeps the two settings honest instead of guessing:
   Enigma2 → use FTP for bouquet/subtitle files**.
 * Preview the exact file in the UI before anything is uploaded.
 
+#### Movie plots in the OpenPLi EPG
+
+The **Stream → push bouquet to Enigma2** action also publishes the enabled
+playlist's movie descriptions as XMLTV and requests an immediate import. This
+works independently of the 5002 playback stream: the EPG times are synthetic
+six-hour slots, not the actual movie start time or playback progress.
+
+One-time setup on the receiver:
+
+1. Install OpenPLi **EPGImport** from the receiver's package feed. The receiver
+   must have writable `/etc/epgimport` and FTP access to that folder and
+   `/usr/lib/enigma2/python/Plugins/Extensions/`. FTP credentials are the same
+   as for bouquet pushes; the existing bouquet-only mount is not enough.
+2. Push the playlist. vu-movie uploads its `VuMovieEpg` helper and its own
+   `vumovie.*` files. **Restart the Enigma2 GUI once** (not automatically) so
+   OpenPLi loads the helper. The queued import runs after the restart. No shell
+   commands, new network listener or additional password are used by the helper;
+   its frequently updated status is kept in `/tmp` rather than flash.
+3. Use **Stream → check EPG import** to see the receiver's response. An
+   `importing` or `queued` result is not an import success; `finished` reports
+   the number of events EPGImport processed, not proof that each service mapping
+   is visible. Check a movie with the box's EPG/Info button. If EPGImport reports
+   zero events, check its log and its service filtering settings.
+
+Subsequent successful playlist pushes refresh the helper's mapping and request a
+new import. The helper waits for any existing EPGImport run and refreshes its
+synthetic schedule daily; it targets only the vu-movie source for its automatic
+runs. Leave the vu-movie source unselected in EPGImport's separate scheduled
+imports: those runs do not use the helper's request marker and could read files
+while a push is replacing them. The helper does not require the source to be
+selected there. It never triggers an import while EPGImport's **clear old EPG
+before import** setting is enabled, because that setting could remove other
+services' EPG; disable it and retry/check the status. A missing or failed EPG update does
+not undo a successfully pushed bouquet. A dry run never writes or imports.
+
+Plots use the saved stream description; when missing, a bounded lookup uses
+configured TMDB/OMDB keys and caches a matching result. Unavailable plots show
+`No plot available.` Updating metadata or playlist membership requires another
+playlist push. Generated times, the number of processed events and EPG display
+vary by receiver image; the actual VU+ must be tested. EPG metadata and channel
+mappings contain service URLs/tokens, so restrict FTP access to a trusted LAN.
+Existing non-vu-movie EPG sources and bouquet files are not replaced. Before
+import, both vu-movie and the helper check for SID/TSID/ONID collisions with
+other bouquet files and refuse to import rather than overwrite a different
+service's EPG. If the bouquet was edited separately, push it again. Stale events
+for removed titles expire normally; the helper does not clear the global EPG.
+
 ### Operations
 * **Jobs** for every long action, with progress, logs and a cancel button
   (cancelling kills the underlying Chromium/ffmpeg process).

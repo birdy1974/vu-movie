@@ -13,7 +13,7 @@ function apiKey() {
   return cfg.metadata?.omdbApiKey || process.env.OMDB_API_KEY || '';
 }
 
-export async function searchOMDB({ title, year, type = 'movie', imdbId = null } = {}) {
+export async function searchOMDB({ title, year, type = 'movie', imdbId = null, signal = undefined } = {}) {
   const key = apiKey();
   if (!key) throw new Error('OMDB API key not configured (Settings → Metadata)');
   if (!title && !imdbId) throw new Error('title or imdbId required');
@@ -29,7 +29,7 @@ export async function searchOMDB({ title, year, type = 'movie', imdbId = null } 
     url.searchParams.set('plot', 'full');
   }
 
-  const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+  const res = await fetch(url.toString(), { headers: { Accept: 'application/json' }, signal });
   if (!res.ok) throw new Error(`OMDB failed: HTTP ${res.status}`);
   const data = await res.json();
   if (data.Response === 'False') {
