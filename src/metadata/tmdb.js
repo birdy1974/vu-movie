@@ -30,7 +30,7 @@ function language() {
   return cfg.metadata?.language || 'en-US';
 }
 
-async function tmdbFetch(path, params = {}) {
+async function tmdbFetch(path, params = {}, signal = undefined) {
   const key = apiKey();
   if (!key) throw new Error('TMDB API key not configured (Settings → Metadata)');
   const url = new URL(`${TMDB_BASE}${path}`);
@@ -42,7 +42,7 @@ async function tmdbFetch(path, params = {}) {
     }
   }
   const res = await fetch(url.toString(), {
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json' }, signal,
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -51,16 +51,17 @@ async function tmdbFetch(path, params = {}) {
   return res.json();
 }
 
-export async function searchTMDB({ title, year, type = 'movie', imdbId = null, tmdbId = null } = {}) {
+export async function searchTMDB({ title, year, type = 'movie', imdbId = null, tmdbId = null, signal = undefined } = {}) {
   if (!title && !imdbId && !tmdbId) throw new Error('title, imdbId or tmdbId required');
 
   // Direct ID lookup
   if (tmdbId) {
     const kind = type === 'series' || type === 'tv' ? 'tv' : 'movie';
     try {
-      const details = await tmdbFetch(`/${kind}/${tmdbId}`, { append_to_response: 'credits,external_ids,videos' });
+      const details = await tmdbFetch(`/${kind}/${tmdbId}`, { append_to_response: 'credits,external_ids,videos' }, signal);
       return { results: [normalizeDetails(details, kind)], source: 'tmdb-id' };
     } catch (err) {
+      if (signal?.aborted) throw err;
       log.warn('metadata', `TMDB direct lookup failed for ${tmdbId}`, { error: err.message });
     }
   }
@@ -68,15 +69,16 @@ export async function searchTMDB({ title, year, type = 'movie', imdbId = null, t
   // IMDb -> TMDB via find
   if (imdbId) {
     try {
-      const data = await tmdbFetch(`/find/${imdbId}`, { external_source: 'imdb_id' });
+      const data = await tmdbFetch(`/find/${imdbId}`, { external_source: 'imdb_id' }, signal);
       const all = [...(data.movie_results || []), ...(data.tv_results || [])];
       if (all.length) {
         const first = all[0];
         const kind = first.media_type === 'tv' ? 'tv' : 'movie';
-        const details = await tmdbFetch(`/${kind}/${first.id}`, { append_to_response: 'credits,external_ids,videos' });
+        const details = await tmdbFetch(`/${kind}/${first.id}`, { append_to_response: 'credits,external_ids,videos' }, signal);
         return { results: [normalizeDetails(details, kind)], source: 'imdb-find' };
       }
     } catch (err) {
+      if (signal?.aborted) throw err;
       log.warn('metadata', `TMDB find by IMDb ${imdbId} failed`, { error: err.message });
     }
   }
@@ -89,7 +91,7 @@ export async function searchTMDB({ title, year, type = 'movie', imdbId = null, t
     if (kind === 'tv') params.first_air_date_year = year;
     else params.year = year;
   }
-  const data = await tmdbFetch(searchPath, params);
+  const data = await tmdbFetch(searchPath, params, signal);
   const results = (data.results || []).slice(0, 5).map((r) => normalizeSearchResult(r, kind));
   return { results, source: 'search' };
 }

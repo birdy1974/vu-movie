@@ -33,6 +33,8 @@ import * as store from '../streams/store.js';
 import * as exporter from '../streams/export.js';
 import * as relay from '../streams/relay.js';
 import * as enigma2 from '../enigma2/index.js';
+import { pushPlaylistEpg, readPlaylistEpgStatus } from '../enigma2/epg.js';
+import { enrichEpgPlots } from '../enigma2/epg-metadata.js';
 import { publicPosterUrl } from '../http/poster-proxy.js';
 import { OUTPUT_LABELS, OUTPUT_TYPES, requestAbortSignal } from '../http/api.js';
 import * as playlist from './index.js';
@@ -534,25 +536,61 @@ router.get('/m3u', wrap(async (req, res) => {
   res.send(built.text);
 }));
 
+/** Serialize the complete bouquet + EPG publication, not just individual FTP writes.
+ * Otherwise a second push can replace the bouquet while the first is waiting
+ * for metadata and then receive the first push's stale EPG mapping. */
+let playlistPushQueue = Promise.resolve();
+export function serialPlaylistPush(operation) {
+  const current = playlistPushQueue.then(operation);
+  playlistPushQueue = current.catch(() => {});
+  return current;
+}
+
 /** Enigma2 bouquet preview or push for the playlist (enabled items, in order). */
 router.post('/enigma2', wrap(async (req, res) => {
   const baseUrl = baseUrlFrom(req);
-  const built = await playlist.bouquet(baseUrl, { serviceType: Number(req.body?.serviceType) || null });
-  // Lifted out of the bouquet so the UI can toast it without digging: these
-  // entries are written for a player that may not be able to open them.
-  const warnings = built.warnings || [];
   if (req.body?.action !== 'push') {
-    return res.json({ ok: true, mode: 'preview', warnings, bouquet: built, ...enigma2.previewBouquet(await bouquetEntries(baseUrl), { name: playlist.name() }) });
+    const built = await playlist.bouquet(baseUrl, { serviceType: Number(req.body?.serviceType) || null });
+    return res.json({ ok: true, mode: 'preview', warnings: built.warnings || [], bouquet: built, ...enigma2.previewBouquet(await bouquetEntries(baseUrl), { name: playlist.name() }) });
   }
-  const result = await enigma2.pushBouquet(await bouquetEntries(baseUrl), { name: playlist.name(), dryRun: Boolean(req.body?.dryRun) });
+  const dryRun = Boolean(req.body?.dryRun);
+  const { built, warnings, result, epg } = await serialPlaylistPush(async () => {
+    const built = await playlist.bouquet(baseUrl, { serviceType: Number(req.body?.serviceType) || null });
+    const warnings = built.warnings || [];
+    const entries = await bouquetEntries(baseUrl);
+    const result = await enigma2.pushBouquet(entries, { name: playlist.name(), dryRun });
+    let epg = null;
+    if (result.ok && !dryRun) {
+      if (!result.reloadOk) {
+        epg = { state: 'error', message: 'Bouquet uploaded but reload failed; EPG import not requested. Restore OpenWebif and push again.' };
+      } else {
+        try {
+          const enriched = await enrichEpgPlots(entries);
+          epg = pushPlaylistEpg(enriched, result.bouquet, getConfig().enigma2);
+        } catch (err) {
+          epg = { state: 'error', message: `Bouquet pushed, but EPG setup failed: ${errorText(err)}` };
+          log.warn('playlist', 'playlist EPG update failed', { error: errorText(err) });
+        }
+      }
+    }
+    return { built, warnings, result, epg };
+  });
   log.info('playlist', `bouquet ${result.ok ? 'pushed' : 'push failed'} from the playlist`, {
-    entries: built.count, dryRun: Boolean(req.body?.dryRun), via: result.transport?.via || result.transport || null,
+    entries: built.count, dryRun, via: result.transport?.via || result.transport || null,
     serviceType: built.serviceType, player: built.player,
   });
-  // The bouquet just landed on the box — the viewer is about to zap. Prove
-  // (and if needed repair) the enabled links now, in the background.
-  if (result.ok && !req.body?.dryRun) kickPlaylistPrewarm({ reason: 'bouquet-push' });
-  res.status(result.ok ? 200 : 502).json({ ok: result.ok, mode: 'push', warnings, bouquet: built, ...result });
+  // Prove (and if needed repair) enabled links without holding the push open.
+  if (result.ok && !dryRun) kickPlaylistPrewarm({ reason: 'bouquet-push' });
+  res.status(result.ok ? 200 : 502).json({ ok: result.ok, mode: 'push', warnings, bouquet: built, ...result, epg });
+}));
+
+/** Read the helper's latest acknowledgement; no claim of completion on upload. */
+router.get('/enigma2/epg-status', wrap(async (req, res) => {
+  try {
+    res.json({ ok: true, epg: readPlaylistEpgStatus(getConfig().enigma2, String(req.query.requestId || '')) });
+  } catch (err) {
+    res.json({ ok: false, epg: { state: 'error', message: `Cannot read receiver EPG status: ${errorText(err)}` } });
+  }
 }));
 
 /** The bouquet entries of the enabled playlist items (shared by preview and push). */
@@ -562,6 +600,10 @@ async function bouquetEntries(baseUrl) {
     year: stream.year,
     url: store.urlsFor(stream, baseUrl).forBox,
     description: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
+    plot: stream.description || stream.payload?.meta?.description || '',
+    kind: stream.kind || 'movie',
+    imdbId: stream.payload?.meta?.imdbId || null,
+    tmdbId: stream.payload?.meta?.tmdbId || null,
     subtitle: stream.profile?.subtitlePath ? (stream.profile.subtitleLanguage || '').slice(0, 3) : null,
     season: stream.upstream?.season || null,
     series: stream.title,

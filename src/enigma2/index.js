@@ -403,7 +403,7 @@ function outputText(value) {
  * runtime image. `runCommand` is injectable so tests can assert the FTP command
  * sequence without needing a receiver or a real FTP daemon.
  */
-export function createFtpFileTransport(cfg = getConfig().enigma2, { runCommand = null } = {}) {
+export function createFtpFileTransport(cfg = getConfig().enigma2, { runCommand = null, createDirs = false } = {}) {
   const username = cfg.username || 'root';
   const password = cfg.password || '';
   const baseArgs = [
@@ -458,7 +458,7 @@ export function createFtpFileTransport(cfg = getConfig().enigma2, { runCommand =
     const localFile = path.join(tempDir, 'payload');
     try {
       fs.writeFileSync(localFile, Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8'), { mode: 0o600 });
-      invoke(`uploading ${fileName}`, [...baseArgs, '--upload-file', localFile, ftpUrl(cfg, temporary)]);
+      invoke(`uploading ${fileName}`, [...baseArgs, ...(createDirs ? ['--ftp-create-dirs'] : []), '--upload-file', localFile, ftpUrl(cfg, temporary)]);
       const temporaryPath = ftpCommandPath(cfg, temporary);
       const targetPath = ftpCommandPath(cfg, fileName);
       try {

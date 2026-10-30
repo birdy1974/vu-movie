@@ -2963,6 +2963,7 @@ function initStream() {
   $('#btn-st-refresh')?.addEventListener('click', () => refreshStream(true));
   $('#btn-st-dry')?.addEventListener('click', () => pushBouquet({ dryRun: true }));
   $('#btn-st-push')?.addEventListener('click', () => pushBouquet({}));
+  $('#btn-st-epg-status')?.addEventListener('click', checkBouquetEpg);
   $('#btn-st-test-box')?.addEventListener('click', testReceiver);
   $('#btn-e2-copy')?.addEventListener('click', () => copyText($('#e2-preview')?.textContent || ''));
   $('#btn-e2-download')?.addEventListener('click', () => {
@@ -3149,6 +3150,7 @@ async function pushBouquet({ dryRun = false } = {}) {
       ...(data.warnings || []).map((warning) => `⚠ ${warning}`),
       data.transport ? `transport: ${data.transport.via || JSON.stringify(data.transport)}` : '',
       data.error ? `error: ${data.error}` : '',
+      data.epg ? `EPG: ${data.epg.message}` : '',
       data.reload ? `reload: ${data.reload.ok ? 'ok' : data.reload.error || 'failed'}` : '',
     ].filter(Boolean);
     if (log) log.textContent = lines.join('\n') + (data.bouquet?.text ? `\n\n${data.bouquet.text.slice(0, 4000)}` : '');
@@ -3156,10 +3158,46 @@ async function pushBouquet({ dryRun = false } = {}) {
     toast(dryRun ? 'Dry run finished' : (data.ok ? 'Bouquet pushed' : `Push failed: ${data.error || 'unknown error'}`),
       warned ? 'warn' : (data.ok ? 'ok' : 'err'), warned ? 12000 : 6000);
     if (warned) toast(data.warnings[0], 'warn', 14000);
+    if (data.epg?.state === 'error') toast(data.epg.message, 'warn', 16000);
+    if (data.epg?.requestId) watchBouquetEpg(data.epg.requestId, log);
     await refreshStream();
   } catch (error) {
     if (log) log.textContent = `✗ ${error.message}`;
     toast(error.message, 'err');
+  }
+}
+
+// Import runs inside Enigma2 after the push. Report acknowledgements, not upload as success.
+async function watchBouquetEpg(requestId, log) {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    try {
+      const data = await api(`/api/playlist/enigma2/epg-status?requestId=${encodeURIComponent(requestId)}`, { silent: true });
+      const epg = data.epg;
+      if (!epg) return;
+      if (log) {
+        const line = `EPG [${epg.state}]: ${epg.message}${epg.events != null ? ` (${epg.events} events processed)` : ''}`;
+        const old = log.textContent.split('\n').filter((part) => !part.startsWith('EPG [')).join('\n');
+        log.textContent = `${old}\n${line}`;
+      }
+      if (['finished', 'error', 'superseded'].includes(epg.state)) {
+        if (epg.state === 'error') toast(epg.message, 'warn', 16000);
+        return;
+      }
+    } catch { return; }
+  }
+}
+
+async function checkBouquetEpg() {
+  const log = $('#st-push-log');
+  log?.classList.remove('hide');
+  if (log) log.textContent = 'Checking receiver EPG import…';
+  try {
+    const data = await api('/api/playlist/enigma2/epg-status', { silent: true });
+    const epg = data.epg || {};
+    if (log) log.textContent = `EPG [${epg.state || 'unknown'}]: ${epg.message || 'No status'}${epg.events != null ? ` (${epg.events} events processed)` : ''}`;
+  } catch (error) {
+    if (log) log.textContent = `Could not check EPG: ${error.message}`;
   }
 }
 
@@ -3921,7 +3959,9 @@ async function initMobile() {
     log.textContent = 'pushing…';
     try {
       const data = await api('/api/playlist/enigma2', { method: 'POST', body: { action: 'push' }, silent: true });
-      log.textContent = data.ok ? `✓ pushed ${data.bouquet?.entries ?? 0} entries (${data.transport?.via || 'receiver'})` : `✗ ${data.error || 'push failed'}`;
+      log.textContent = data.ok ? `✓ pushed ${data.bouquet?.entries ?? 0} entries (${data.transport?.via || data.transport || 'receiver'})${data.epg ? `\nEPG: ${data.epg.message}` : ''}` : `✗ ${data.error || 'push failed'}`;
+      if (data.epg?.requestId) watchBouquetEpg(data.epg.requestId, log);
+      if (data.epg?.state === 'error') toast(data.epg.message, 'warn', 16000);
       toast(data.ok ? 'Bouquet pushed to the box' : 'Push failed', data.ok ? 'ok' : 'err');
     } catch (error) {
       log.textContent = `✗ ${error.message}`;
