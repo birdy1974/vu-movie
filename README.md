@@ -425,10 +425,24 @@ before import** setting is enabled, because that setting could remove other
 services' EPG; disable it and retry/check the status. A missing or failed EPG update does
 not undo a successfully pushed bouquet. A dry run never writes or imports.
 
-Plots use the saved stream description; when missing, a bounded lookup uses
-configured TMDB/OMDB keys and caches a matching result. Unavailable plots show
-`No plot available.` Updating metadata or playlist membership requires another
-playlist push. Generated times, the number of processed events and EPG display
+Plots are stored on the stream record, so a push does not depend on live
+metadata lookups:
+
+- When a title is added to the playlist, vu-movie looks up its plot once with
+  the configured TMDB/OMDB keys and stores it. If you opened the title's meta
+  details first, the plot shown there is reused as-is (same lookup, no second
+  request), so the EPG shows what the UI showed.
+- Streams that still lack a stored plot (added before this version, or while
+  no metadata key was configured) are filled in by a background backfill: once
+  after startup and after every push, one lookup at a time and without a push
+  deadline. The push itself only runs a short, bounded lookup as a last
+  resort and stores whatever it finds, so no lookup is ever repeated.
+- The push result reports how many plots are still missing; push again later to
+  publish them. Unattended lookups accept only a result whose title and year
+  match; a stored metadata plot takes precedence over the scraper's
+  description, and titles without any match show `No plot available.`
+
+Updating playlist membership requires another playlist push. Generated times, the number of processed events and EPG display
 vary by receiver image; the actual VU+ must be tested. EPG metadata and channel
 mappings contain service URLs/tokens, so restrict FTP access to a trusted LAN.
 Existing non-vu-movie EPG sources and bouquet files are not replaced. Before

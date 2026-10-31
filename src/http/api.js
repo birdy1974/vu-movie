@@ -38,6 +38,7 @@ import * as enigma2 from '../enigma2/index.js';
 import { fetchPosterImage, posterProxyUrl, posterSource, publicPosterUrl } from './poster-proxy.js';
 import { pushSubtitleToReceiver } from '../subtitles/push.js';
 import * as metadata from '../metadata/index.js';
+import { ensureStreamPlot, rememberEnrichedPlot } from '../metadata/plots.js';
 import * as discovery from '../metadata/discovery.js';
 import * as playlist from '../playlist/index.js';
 import { reconfigurePlaylistMaintenance, kickPlaylistPrewarm } from '../playlist/maintenance.js';
@@ -800,11 +801,17 @@ router.post('/streams', wrap(async (req, res) => {
  */
 function afterStreamCreated(stream, baseUrl, { skipSubtitleSearch = false } = {}) {
   const cfgObject = getConfig();
-  if (cfgObject.subtitles.autoSearch && !skipSubtitleSearch) {
-    autoAttachSubtitle(stream).catch((err) => {
-      logError('subtitles', 'automatic subtitle search failed', err, { stream: stream.id, title: stream.title });
-    });
-  }
+  // Plot first, then subtitles: both re-save the record, and the subtitle
+  // chore writes the `stream` object it holds, so the plot must already be
+  // on it (ensureStreamPlot updates that object in place).
+  (async () => {
+    const plot = await ensureStreamPlot(stream);
+    if (plot.state === 'stored') log.info('metadata', `plot stored for "${stream.title}"`, { stream: stream.id, cached: plot.cached === true });
+    else if (plot.state === 'missing') log.info('metadata', `no matching TMDB/OMDB plot for "${stream.title}"`, { stream: stream.id, year: stream.year });
+    if (cfgObject.subtitles.autoSearch && !skipSubtitleSearch) await autoAttachSubtitle(stream);
+  })().catch((err) => {
+    logError('subtitles', 'automatic subtitle search failed', err, { stream: stream.id, title: stream.title });
+  });
   if (cfgObject.enigma2.autoPush) {
     (async () => {
       const entries = bouquetEntries(await store.listStreams(), baseUrl);
@@ -1425,27 +1432,33 @@ router.get('/discovery/:list', wrap(async (req, res) => {
 router.get('/metadata/tmdb', wrap(async (req, res) => {
   const { title, year, type, imdbId, tmdbId } = req.query;
   if (!title && !imdbId && !tmdbId) return res.status(400).json({ ok: false, error: 'title, imdbId or tmdbId required' });
-  const data = await metadata.enrichMetadata({
+  const query = {
     title: title ? String(title) : '',
     year: year ? Number(year) : null,
     type: type ? String(type) : 'movie',
     imdbId: imdbId ? String(imdbId) : null,
     tmdbId: tmdbId ? String(tmdbId) : null,
-  });
+  };
+  const data = await metadata.enrichMetadata(query);
   res.json({ ok: true, ...data });
+  // The plot the user sees here is the one the playlist EPG will carry when
+  // the title is added (metadata/plots.js shares this cache with add time).
+  rememberEnrichedPlot({ ...query, kind: query.type }, data).catch(() => {});
 }));
 
 router.post('/metadata/enrich', wrap(async (req, res) => {
   const { title, year, type, imdbId, tmdbId } = req.body || {};
   if (!title && !imdbId && !tmdbId) return res.status(400).json({ ok: false, error: 'title, imdbId or tmdbId required' });
-  const data = await metadata.enrichMetadata({
+  const query = {
     title: title ? String(title) : '',
     year: year ? Number(year) : null,
     type: type ? String(type) : 'movie',
     imdbId: imdbId ? String(imdbId) : null,
     tmdbId: tmdbId ? String(tmdbId) : null,
-  });
+  };
+  const data = await metadata.enrichMetadata(query);
   res.json({ ok: true, ...data });
+  rememberEnrichedPlot({ ...query, kind: query.type }, data).catch(() => {});
 }));
 
 export default router;
