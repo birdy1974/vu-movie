@@ -18,6 +18,7 @@ import { ensureStreamReady } from '../streams/recovery.js';
 import * as readiness from '../streams/readiness.js';
 import * as relay from '../streams/relay.js';
 import { sweepEphemeralStreams } from '../streams/store.js';
+import { backfillStoredPlots } from '../metadata/plots.js';
 
 const DEFAULT_INTERVAL_MINUTES = 360;
 const MIN_INTERVAL_MINUTES = 15;
@@ -359,6 +360,7 @@ export function startPlaylistMaintenance() {
   state.started = true;
   startPlaylistPrewarm();
   queueNext(STARTUP_DELAY_MS);
+  startPlotBackfill(STARTUP_DELAY_MS);
   const config = scheduleConfig();
   log.info('playlist', config.enabled
     ? `scheduled playlist availability checks every ${config.intervalMinutes} minutes`
@@ -384,6 +386,33 @@ export function stopPlaylistMaintenance() {
   state.started = false;
   cancelTimer();
   stopPlaylistPrewarm();
+  stopPlotBackfill();
+}
+
+/* ---------------- stored plot backfill ---------------- */
+
+const plotBackfill = { timer: null };
+
+/**
+ * Streams saved before plots were stored on the record (or added while the
+ * metadata keys were missing) get their plot once, in the background and
+ * without the bouquet push deadline, so the next push publishes a complete
+ * EPG. Delayed like the other startup chores so startup stays light.
+ */
+export function startPlotBackfill(delayMs = STARTUP_DELAY_MS) {
+  stopPlotBackfill();
+  plotBackfill.timer = setTimeout(() => {
+    plotBackfill.timer = null;
+    backfillStoredPlots({ reason: 'startup' }).catch((error) => {
+      log.warn('metadata', 'stored plot backfill failed', { error: errorText(error) });
+    });
+  }, delayMs);
+  plotBackfill.timer.unref?.();
+}
+
+export function stopPlotBackfill() {
+  if (plotBackfill.timer) clearTimeout(plotBackfill.timer);
+  plotBackfill.timer = null;
 }
 
 export function getPlaylistMaintenanceStatus() {

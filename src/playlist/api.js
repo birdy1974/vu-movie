@@ -35,6 +35,7 @@ import * as relay from '../streams/relay.js';
 import * as enigma2 from '../enigma2/index.js';
 import { pushPlaylistEpg, readPlaylistEpgStatus } from '../enigma2/epg.js';
 import { enrichEpgPlots } from '../enigma2/epg-metadata.js';
+import { storedPlot, backfillStoredPlots, providersConfigured } from '../metadata/plots.js';
 import { publicPosterUrl } from '../http/poster-proxy.js';
 import { OUTPUT_LABELS, OUTPUT_TYPES, requestAbortSignal } from '../http/api.js';
 import * as playlist from './index.js';
@@ -565,8 +566,18 @@ router.post('/enigma2', wrap(async (req, res) => {
         epg = { state: 'error', message: 'Bouquet uploaded but reload failed; EPG import not requested. Restore OpenWebif and push again.' };
       } else {
         try {
+          // Plots come stored on the stream records (add time + backfill);
+          // the bounded lookup is only a last resort for entries without one.
           const enriched = await enrichEpgPlots(entries);
           epg = pushPlaylistEpg(enriched, result.bouquet, getConfig().enigma2);
+          const missing = enriched.filter((entry) => !String(entry.plot || '').trim()).length;
+          epg.plots = { total: enriched.length, missing };
+          if (missing && providersConfigured()) {
+            epg.message += ` ${missing} of ${enriched.length} plots are still missing; they are being looked up in the background — push again later to publish them.`;
+            backfillStoredPlots({ reason: 'bouquet-push' }).catch(() => {});
+          } else if (missing) {
+            epg.message += ` ${missing} of ${enriched.length} entries have no plot (no TMDB/OMDB key in Settings → Metadata).`;
+          }
         } catch (err) {
           epg = { state: 'error', message: `Bouquet pushed, but EPG setup failed: ${errorText(err)}` };
           log.warn('playlist', 'playlist EPG update failed', { error: errorText(err) });
@@ -600,7 +611,10 @@ async function bouquetEntries(baseUrl) {
     year: stream.year,
     url: store.urlsFor(stream, baseUrl).forBox,
     description: `${stream.title}${stream.year ? ` (${stream.year})` : ''}`,
-    plot: stream.description || stream.payload?.meta?.description || '',
+    // The stored metadata plot first (the one the details view showed), then
+    // the scraper's description; `streamId` lets a push-time lookup store its find.
+    plot: storedPlot(stream),
+    streamId: stream.id,
     kind: stream.kind || 'movie',
     imdbId: stream.payload?.meta?.imdbId || null,
     tmdbId: stream.payload?.meta?.tmdbId || null,
