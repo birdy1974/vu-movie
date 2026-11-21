@@ -490,6 +490,8 @@ router.post('/items/:id/subtitle', wrap(async (req, res) => {
     provider: attached.provider,
     cues: attached.cues,
     filename: attached.filename || null,
+    check: attached.check || null,
+    adjustment: attached.adjustment || null,
   });
 }));
 

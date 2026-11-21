@@ -320,12 +320,12 @@ still drives grouping and sorting.
 ### Subtitles (Dutch + English by default)
 | Provider | Type | Key needed |
 |---|---|---|
-| OpenSubtitles.org | XML-RPC, hash matching | no |
+| OpenSubtitles.org | XML-RPC, hash matching, fps/length facts | no |
 | Podnapisi | scrape | no |
 | TVsubtitles.net | scrape (series only) | no |
 | TVsubs.net | scrape (series only), ZIP archives | no |
 | SubDL | REST API | free key, 2000 req/day |
-| OpenSubtitles.com | REST API | free key, 5–20 downloads/day |
+| OpenSubtitles.com | REST API, hash matching, fps/HI/translation flags | free key, 5–20 downloads/day (the automatic check downloads at most one candidate from here per search) |
 | Addic7ed | scrape (series only) | free account (`ADDIC7ED_USER`/`ADDIC7ED_PASS`) — anonymous downloads are throttled to nothing |
 | *your own* | template (URL + regex), added in the UI | — |
 
@@ -337,6 +337,35 @@ custom template if you have one, or any of the providers above.
 Search, preview the cues, **shift the timing** (+/− ms), download the `.srt`, or
 push it to the receiver (`/media/hdd/movie/vumovie`, configurable) so the Duo2
 picks it up next to the recording.
+
+**Picking the one that fits.** When the search runs for a playlist item the
+stream's ffprobe facts take part — its length and average frame rate — and
+each hit shows *why* it ranks where it does (tags such as `exact file match`,
+`25 fps ✓`, `timed for 25 fps, video is 23.976 — drift likely`, `ends 0:52 of
+1:45 — part of a multi-CD set?`, `SDH`, `machine translated`):
+
+* **Provider facts** (OpenSubtitles.org/.com send them): the frame rate the
+  file was timed on, its last timestamp and the uploader's video length are
+  compared with the probe; multi-CD, foreign-parts-only, machine-translated
+  and "bad"-flagged files drop, trusted uploads rise.
+* **Exact-file hash** — for a plain file on a CDN that honours `Range`, two
+  64 KiB requests compute the OpenSubtitles *moviehash*; a subtitle uploaded
+  for that very file comes first (HLS/DASH have no file to hash). Setting
+  *Exact-file hash* / `SUBTITLE_MOVIEHASH=false` switches it off.
+* **Download and measure** — the automatic search (and *Candidates to check* /
+  `SUBTITLE_VERIFY_CANDIDATES`, default 3) downloads the ranked hits in turn
+  and measures each against the video: the first whose cues end near the end
+  of the film is attached; a file covering half the film, one far longer than
+  the video, or a forced track with two cues a minute is skipped. A manual
+  attach reports the same verdict in its confirmation.
+* **Frame-rate drift** — a file timed for 25 fps on a 23.976 fps video (or
+  the reverse) is 4.3 % out by the end; when that is *certain* (the file runs
+  past the end of the video by exactly that ratio, or the provider's fps
+  confirms the pair) the timestamps are rescaled on attach and the UI says so
+  (`timing rescaled ×1.0427`). An early end alone is **not** corrected —
+  credits without dialogue look the same — it is only ranked lower. *Fix
+  frame-rate drift* / `SUBTITLE_AUTO_RESCALE=false` turns the correction off;
+  the measurement still runs.
 
 ### Getting a subtitle onto the Duo2 (4097 / 5001 / 5002)
 The receiver reads subtitles out of the *stream*, so which container you play
@@ -910,7 +939,7 @@ src/core/       log, config, db+repo, job queue, media (ffmpeg probing + VAAPI),
 src/scrapers/   http, headless-Chromium sniffer, recipes, registry, MovieBox client,
                 failure diagnostics (DNS/egress/TLS verdicts)
 src/streams/    stream store (tokens/URLs), relay (ffmpeg sessions), downloads, M3U
-src/subtitles/  7 providers + custom templates, SRT/VTT/encoding tools, receiver push
+src/subtitles/  7 providers + custom templates, SRT/VTT/encoding tools, fit ranking + moviehash, receiver push
 src/enigma2/    bouquet builder + atomic FTP writes; OpenWebif reload/verification
 src/http/       REST API + server (static UI, playable /s, /dl, /hls, /watch)
 public/         the entire UI (no build step): index.html, app.js, style.css

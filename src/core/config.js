@@ -366,6 +366,24 @@ export const DEFAULTS = {
     // detects UTF-8/UTF-16/CP1252 — the flag that existed was read by nothing.)
     /** Default for "also copy the .srt to the receiver" when a subtitle is downloaded. */
     pushToReceiver: String(process.env.SUBTITLE_PUSH || 'false').toLowerCase() === 'true',
+    /**
+     * How many ranked hits the automatic search may download and measure
+     * against the video before it settles (the first one that fits wins).
+     * 1 = trust the ranking, as before.
+     */
+    verifyCandidates: Math.max(1, Number(process.env.SUBTITLE_VERIFY_CANDIDATES) || 3),
+    /**
+     * Correct a certain frame-rate mismatch (a 25 fps timing on a 23.976 fps
+     * video and the like) by rescaling the timestamps when the file is
+     * attached. Only applied when the evidence is unambiguous; see
+     * assessSubtitle() in subtitles/util.js.
+     */
+    autoRescale: String(process.env.SUBTITLE_AUTO_RESCALE || 'true').toLowerCase() !== 'false',
+    /**
+     * Send OpenSubtitles the hash of the exact file (two small Range requests
+     * to the CDN) so subtitles made for that very file come first.
+     */
+    useMovieHash: String(process.env.SUBTITLE_MOVIEHASH || 'true').toLowerCase() !== 'false',
     receiverDir: process.env.SUBTITLE_RECEIVER_DIR || '/media/hdd/movie/vumovie',
     /** API keys — set here or through the UI (stored in /config only). */
     keys: {

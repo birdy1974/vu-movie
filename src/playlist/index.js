@@ -554,7 +554,12 @@ export async function attachSubtitle(streamId, { result = null, srt = null, lang
       release: 'uploaded file',
     };
   } else if (result?.providerId) {
-    fetched = await subs.fetchSubtitle(result, { offsetMs: Number(offsetMs) || 0 });
+    // Measured against this item's video (ffprobe length / frame rate): a
+    // certain frame-rate drift is corrected, anything doubtful is reported.
+    fetched = await subs.fetchSubtitle(result, {
+      offsetMs: Number(offsetMs) || 0,
+      video: await subs.videoFactsFor(stream, { hash: false }),
+    });
   } else {
     throw Object.assign(new Error('a subtitle result or an .srt file is required'), { status: 422 });
   }
