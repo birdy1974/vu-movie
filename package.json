@@ -12,7 +12,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "LOG_LEVEL=debug node --watch src/index.js",
-    "test": "node --test \"test/*.test.js\"",
+    "test": "node --test --test-concurrency=8 \"test/*.test.js\"",
     "check": "node scripts/check-syntax.mjs",
     "lock": "npm install --package-lock-only --ignore-scripts",
     "bootstrap": "npm install --omit=dev",
