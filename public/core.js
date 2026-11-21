@@ -211,20 +211,25 @@ function toast(message, kind = 'info', ms = 6000) {
 }
 
 /**
- * `POST` a JSON body and read the answer as Server-Sent Events.
+ * `POST` a JSON body (or `GET`, with `{ method: 'GET' }`) and read the answer
+ * as Server-Sent Events.
  *
- * The live ffmpeg test uses this: EventSource cannot send a body and cannot be
- * aborted cleanly, but fetch() can do both. Returns a handle with `abort()`.
+ * The live ffmpeg test and the progressive search use this: EventSource cannot
+ * send a body and cannot be aborted cleanly, but fetch() can do both. Returns a
+ * handle with `abort()` and `done` (a promise that settles when the stream ends).
  */
-function apiSse(path, body, handlers = {}) {
+function apiSse(path, body, handlers = {}, { method = 'POST', signal = null } = {}) {
   const controller = new AbortController();
+  // A caller's own signal (the search box replacing a running search) aborts
+  // the stream too.
+  signal?.addEventListener('abort', () => controller.abort(), { once: true });
   const run = (async () => {
     let response;
     try {
       response = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body || {}),
+        method,
+        headers: method === 'GET' ? { Accept: 'text/event-stream' } : { 'Content-Type': 'application/json' },
+        ...(method === 'GET' ? {} : { body: JSON.stringify(body || {}) }),
         signal: controller.signal,
       });
     } catch (error) {

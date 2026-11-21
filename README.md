@@ -104,6 +104,28 @@ permissions, Container Manager project import, firewall, where the data lives).
   links the page exposed, how long we waited, and a sample of the links the recipe
   pattern rejected. Per-source waits live in the recipe (`search.waitMs`), the
   global budget in `SEARCH_WAIT_MS`.
+* Only hits that are about the query are listed. A scraped search page also
+  carries the site's "trending now" rail, "you may also like" cards and the
+  genre menu (Comedy, Animation, Crime, …), all linking to the same detail
+  routes as real results; a row is kept only when its title, URL slug or own
+  card text shares the query's words (one typo and plurals allowed; a
+  multi-word query needs at least half of its words). Genre/category/year
+  listing links are never titles. Structured providers (API recipes, MovieBox)
+  run a real search and keep their answer, except that recommendations padded
+  behind title matches are dropped. Side effect: a site that matched a title by
+  an alternative-language name (searching the Dutch title of an English film)
+  is kept only when the provider is structured or the site's card shows that
+  name.
+* Results arrive **per provider**: the Search tab reads the search as a stream
+  (`GET /api/find/search/stream`, Server-Sent Events) and lists each
+  provider's hits the moment that provider answers, with "n of m sources
+  answered" in the hint; MovieBox is searched alongside the sites rather than
+  after them. The final event carries the merged, de-duplicated and sorted list
+  (identical to `GET /api/find/search`), which replaces the partial lists. If
+  the stream cannot be read (a proxy that buffers it), the plain request is used.
+  The Mobile pane still uses the plain request.
+* Floating ↑ / ↓ buttons on the Search tab jump to the top or bottom of the
+  page; they appear only while the page is taller than the window.
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match
@@ -859,7 +881,7 @@ cached for a week.
 
 ```bash
 npm install          # express + pg + playwright-core only
-npm test             # 42 unit tests (ffmpeg args, subtitles, bouquet, MovieBox signing)
+npm test             # unit tests, 8 files in parallel (mostly waiting on timers/sockets, so ~25 s)
 npm run check        # node --check on every source file
 npm run dev          # nodemon-style watch with debug logging
 LOG_LEVEL=debug npm start
@@ -869,6 +891,12 @@ See [docs/MOVIEBOX-TUI-COMPARISON.md](docs/MOVIEBOX-TUI-COMPARISON.md) for how t
 app's title selection and stream fetching compare to the MovieBox-TUI reference client,
 and for the failure-verdict table (`no-egress` / `tls-intercepted` / `dns-filtered` /
 `tls-or-ip-block`) that tells you which layer is broken when a resolve fails.
+
+CI (`.github/workflows/docker-publish.yml`) runs the same `npm run check` +
+`npm test`, then builds the image. The ~350 MB apt/Chromium/ffmpeg layer is
+cached in two places: `ghcr.io/birdy1974/vu-movie:buildcache` (written on every
+push to `main`, read by every run including PRs — never evicted) and the
+per-branch GitHub Actions cache. Only a `Dockerfile` change rebuilds that layer.
 
 Useful endpoints while debugging: `GET /api/health`, `GET /api/logs?level=warn`,
 `GET /api/events` (SSE), `POST /api/find/resolve`, `GET /api/streams/:id/command`

@@ -23,6 +23,7 @@ import { getConfig } from '../core/config.js';
 import { isDisguisedManifestUrl, isInitSegmentUrl } from '../core/media.js';
 import { sleep, safeHost, resolveUrl, request } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
+import { queryTerms, coversQuery, isNavigationUrl, isGenreTitle, urlSlugText } from './search-relevance.js';
 
 let playwright = null;
 let browser = null;
@@ -955,7 +956,6 @@ function hasDetailIdentifier(url) {
   return DETAIL_ID_PARAMS.some((name) => Boolean(String(url.searchParams.get(name) || '').trim()));
 }
 const GENERIC_RESULT_TITLES = /^(?:home|movies?|films?|tv|series?|shows?|search|browse|login|log in|register|sign up|watch|watch now|play|view details|details|more|next|previous)$/i;
-const QUERY_STOP_WORDS = new Set(['a', 'an', 'and', 'for', 'in', 'of', 'the', 'to']);
 
 function plainText(value) {
   return String(value || '').replace(/[\s\u00a0]+/g, ' ').trim();
@@ -1417,7 +1417,7 @@ export function normalizeSearchRows(rows, {
   siteName = siteId,
   limit = 40,
 } = {}) {
-  const terms = normalizeForSearch(query).split(/[^a-z0-9]+/).filter((word) => word.length > 1 && !QUERY_STOP_WORDS.has(word));
+  const terms = queryTerms(query);
   let configuredPattern = null;
   if (resultPattern) {
     try { configuredPattern = new RegExp(resultPattern, 'i'); } catch { /* bad custom recipe: use generic route detection */ }
@@ -1438,11 +1438,20 @@ export function normalizeSearchRows(rows, {
 
     const title = cleanResultTitle(row.title || row.cardTitle || row.text || row.cardText || titleFromPath(target.href));
     if (!title || title.length < 2 || GENERIC_RESULT_TITLES.test(title)) continue;
+    // Genre/category/year listings share the detail-route prefix ("/movie/
+    // genre/comedy") and used to arrive as titles called "Comedy".
+    if (isNavigationUrl(target) || (isGenreTitle(title) && !hasDetailIdentifier(target) && !/\d{3,}/.test(target.pathname))) continue;
     const cardText = plainText(row.cardText || '');
-    const contentForMatch = normalizeForSearch(`${title} ${row.text || ''} ${cardText}`);
-    const pathForMatch = normalizeForSearch(`${target.pathname} ${target.search}`);
-    const contentMatch = terms.some((word) => contentForMatch.includes(word));
-    const queryMatch = contentMatch || terms.some((word) => pathForMatch.includes(word));
+    // Relevance is judged on the row's own words: its title, its URL slug and
+    // its card text. A trending rail or "you may also like" card matches the
+    // recipe's route pattern just as well as a real hit — the query decides.
+    const titleMatch = coversQuery(terms, `${title} ${row.text || ''}`);
+    const pathMatch = coversQuery(terms, urlSlugText(target));
+    // Card text only counts when it is one card, not a whole section whose
+    // text happens to contain the query somewhere.
+    const cardMatch = cardText.length <= 320 && coversQuery(terms, cardText);
+    const contentMatch = titleMatch || cardMatch;
+    const queryMatch = contentMatch || pathMatch;
     const routeMatch = SEARCH_RESULT_ROUTE.test(`${target.pathname}${target.search}`)
       || hasDetailIdentifier(target)
       || Boolean(target.searchParams.get('type') && (target.searchParams.get('id') || target.searchParams.get('tmdb')));
@@ -1459,7 +1468,10 @@ export function normalizeSearchRows(rows, {
     // for an item, though; result links there normally carry an explicit id.
     if (searchLanding) continue;
     const resultSignal = routeMatch || classSignal || hasImage || contentMatch;
-    if (!explicitMatch && (!queryMatch || !resultSignal)) continue;
+    // A row must look like a result *and* be about the query. The recipe
+    // pattern decides the former; it never excuses an unrelated title.
+    if (!queryMatch) continue;
+    if (!explicitMatch && !resultSignal) continue;
 
     const metadata = normalizeSearchMetadata(row, `${row.text || ''} ${cardText}`);
     const yearText = `${row.year || ''} ${metadata.releaseDate || ''} ${row.title || ''} ${row.cardTitle || ''} ${title} ${row.text || ''} ${cardText}`;
