@@ -72,6 +72,7 @@ async function go(page, { hash = true, force = false } = {}) {
   $$('.nav button').forEach((button) => button.classList.toggle('on', button.dataset.p === page));
   APP_PAGES.forEach((name) => $(`#p-${name}`)?.classList.toggle('hide', name !== page));
   document.body.dataset.page = page;
+  if (typeof CustomEvent === 'function') document.dispatchEvent(new CustomEvent('vumovie:page', { detail: { page } }));
   if (hash && pageFromHash() !== page) {
     // `hash = page` keeps the back button working without a scroll jump.
     window.location.hash = `#${page}`;
@@ -629,6 +630,49 @@ function initFind() {
   renderBrowseLinks();
   loadSources().catch((error) => toast(error.message, 'err'));
   wireFind();
+  wireScrollFabs();
+}
+
+/**
+ * Floating ↑ / ↓ buttons on the Search tab. Shown only while the page is
+ * actually taller than the window (a long result list, or the selected
+ * title's formats below it); the button for the end you are already at is
+ * disabled rather than hidden, so the pair never jumps around.
+ */
+function wireScrollFabs() {
+  const host = $('#find-scroll-fabs');
+  if (!host || host.dataset.wired) return;
+  host.dataset.wired = '1';
+  const root = document.scrollingElement || document.documentElement;
+  const update = () => {
+    if (currentPage !== 'find') { host.classList.add('hide'); return; }
+    const scrollable = root.scrollHeight - window.innerHeight > 160;
+    host.classList.toggle('hide', !scrollable);
+    if (!scrollable) return;
+    const top = root.scrollTop <= 8;
+    const bottom = root.scrollTop + window.innerHeight >= root.scrollHeight - 8;
+    $('[data-scroll="top"]', host).disabled = top;
+    $('[data-scroll="bottom"]', host).disabled = bottom;
+  };
+  host.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-scroll]');
+    if (!button) return;
+    const top = button.dataset.scroll === 'top' ? 0 : root.scrollHeight;
+    window.scrollTo({ top, behavior: 'smooth' });
+  });
+  let pending = null;
+  const frame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+  const schedule = () => {
+    if (pending) return;
+    pending = frame(() => { pending = null; update(); });
+  };
+  window.addEventListener('scroll', schedule, { passive: true });
+  window.addEventListener('resize', schedule);
+  // Results, formats and episode lists change the page height without any
+  // scroll or resize event.
+  if (typeof ResizeObserver === 'function') new ResizeObserver(schedule).observe(document.body);
+  document.addEventListener('vumovie:page', schedule);
+  schedule();
 }
 
 function saveSearchState() {
@@ -710,7 +754,7 @@ async function doSearch() {
     if (ui.search.type) params.set('type', ui.search.type);
     if (state.selectedSources.length && state.selectedSources.length !== state.sources.length) params.set('sources', state.selectedSources.join(','));
     params.set('moviebox', ui.search.moviebox ? 'true' : 'false');
-    const data = await api(`/api/find/search?${params}`, { silent: true, signal: searchAbort.signal });
+    const data = await searchProgressively(params, { seq, hint });
     if (seq !== searchSeq) return;
     state.searching = null;
     state.searchError = null;
@@ -733,6 +777,54 @@ async function doSearch() {
   } finally {
     if (seq === searchSeq) $('#btn-search').disabled = false;
   }
+}
+
+/**
+ * Run the search as a stream: every provider's hits are listed the moment
+ * that provider answers, so the first cards appear after a second or two
+ * instead of after the slowest site. Resolves with the final merged answer
+ * (what GET /api/find/search returns), or falls back to that plain request
+ * when the browser cannot read the stream.
+ */
+function searchProgressively(params, { seq, hint }) {
+  return new Promise((resolve, reject) => {
+    const answered = new Set();
+    const partialErrors = [];
+    let finished = false;
+    const finish = (fn) => { if (!finished) { finished = true; fn(); } };
+    const stream = apiSse(`/api/find/search/stream?${params}`, null, {
+      source: (event) => {
+        if (seq !== searchSeq || finished) return;
+        answered.add(event.sourceId);
+        if (event.error?.error) partialErrors.push(event.error);
+        if (event.results?.length) {
+          state.results = [...(state.results || []), ...event.results];
+          renderResults();
+        }
+        renderFindErrors(partialErrors);
+        if (state.searching) state.searching.pending = event.pending;
+        if (hint) {
+          const total = answered.size + (Number(event.pending) || 0);
+          hint.textContent = `${state.results.length} result(s) so far · ${answered.size} of ${total} source(s) answered${event.pending ? `, ${event.pending} still searching…` : ''}`;
+        }
+      },
+      done: (data) => finish(() => resolve(data)),
+      error: (data) => finish(() => reject(new Error(data?.error || 'search failed'))),
+      onError: (error) => finish(() => {
+        // A proxy that cannot stream events: do the plain request instead.
+        if (error?.name === 'AbortError') { reject(error); return; }
+        api(`/api/find/search?${params}`, { silent: true, signal: searchAbort.signal }).then(resolve, reject);
+      }),
+      onEnd: () => finish(() => {
+        if (searchAbort.signal.aborted) reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        else api(`/api/find/search?${params}`, { silent: true, signal: searchAbort.signal }).then(resolve, reject);
+      }),
+    }, { method: 'GET', signal: searchAbort.signal });
+    searchAbort.signal.addEventListener('abort', () => {
+      stream.abort();
+      finish(() => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    }, { once: true });
+  });
 }
 
 function renderFindErrors(providerErrors) {
@@ -900,7 +992,7 @@ function renderResults() {
   const count = $('#results-count');
   if (count) {
     const providers = new Set((state.results || []).map((result) => result.sourceId));
-    if (state.searching) count.textContent = 'searching…';
+    if (state.searching) count.textContent = state.results?.length ? `searching… ${total} title(s) so far` : 'searching…';
     else if (!state.results?.length) count.textContent = '';
     else count.textContent = `${filtered ? `${groups.length} of ${total}` : total} title(s) · ${state.results.length} hit(s) · ${providers.size} provider(s)`;
   }

@@ -23,6 +23,7 @@ import {
 } from '../core/media.js';
 import { request, resolveUrl } from './http.js';
 import { normalizeSearchMetadata } from './metadata.js';
+import { trimUnrelatedResults } from './search-relevance.js';
 import * as browser from './browser.js';
 import * as moviebox from './moviebox.js';
 import { diagnoseReachability } from './diagnostics.js';
@@ -282,9 +283,14 @@ export async function searchSource(source, query, { signal = null, detailed = fa
           ...metadata,
         };
       }).filter((r) => r.url && r.title);
+      // A structured search is trusted, but an API that pads its title matches
+      // with recommendations gets the padding removed (see search-relevance.js).
+      const related = trimUnrelatedResults(rows, query);
       noteHealth(source.id, rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
-      log.info('scraper', `${source.id}: api search → ${rows.length} results`, { ms: Date.now() - started });
-      return finish(rows);
+      log.info('scraper', `${source.id}: api search → ${related.length} results`, {
+        ms: Date.now() - started, ...(related.length !== rows.length ? { unrelated: rows.length - related.length } : {}),
+      });
+      return finish(related);
     }
 
     // browser search
@@ -502,7 +508,7 @@ export function sortResultsForDisplay(results) {
 /** Search every enabled source (plus MovieBox). Runs with a small pool to spare the NAS. */
 export async function searchAll(query, {
   sources = null, type = null, limitPerSource = 12, includeMoviebox = true,
-  signal = null, detailed = false,
+  signal = null, detailed = false, onSource = null,
 } = {}) {
   const all = loadSources().filter((s) => s.enabled);
   const chosen = sources == null ? all : all.filter((s) => sources.includes(s.id));
@@ -510,68 +516,96 @@ export async function searchAll(query, {
 
   const results = [];
   const providerErrors = [];
+  const matchesType = (r) => !type || type === 'both' || r.kind === type;
+  let pendingSources = chosen.length + (includeMoviebox ? 1 : 0);
+  /** Tell a streaming caller what one provider produced, as soon as it did. */
+  const report = (sourceId, sourceName, rows, error = null) => {
+    pendingSources -= 1;
+    if (typeof onSource !== 'function' || signal?.aborted) return;
+    try {
+      onSource({ sourceId, sourceName, results: rows.filter(matchesType), error, pending: pendingSources });
+    } catch (err) { log.warn('scraper', 'search progress listener failed', { error: errorText(err) }); }
+  };
   const jobs = chosen.map((source) => async () => {
     if (isSourceCoolingDown(source.id)) {
       const h = healthOf(source.id);
       const msg = `${source.name} is in cooldown for another ${Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000))}s after ${h.failures} consecutive failures (${h.message || 'unknown error'})`;
       log.warn('scraper', `skipping ${source.name} (circuit breaker open)`, { backoffSeconds: h.backoffSeconds });
-      providerErrors.push({ sourceId: source.id, sourceName: source.name, error: msg, skipped: true });
+      const skipped = { sourceId: source.id, sourceName: source.name, error: msg, skipped: true };
+      providerErrors.push(skipped);
+      report(source.id, source.name, [], skipped);
       return;
     }
     const outcome = await searchSource(source, query, { signal, detailed: true });
     results.push(...outcome.results);
+    let failure = null;
     if (outcome.error) {
-      providerErrors.push({
+      failure = {
         sourceId: source.id,
         sourceName: source.name,
         error: outcome.error,
         ...(outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}),
-      });
+      };
+      providerErrors.push(failure);
     }
+    report(source.id, source.name, outcome.results, failure);
   });
   const pool = 3;
   let idx = 0;
-  await Promise.all(Array.from({ length: Math.min(pool, jobs.length) }, async () => {
-    while (idx < jobs.length) {
-      if (signal?.aborted) throw Object.assign(new Error('search aborted'), { name: 'AbortError' });
-      const myIndex = idx++;
-      await jobs[myIndex]();
-    }
-  }));
-
-  if (includeMoviebox) {
+  // MovieBox searches alongside the sites instead of after them, so the
+  // slowest browser scrape no longer delays its (usually first) answer.
+  const movieboxJob = async () => {
     if (isSourceCoolingDown('moviebox')) {
       const h = healthOf('moviebox');
       const waitSec = Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000));
       log.warn('scraper', 'skipping MovieBox (circuit breaker open)', { backoffSeconds: waitSec });
-      providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: `MovieBox is in cooldown for another ${waitSec}s after ${h.failures} consecutive failures (${h.message || 'unknown error'})`, skipped: true });
-    } else {
-      try {
-        const rows = await moviebox.search(query, { perPage: limitPerSource, signal });
-        noteHealth('moviebox', rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
-        for (const r of rows) {
-          const metadata = normalizeSearchMetadata(r);
-          results.push({
-            title: r.title,
-            year: r.year || Number(metadata.releaseDate?.slice(0, 4)) || null,
-            kind: r.kind,
-            poster: r.poster,
-            movieboxSubjectId: r.subjectId,
-            url: `moviebox://subject/${encodeURIComponent(r.subjectId)}${r.detailPath ? `?dp=${encodeURIComponent(r.detailPath)}` : ''}`,
-            sourceId: 'moviebox',
-            sourceName: 'MovieBox',
-            ...metadata,
-          });
-        }
-      } catch (err) {
-        if (signal?.aborted || err?.name === 'AbortError') throw err;
-        const message = errorText(err);
-        noteHealth('moviebox', false, message);
-        providerErrors.push({ sourceId: 'moviebox', sourceName: 'MovieBox', error: message });
-        logError('scraper', 'MovieBox search failed', err);
-      }
+      const skipped = { sourceId: 'moviebox', sourceName: 'MovieBox', error: `MovieBox is in cooldown for another ${waitSec}s after ${h.failures} consecutive failures (${h.message || 'unknown error'})`, skipped: true };
+      providerErrors.push(skipped);
+      report('moviebox', 'MovieBox', [], skipped);
+      return;
     }
-  }
+    try {
+      const rows = await moviebox.search(query, { perPage: limitPerSource, signal });
+      noteHealth('moviebox', rows.length > 0, rows.length ? `${rows.length} results` : 'no results');
+      const mapped = rows.map((r) => {
+        const metadata = normalizeSearchMetadata(r);
+        return {
+          title: r.title,
+          year: r.year || Number(metadata.releaseDate?.slice(0, 4)) || null,
+          kind: r.kind,
+          poster: r.poster,
+          movieboxSubjectId: r.subjectId,
+          url: `moviebox://subject/${encodeURIComponent(r.subjectId)}${r.detailPath ? `?dp=${encodeURIComponent(r.detailPath)}` : ''}`,
+          sourceId: 'moviebox',
+          sourceName: 'MovieBox',
+          ...metadata,
+        };
+      });
+      // MovieBox pads title matches with recommendations; keep the matches.
+      const related = trimUnrelatedResults(mapped, query);
+      if (related.length !== mapped.length) log.info('scraper', `MovieBox: ${mapped.length - related.length} unrelated recommendation(s) dropped`, { query });
+      results.push(...related);
+      report('moviebox', 'MovieBox', related);
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') throw err;
+      const message = errorText(err);
+      noteHealth('moviebox', false, message);
+      const failure = { sourceId: 'moviebox', sourceName: 'MovieBox', error: message };
+      providerErrors.push(failure);
+      logError('scraper', 'MovieBox search failed', err);
+      report('moviebox', 'MovieBox', [], failure);
+    }
+  };
+  await Promise.all([
+    ...Array.from({ length: Math.min(pool, jobs.length) }, async () => {
+      while (idx < jobs.length) {
+        if (signal?.aborted) throw Object.assign(new Error('search aborted'), { name: 'AbortError' });
+        const myIndex = idx++;
+        await jobs[myIndex]();
+      }
+    }),
+    ...(includeMoviebox ? [movieboxJob()] : []),
+  ]);
 
   const enriched = fillMissingMetadata(fillMissingPosters(results));
   const filtered = type && type !== 'both' ? enriched.filter((r) => r.kind === type) : enriched;

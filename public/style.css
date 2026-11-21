@@ -682,3 +682,14 @@ th,td{padding:7px 9px}
 .result-card{padding:8px;gap:9px}
 .result-actions{gap:5px}
 body[data-page="mobile"] .card:not(.pad0){padding:10px}
+
+/* Floating scroll-to-top / scroll-to-bottom buttons (Search tab). Right edge,
+   vertically centred so they never cover the toasts in the bottom-right corner. */
+.scroll-fabs{position:fixed;right:16px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px;z-index:40}
+.scroll-fabs.hide{display:none}
+.scroll-fabs .fab{width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:rgba(21,29,44,.92);color:var(--fg);
+  font-size:18px;line-height:1;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.45);display:grid;place-items:center;transition:opacity .15s,transform .15s}
+.scroll-fabs .fab:hover{border-color:var(--acc);color:var(--acc);transform:translateY(-1px)}
+.scroll-fabs .fab[disabled]{opacity:.3;cursor:default;transform:none}
+.scroll-fabs .fab:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+@media (max-width:720px){.scroll-fabs{right:8px}.scroll-fabs .fab{width:36px;height:36px;font-size:16px}}

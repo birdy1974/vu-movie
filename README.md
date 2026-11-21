@@ -104,6 +104,28 @@ permissions, Container Manager project import, firewall, where the data lives).
   links the page exposed, how long we waited, and a sample of the links the recipe
   pattern rejected. Per-source waits live in the recipe (`search.waitMs`), the
   global budget in `SEARCH_WAIT_MS`.
+* Only hits that are about the query are listed. A scraped search page also
+  carries the site's "trending now" rail, "you may also like" cards and the
+  genre menu (Comedy, Animation, Crime, …), all linking to the same detail
+  routes as real results; a row is kept only when its title, URL slug or own
+  card text shares the query's words (one typo and plurals allowed; a
+  multi-word query needs at least half of its words). Genre/category/year
+  listing links are never titles. Structured providers (API recipes, MovieBox)
+  run a real search and keep their answer, except that recommendations padded
+  behind title matches are dropped. Side effect: a site that matched a title by
+  an alternative-language name (searching the Dutch title of an English film)
+  is kept only when the provider is structured or the site's card shows that
+  name.
+* Results arrive **per provider**: the Search tab reads the search as a stream
+  (`GET /api/find/search/stream`, Server-Sent Events) and lists each
+  provider's hits the moment that provider answers, with "n of m sources
+  answered" in the hint; MovieBox is searched alongside the sites rather than
+  after them. The final event carries the merged, de-duplicated and sorted list
+  (identical to `GET /api/find/search`), which replaces the partial lists. If
+  the stream cannot be read (a proxy that buffers it), the plain request is used.
+  The Mobile pane still uses the plain request.
+* Floating ↑ / ↓ buttons on the Search tab jump to the top or bottom of the
+  page; they appear only while the page is taller than the window.
 * Result cards show available release year, rating, genres and runtime; the
   selected-title panel adds the synopsis, release date and language when a source
   provides them. Missing fields can be filled from an exact title/year/type match

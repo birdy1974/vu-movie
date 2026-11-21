@@ -616,6 +616,56 @@ router.get('/find/search', wrap(async (req, res) => {
   }
 }));
 
+/**
+ * The same search as Server-Sent Events: one `source` event per provider as
+ * soon as it answers (so the UI can list hits while slower sites are still
+ * loading), then a `done` event with exactly what GET /find/search returns —
+ * the merged, de-duplicated and sorted list the final render replaces the
+ * partial lists with.
+ */
+router.get('/find/search/stream', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ ok: false, error: 'q is required' });
+  const request = requestAbortSignal(req, res);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
+  const send = (event, payload) => {
+    if (res.writableEnded || request.signal.aborted) return;
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`); } catch { /* client gone */ }
+  };
+  const proxied = (results) => results.map((result) => ({
+    ...result,
+    poster: result.poster ? (posterProxyUrl(result.poster, result.url) || '') : '',
+  }));
+  const keepAlive = setInterval(() => send('ping', { t: Date.now() }), 15000);
+  try {
+    send('start', { query: q });
+    const outcome = await registry.searchAll(q, {
+      type: req.query.type || null,
+      sources: req.query.sources === undefined ? null : String(req.query.sources).split(',').filter(Boolean),
+      includeMoviebox: req.query.moviebox === undefined || String(req.query.moviebox).toLowerCase() !== 'false',
+      signal: request.signal,
+      detailed: true,
+      onSource: ({ sourceId, sourceName, results, error, pending }) => send('source', {
+        sourceId, sourceName, pending, results: proxied(results), error: error || null,
+      }),
+    });
+    if (request.signal.aborted) return;
+    send('done', { ok: true, query: q, results: proxied(outcome.results), providerErrors: outcome.providerErrors });
+  } catch (err) {
+    if (!request.signal.aborted) send('error', { ok: false, error: errorText(err) });
+  } finally {
+    clearInterval(keepAlive);
+    request.dispose();
+    if (!res.writableEnded) res.end();
+  }
+}));
+
 router.get('/find/details', wrap(async (req, res) => {
   const subjectId = String(req.query.subjectId || '').trim();
   if (!subjectId) return res.status(400).json({ ok: false, error: 'subjectId is required' });

@@ -317,6 +317,61 @@ test('a new search clears the previous answer before the request comes back', as
   assert.equal(app.el('#results-title-filter').value, '');
 });
 
+test('results are listed per provider while the search is still running', async () => {
+  // A hand-driven SSE body: each push() is one chunk the reader hands out.
+  const chunks = [];
+  let wake = null;
+  let closed = false;
+  const encoder = new TextEncoder();
+  const push = (event, data) => { chunks.push(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); wake?.(); };
+  const reader = {
+    read: async () => {
+      for (;;) {
+        if (chunks.length) return { value: chunks.shift(), done: false };
+        if (closed) return { value: undefined, done: true };
+        await new Promise((resolve) => { wake = resolve; });
+      }
+    },
+  };
+  const app = loadApp({
+    onFetch: standardFetch({
+      search: (request) => {
+        if (request.url.startsWith('/api/find/search/stream')) return { ok: true, status: 200, body: { getReader: () => reader } };
+        throw new Error(`unexpected plain search ${request.url}`);
+      },
+    }),
+  });
+  app.run(`state.sources = ${JSON.stringify(SOURCES)}; state.selectedSources = ${JSON.stringify(SOURCES.map((s) => s.id))};`);
+  app.el('#q').value = 'smurfs';
+  const searching = app.run('doSearch()');
+  await tick();
+  assert.equal(app.el('#results-count').textContent, 'searching…');
+
+  push('start', { query: 'smurfs' });
+  push('source', { sourceId: 'cinejoy', sourceName: 'Cinejoy', pending: 2, results: [SMURFS[0]], error: null });
+  await tick(); await tick();
+  // The first provider's card is on screen while two providers are still searching.
+  assert.match(app.el('#results').innerHTML, /The Smurfs/);
+  assert.equal(app.el('#results')['aria-busy'], 'true');
+  assert.match(app.el('#results-count').textContent, /searching… 1 title\(s\) so far/);
+  assert.match(app.el('#find-hint').textContent, /1 result\(s\) so far · 1 of 3 source\(s\) answered, 2 still searching/);
+
+  push('source', { sourceId: 'redflix', sourceName: 'Redflix', pending: 1, results: [], error: { sourceId: 'redflix', error: 'search page unavailable (HTTP 503)' } });
+  await tick(); await tick();
+  assert.match(app.el('#find-errors').innerHTML, /HTTP 503/);
+
+  push('source', { sourceId: 'cinevo', sourceName: 'Cinevo', pending: 0, results: [SMURFS[2]], error: null });
+  push('done', { ok: true, results: SMURFS, providerErrors: [{ sourceId: 'redflix', error: 'search page unavailable (HTTP 503)' }] });
+  closed = true; wake?.();
+  await searching;
+
+  // The final answer (merged + sorted by the server) replaces the partial lists.
+  assert.equal(app.run('state.results.length'), 3);
+  assert.equal(app.el('#results')['aria-busy'], 'false');
+  assert.match(app.el('#find-hint').textContent, /3 result\(s\) on 3 provider\(s\)/);
+  assert.match(app.el('#results-count').textContent, /2 title\(s\) · 3 hit\(s\)/);
+});
+
 test('a failed search reports itself and does not fall back to the old cards', async () => {
   const app = loadApp({ onFetch: standardFetch({ search: () => json({ ok: false, error: 'nothing answered' }, 502) }) });
   app.run(`state.sources = ${JSON.stringify(SOURCES)}; state.selectedSources = [];`);
