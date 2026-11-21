@@ -2374,12 +2374,34 @@ async function openSelectionSubtitles() {
   }
 }
 
+/**
+ * The ranking's reasons as tags: "exact file match", "25 fps ✓",
+ * "timed for 25 fps, video is 23.976 — drift likely", "SDH" …
+ * (server: rankResult() in src/subtitles/util.js).
+ */
+function subtitleNoteTags(result) {
+  const notes = Array.isArray(result?.notes) ? result.notes : [];
+  return notes.slice(0, 5).map((note) => tag(note.text, note.tone === 'ok' ? 'ok' : note.tone === 'warn' ? 'warn' : '')).join(' ');
+}
+
+/** One line about what fetchSubtitle() measured — for the toast after an attach. */
+function subtitleCheckSummary(data) {
+  if (!data) return '';
+  if (data.adjustment?.scale) return ` — timing rescaled ×${data.adjustment.scale} (${data.adjustment.label || 'frame-rate drift'})`;
+  const check = data.check;
+  if (!check || !Array.isArray(check.reasons) || !check.reasons.length) return '';
+  if (check.verdict === 'good') return ` — ${check.reasons[0]}`;
+  if (check.verdict === 'suspect' || check.verdict === 'bad') return ` — check the timing: ${check.reasons.join('; ')}`;
+  return '';
+}
+
 function subtitleRowMarkup(result, index, scope) {
   return `<div class="pick-row">
     <div class="pick-main">
       <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
         ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
-        ${result.rating ? tag(`★ ${result.rating}`) : ''}</div>
+        ${result.rating ? tag(`★ ${result.rating}`) : ''}
+        ${subtitleNoteTags(result)}</div>
       <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
     </div>
     <div class="row">
@@ -2423,12 +2445,13 @@ async function attachSubtitle(result, { streamId = null, language = null } = {})
     toast('Pick the playlist item this subtitle belongs to first', 'warn');
     return;
   }
-  await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, {
+  const data = await api(`/api/playlist/items/${encodeURIComponent(streamId)}/subtitle`, {
     method: 'POST',
     body: { result, language: language || result.language || '' },
   });
   await VMPlaylist.refresh({ render: currentPage === 'list' });
-  toast(`Subtitle attached to the playlist item (${result.language || 'srt'})`, 'ok');
+  const doubtful = data?.check?.verdict === 'suspect' || data?.check?.verdict === 'bad';
+  toast(`Subtitle attached to the playlist item (${result.language || 'srt'})${subtitleCheckSummary(data)}`, doubtful && !data?.adjustment ? 'warn' : 'ok');
 }
 
 /* ---------------- URL resolve tab ---------------- */
@@ -2882,7 +2905,8 @@ function renderSubResults() {
             <div>
               <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
                 ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
-                ${result.rating ? tag(`★ ${result.rating}`) : ''}</div>
+                ${result.rating ? tag(`★ ${result.rating}`) : ''}
+                ${subtitleNoteTags(result)}</div>
               <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
             </div>
             <button class="btn sm pri" data-attach="${index}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${escapeHtml(block.title)}">attach</button>
@@ -3499,7 +3523,8 @@ const SETTINGS_SECTIONS = [
   {
     key: 'subtitles', title: 'Subtitles',
     fields: [
-      ['languages', 'list'], ['autoSearch', 'bool'], ['pushToReceiver', 'bool'],
+      ['languages', 'list'], ['autoSearch', 'bool'], ['verifyCandidates', 'number'], ['autoRescale', 'bool'],
+      ['useMovieHash', 'bool'], ['pushToReceiver', 'bool'],
       ['receiverDir', 'text'], ['disabledProviders', 'list'],
     ],
   },
@@ -3588,6 +3613,9 @@ const SETTINGS_LABELS = {
 
   'subtitles.languages': ['Languages', 'Search order, comma separated — e.g. nl, en.'],
   'subtitles.autoSearch': ['Auto search', 'Search subtitles automatically after a title is resolved.'],
+  'subtitles.verifyCandidates': ['Candidates to check', 'How many ranked hits the automatic search downloads and measures against the video (length, cue density) before it settles. 1 = trust the ranking.'],
+  'subtitles.autoRescale': ['Fix frame-rate drift', 'When a file is certainly timed for another frame rate (25 fps subtitles on a 23.976 fps video), rescale its timestamps on attach.'],
+  'subtitles.useMovieHash': ['Exact-file hash', 'Send OpenSubtitles the hash of the exact file (two small Range requests to the CDN) so subtitles made for that file come first.'],
   'subtitles.pushToReceiver': ['Push to receiver', 'Upload the chosen subtitle to the Enigma2 box as well.'],
   'subtitles.receiverDir': ['Receiver directory', 'Folder on the box that receives the .srt files.'],
   'subtitles.disabledProviders': ['Disabled providers', 'Provider ids to skip, comma separated (see the Subtitles tab).'],
@@ -4775,7 +4803,7 @@ async function mobileSubtitleSearch() {
     state.mobile.subs = results;
     host.innerHTML = results.length ? results.slice(0, 25).map((result, index) => `
       <div class="mob-sub">
-        <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span>
+        <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span> ${subtitleNoteTags(result)}
           <div class="meta">${escapeHtml(result.release || result.title || '')}</div></div>
         <button class="btn sm pri" data-mattach="${index}">attach</button>
       </div>`).join('') : '<div class="meta">nothing found for this language</div>';

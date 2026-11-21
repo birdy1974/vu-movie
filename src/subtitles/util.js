@@ -118,12 +118,228 @@ export function releaseTokens(name) {
     .filter((t) => t.length > 1 && !['the', 'a', 'of', 'and', 'x264', 'x265', 'h264', 'h265', 'aac', 'web', 'dl'].includes(t));
 }
 
+/* ------------------------------------------------------------------ *
+ * timing facts: what the video is, what the provider says, what the file says
+ * ------------------------------------------------------------------ */
+
+/** "01:47:44", "01:47:44,123", "1:47:44.5" → milliseconds (null when unreadable). */
+export function parseTimestampMs(stamp) {
+  const m = /(\d{1,3}):(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?/.exec(String(stamp || ''));
+  if (!m) return null;
+  const ms = ((+m[1]) * 3600 + (+m[2]) * 60 + (+m[3])) * 1000 + (m[4] ? Number(m[4].padEnd(3, '0')) : 0);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+const fmtClock = (ms) => {
+  const total = Math.max(0, Math.round(Number(ms) || 0) / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = Math.floor(total % 60);
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+};
+
 /**
- * Score a subtitle hit. Higher is better.
- * `target` = { title, year, release, season, episode, language }
+ * The frame-rate pairs that explain a subtitle running a few percent too fast
+ * or too slow: a file timed on a PAL (25 fps) release played on a 23.976 fps
+ * encode drifts linearly by 4.3 % — 25 s at 10 minutes, almost two minutes by
+ * the end of an episode. The ratio (subtitle length ÷ video length) names the
+ * pair; multiplying every timestamp by `scale` undoes it.
  */
-export function scoreResult(result, target = {}) {
+const FRAME_RATES = [23.976, 24, 25, 29.97, 30];
+export const FRAME_RATE_FACTORS = (() => {
+  const out = [];
+  for (const from of FRAME_RATES) {
+    for (const to of FRAME_RATES) {
+      if (from === to) continue;
+      const ratio = to / from;             // observed: subtitle timed at `from`, video runs at `to`
+      if (Math.abs(ratio - 1) < 0.01) continue;  // 23.976↔24 is 0.1 % — not detectable from lengths
+      out.push({ from, to, ratio, scale: from / to, label: `${from}→${to} fps` });
+    }
+  }
+  return out;
+})();
+
+/** The frame-rate pair whose length ratio matches `ratio`, or null. */
+export function frameRateFactorFor(ratio, tolerance = 0.006) {
+  if (!Number.isFinite(ratio)) return null;
+  let best = null;
+  for (const f of FRAME_RATE_FACTORS) {
+    const diff = Math.abs(ratio - f.ratio);
+    if (diff <= tolerance && (!best || diff < best.diff)) best = { ...f, diff };
+  }
+  return best;
+}
+
+/** Do two frame rates name the same timing (23.976 vs 23.98 vs 24)? */
+export function sameFrameRate(a, b, tolerance = 0.002) {
+  const x = Number(a);
+  const y = Number(b);
+  if (!(x > 0) || !(y > 0)) return null;
+  return Math.abs(x / y - 1) <= tolerance;
+}
+
+/** Start/end of every cue in an SRT (milliseconds), in file order. */
+export function parseCueTimes(srtText) {
+  const out = [];
+  const re = /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/g;
+  for (const m of String(srtText || '').matchAll(re)) {
+    const start = parseTimestampMs(m[1]);
+    const end = parseTimestampMs(m[2]);
+    if (start === null || end === null) continue;
+    out.push({ start, end });
+  }
+  return out;
+}
+
+const HI_LINE = /^\s*(?:[-–]\s*)?(?:[\[(][^\])]{1,60}[\])]|[A-Z][A-Z0-9 .'&-]{1,30}:)\s*$/;
+
+/**
+ * What a downloaded subtitle file looks like, measured — the facts the
+ * assessment below reasons about. Pure; no video needed.
+ */
+export function inspectSrt(srtText) {
+  const text = String(srtText || '');
+  const cues = parseCueTimes(text);
+  let overlaps = 0;
+  for (let i = 1; i < cues.length; i += 1) if (cues[i].start < cues[i - 1].end - 1) overlaps += 1;
+  const lines = text.split('\n').filter((l) => l.trim() && !/-->/.test(l) && !/^\d+\s*$/.test(l));
+  const hiLines = lines.filter((l) => HI_LINE.test(l)).length;
+  const firstMs = cues.length ? cues[0].start : null;
+  const lastMs = cues.length ? Math.max(...cues.map((c) => c.end)) : null;
+  return {
+    cues: cues.length,
+    firstMs,
+    lastMs,
+    spanMs: cues.length ? lastMs - firstMs : 0,
+    textLines: lines.length,
+    hiLines,
+    hiShare: lines.length ? hiLines / lines.length : 0,
+    overlaps,
+  };
+}
+
+/**
+ * Judge a downloaded subtitle against the video it is meant for.
+ *
+ * `video` = { durationSec, fps } from ffprobe (both optional); `meta` = the
+ * provider's own facts about the file ({ fps } — the frame rate of the video
+ * the subtitle was timed on).
+ *
+ * Returns { verdict, reasons, penalty, lengthRatio, suggestedScale, confidence }:
+ *   verdict        good | suspect | bad | unknown (no video length to compare)
+ *   penalty        points to take off the search score (0 for good)
+ *   suggestedScale multiply every timestamp by this to undo a frame-rate
+ *                  mismatch, or null; `confidence` says how sure that is:
+ *                  'high' only when the file runs *past* the end of the video
+ *                  (no credits can explain that) or the provider's fps
+ *                  confirms the same pair. Credits without dialogue make a
+ *                  correct file end 3–8 % early, so an early end alone is never
+ *                  "fixed" — it is only ranked below a file that fits.
+ */
+export function assessSubtitle(inspection, video = {}, meta = {}) {
+  const reasons = [];
+  let penalty = 0;
+  let verdict = 'unknown';
+  let suggestedScale = null;
+  let confidence = null;
+  let lengthRatio = null;
+  const bump = (points, reason) => { penalty += points; reasons.push(reason); };
+
+  if (!inspection || inspection.cues < 5) {
+    return { verdict: 'bad', reasons: ['almost no cues — not a usable subtitle'], penalty: 100, lengthRatio, suggestedScale, confidence };
+  }
+
+  const durationMs = Number(video.durationSec) > 0 ? Number(video.durationSec) * 1000 : null;
+  if (durationMs && inspection.lastMs) {
+    lengthRatio = inspection.lastMs / durationMs;
+    const factor = frameRateFactorFor(lengthRatio);
+    const fpsPairConfirmed = factor && meta.fps > 0 && video.fps > 0
+      && sameFrameRate(meta.fps, factor.from, 0.01) && sameFrameRate(video.fps, factor.to, 0.01);
+    const ends = `ends at ${fmtClock(inspection.lastMs)} of ${fmtClock(durationMs)}`;
+    if (lengthRatio >= 0.85 && lengthRatio <= 1.015) {
+      if (fpsPairConfirmed) {
+        // Ends early by exactly the pair the provider's fps predicts: that is
+        // drift, not credits.
+        verdict = 'suspect';
+        suggestedScale = factor.scale;
+        confidence = 'high';
+        bump(20, `${ends} — ${factor.label} drift (provider fps confirms)`);
+      } else {
+        verdict = 'good';
+        reasons.push('length fits the video');
+      }
+    } else if (lengthRatio > 1.015 && lengthRatio <= 1.08) {
+      verdict = 'suspect';
+      if (factor) {
+        suggestedScale = factor.scale;
+        confidence = 'high';
+        bump(20, `${ends} — ${factor.label} drift (runs past the end)`);
+      } else bump(15, `${ends} — runs past the end of the video`);
+    } else if (lengthRatio > 1.08) {
+      verdict = 'bad';
+      bump(40, `${ends} — much longer than the video (different cut?)`);
+    } else if (lengthRatio >= 0.6) {
+      verdict = 'suspect';
+      if (factor) {
+        suggestedScale = factor.scale;
+        confidence = fpsPairConfirmed ? 'high' : 'low';
+        bump(fpsPairConfirmed ? 20 : 10, `${ends} — ${fpsPairConfirmed ? `${factor.label} drift (provider fps confirms)` : `could be ${factor.label} drift`}`);
+      } else bump(10, `${ends} — ends early`);
+    } else {
+      verdict = 'bad';
+      bump(40, `${ends} — covers only part of the video (CD 1 of 2?)`);
+    }
+  }
+
+  // Density: a feature film with two cues a minute is a forced/foreign-parts
+  // track, not dialogue. Judged against the subtitle's own span so it works
+  // without a probe too.
+  const spanMin = inspection.spanMs / 60000;
+  if (spanMin >= 20 && inspection.cues / spanMin < 2) {
+    if (verdict !== 'bad') verdict = 'suspect';
+    bump(20, `only ${inspection.cues} cues in ${Math.round(spanMin)} min — forced / foreign-parts track?`);
+  }
+  if (inspection.hiShare > 0.25) {
+    bump(3, 'hearing-impaired (SDH) captions');
+  }
+  if (inspection.overlaps > inspection.cues * 0.2) {
+    if (verdict !== 'bad') verdict = 'suspect';
+    bump(8, `${inspection.overlaps} overlapping cues`);
+  }
+  return { verdict, reasons, penalty, lengthRatio, suggestedScale, confidence };
+}
+
+/** Multiply every timestamp by `factor` (1.0427 = 25 fps timing onto a 23.976 fps video). */
+export function applyScale(srtText, factor) {
+  const f = Number(factor);
+  if (!Number.isFinite(f) || f <= 0 || Math.abs(f - 1) < 1e-6) return srtText;
+  const fmt = (totalMs) => {
+    const clamped = Math.max(0, Math.round(totalMs));
+    const h = String(Math.floor(clamped / 3600000)).padStart(2, '0');
+    const m = String(Math.floor((clamped % 3600000) / 60000)).padStart(2, '0');
+    const s = String(Math.floor((clamped % 60000) / 1000)).padStart(2, '0');
+    const msec = String(clamped % 1000).padStart(3, '0');
+    return `${h}:${m}:${s},${msec}`;
+  };
+  return String(srtText).replace(/(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/g, (full, a, b) => {
+    const start = parseTimestampMs(a);
+    const end = parseTimestampMs(b);
+    if (start === null || end === null) return full;
+    return `${fmt(start * f)} --> ${fmt(end * f)}`;
+  });
+}
+
+/**
+ * Rank a subtitle hit against what we know about the video. Higher is better.
+ * `target` = { title, year, release, season, episode, languages,
+ *              durationSec, fps }   (the last two from the stream's ffprobe)
+ *
+ * Returns { score, notes }: `notes` are the short, user-facing reasons behind
+ * the metadata part of the score ("timed for 25 fps, video is 23.976").
+ */
+export function rankResult(result, target = {}) {
   let score = 0;
+  const notes = [];
   const lang = normaliseLang(result.language);
   const wanted = (target.languages || ['nl', 'en']).map(normaliseLang);
   const langRank = wanted.indexOf(lang);
@@ -141,11 +357,66 @@ export function scoreResult(result, target = {}) {
     if (r.includes(t) || t.includes(r)) score += 15;
   }
   if (target.year && result.year && Math.abs(Number(result.year) - Number(target.year)) <= 1) score += 8;
-  if (result.hashMatch) score += 25;
   if (result.downloads) score += Math.min(10, Math.log10(Number(result.downloads) + 1) * 4);
   if (result.rating) score += Math.max(0, Math.min(8, (Number(result.rating) - 5) * 1.5));
   if (result.episodeMatch) score += 10;
-  return Math.round(score * 10) / 10;
+
+  // ---- what the provider knows about the file vs. what ffprobe knows ----
+  // An exact file match (OpenSubtitles moviehash) is the one signal that
+  // practically guarantees sync: subliminal/Bazarr let it override every
+  // other criterion. Here it outranks release matching but not language.
+  if (result.hashMatch) { score += 35; notes.push({ text: 'exact file match', tone: 'ok' }); }
+
+  const subFps = Number(result.fps) || 0;
+  const videoFps = Number(target.fps) || 0;
+  if (subFps > 0 && videoFps > 0) {
+    const same = sameFrameRate(subFps, videoFps);
+    if (same) { score += 10; notes.push({ text: `${subFps} fps ✓`, tone: 'ok' }); }
+    else if (!sameFrameRate(subFps, videoFps, 0.02)) {
+      score -= 20;
+      notes.push({ text: `timed for ${subFps} fps, video is ${videoFps} — drift likely`, tone: 'warn' });
+    }
+  } else if (subFps > 0) {
+    notes.push({ text: `${subFps} fps`, tone: '' });
+  }
+
+  const durationMs = Number(target.durationSec) > 0 ? Number(target.durationSec) * 1000 : 0;
+  const lastMs = Number(result.lastTimestampMs) || 0;
+  if (durationMs && lastMs) {
+    const ratio = lastMs / durationMs;
+    const factor = frameRateFactorFor(ratio);
+    const fpsPairConfirmed = factor && subFps > 0 && videoFps > 0
+      && sameFrameRate(subFps, factor.from, 0.01) && sameFrameRate(videoFps, factor.to, 0.01);
+    const ends = `ends ${fmtClock(lastMs)} of ${fmtClock(durationMs)}`;
+    if (fpsPairConfirmed) { score -= 10; notes.push({ text: `${ends} — ${factor.label} drift pattern`, tone: 'warn' }); }
+    else if (ratio >= 0.88 && ratio <= 1.02) { score += 10; notes.push({ text: 'length fits', tone: 'ok' }); }
+    else if (factor && ratio > 1) { score -= 20; notes.push({ text: `${ends} — ${factor.label} drift`, tone: 'warn' }); }
+    else if (ratio < 0.6) { score -= 25; notes.push({ text: `${ends} — part of a multi-CD set?`, tone: 'warn' }); }
+    else if (ratio > 1.08) { score -= 25; notes.push({ text: `${ends} — longer than the video`, tone: 'warn' }); }
+    else if (ratio < 0.88) { score -= factor ? 8 : 5; notes.push({ text: `${ends}${factor ? ` — ${factor.label} drift or long credits` : ''}`, tone: 'warn' }); }
+    else { score -= 5; notes.push({ text: ends, tone: 'warn' }); }
+  }
+  const videoMs = Number(result.videoDurationMs) || 0;
+  if (durationMs && videoMs) {
+    const diff = Math.abs(videoMs / durationMs - 1);
+    if (diff <= 0.015) { score += 6; notes.push({ text: `made for a ${fmtClock(videoMs)} video`, tone: 'ok' }); }
+    else if (diff > 0.06) { score -= 8; notes.push({ text: `made for a ${fmtClock(videoMs)} video`, tone: 'warn' }); }
+  }
+
+  if (Number(result.cds) > 1) { score -= 20; notes.push({ text: `${result.cds}-CD release`, tone: 'warn' }); }
+  if (result.foreignPartsOnly) { score -= 30; notes.push({ text: 'foreign parts only', tone: 'warn' }); }
+  if (result.machineTranslated) { score -= 25; notes.push({ text: 'machine translated', tone: 'warn' }); }
+  else if (result.aiTranslated) { score -= 5; notes.push({ text: 'AI translated', tone: '' }); }
+  if (result.hearingImpaired) { score -= 3; notes.push({ text: 'SDH', tone: '' }); }
+  if (result.bad) { score -= 30; notes.push({ text: 'flagged as bad', tone: 'warn' }); }
+  if (result.trusted) { score += 5; notes.push({ text: 'trusted uploader', tone: 'ok' }); }
+
+  return { score: Math.round(score * 10) / 10, notes };
+}
+
+/** The numeric part of rankResult() — kept for callers that only sort. */
+export function scoreResult(result, target = {}) {
+  return rankResult(result, target).score;
 }
 
 /** Extract .srt out of a downloaded archive using the CLI tools in the image. */
@@ -272,7 +543,8 @@ export function extractSubtitleFromBuffer(buffer, tmpDir = null) {
 }
 
 export default {
-  decodeSubtitle, cleanSrt, countCues, vttToSrt, applyOffset, scoreResult,
+  decodeSubtitle, cleanSrt, countCues, vttToSrt, applyOffset, applyScale, scoreResult, rankResult,
+  parseTimestampMs, parseCueTimes, inspectSrt, assessSubtitle, frameRateFactorFor, sameFrameRate,
   normaliseLang, releaseTokens, extractSubtitleFromArchive, extractSubtitleFromBuffer,
   readZipEntries, isZip, isRar,
 };

@@ -822,7 +822,7 @@ router.post('/streams', wrap(async (req, res) => {
   let subtitleError = null;
   if (subtitleResult) {
     try {
-      const fetched = await subs.fetchSubtitle(subtitleResult);
+      const fetched = await subs.fetchSubtitle(subtitleResult, { video: await subs.videoFactsFor(stream, { hash: false }) });
       await attachSubtitleToStream(stream, fetched);
       log.info('subtitles', `selected subtitle attached to "${stream.title}"`, { provider: fetched.provider, language: fetched.language });
       if (getConfig().subtitles.pushToReceiver) {
@@ -875,7 +875,10 @@ function afterStreamCreated(stream, baseUrl, { skipSubtitleSearch = false } = {}
 /** Search + attach the best subtitle for a stream that was just created. */
 async function autoAttachSubtitle(stream) {
   const cfgObject = getConfig();
+  // The probe's length/frame rate and the file hash let the search rank by
+  // "fits this video" and let autoFetch measure what it downloads.
   const target = {
+    ...(await subs.videoFactsFor(stream)),
     title: stream.title, year: stream.year, kind: stream.kind,
     season: stream.upstream?.season || null, episode: stream.upstream?.episode || null,
     languages: cfgObject.subtitles.languages,
@@ -883,7 +886,10 @@ async function autoAttachSubtitle(stream) {
   const fetched = await subs.autoFetch(target);
   if (!fetched) return;
   await attachSubtitleToStream(stream, fetched);
-  log.info('subtitles', `subtitle attached automatically to "${stream.title}"`, { language: fetched.language });
+  log.info('subtitles', `subtitle attached automatically to "${stream.title}"`, {
+    language: fetched.language, verdict: fetched.check?.verdict,
+    ...(fetched.adjustment ? { rescaled: `×${fetched.adjustment.scale}` } : {}),
+  });
   if (cfgObject.subtitles.pushToReceiver) {
     const pushed = await pushSubtitleToReceiver({ stream, language: fetched.language });
     if (!pushed.ok) log.warn('subtitles', 'could not push the subtitle to the receiver', { error: pushed.error });
@@ -1297,6 +1303,10 @@ router.get('/subtitles/providers', wrap(async (req, res) => {
 router.post('/subtitles/search', wrap(async (req, res) => {
   const body = req.body || {};
   const stream = body.streamId ? await store.getStream(body.streamId) : null;
+  // With a stream the search knows the video: its length and frame rate rank
+  // the hits ("timed for 25 fps, video is 23.976"), and for a plain file the
+  // moviehash puts subtitles made for that exact file first.
+  const facts = stream ? await subs.videoFactsFor(stream) : {};
   const target = {
     title: body.title || stream?.title,
     year: body.year || stream?.year,
@@ -1305,8 +1315,12 @@ router.post('/subtitles/search', wrap(async (req, res) => {
     episode: body.episode || stream?.upstream?.episode || null,
     imdb: body.imdb || null,
     tmdb: body.tmdb || null,
-    release: body.release || stream?.upstream?.label || null,
+    release: body.release || facts.release || null,
     languages: body.languages || cfg('subtitles.languages'),
+    durationSec: facts.durationSec || null,
+    fps: facts.fps || null,
+    moviehash: facts.moviehash || null,
+    sizeBytes: facts.sizeBytes || null,
   };
   if (!target.title) return res.status(400).json({ ok: false, error: 'title or streamId is required' });
   const results = await subs.searchSubtitles(target);
@@ -1316,14 +1330,18 @@ router.post('/subtitles/search', wrap(async (req, res) => {
 router.post('/subtitles/download', wrap(async (req, res) => {
   const { result, offsetMs = 0, streamId = null, push = null, language = null } = req.body || {};
   if (!result?.providerId) return res.status(400).json({ ok: false, error: 'result is required' });
-  const fetched = await subs.fetchSubtitle(result, { offsetMs: Number(offsetMs) || 0 });
-  let stored = null;
   let stream = null;
   if (streamId) {
     stream = await store.getStream(streamId);
     if (!stream) return res.status(404).json({ ok: false, error: 'stream not found' });
-    stored = await attachSubtitleToStream(stream, fetched);
   }
+  // Measured against the stream's video when there is one: the answer's
+  // `check` says whether the file fits and `adjustment` whether a certain
+  // frame-rate drift was corrected on the way in.
+  const video = stream ? await subs.videoFactsFor(stream, { hash: false }) : null;
+  const fetched = await subs.fetchSubtitle(result, { offsetMs: Number(offsetMs) || 0, video });
+  let stored = null;
+  if (stream) stored = await attachSubtitleToStream(stream, fetched);
   // `push` wins when the caller says so explicitly; otherwise the setting is the
   // default ("setting to push subtitle file to satellite receiver" in
   // requirements.md) — it used to be read by nothing at all.

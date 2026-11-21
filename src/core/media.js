@@ -1455,6 +1455,9 @@ export function parseProbeJson(json) {
       width: num(video.width),
       height: num(video.height),
       fps: parseFps(video.r_frame_rate || video.avg_frame_rate),
+      // frames ÷ duration — the rate to compare subtitle timings against
+      // (r_frame_rate is the nominal base and reads 1000/90000 on VFR input).
+      avgFps: parseFps(video.avg_frame_rate),
       pixFmt: video.pix_fmt || null,
       bitrate: num(video.bit_rate),
       hdr: /bt2020|smpte2084|arib-std-b67/i.test(String(video.color_transfer || '')),

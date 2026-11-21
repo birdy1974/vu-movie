@@ -23,9 +23,14 @@ import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { request, CookieJar } from '../scrapers/http.js';
 import {
-  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, countCues, scoreResult, normaliseLang,
-  extractSubtitleFromBuffer, isZip, isRar,
+  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, applyScale, countCues, rankResult, normaliseLang,
+  parseTimestampMs, inspectSrt, assessSubtitle, extractSubtitleFromBuffer, isZip, isRar,
 } from './util.js';
+import { cachedMovieHash } from './moviehash.js';
+import { streamKind } from '../core/media.js';
+
+/** "1" / 1 / true / "true" → true (the legacy API sends flags as strings). */
+const flag = (v) => v === true || v === 1 || v === '1' || v === 'true';
 
 /* ------------------------------------------------------------------ *
  * minimal XML-RPC support (OpenSubtitles.org legacy API)
@@ -235,9 +240,14 @@ class OpenSubtitlesOrg extends Provider {
     const langs = (ctx.languages || ['nl', 'en']).map((l) => (l === 'nl' ? 'dut' : l === 'en' ? 'eng' : l));
     const queries = [];
     for (const sublanguageid of langs) {
+      // The exact-file query first: a moviehash hit is the one answer that is
+      // known to be in sync. The title/imdb query runs next to it so a file
+      // nobody uploaded a subtitle for still gets the usual candidates.
+      if (ctx.moviehash && ctx.sizeBytes) {
+        queries.push({ sublanguageid, moviehash: ctx.moviehash, moviebytesize: String(ctx.sizeBytes) });
+      }
       const q = { sublanguageid, ...(ctx.imdb ? { imdbid: String(ctx.imdb).replace(/^tt/, '') } : { query: ctx.title }) };
       if (ctx.kind === 'series') { q.season = ctx.season || 1; q.episode = ctx.episode || 1; }
-      if (ctx.year && ctx.kind !== 'series') q.moviehash = undefined;
       queries.push(q);
     }
     const [result] = await this.call('SearchSubtitles', [token, queries]);
@@ -245,9 +255,24 @@ class OpenSubtitlesOrg extends Provider {
       this.setState(false, `status ${result?.status}`);
       throw new Error(`SearchSubtitles failed with status ${result?.status}`);
     }
-    const rows = result.data || [];
-    this.setState(true, `${rows.length} hits`);
-    return rows.map((r) => ({
+    const rows = Array.isArray(result.data) ? result.data : [];
+    const seen = new Map();
+    for (const r of rows) {
+      const mapped = this.mapRow(r);
+      const previous = seen.get(mapped.id);
+      // The same file can answer both queries; keep the hash-matched copy.
+      if (!previous || (mapped.hashMatch && !previous.hashMatch)) seen.set(mapped.id, mapped);
+    }
+    const hits = [...seen.values()];
+    const hashHits = hits.filter((h) => h.hashMatch).length;
+    this.setState(true, `${hits.length} hits${hashHits ? ` (${hashHits} exact file match${hashHits > 1 ? 'es' : ''})` : ''}`);
+    return hits;
+  }
+
+  /** One SearchSubtitles row → the normalised result, timing facts included. */
+  mapRow(r) {
+    const cds = Number(r.SubSumCD) || 1;
+    return {
       providerId: this.id,
       language: normaliseLang(r.SubLanguageID),
       title: r.MovieName,
@@ -255,12 +280,24 @@ class OpenSubtitlesOrg extends Provider {
       year: r.MovieYear ? Number(r.MovieYear) : null,
       downloads: Number(r.SubDownloadsCnt || 0),
       rating: r.SubRating ? Number(r.SubRating) : null,
-      hashMatch: Boolean(r.MovieHashMatch),
+      // MatchedBy names the query that found the row: moviehash / imdbid / tag / fulltext.
+      hashMatch: String(r.MatchedBy || '').toLowerCase() === 'moviehash',
+      matchedBy: r.MatchedBy || null,
       id: r.IDSubtitleFile,
       url: r.SubDownloadLink,
       format: (r.SubFormat || 'srt').toLowerCase(),
-      episodeMatch: Boolean(r.SeriesEpisode),
-    }));
+      episodeMatch: Boolean(Number(r.SeriesEpisode)),
+      // --- what the uploader's video looked like ---
+      fps: Number(r.MovieFPS) > 0 ? Number(r.MovieFPS) : null,
+      videoDurationMs: Number(r.MovieTimeMS) > 0 ? Number(r.MovieTimeMS) : null,
+      lastTimestampMs: parseTimestampMs(r.SubLastTS),
+      cds,
+      hearingImpaired: flag(r.SubHearingImpaired),
+      foreignPartsOnly: flag(r.SubForeignPartsOnly),
+      machineTranslated: flag(r.SubAutoTranslation),
+      trusted: flag(r.SubFromTrusted),
+      bad: Number(r.SubBad) > 0,
+    };
   }
 
   async download(result) {
@@ -312,6 +349,7 @@ class SubDL extends Provider {
       url: r.url ? `https://dl.subdl.com${r.url}` : null,
       format: 'srt',
       episodeMatch: Boolean(r.episode),
+      hearingImpaired: r.hi === true || r.hi === 1,
     })).filter((r) => r.url);
   }
 
@@ -344,12 +382,13 @@ class OpenSubtitlesCom extends Provider {
     if (ctx.kind === 'series') { params.set('type', 'episode'); params.set('season_number', String(ctx.season || 1)); params.set('episode_number', String(ctx.episode || 1)); }
     else params.set('type', 'movie');
     if (ctx.year) params.set('year', String(ctx.year));
+    // With a moviehash the API puts exact-file matches first and flags them.
+    if (ctx.moviehash) params.set('moviehash', ctx.moviehash);
 
     const res = await request(`https://api.opensubtitles.com/api/v1/subtitles?${params}`, { headers: this.headers(), json: true, allowFailure: true });
     if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
     const rows = res.data?.data || [];
-    this.setState(true, `${rows.length} hits`);
-    return rows.map((r) => {
+    const hits = rows.map((r) => {
       const a = r.attributes || {};
       return {
         providerId: this.id,
@@ -363,8 +402,19 @@ class OpenSubtitlesCom extends Provider {
         id: a.files?.[0]?.file_id,
         format: 'srt',
         episodeMatch: Boolean(a.feature_details?.episode_number),
+        hashMatch: a.moviehash_match === true,
+        fps: Number(a.fps) > 0 ? Number(a.fps) : null,
+        cds: Number(a.nb_cd) || (Array.isArray(a.files) && a.files.length > 1 ? a.files.length : 1),
+        hearingImpaired: a.hearing_impaired === true,
+        foreignPartsOnly: a.foreign_parts_only === true,
+        machineTranslated: a.machine_translated === true,
+        aiTranslated: a.ai_translated === true,
+        trusted: a.from_trusted === true,
       };
     }).filter((r) => r.fileId);
+    const hashHits = hits.filter((h) => h.hashMatch).length;
+    this.setState(true, `${hits.length} hits${hashHits ? ` (${hashHits} exact file match${hashHits > 1 ? 'es' : ''})` : ''}`);
+    return hits;
   }
 
   async download(result) {
@@ -911,8 +961,44 @@ export async function testProvider(id) {
 }
 
 /**
+ * What the stream itself tells us about the video, for ranking and checking
+ * subtitles: the ffprobe length and frame rate, the release label, and — for
+ * a plain file on a Range-capable CDN — the OpenSubtitles moviehash of that
+ * exact file. Fields the stream cannot answer stay absent, so a caller's own
+ * values (`target` wins) and the plain title search keep working.
+ *
+ * @param {object} stream  a stored stream record
+ * @param {object} [opts]
+ * @param {boolean} [opts.hash=true] also compute the moviehash (two small
+ *   ranged requests; cached per URL; skipped for HLS/DASH and when
+ *   `subtitles.useMovieHash` is off)
+ */
+export async function videoFactsFor(stream, { hash = true } = {}) {
+  const upstream = stream?.upstream || {};
+  const probe = upstream.probe || {};
+  const facts = {};
+  const durationSec = Number(probe.durationSec) || Number(upstream.durationSec) || 0;
+  if (durationSec > 0) facts.durationSec = durationSec;
+  // avg_frame_rate is frames ÷ duration; r_frame_rate is the container's
+  // nominal base rate and reads 1000 or 90000 on variable-rate streams. For a
+  // "same timing?" comparison the average is the honest one.
+  const fps = Number(probe.video?.avgFps) || Number(probe.video?.fps) || 0;
+  if (fps > 0 && fps < 130) facts.fps = Math.round(fps * 1000) / 1000;
+  if (upstream.label) facts.release = upstream.label;
+  if (hash && upstream.url && getConfig().subtitles.useMovieHash !== false) {
+    const kind = upstream.kind || streamKind(upstream.url);
+    if (kind === 'file') {
+      const hashed = await cachedMovieHash(upstream.url, { headers: upstream.headers || {} });
+      if (hashed) { facts.moviehash = hashed.hash; facts.sizeBytes = hashed.size; }
+    }
+  }
+  return facts;
+}
+
+/**
  * Search all enabled providers and rank the hits.
- * @param {object} target { title, year, kind, season, episode, imdb, tmdb, release, languages }
+ * @param {object} target { title, year, kind, season, episode, imdb, tmdb, release, languages,
+ *                          durationSec, fps, moviehash, sizeBytes }  (see videoFactsFor)
  */
 export async function searchSubtitles(target) {
   const cfg = getConfig();
@@ -921,6 +1007,9 @@ export async function searchSubtitles(target) {
   const active = allProviders().filter((p) => p.enabled);
   log.info('subtitles', `searching ${active.length} provider(s)`, {
     title: target.title, languages: languages.join(','), providers: active.map((p) => p.id).join(','),
+    ...(target.durationSec ? { durationSec: Math.round(target.durationSec) } : {}),
+    ...(target.fps ? { fps: target.fps } : {}),
+    ...(target.moviehash ? { moviehash: target.moviehash } : {}),
   });
 
   const settled = await Promise.all(active.map(async (p) => {
@@ -937,11 +1026,15 @@ export async function searchSubtitles(target) {
   }));
 
   const all = settled.flat()
-    .map((r) => ({ ...r, score: scoreResult(r, { ...target, languages }) }))
+    .map((r) => {
+      const { score, notes } = rankResult(r, { ...target, languages });
+      return { ...r, score, notes };
+    })
     .sort((a, b) => b.score - a.score);
 
   log.info('subtitles', `total ${all.length} subtitle candidate(s)`, {
     best: all[0] ? `${all[0].providerId}/${all[0].language} ${all[0].release}` : 'none',
+    ...(all[0]?.notes?.length ? { notes: all[0].notes.map((n) => n.text).join('; ') } : {}),
   });
   return all;
 }
@@ -949,8 +1042,21 @@ export async function searchSubtitles(target) {
 /**
  * Download a hit and return normalised SRT text.
  * Handles .gz/.zip/.rar archives and VTT responses transparently.
+ *
+ * With `video` ({ durationSec, fps } — see videoFactsFor) the file is also
+ * measured against the video: the answer carries `check` (verdict, reasons,
+ * penalty) and, when a frame-rate mismatch is certain and `rescale` allows
+ * it, the timestamps are corrected and `adjustment` says by how much.
+ *
+ * @param {object} result   a search hit
+ * @param {object} [opts]
+ * @param {number} [opts.offsetMs]  shift applied after any rescale
+ * @param {object} [opts.video]     { durationSec, fps }
+ * @param {'auto'|false} [opts.rescale='auto']  'auto' = fix a certain
+ *   frame-rate drift (setting `subtitles.autoRescale`); false = never touch
+ *   the timing, only report
  */
-export async function fetchSubtitle(result, { offsetMs = 0 } = {}) {
+export async function fetchSubtitle(result, { offsetMs = 0, video = null, rescale = 'auto' } = {}) {
   const provider = getProvider(result.providerId);
   if (!provider) throw new Error(`unknown provider ${result.providerId}`);
   const t0 = Date.now();
@@ -973,6 +1079,28 @@ export async function fetchSubtitle(result, { offsetMs = 0 } = {}) {
   if (/^WEBVTT/.test(text.trim())) text = vttToSrt(text);
   let srt = cleanSrt(text);
   if (!/-->/.test(srt)) throw new Error('downloaded file does not look like a subtitle');
+
+  // Measure the file against the video (see assessSubtitle for the rules).
+  const inspection = inspectSrt(srt);
+  const check = assessSubtitle(inspection, video || {}, { fps: result.fps });
+  let adjustment = null;
+  const allowRescale = rescale === 'auto' && getConfig().subtitles.autoRescale !== false;
+  if (allowRescale && check.suggestedScale && check.confidence === 'high') {
+    srt = applyScale(srt, check.suggestedScale);
+    const after = inspectSrt(srt);
+    adjustment = {
+      scale: Math.round(check.suggestedScale * 10000) / 10000,
+      label: check.reasons.find((r) => /fps/.test(r)) || 'frame-rate drift corrected',
+      lastMs: after.lastMs,
+    };
+    log.info('subtitles', `frame-rate drift corrected (×${adjustment.scale})`, {
+      provider: provider.id, release: truncate(result.release || '', 60), reason: adjustment.label,
+    });
+  } else if (check.verdict === 'suspect' || check.verdict === 'bad') {
+    log.warn('subtitles', `subtitle looks ${check.verdict}: ${check.reasons.join('; ')}`, {
+      provider: provider.id, release: truncate(result.release || '', 60),
+    });
+  }
   if (offsetMs) srt = applyOffset(srt, offsetMs);
   return {
     srt,
@@ -981,6 +1109,8 @@ export async function fetchSubtitle(result, { offsetMs = 0 } = {}) {
     provider: result.providerId,
     release: result.release || result.title,
     filename: `${result.release || result.title || 'subtitle'}.${normaliseLang(result.language)}.srt`,
+    check: { ...check, cues: inspection.cues, lastMs: inspection.lastMs, hiShare: Math.round(inspection.hiShare * 100) / 100 },
+    adjustment,
   };
 }
 
@@ -995,22 +1125,70 @@ export function storeSubtitle(srtText, { slug, language }) {
   return file;
 }
 
-/** One-shot: search + pick the best hit + download it. */
+/**
+ * One-shot: search, then download the best hit *that holds up*.
+ *
+ * The ranking is a prediction; the file is the proof. Up to
+ * `subtitles.verifyCandidates` hits (default 3) are downloaded in rank order
+ * and measured against the video (`target.durationSec` / `target.fps`, see
+ * videoFactsFor). The first one that fits is used; otherwise the fetched file
+ * with the best score-after-penalty wins, so a wrong-cut or two-CD file no
+ * longer gets attached just because it ranked first. OpenSubtitles.com
+ * downloads are metered (5–20 a day), so at most one candidate per search
+ * comes from there.
+ */
 export async function autoFetch(target, { offsetMs = 0 } = {}) {
   const results = await searchSubtitles(target);
   if (!results.length) {
     log.warn('subtitles', 'no subtitle found', { title: target.title, languages: target.languages });
     return null;
   }
-  const best = results[0];
-  log.info('subtitles', `auto-selected subtitle`, {
-    provider: best.providerId, language: best.language, release: truncate(best.release, 80), score: best.score,
+  const video = { durationSec: target.durationSec || null, fps: target.fps || null };
+  const budget = Math.max(1, Number(getConfig().subtitles.verifyCandidates) || 1);
+  let tried = 0;
+  let meteredUsed = false;
+  let best = null;
+  let lastError = null;
+  for (const candidate of results) {
+    if (tried >= budget) break;
+    if (candidate.providerId === 'opensubtitles-com' && meteredUsed) continue;
+    let fetched;
+    try {
+      fetched = await fetchSubtitle(candidate, { offsetMs, video });
+    } catch (err) {
+      lastError = err;
+      logError('subtitles', `candidate from ${candidate.providerId} could not be fetched — trying the next one`, err, {
+        release: truncate(candidate.release || '', 80),
+      });
+      continue;
+    }
+    tried += 1;
+    if (candidate.providerId === 'opensubtitles-com') meteredUsed = true;
+    // A rescaled file is an exact fix when the diagnosis is right; a file that
+    // fits as delivered is still the safer pick, so the correction costs a few
+    // points and the search goes on looking for a native fit.
+    const effective = candidate.score - (fetched.adjustment ? 5 : fetched.check.penalty);
+    log.info('subtitles', `candidate ${tried}/${budget}: ${fetched.check.verdict}`, {
+      provider: candidate.providerId, language: candidate.language, release: truncate(candidate.release || '', 80),
+      score: candidate.score, effective, reasons: fetched.check.reasons.join('; ') || '—',
+      ...(fetched.adjustment ? { rescaled: `×${fetched.adjustment.scale}` } : {}),
+    });
+    if (!best || effective > best.effective) best = { fetched, result: candidate, effective };
+    if (fetched.check.verdict === 'good') break;
+    if (fetched.check.verdict === 'unknown' && !video.durationSec) break;   // nothing to compare against — the ranking is all we have
+  }
+  if (!best) {
+    if (lastError) throw lastError;
+    return null;
+  }
+  log.info('subtitles', 'auto-selected subtitle', {
+    provider: best.result.providerId, language: best.result.language, release: truncate(best.result.release || '', 80),
+    score: best.result.score, verdict: best.fetched.check.verdict, tried,
   });
-  const fetched = await fetchSubtitle(best, { offsetMs });
-  return { ...fetched, result: best, alternatives: results.slice(1, 10) };
+  return { ...best.fetched, result: best.result, alternatives: results.filter((r) => r !== best.result).slice(0, 10) };
 }
 
 export default {
-  listProviders, searchSubtitles, fetchSubtitle, storeSubtitle, autoFetch, testProvider,
+  listProviders, searchSubtitles, fetchSubtitle, storeSubtitle, autoFetch, testProvider, videoFactsFor,
   getProvider, parseXmlRpc, CustomProvider, parseAddic7edRows, parseTvsubsSeason, parseTvsubsEpisode,
 };
