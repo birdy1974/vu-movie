@@ -23,7 +23,7 @@ import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { request, CookieJar } from '../scrapers/http.js';
 import {
-  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, applyScale, countCues, rankResult, normaliseLang,
+  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, applyScale, countCues, rankResult, matchesTarget, normaliseLang,
   parseTimestampMs, inspectSrt, assessSubtitle, extractSubtitleFromBuffer, isZip, isRar,
 } from './util.js';
 import { cachedMovieHash } from './moviehash.js';
@@ -996,11 +996,61 @@ export async function videoFactsFor(stream, { hash = true } = {}) {
 }
 
 /**
+ * The technical facts of a stream's video for display next to its title
+ * (duration, resolution, codecs, frame rate, bitrate, container) — or null
+ * when nothing was ever probed.
+ */
+export function videoSummaryFor(stream) {
+  const upstream = stream?.upstream || {};
+  const probe = upstream.probe || {};
+  const video = probe.video || null;
+  const audio = Array.isArray(probe.audio) ? probe.audio[0] : null;
+  const durationSec = Number(probe.durationSec) || Number(upstream.durationSec) || null;
+  const width = Number(upstream.width) || Number(video?.width) || null;
+  const height = Number(upstream.height) || Number(video?.height) || null;
+  const summary = {
+    durationSec,
+    width, height,
+    resolution: width && height ? `${width}×${height}` : upstream.resolution || upstream.quality || null,
+    videoCodec: video?.codec || null,
+    profile: video?.profile || null,
+    fps: Number(video?.avgFps) || Number(video?.fps) || null,
+    nominalFps: Number(video?.fps) || null,
+    hdr: video?.hdr === true,
+    interlaced: video?.interlaced === true,
+    bitrate: Number(probe.bitrate) || null,
+    videoBitrate: Number(video?.bitrate) || null,
+    audioCodec: audio?.codec || null,
+    audioChannels: Number(audio?.channels) || null,
+    audioLanguage: audio?.language || null,
+    audioTracks: Array.isArray(probe.audio) ? probe.audio.length : null,
+    subtitleTracks: Array.isArray(probe.subtitles) ? probe.subtitles.length : null,
+    container: probe.container || null,
+    sizeBytes: Number(probe.sizeBytes) || null,
+    kind: upstream.kind || null,
+    label: upstream.label || null,
+  };
+  return Object.values(summary).some((v) => v !== null && v !== false) ? summary : null;
+}
+
+/**
  * Search all enabled providers and rank the hits.
  * @param {object} target { title, year, kind, season, episode, imdb, tmdb, release, languages,
  *                          durationSec, fps, moviehash, sizeBytes }  (see videoFactsFor)
+ * @returns {Promise<object[]>} the related hits, best first (see searchSubtitlesDetailed
+ *   for the count of unrelated hits that were dropped)
  */
 export async function searchSubtitles(target) {
+  return (await searchSubtitlesDetailed(target)).results;
+}
+
+/**
+ * searchSubtitles() plus what was left out: hits that do not name the wanted
+ * title (or name another year / episode) are dropped — keyword providers
+ * answer "Heat" with Heat Wave and Dead Heat — and counted in `dropped`.
+ * @returns {Promise<{results: object[], dropped: number, droppedExamples: string[]}>}
+ */
+export async function searchSubtitlesDetailed(target) {
   const cfg = getConfig();
   const languages = target.languages?.length ? target.languages : cfg.subtitles.languages;
   const ctx = { ...target, languages };
@@ -1025,18 +1075,28 @@ export async function searchSubtitles(target) {
     }
   }));
 
-  const all = settled.flat()
+  const related = [];
+  const droppedExamples = [];
+  let dropped = 0;
+  for (const r of settled.flat()) {
+    const match = matchesTarget(r, target);
+    if (match.ok) { related.push(r); continue; }
+    dropped += 1;
+    if (droppedExamples.length < 5) droppedExamples.push(`${r.providerId}: ${truncate(r.release || r.title || '?', 60)} (${match.reason})`);
+  }
+  const all = related
     .map((r) => {
       const { score, notes } = rankResult(r, { ...target, languages });
       return { ...r, score, notes };
     })
     .sort((a, b) => b.score - a.score);
 
-  log.info('subtitles', `total ${all.length} subtitle candidate(s)`, {
+  log.info('subtitles', `total ${all.length} subtitle candidate(s)${dropped ? `, ${dropped} unrelated hit(s) dropped` : ''}`, {
     best: all[0] ? `${all[0].providerId}/${all[0].language} ${all[0].release}` : 'none',
     ...(all[0]?.notes?.length ? { notes: all[0].notes.map((n) => n.text).join('; ') } : {}),
+    ...(dropped ? { dropped: droppedExamples.join(' | ') } : {}),
   });
-  return all;
+  return { results: all, dropped, droppedExamples };
 }
 
 /**
@@ -1189,6 +1249,7 @@ export async function autoFetch(target, { offsetMs = 0 } = {}) {
 }
 
 export default {
-  listProviders, searchSubtitles, fetchSubtitle, storeSubtitle, autoFetch, testProvider, videoFactsFor,
+  listProviders, searchSubtitles, searchSubtitlesDetailed, fetchSubtitle, storeSubtitle, autoFetch, testProvider,
+  videoFactsFor, videoSummaryFor,
   getProvider, parseXmlRpc, CustomProvider, parseAddic7edRows, parseTvsubsSeason, parseTvsubsEpisode,
 };

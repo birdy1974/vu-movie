@@ -1323,8 +1323,13 @@ router.post('/subtitles/search', wrap(async (req, res) => {
     sizeBytes: facts.sizeBytes || null,
   };
   if (!target.title) return res.status(400).json({ ok: false, error: 'title or streamId is required' });
-  const results = await subs.searchSubtitles(target);
-  res.json({ ok: true, target, results: results.slice(0, 80), providers: subs.listProviders() });
+  const { results, dropped, droppedExamples } = await subs.searchSubtitlesDetailed(target);
+  res.json({
+    ok: true, target, results: results.slice(0, 80), dropped, droppedExamples,
+    // The video's own technical facts, shown next to the title in the UI.
+    video: stream ? subs.videoSummaryFor(stream) : null,
+    providers: subs.listProviders(),
+  });
 }));
 
 router.post('/subtitles/download', wrap(async (req, res) => {

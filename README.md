@@ -338,6 +338,19 @@ Search, preview the cues, **shift the timing** (+/− ms), download the `.srt`, 
 push it to the receiver (`/media/hdd/movie/vumovie`, configurable) so the Duo2
 picks it up next to the recording.
 
+**Only this film.** Keyword providers answer "Heat" with *Heat Wave*, *Dead
+Heat* and *Casino* too. A hit is offered only when its name carries the words
+of the wanted title (all of them for short titles, most of them for long ones
+— "Dead Reckoning" without the "Part One" still passes) **and** its year
+agrees within one year of the film's; a title that says more than was asked
+for (*Heat Wave*) needs an agreeing year to vouch for it. Series compare
+`SxxEyy` instead of the year; an exact file-hash match is kept whatever it is
+called. The result header counts the hidden hits (`12 unrelated hits hidden
+(title/year did not match)`; hover for examples). Next to the title the
+video's own facts are shown — `1h 50m · 1920×1080 · h264 High · 23.976 fps ·
+6.3 Mb/s · eac3 5.1 · matroska` — so a hit's `25 fps` or `ends 1:42` can be
+read against the file it is meant for.
+
 **Picking the one that fits.** When the search runs for a playlist item the
 stream's ffprobe facts take part — its length and average frame rate — and
 each hit shows *why* it ranks where it does (tags such as `exact file match`,

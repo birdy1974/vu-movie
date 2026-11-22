@@ -23,6 +23,7 @@ process.env.DOWNLOADS_DIR = path.join(tempDir, 'downloads');
 
 const {
   parseTimestampMs, parseCueTimes, inspectSrt, assessSubtitle, applyScale, rankResult, scoreResult, frameRateFactorFor,
+  matchesTarget, yearInRelease, episodeInRelease,
 } = await import('../src/subtitles/util.js');
 const { movieHashFromBuffer, movieHashFromChunks, fetchMovieHash, cachedMovieHash, resetMovieHashCache, CHUNK } = await import('../src/subtitles/moviehash.js');
 const { saveConfig, getConfig } = await import('../src/core/config.js');
@@ -244,7 +245,15 @@ async function subtitleSite(files) {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/search') {
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ subtitles: Object.keys(files).map((name) => ({ url: `/files/${name}.srt`, title: 'Heat', release: name, language: 'nl' })) }));
+      res.end(JSON.stringify({
+        subtitles: Object.keys(files).map((name) => ({ url: `/files/${name}.srt`, title: 'Heat', release: name, language: 'nl' }))
+          // Unrelated hits a keyword provider throws in for "heat".
+          .concat([
+            { url: '/files/x-heatwave.srt', title: 'Heat Wave', release: 'Heat.Wave.2022.1080p.WEB', language: 'nl' },
+            { url: '/files/x-deadheat.srt', title: 'Dead Heat', release: 'Dead.Heat.1988.BluRay', language: 'nl' },
+            { url: '/files/x-casino.srt', title: 'Casino', release: 'Casino.1995.1080p', language: 'nl' },
+          ]),
+      }));
       return;
     }
     const m = /^\/files\/(.+)\.srt$/.exec(url.pathname);
@@ -348,7 +357,7 @@ test('without a video length the first ranked hit is taken, as before', async ()
 
 test('the search results carry the video facts and the ranking notes', async () => {
   const results = await subs.searchSubtitles({ title: 'Heat', kind: 'movie', languages: ['nl'], durationSec: 6300, fps: 25 });
-  assert.equal(results.length, 3);
+  assert.equal(results.length, 3, 'without a year "Heat Wave" and "Dead Heat" are still other films');
   for (const r of results) assert.ok(Array.isArray(r.notes));
   assert.equal(getConfig().subtitles.verifyCandidates, 3);
 });
@@ -387,6 +396,72 @@ test('videoFactsFor reads the probe and hashes only plain files', async () => {
   }
 });
 
+test('hits that name another film, year or episode are not search results', () => {
+  const heat = { title: 'Heat', year: 1995, kind: 'movie' };
+  assert.equal(matchesTarget({ title: 'Heat', release: 'Heat.1995.1080p.BluRay.x264' }, heat).ok, true);
+  assert.equal(matchesTarget({ title: 'Heat (1995)' }, heat).ok, true);
+  assert.equal(matchesTarget({ title: 'Heat', release: 'Heat.NL.srt' }, heat).ok, true, 'a hit without a year is kept');
+  assert.match(matchesTarget({ title: 'Heat Wave', year: 2022 }, heat).reason, /2022 is not 1995/);
+  assert.match(matchesTarget({ title: 'Heat Wave' }, heat).reason, /more than "Heat"/);
+  assert.match(matchesTarget({ title: 'Heat Wave', year: 2022 }, { title: 'Heat' }).reason, /more than "Heat"/);
+  assert.equal(matchesTarget({ title: 'Heat Wave', year: 1996 }, heat).ok, true, 'a year that agrees vouches for a longer title');
+  assert.match(matchesTarget({ title: 'Dead Heat', release: 'Dead.Heat.1988' }, heat).reason, /1988 is not 1995/);
+  assert.match(matchesTarget({ title: 'Casino', release: 'Casino.1995.1080p' }, heat).reason, /does not name "Heat"/);
+  assert.equal(matchesTarget({ title: 'Casino', hashMatch: true }, heat).ok, true, 'the file hash outranks the name');
+  // 1080p is not a year; a remaster's year next to the original is tolerated.
+  assert.equal(yearInRelease('Heat.1080p.BluRay'), null);
+  assert.equal(yearInRelease('Heat.1995.1080p'), 1995);
+  assert.equal(matchesTarget({ title: 'Heat', release: 'Heat.1996.DVDRip' }, heat).ok, true);
+  // Long titles tolerate a missing "Part One"; a different entry does not pass.
+  const mi = { title: 'Mission: Impossible – Dead Reckoning Part One', year: 2023, kind: 'movie' };
+  assert.equal(matchesTarget({ title: 'Mission: Impossible - Dead Reckoning', year: 2023 }, mi).ok, true);
+  assert.equal(matchesTarget({ title: 'Mission: Impossible - Fallout', year: 2018 }, mi).ok, false);
+  // Series: the episode must agree, the year is ignored (the show's year is not the episode's).
+  const bb = { title: 'Breaking Bad', kind: 'series', season: 1, episode: 2, year: 2008 };
+  assert.deepEqual(episodeInRelease('Breaking.Bad.S01E02.720p'), { season: 1, episode: 2 });
+  assert.deepEqual(episodeInRelease('breaking bad 1x02'), { season: 1, episode: 2 });
+  assert.equal(matchesTarget({ title: 'Breaking Bad', release: 'Breaking.Bad.S01E02.2009.720p' }, bb).ok, true);
+  assert.match(matchesTarget({ title: 'Breaking Bad', release: 'Breaking.Bad.S01E03.720p' }, bb).reason, /S01E03/);
+});
+
+test('the search drops the unrelated hits and says how many', async () => {
+  const detailed = await subs.searchSubtitlesDetailed({ title: 'Heat', year: 1995, kind: 'movie', languages: ['nl'] });
+  assert.deepEqual(detailed.results.map((r) => r.release).sort(), ['a-half', 'b-drift', 'c-good']);
+  assert.equal(detailed.dropped, 3);
+  assert.equal(detailed.droppedExamples.length, 3);
+  assert.match(detailed.droppedExamples.join('\n'), /Heat\.Wave\.2022.*2022 is not 1995/);
+  assert.match(detailed.droppedExamples.join('\n'), /Casino.*does not name "Heat"/);
+  const plain = await subs.searchSubtitles({ title: 'Heat', year: 1995, kind: 'movie', languages: ['nl'] });
+  assert.equal(plain.length, 3);
+});
+
+test('videoSummaryFor reads the probe into one line of facts', () => {
+  assert.equal(subs.videoSummaryFor({ upstream: { url: 'http://x/a.mkv' } }), null);
+  const summary = subs.videoSummaryFor({
+    upstream: {
+      url: 'http://x/a.mkv', kind: 'file', label: 'Heat.1995.1080p.BluRay.x264-GRP',
+      probe: {
+        container: 'matroska,webm', durationSec: 10200.5, sizeBytes: 8e9, bitrate: 6274000,
+        video: { codec: 'h264', profile: 'High', width: 1920, height: 1080, fps: 25, avgFps: 23.976, bitrate: 5600000, hdr: false, interlaced: false },
+        audio: [{ codec: 'eac3', channels: 6, language: 'eng' }, { codec: 'aac', channels: 2, language: 'nld' }],
+        subtitles: [{ codec: 'subrip', language: 'nld' }],
+      },
+    },
+  });
+  assert.equal(summary.resolution, '1920×1080');
+  assert.equal(summary.videoCodec, 'h264');
+  assert.equal(summary.fps, 23.976);
+  assert.equal(summary.nominalFps, 25);
+  assert.equal(summary.bitrate, 6274000);
+  assert.equal(summary.audioCodec, 'eac3');
+  assert.equal(summary.audioChannels, 6);
+  assert.equal(summary.audioTracks, 2);
+  assert.equal(summary.subtitleTracks, 1);
+  assert.equal(summary.container, 'matroska,webm');
+  assert.equal(summary.durationSec, 10200.5);
+  assert.equal(summary.label, 'Heat.1995.1080p.BluRay.x264-GRP');
+});
+
 /* ------------------------------------------------------------------ 4. through the HTTP API */
 
 test('the search and attach routes use the stream\'s video facts', async (t) => {
@@ -413,6 +488,10 @@ test('the search and attach routes use the stream\'s video facts', async (t) => 
   assert.equal(search.data.target.fps, 25);
   assert.equal(search.data.target.moviehash, movieHashFromBuffer(file));
   assert.equal(search.data.results.length, 3);
+  assert.equal(search.data.dropped, 3, 'the Heat Wave / Dead Heat / Casino hits are not offered');
+  assert.equal(search.data.video.durationSec, 6300);
+  assert.equal(search.data.video.fps, 25);
+  assert.equal(search.data.video.videoCodec, 'h264');
   const drift = search.data.results.find((r) => r.release === 'b-drift');
   assert.ok(drift && Array.isArray(drift.notes));
 

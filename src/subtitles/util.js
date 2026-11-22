@@ -9,6 +9,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { log } from '../core/log.js';
+import { queryTerms, termCoverage } from '../scrapers/search-relevance.js';
 
 export const LANGUAGE_NAMES = {
   nl: 'Nederlands', en: 'English', de: 'Deutsch', fr: 'Français', es: 'Español',
@@ -329,6 +330,79 @@ export function applyScale(srtText, factor) {
   });
 }
 
+/* ------------------------------------------------------------------ *
+ * is this hit even about the film we asked for?
+ * ------------------------------------------------------------------ */
+
+/** The release year named in a release string ("Heat.1995.1080p" → 1995; 1080p/2160p are not years). */
+export function yearInRelease(text) {
+  for (const m of String(text || '').matchAll(/(?<![\d])((?:19|20)\d{2})(?![\dp])/gi)) {
+    const year = Number(m[1]);
+    if (year >= 1900 && year <= new Date().getFullYear() + 1) return year;
+  }
+  return null;
+}
+
+/** "S02E05" in a release string → { season: 2, episode: 5 }, or null. */
+export function episodeInRelease(text) {
+  const m = /(?:^|[^a-z0-9])s(\d{1,2})\s*[ex](\d{1,3})(?![0-9])/i.exec(String(text || ''))
+    || /(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?![0-9])/i.exec(String(text || ''));
+  return m ? { season: Number(m[1]), episode: Number(m[2]) } : null;
+}
+
+/**
+ * Does a search hit belong to the title we searched for?
+ *
+ * Keyword providers (OpenSubtitles full-text, Podnapisi, the scrapers) answer
+ * "Heat" with Heat Wave, Dead Heat and every episode that mentions heat, so
+ * the hit's own name — its title *or* its release string — must carry the
+ * words of the wanted title (all of them for one- and two-word titles, 60 %
+ * for longer ones: "Mission: Impossible – Dead Reckoning Part One" is
+ * usually released without the "Part One"). When both sides name a year
+ * they must agree within one year (a 1995 film and its 2022 remake share a
+ * title, not subtitles); series skip the year because the show's year and
+ * the episode's year differ, and compare SxxEyy instead. An exact-file hash
+ * match is kept whatever its name says — it *is* this file.
+ *
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function matchesTarget(result, target = {}) {
+  if (!result) return { ok: false, reason: 'empty' };
+  if (result.hashMatch) return { ok: true };
+  const wanted = String(target.title || '').trim();
+  const texts = [result.title, result.release, result.filename].filter(Boolean).map(String);
+  if (wanted) {
+    const terms = queryTerms(wanted);
+    const required = terms.length <= 2 ? 1 : 0.6;
+    const covered = texts.some((text) => termCoverage(terms, text) >= required - 1e-9);
+    if (!covered) return { ok: false, reason: `"${texts[0] || '?'}" does not name "${wanted}"` };
+  }
+  const series = target.kind === 'series' || Number(target.season) > 0;
+  if (series) {
+    const wantedEp = Number(target.season) > 0 && Number(target.episode) > 0
+      ? { season: Number(target.season), episode: Number(target.episode) } : null;
+    const named = wantedEp ? texts.map(episodeInRelease).find(Boolean) : null;
+    if (wantedEp && named && (named.season !== wantedEp.season || named.episode !== wantedEp.episode)) {
+      return { ok: false, reason: `S${String(named.season).padStart(2, '0')}E${String(named.episode).padStart(2, '0')} is not the wanted episode` };
+    }
+    return { ok: true };
+  }
+  const wantedYear = Number(target.year) || 0;
+  const year = Number(result.year) || texts.map(yearInRelease).find(Boolean) || 0;
+  if (wantedYear && year && Math.abs(year - wantedYear) > 1) return { ok: false, reason: `${year} is not ${wantedYear}` };
+  // "Heat" is in "Heat Wave" and "Dead Heat" too. A hit whose *title* says
+  // more than we asked for is another film unless its year vouches for it
+  // (release strings always say more — 1080p BluRay — so only the title
+  // field is held to this).
+  if (wanted && result.title) {
+    const asked = new Set(queryTerms(wanted));
+    const extra = queryTerms(String(result.title)).filter((term) => !asked.has(term) && !/^(?:19|20)\d{2}$/.test(term));
+    const vouched = wantedYear && year && Math.abs(year - wantedYear) <= 1;
+    if (extra.length && !vouched) return { ok: false, reason: `"${result.title}" is more than "${wanted}"${year ? '' : ' and names no year'}` };
+  }
+  return { ok: true };
+}
+
 /**
  * Rank a subtitle hit against what we know about the video. Higher is better.
  * `target` = { title, year, release, season, episode, languages,
@@ -545,6 +619,7 @@ export function extractSubtitleFromBuffer(buffer, tmpDir = null) {
 export default {
   decodeSubtitle, cleanSrt, countCues, vttToSrt, applyOffset, applyScale, scoreResult, rankResult,
   parseTimestampMs, parseCueTimes, inspectSrt, assessSubtitle, frameRateFactorFor, sameFrameRate,
+  matchesTarget, yearInRelease, episodeInRelease,
   normaliseLang, releaseTokens, extractSubtitleFromArchive, extractSubtitleFromBuffer,
   readZipEntries, isZip, isRar,
 };
