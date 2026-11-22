@@ -459,6 +459,7 @@ tr.row-off td{opacity:.55}
 .sub-attached{padding:8px 10px;margin:6px 0;border:1px solid #2f5d3f;border-radius:8px;background:rgba(72,187,120,.06)}
 .pick-row.is-attached,.mob-sub.is-attached{background:rgba(72,187,120,.06)}
 .pick-row.is-hidden,.mob-sub.is-hidden{opacity:.72}
+.sub-hidden{margin-top:6px;padding-top:4px;border-top:1px dashed var(--line)}
 .video-meta .tag{font-size:10.5px}
 .sub-block+.sub-block{border-top:1px solid var(--line)}
 
