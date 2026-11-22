@@ -1323,9 +1323,12 @@ router.post('/subtitles/search', wrap(async (req, res) => {
     sizeBytes: facts.sizeBytes || null,
   };
   if (!target.title) return res.status(400).json({ ok: false, error: 'title or streamId is required' });
-  const { results, dropped, droppedExamples } = await subs.searchSubtitlesDetailed(target);
+  const { results, dropped, droppedExamples, relaxed, query, attempts } = await subs.searchSubtitlesDetailed(target);
   res.json({
     ok: true, target, results: results.slice(0, 80), dropped, droppedExamples,
+    // How hard the search had to look: null when the exact title + year
+    // found hits, else the step that did ("without the year", 'as "Leon"', …).
+    relaxed, query, attempts,
     // The video's own technical facts, shown next to the title in the UI.
     video: stream ? subs.videoSummaryFor(stream) : null,
     providers: subs.listProviders(),

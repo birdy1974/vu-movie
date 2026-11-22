@@ -9,7 +9,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { log } from '../core/log.js';
-import { queryTerms, termCoverage } from '../scrapers/search-relevance.js';
+import { normalizeText, queryTerms, termCoverage } from '../scrapers/search-relevance.js';
 
 export const LANGUAGE_NAMES = {
   nl: 'Nederlands', en: 'English', de: 'Deutsch', fr: 'Français', es: 'Español',
@@ -351,6 +351,47 @@ export function episodeInRelease(text) {
 }
 
 /**
+ * Looser spellings of a title to search with when the exact one finds
+ * nothing, loosest last and none equal to the original:
+ *   "Léon: The Professional (Director's Cut)"
+ *     → "Leon The Professional"   (no brackets, accents or punctuation)
+ *     → "Leon"                     (the part before the colon / dash)
+ *   "Mission: Impossible – Dead Reckoning Part One"
+ *     → "Mission Impossible Dead Reckoning Part One"
+ *     → "Mission Impossible Dead Reckoning"   (no "Part One")
+ *     → "Mission Impossible"
+ * Providers index titles differently — with or without the subtitle after
+ * the colon, with "and" for "&", without the accents — and a strict query
+ * string finds none of those spellings.
+ */
+export function relaxedTitles(title) {
+  const raw = String(title || '').trim();
+  if (!raw) return [];
+  const out = [];
+  const seen = new Set([raw.toLowerCase()]);
+  const push = (text) => {
+    const words = normalizeText(text).split(' ').filter(Boolean);
+    // Title case for readability in the UI note; providers do not care.
+    const spelled = words.map((w) => (w.length > 1 && !/^\d+$/.test(w) ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
+    if (!spelled || seen.has(spelled.toLowerCase())) return;
+    seen.add(spelled.toLowerCase());
+    out.push(spelled);
+  };
+  const noBrackets = raw.replace(/\s*[([{][^)\]}]*[)\]}]/g, '').trim() || raw;
+  push(noBrackets);
+  const noPart = noBrackets.replace(/[\s:,-]*\b(?:part|chapter|vol(?:ume)?)\s+(?:one|two|three|four|five|i{1,3}|iv|v|\d{1,2})\b.*$/i, '').trim();
+  if (noPart) push(noPart);
+  // The part before the *last* colon / dash: "Mission: Impossible – Dead
+  // Reckoning" → "Mission: Impossible", not the lone "Mission".
+  const pieces = noPart.split(/\s*(?::|\s[-–—|]\s)\s*/).map((piece) => piece.trim()).filter(Boolean);
+  if (pieces.length > 1) {
+    const head = pieces.slice(0, -1).join(' ');
+    if (queryTerms(head).length) push(head);
+  }
+  return out;
+}
+
+/**
  * Does a search hit belong to the title we searched for?
  *
  * Keyword providers (OpenSubtitles full-text, Podnapisi, the scrapers) answer
@@ -619,7 +660,7 @@ export function extractSubtitleFromBuffer(buffer, tmpDir = null) {
 export default {
   decodeSubtitle, cleanSrt, countCues, vttToSrt, applyOffset, applyScale, scoreResult, rankResult,
   parseTimestampMs, parseCueTimes, inspectSrt, assessSubtitle, frameRateFactorFor, sameFrameRate,
-  matchesTarget, yearInRelease, episodeInRelease,
+  matchesTarget, relaxedTitles, yearInRelease, episodeInRelease,
   normaliseLang, releaseTokens, extractSubtitleFromArchive, extractSubtitleFromBuffer,
   readZipEntries, isZip, isRar,
 };

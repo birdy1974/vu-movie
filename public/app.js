@@ -2369,7 +2369,7 @@ async function openSelectionSubtitles() {
     state.findSubtitleResults = data.results || [];
     const videoHost = $('#sel-subtitle-video');
     if (videoHost) videoHost.innerHTML = videoMetaTags(data.video);
-    $('#sel-subtitle-count').innerHTML = `${state.findSubtitleResults.length} result(s) ${droppedHitsNote(data)}`;
+    $('#sel-subtitle-count').innerHTML = `${state.findSubtitleResults.length} result(s) ${droppedHitsNote(data)} ${relaxedSearchNote(data)}`;
     host.innerHTML = state.findSubtitleResults.length
       ? state.findSubtitleResults.slice(0, 40).map((result, index) => subtitleRowMarkup(result, index, 'find')).join('')
       : '<div class="meta" style="padding:14px">no subtitles found</div>';
@@ -2403,6 +2403,19 @@ function videoMetaTags(video) {
   if (video.sizeBytes) parts.push(fmtBytes(video.sizeBytes));
   if (!parts.length) return '';
   return `<span class="video-meta">${parts.map((part) => tag(part, 'info')).join(' ')}</span>`;
+}
+
+/**
+ * "nothing matched "Léon: The Professional" (1994) exactly — searched again
+ * as "Leon"" — when the server had to loosen the query to find anything.
+ */
+function relaxedSearchNote(data) {
+  if (!data?.relaxed) return '';
+  const wanted = `${data.target?.title || data.title || ''}${data.target?.year || data.year ? ` (${data.target?.year || data.year})` : ''}`;
+  const steps = Array.isArray(data.attempts) && data.attempts.length
+    ? ` title="${escapeHtml(data.attempts.map((a) => `${a.relaxed || 'exact'}: ${a.found} hit(s)${a.dropped ? `, ${a.dropped} unrelated` : ''}`).join('\n'))}"` : '';
+  const found = Number(data.results?.length ?? data.found) || 0;
+  return `<span class="tag warn"${steps}>${found ? 'nothing matched' : 'still nothing after'} ${escapeHtml(wanted)} exactly — searched again ${escapeHtml(data.relaxed)}</span>`;
 }
 
 /** "12 unrelated hits hidden (title/year did not match)" — after a search answer. */
@@ -2909,7 +2922,7 @@ async function searchSubtitles() {
               languages: [item?.subtitleLanguage].filter(Boolean).length ? [item.subtitleLanguage] : languages,
             },
           });
-          state.subResults.push({ streamId, title: item?.title || streamId, year: item?.year || null, results: data.results || [], video: data.video || null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [] });
+          state.subResults.push({ streamId, title: item?.title || streamId, year: item?.year || null, results: data.results || [], video: data.video || null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
         } catch (error) {
           state.subResults.push({ streamId, title: item?.title || streamId, results: [], error: error.message });
         }
@@ -2920,7 +2933,7 @@ async function searchSubtitles() {
         silent: true,
         body: { title: manualTitle, year: Number($('#sub-year')?.value) || null, imdb: $('#sub-imdb')?.value.trim() || null, languages },
       });
-      state.subResults.push({ streamId: null, title: manualTitle, year: Number($('#sub-year')?.value) || null, results: data.results || [], video: null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [] });
+      state.subResults.push({ streamId: null, title: manualTitle, year: Number($('#sub-year')?.value) || null, results: data.results || [], video: null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
     }
   } finally {
     $('#btn-sub-search').disabled = false;
@@ -2940,7 +2953,7 @@ function renderSubResults() {
     return `<div class="sub-block">
       <div class="cardhead"><div><h3 style="margin:0">${escapeHtml(block.title)}${block.year ? ` <span class="mut">(${block.year})</span>` : ''}</h3>
           ${videoMetaTags(block.video)}</div>
-        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)}</span></div>
+        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)} ${relaxedSearchNote(block)}</span></div>
       ${results.length
         ? results.slice(0, 60).map((result, index) => `<div class="pick-row">
             <div>
@@ -4842,7 +4855,7 @@ async function mobileSubtitleSearch() {
     const filter = $('#mob-sub-lang')?.value || 'nl';
     const results = (data.results || []).filter((result) => filter === 'all' || (result.language || '').startsWith(filter));
     state.mobile.subs = results;
-    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)}</div>`;
+    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)} ${relaxedSearchNote(data)}</div>`;
     host.innerHTML = head + (results.length ? results.slice(0, 25).map((result, index) => `
       <div class="mob-sub">
         <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span> ${subtitleNoteTags(result)}

@@ -351,6 +351,17 @@ video's own facts are shown — `1h 50m · 1920×1080 · h264 High · 23.976 fps
 6.3 Mb/s · eac3 5.1 · matroska` — so a hit's `25 fps` or `ends 1:42` can be
 read against the file it is meant for.
 
+**Nothing found? It looks again, looser.** When the strict search leaves no
+hit, the query is widened one step at a time until something matches: the
+same title without the year (a release-vs-production year is a hard filter
+at some providers), then looser spellings of the title — no punctuation or
+accents, no "Part One", the part before the colon (`Léon: The Professional
+(Director's Cut)` → `Leon The Professional` → `Leon`) — and, for films, as a
+last resort the title alone with the year no longer required of the hits. The
+title check never loosens, so *Heat Wave* stays out even then. The header
+says which step found the results (`nothing matched Léon: The Professional
+(1994) exactly — searched again as "Leon"`; hover for every step tried).
+
 **Picking the one that fits.** When the search runs for a playlist item the
 stream's ffprobe facts take part — its length and average frame rate — and
 each hit shows *why* it ranks where it does (tags such as `exact file match`,

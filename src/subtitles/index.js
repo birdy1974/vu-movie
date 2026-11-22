@@ -23,7 +23,7 @@ import { log, logError, truncate } from '../core/log.js';
 import { getConfig } from '../core/config.js';
 import { request, CookieJar } from '../scrapers/http.js';
 import {
-  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, applyScale, countCues, rankResult, matchesTarget, normaliseLang,
+  decodeSubtitle, cleanSrt, vttToSrt, applyOffset, applyScale, countCues, rankResult, matchesTarget, relaxedTitles, normaliseLang,
   parseTimestampMs, inspectSrt, assessSubtitle, extractSubtitleFromBuffer, isZip, isRar,
 } from './util.js';
 import { cachedMovieHash } from './moviehash.js';
@@ -1045,23 +1045,71 @@ export async function searchSubtitles(target) {
 }
 
 /**
- * searchSubtitles() plus what was left out: hits that do not name the wanted
- * title (or name another year / episode) are dropped — keyword providers
- * answer "Heat" with Heat Wave and Dead Heat — and counted in `dropped`.
- * @returns {Promise<{results: object[], dropped: number, droppedExamples: string[]}>}
+ * searchSubtitles() plus what was left out and how hard it had to look.
+ *
+ * Hits that do not name the wanted title (or name another year / episode)
+ * are dropped — keyword providers answer "Heat" with Heat Wave and Dead Heat
+ * — and counted in `dropped`. When nothing is left the search is run again
+ * with a looser query, one step at a time, until something matches:
+ *
+ *   1. the title as given, with the year            (strict)
+ *   2. the same title without the year              — a wrong or
+ *      release-vs-production year is a hard filter at some providers
+ *   3. looser spellings of the title (relaxedTitles: no punctuation or
+ *      accents, no "Part One", the part before the colon)
+ *   4. the title alone, the year no longer required of the hits — the
+ *      title words must still all be there, so Heat Wave stays out
+ *
+ * Steps 2–4 only ever widen the *query*; the title check stays. Series skip
+ * step 4 (their year is never compared).
+ *
+ * @returns {Promise<{results: object[], dropped: number, droppedExamples: string[],
+ *   relaxed: string|null, query: {title: string, year: number|null}, attempts: object[]}>}
+ *   `relaxed` names the step that found the results (null when the exact
+ *   search did), `attempts` lists every step that ran.
  */
 export async function searchSubtitlesDetailed(target) {
   const cfg = getConfig();
   const languages = target.languages?.length ? target.languages : cfg.subtitles.languages;
-  const ctx = { ...target, languages };
   const active = allProviders().filter((p) => p.enabled);
-  log.info('subtitles', `searching ${active.length} provider(s)`, {
-    title: target.title, languages: languages.join(','), providers: active.map((p) => p.id).join(','),
-    ...(target.durationSec ? { durationSec: Math.round(target.durationSec) } : {}),
-    ...(target.fps ? { fps: target.fps } : {}),
-    ...(target.moviehash ? { moviehash: target.moviehash } : {}),
+  const year = Number(target.year) || null;
+  const series = target.kind === 'series' || Number(target.season) > 0;
+
+  const steps = [{ title: target.title, year, relaxed: null, ignoreYear: false }];
+  if (year) steps.push({ title: target.title, year: null, relaxed: 'without the year', ignoreYear: false });
+  for (const title of relaxedTitles(target.title)) steps.push({ title, year: null, relaxed: `as "${title}"`, ignoreYear: false });
+  if (year && !series) steps.push({ title: target.title, year: null, relaxed: 'title only — the year is no longer required of the hits', ignoreYear: true });
+
+  const attempts = [];
+  let last = null;
+  for (const step of steps) {
+    const ctx = { ...target, title: step.title, year: step.year, languages };
+    const filterTarget = step.ignoreYear ? { ...target, year: null } : target;
+    const outcome = await runSearch(ctx, filterTarget, active, step.relaxed);
+    attempts.push({ title: step.title, year: step.year, relaxed: step.relaxed, found: outcome.results.length, dropped: outcome.dropped });
+    last = { ...outcome, relaxed: step.relaxed, query: { title: step.title, year: step.year } };
+    if (outcome.results.length) break;
+    if (outcome.failed === active.length && active.length) break;   // every provider errored: retrying will not help
+  }
+  if (last.relaxed) {
+    log.info('subtitles', `nothing matched "${target.title}"${year ? ` (${year})` : ''} exactly — searched again ${last.relaxed}`, {
+      found: last.results.length, attempts: attempts.length,
+    });
+  }
+  return { ...last, attempts };
+}
+
+/** One pass over the providers with one query, filtered against `filterTarget` and ranked. */
+async function runSearch(ctx, filterTarget, active, relaxed) {
+  const { languages } = ctx;
+  log.info('subtitles', `searching ${active.length} provider(s)${relaxed ? ` again ${relaxed}` : ''}`, {
+    title: ctx.title, ...(ctx.year ? { year: ctx.year } : {}), languages: languages.join(','), providers: active.map((p) => p.id).join(','),
+    ...(ctx.durationSec ? { durationSec: Math.round(ctx.durationSec) } : {}),
+    ...(ctx.fps ? { fps: ctx.fps } : {}),
+    ...(ctx.moviehash ? { moviehash: ctx.moviehash } : {}),
   });
 
+  let failed = 0;
   const settled = await Promise.all(active.map(async (p) => {
     const t0 = Date.now();
     try {
@@ -1069,8 +1117,9 @@ export async function searchSubtitlesDetailed(target) {
       log.debug('subtitles', `${p.id}: ${hits.length} hits in ${Date.now() - t0} ms`);
       return hits;
     } catch (err) {
+      failed += 1;
       p.setState(false, `search failed: ${String(err?.message || err)}`);
-      logError('subtitles', `${p.id}: search failed`, err, { title: target.title });
+      logError('subtitles', `${p.id}: search failed`, err, { title: ctx.title });
       return [];
     }
   }));
@@ -1079,14 +1128,14 @@ export async function searchSubtitlesDetailed(target) {
   const droppedExamples = [];
   let dropped = 0;
   for (const r of settled.flat()) {
-    const match = matchesTarget(r, target);
+    const match = matchesTarget(r, filterTarget);
     if (match.ok) { related.push(r); continue; }
     dropped += 1;
     if (droppedExamples.length < 5) droppedExamples.push(`${r.providerId}: ${truncate(r.release || r.title || '?', 60)} (${match.reason})`);
   }
   const all = related
     .map((r) => {
-      const { score, notes } = rankResult(r, { ...target, languages });
+      const { score, notes } = rankResult(r, { ...filterTarget, languages });
       return { ...r, score, notes };
     })
     .sort((a, b) => b.score - a.score);
@@ -1096,7 +1145,7 @@ export async function searchSubtitlesDetailed(target) {
     ...(all[0]?.notes?.length ? { notes: all[0].notes.map((n) => n.text).join('; ') } : {}),
     ...(dropped ? { dropped: droppedExamples.join(' | ') } : {}),
   });
-  return { results: all, dropped, droppedExamples };
+  return { results: all, dropped, droppedExamples, failed };
 }
 
 /**
