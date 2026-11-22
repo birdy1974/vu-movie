@@ -448,6 +448,8 @@ tr.row-off td{opacity:.55}
   border:1px solid var(--line);border-radius:10px;background:var(--bg2);flex-wrap:wrap}
 .pick-main{min-width:0;flex:1}
 .sub-block{padding:8px 0}
+.video-meta{display:inline-flex;flex-wrap:wrap;gap:4px;margin:4px 0 0;vertical-align:middle}
+.video-meta .tag{font-size:10.5px}
 .sub-block+.sub-block{border-top:1px solid var(--line)}
 
 /* ---- web player ---- */
