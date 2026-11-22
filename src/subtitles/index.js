@@ -297,6 +297,19 @@ class OpenSubtitlesOrg extends Provider {
       machineTranslated: flag(r.SubAutoTranslation),
       trusted: flag(r.SubFromTrusted),
       bad: Number(r.SubBad) > 0,
+      // --- the rest of what the row says about the file ---
+      filename: r.SubFileName || null,
+      uploader: r.UserNickName || null,
+      uploaderRank: r.UserRank || null,
+      uploadedAt: r.SubAddDate || null,
+      encoding: r.SubEncoding || null,
+      sizeBytes: Number(r.SubSize) > 0 ? Number(r.SubSize) : null,
+      votes: Number(r.SubSumVotes) > 0 ? Number(r.SubSumVotes) : null,
+      featured: flag(r.SubFeatured),
+      hd: flag(r.SubHD),
+      comments: r.SubAuthorComment || null,
+      imdb: r.IDMovieImdb ? `tt${String(r.IDMovieImdb).padStart(7, '0')}` : null,
+      page: r.SubtitlesLink || null,
     };
   }
 
@@ -350,6 +363,9 @@ class SubDL extends Provider {
       format: 'srt',
       episodeMatch: Boolean(r.episode),
       hearingImpaired: r.hi === true || r.hi === 1,
+      uploader: r.author || null,
+      comments: r.comment || null,
+      filename: r.release_name ? `${r.release_name}.srt` : null,
     })).filter((r) => r.url);
   }
 
@@ -410,6 +426,15 @@ class OpenSubtitlesCom extends Provider {
         machineTranslated: a.machine_translated === true,
         aiTranslated: a.ai_translated === true,
         trusted: a.from_trusted === true,
+        filename: a.files?.[0]?.file_name || null,
+        uploader: a.uploader?.name || null,
+        uploaderRank: a.uploader?.rank || null,
+        uploadedAt: a.upload_date || null,
+        votes: Number(a.votes) > 0 ? Number(a.votes) : null,
+        hd: a.hd === true,
+        comments: a.comments || null,
+        imdb: a.feature_details?.imdb_id ? `tt${String(a.feature_details.imdb_id).padStart(7, '0')}` : null,
+        page: a.url || null,
       };
     }).filter((r) => r.fileId);
     const hashHits = hits.filter((h) => h.hashMatch).length;
@@ -1055,16 +1080,20 @@ export async function searchSubtitles(target) {
  *   1. the title as given, with the year            (strict)
  *   2. the same title without the year              — a wrong or
  *      release-vs-production year is a hard filter at some providers
- *   3. looser spellings of the title (relaxedTitles: no punctuation or
+ *   3. the dotted release form, "Leon.The.Professional.1994" then without
+ *      the year — providers that index file names find those
+ *   4. looser spellings of the title (relaxedTitles: no punctuation or
  *      accents, no "Part One", the part before the colon)
- *   4. the title alone, the year no longer required of the hits — the
+ *   5. the title alone, the year no longer required of the hits — the
  *      title words must still all be there, so Heat Wave stays out
  *
- * Steps 2–4 only ever widen the *query*; the title check stays. Series skip
- * step 4 (their year is never compared).
+ * Steps 2–5 only ever widen the *query*; the title check stays. Series skip
+ * step 5 (their year is never compared).
  *
- * @returns {Promise<{results: object[], dropped: number, droppedExamples: string[],
+ * @returns {Promise<{results: object[], hidden: object[], dropped: number, droppedExamples: string[],
  *   relaxed: string|null, query: {title: string, year: number|null}, attempts: object[]}>}
+ *   `hidden` holds the dropped hits (ranked, each with `hiddenReason`) so the
+ *   UI can show them on request.
  *   `relaxed` names the step that found the results (null when the exact
  *   search did), `attempts` lists every step that ran.
  */
@@ -1077,6 +1106,9 @@ export async function searchSubtitlesDetailed(target) {
 
   const steps = [{ title: target.title, year, relaxed: null, ignoreYear: false }];
   if (year) steps.push({ title: target.title, year: null, relaxed: 'without the year', ignoreYear: false });
+  // Release names are dotted — "Leon.The.Professional.1994" — and a keyword
+  // provider that indexes file names finds those with a dotted query.
+  for (const title of dottedTitles(target.title, year)) steps.push({ title, year: null, relaxed: `as "${title}"`, ignoreYear: false });
   for (const title of relaxedTitles(target.title)) steps.push({ title, year: null, relaxed: `as "${title}"`, ignoreYear: false });
   if (year && !series) steps.push({ title: target.title, year: null, relaxed: 'title only — the year is no longer required of the hits', ignoreYear: true });
 
@@ -1097,6 +1129,14 @@ export async function searchSubtitlesDetailed(target) {
     });
   }
   return { ...last, attempts };
+}
+
+/** "Leon The Professional" (1994) → ["Leon.The.Professional.1994", "Leon.The.Professional"]. */
+function dottedTitles(title, year) {
+  const words = String(title || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').split(/[^A-Za-z0-9]+/).filter(Boolean);
+  if (!words.length) return [];
+  const dotted = words.join('.');
+  return year ? [`${dotted}.${year}`, dotted] : [dotted];
 }
 
 /** One pass over the providers with one query, filtered against `filterTarget` and ranked. */
@@ -1125,27 +1165,31 @@ async function runSearch(ctx, filterTarget, active, relaxed) {
   }));
 
   const related = [];
+  const hidden = [];
   const droppedExamples = [];
   let dropped = 0;
+  const ranked = (r) => {
+    const { score, notes } = rankResult(r, { ...filterTarget, languages });
+    return { ...r, score, notes };
+  };
   for (const r of settled.flat()) {
     const match = matchesTarget(r, filterTarget);
     if (match.ok) { related.push(r); continue; }
     dropped += 1;
+    // Kept, ranked and labelled, for the "show hidden" button — the filter
+    // can be wrong about a renamed release, and the user can see why it hid.
+    if (hidden.length < 80) hidden.push({ ...ranked(r), hidden: true, hiddenReason: match.reason });
     if (droppedExamples.length < 5) droppedExamples.push(`${r.providerId}: ${truncate(r.release || r.title || '?', 60)} (${match.reason})`);
   }
-  const all = related
-    .map((r) => {
-      const { score, notes } = rankResult(r, { ...filterTarget, languages });
-      return { ...r, score, notes };
-    })
-    .sort((a, b) => b.score - a.score);
+  hidden.sort((a, b) => b.score - a.score);
+  const all = related.map(ranked).sort((a, b) => b.score - a.score);
 
   log.info('subtitles', `total ${all.length} subtitle candidate(s)${dropped ? `, ${dropped} unrelated hit(s) dropped` : ''}`, {
     best: all[0] ? `${all[0].providerId}/${all[0].language} ${all[0].release}` : 'none',
     ...(all[0]?.notes?.length ? { notes: all[0].notes.map((n) => n.text).join('; ') } : {}),
     ...(dropped ? { dropped: droppedExamples.join(' | ') } : {}),
   });
-  return { results: all, dropped, droppedExamples, failed };
+  return { results: all, hidden, dropped, droppedExamples, failed };
 }
 
 /**

@@ -905,6 +905,7 @@ async function attachSubtitleToStream(stream, fetched) {
     subtitlePath: stored,
     subtitleLanguage: fetched.language === 'nl' ? 'nld' : 'eng',
     subtitles: (stream.profile?.subtitles && stream.profile.subtitles !== 'none') ? stream.profile.subtitles : 'soft',
+    subtitleSource: { ...playlist.subtitleSourceOf(fetched.result || null, fetched), auto: true },
   };
   await store.createStream({
     ...stream,
@@ -1300,6 +1301,17 @@ router.get('/subtitles/providers', wrap(async (req, res) => {
   res.json({ ok: true, providers: subs.listProviders() });
 }));
 
+/** The subtitle attached to a stream, as the UI shows it: null when none. */
+function attachedSubtitleOf(stream) {
+  const profile = stream?.profile || {};
+  if (!profile.subtitlePath) return null;
+  return {
+    language: profile.subtitleLanguage || '',
+    path: profile.subtitlePath,
+    ...(profile.subtitleSource || { providerId: null, release: 'attached before this version recorded the source' }),
+  };
+}
+
 router.post('/subtitles/search', wrap(async (req, res) => {
   const body = req.body || {};
   const stream = body.streamId ? await store.getStream(body.streamId) : null;
@@ -1323,9 +1335,12 @@ router.post('/subtitles/search', wrap(async (req, res) => {
     sizeBytes: facts.sizeBytes || null,
   };
   if (!target.title) return res.status(400).json({ ok: false, error: 'title or streamId is required' });
-  const { results, dropped, droppedExamples, relaxed, query, attempts } = await subs.searchSubtitlesDetailed(target);
+  const { results, hidden, dropped, droppedExamples, relaxed, query, attempts } = await subs.searchSubtitlesDetailed(target);
   res.json({
-    ok: true, target, results: results.slice(0, 80), dropped, droppedExamples,
+    ok: true, target, results: results.slice(0, 80), hidden, dropped, droppedExamples,
+    // What is attached to this item right now (provider, release, when, how
+    // it measured) so the list can mark it and the header can show it.
+    attached: stream ? attachedSubtitleOf(stream) : null,
     // How hard the search had to look: null when the exact title + year
     // found hits, else the step that did ("without the year", 'as "Leon"', …).
     relaxed, query, attempts,

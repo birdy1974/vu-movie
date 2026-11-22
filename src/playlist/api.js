@@ -142,6 +142,7 @@ function publicItem(entry, baseUrl) {
     transcode: stream.profile?.transcode ?? null,
     subtitlePath: stream.profile?.subtitlePath || '',
     subtitleLanguageStored: stream.profile?.subtitleLanguage || '',
+    subtitleSource: stream.profile?.subtitlePath ? stream.profile?.subtitleSource || null : null,
     // none | soft | burn | push — see playlist.SUBTITLE_MODES. The item owns the
     // choice; before the mode was editable the profile was the only record, so
     // fall back to it for items that predate this field.

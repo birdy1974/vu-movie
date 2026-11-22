@@ -2367,12 +2367,13 @@ async function openSelectionSubtitles() {
       body: { streamId: suggested?.streamId || null, title: selection.title, year: selection.year || null, kind: selection.kind || 'movie', season: selection.season || firstSeries?.season || null, episode: selection.episode || firstSeries?.episode || null },
     });
     state.findSubtitleResults = data.results || [];
+    state.findSubtitleHidden = data.hidden || [];
+    state.findSubtitleAttached = data.attached || null;
+    state.findSubtitleShowHidden = false;
+    state.findSubtitleAnswer = data;
     const videoHost = $('#sel-subtitle-video');
     if (videoHost) videoHost.innerHTML = videoMetaTags(data.video);
-    $('#sel-subtitle-count').innerHTML = `${state.findSubtitleResults.length} result(s) ${droppedHitsNote(data)} ${relaxedSearchNote(data)}`;
-    host.innerHTML = state.findSubtitleResults.length
-      ? state.findSubtitleResults.slice(0, 40).map((result, index) => subtitleRowMarkup(result, index, 'find')).join('')
-      : '<div class="meta" style="padding:14px">no subtitles found</div>';
+    renderFindSubtitles();
   } catch (error) {
     $('#sel-subtitle-count').textContent = '';
     host.innerHTML = `<div class="meta" style="padding:14px">${escapeHtml(error.message)}</div>`;
@@ -2448,20 +2449,93 @@ function subtitleCheckSummary(data) {
   return '';
 }
 
-function subtitleRowMarkup(result, index, scope) {
-  return `<div class="pick-row">
+/** Is this hit the same subtitle file as that one (same provider, same id / file / link)? */
+function sameSubtitle(a, b) {
+  if (!a || !b || !a.providerId || a.providerId !== b.providerId) return false;
+  if (a.fileId && b.fileId) return String(a.fileId) === String(b.fileId);
+  if (a.id && b.id) return String(a.id) === String(b.id);
+  if (a.url && b.url) return a.url === b.url;
+  return Boolean(a.release && b.release && a.release === b.release && (a.language || '') === (b.language || ''));
+}
+
+const SUBTITLE_META_FIELDS = [
+  ['title', 'title'], ['year', 'year'], ['filename', 'file'], ['format', 'format'], ['encoding', 'encoding'],
+  ['sizeBytes', 'size', (v) => fmtBytes(v)], ['cds', 'CDs', (v) => (v > 1 ? `${v} CDs` : null)],
+  ['fps', 'fps', (v) => `${v} fps`], ['videoDurationMs', 'video', (v) => fmtDuration(v / 1000)],
+  ['lastTimestampMs', 'last cue', (v) => fmtDuration(v / 1000)],
+  ['downloads', 'downloads', (v) => `${v} downloads`], ['rating', 'rating', (v) => `★ ${v}`], ['votes', 'votes', (v) => `${v} votes`],
+  ['uploader', 'uploader'], ['uploaderRank', 'rank'], ['uploadedAt', 'uploaded', (v) => String(v).slice(0, 10)],
+  ['matchedBy', 'matched by'], ['hashMatch', 'exact file match', 'flag'], ['episodeMatch', 'episode match', 'flag'],
+  ['trusted', 'trusted uploader', 'flag'], ['featured', 'featured', 'flag'], ['hd', 'HD', 'flag'],
+  ['hearingImpaired', 'SDH / hearing impaired', 'flag'], ['foreignPartsOnly', 'foreign parts only', 'flag'],
+  ['machineTranslated', 'machine translated', 'flag'], ['aiTranslated', 'AI translated', 'flag'], ['bad', 'flagged bad', 'flag'],
+  ['imdb', 'imdb'], ['score', 'rank score', (v) => `score ${v}`], ['cues', 'cues', (v) => `${v} cues`],
+  ['offsetMs', 'offset', (v) => `offset ${v > 0 ? '+' : ''}${v} ms`],
+];
+
+/**
+ * Every fact a provider gave about a subtitle, as chips — "file", "fps",
+ * "uploader", "uploaded", the flags — plus an "all fields" fold-out with the
+ * raw key/value pairs (ids, links, comments) for the curious.
+ */
+function subtitleMetaChips(result) {
+  if (!result) return '';
+  const chips = [];
+  for (const [key, label, format] of SUBTITLE_META_FIELDS) {
+    const value = result[key];
+    if (value === null || value === undefined || value === '' || value === false) continue;
+    if (format === 'flag') { if (value === true) chips.push(`<span class="chip">${escapeHtml(label)}</span>`); continue; }
+    const text = typeof format === 'function' ? format(value) : `${label} ${value}`;
+    if (text) chips.push(`<span class="chip" title="${escapeHtml(label)}">${escapeHtml(String(text))}</span>`);
+  }
+  if (result.check?.verdict) chips.push(`<span class="chip ${result.check.verdict === 'good' ? 'ok' : result.check.verdict === 'bad' ? 'bad' : 'warn'}" title="${escapeHtml((result.check.reasons || []).join('; '))}">timing ${escapeHtml(result.check.verdict)}</span>`);
+  if (result.adjustment?.scale) chips.push(`<span class="chip warn">rescaled ×${result.adjustment.scale}</span>`);
+  const skip = new Set(['notes', 'srt', 'hidden', 'hiddenReason', 'check', 'adjustment', 'headers', 'referer']);
+  const rows = Object.entries(result)
+    .filter(([key, value]) => !skip.has(key) && value !== null && value !== undefined && value !== '' && typeof value !== 'object')
+    .map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${/^https?:\/\//.test(String(value)) ? `<a href="${escapeHtml(String(value))}" target="_blank" rel="noopener">${escapeHtml(String(value))}</a>` : escapeHtml(String(value))}</td></tr>`);
+  return `<div class="sub-chips">${chips.join('')}
+    <details class="sub-all"><summary>all fields (${rows.length})</summary><table>${rows.join('')}</table></details></div>`;
+}
+
+/** The header line for what is attached to the item right now. */
+function attachedSubtitleMarkup(attached) {
+  if (!attached) return '';
+  const when = attached.attachedAt ? ` · ${new Date(attached.attachedAt).toLocaleString()}` : '';
+  return `<div class="sub-attached">
+    <div>${tag('✓ attached now', 'ok')} ${tag(attached.language || '??', 'alt')} ${tag(attached.providerId || 'file')}${attached.auto ? ` ${tag('picked automatically')}` : ''}
+      <span class="meta">${escapeHtml(attached.release || attached.title || attached.filename || '')}${when}</span></div>
+    ${subtitleMetaChips(attached)}
+  </div>`;
+}
+
+/**
+ * One search hit. `actions` is the button HTML for the scope; `attached` is
+ * the item's current subtitle so the same file is marked as already there;
+ * a hidden hit carries `hiddenReason` and is shown dimmed with that reason.
+ */
+function subtitleRowMarkup(result, index, scope, { actions = null, attached = null, list = 'results' } = {}) {
+  const isAttached = sameSubtitle(result, attached);
+  const buttons = actions !== null ? actions : `
+      <button class="btn sm ghost" data-download-sub="${index}" data-scope="${scope}" data-list="${list}">⤓ download .srt</button>
+      <button class="btn sm pri" data-attach-sub="${index}" data-scope="${scope}" data-list="${list}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓ attached' : 'attach to playlist'}</button>`;
+  return `<div class="pick-row${isAttached ? ' is-attached' : ''}${result.hidden ? ' is-hidden' : ''}">
     <div class="pick-main">
-      <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
-        ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
-        ${result.rating ? tag(`★ ${result.rating}`) : ''}
+      <div>${isAttached ? tag('✓ attached to this title', 'ok') : ''}${result.hidden ? tag(`hidden: ${result.hiddenReason || 'did not match'}`, 'warn') : ''}
+        ${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
         ${subtitleNoteTags(result)}</div>
       <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
+      ${subtitleMetaChips(result)}
     </div>
-    <div class="row">
-      <button class="btn sm ghost" data-download-sub="${index}" data-scope="${scope}">⤓ download .srt</button>
-      <button class="btn sm pri" data-attach-sub="${index}" data-scope="${scope}">attach to playlist</button>
-    </div>
+    <div class="row">${buttons}</div>
   </div>`;
+}
+
+/** The "show N hidden" toggle for a search answer with dropped hits. */
+function hiddenToggleMarkup(data, scope, shown) {
+  const n = Array.isArray(data?.hidden) ? data.hidden.length : 0;
+  if (!n) return '';
+  return `<button class="btn sm ghost" data-toggle-hidden="${scope}" data-block="${escapeHtml(data.title || '')}">${shown ? 'hide' : 'show'} ${n} hidden subtitle${n > 1 ? 's' : ''}</button>`;
 }
 
 function subtitleDownloadName(result, selection = {}) {
@@ -2470,6 +2544,23 @@ function subtitleDownloadName(result, selection = {}) {
   const year = Number(selection.year) || Number(result.year) || '';
   const language = String(result.language || 'sub').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 8) || 'sub';
   return `${title}${year ? `-${year}` : ''}.${language}.srt`;
+}
+
+/** The selection popup's subtitle list: attached header, results, the hidden ones on request. */
+function renderFindSubtitles() {
+  const host = $('#sel-subtitle-results');
+  const data = state.findSubtitleAnswer || {};
+  const results = state.findSubtitleResults || [];
+  const hidden = state.findSubtitleHidden || [];
+  const attached = state.findSubtitleAttached || null;
+  $('#sel-subtitle-count').innerHTML = `${results.length} result(s) ${droppedHitsNote(data)} ${relaxedSearchNote(data)} ${hiddenToggleMarkup({ hidden }, 'find', state.findSubtitleShowHidden)}`;
+  host.innerHTML = attachedSubtitleMarkup(attached)
+    + (results.length
+      ? results.slice(0, 40).map((result, index) => subtitleRowMarkup(result, index, 'find', { attached })).join('')
+      : '<div class="meta" style="padding:14px">no subtitles found</div>')
+    + (state.findSubtitleShowHidden && hidden.length
+      ? `<div class="meta" style="padding:10px 0 4px">hidden — the title or year did not match this film:</div>${hidden.map((result, index) => subtitleRowMarkup(result, index, 'find', { attached, list: 'hidden' })).join('')}`
+      : '');
 }
 
 /** Download a provider result without requiring the title to be in the playlist. */
@@ -2505,6 +2596,7 @@ async function attachSubtitle(result, { streamId = null, language = null } = {})
   await VMPlaylist.refresh({ render: currentPage === 'list' });
   const doubtful = data?.check?.verdict === 'suspect' || data?.check?.verdict === 'bad';
   toast(`Subtitle attached to the playlist item (${result.language || 'srt'})${subtitleCheckSummary(data)}`, doubtful && !data?.adjustment ? 'warn' : 'ok');
+  return data;
 }
 
 /* ---------------- URL resolve tab ---------------- */
@@ -2707,10 +2799,16 @@ function wireFind() {
     }
   }, true);
   $('#btn-sel-subs-close')?.addEventListener('click', () => $('#sel-subtitle-panel')?.classList.add('hide'));
+  $('#sel-subtitle-count')?.addEventListener('click', (event) => {
+    if (!event.target.closest('[data-toggle-hidden]')) return;
+    state.findSubtitleShowHidden = !state.findSubtitleShowHidden;
+    renderFindSubtitles();
+  });
   $('#sel-subtitle-results')?.addEventListener('click', (event) => {
+    const listOf = (el) => (el.dataset.list === 'hidden' ? state.findSubtitleHidden || [] : state.findSubtitleResults || []);
     const download = event.target.closest('[data-download-sub]');
     if (download) {
-      const result = state.findSubtitleResults[Number(download.dataset.downloadSub)];
+      const result = listOf(download)[Number(download.dataset.downloadSub)];
       download.disabled = true;
       downloadSubtitle(result)
         .catch((error) => toast(`Subtitle download failed: ${error.message}`, 'err'))
@@ -2719,11 +2817,17 @@ function wireFind() {
     }
     const button = event.target.closest('[data-attach-sub]');
     if (!button) return;
-    const result = state.findSubtitleResults[Number(button.dataset.attachSub)];
+    const result = listOf(button)[Number(button.dataset.attachSub)];
     const target = $('#sel-subtitle-item')?.value;
+    button.disabled = true;
     attachSubtitle(result, { streamId: target })
-      .then(() => { $('#sel-subtitle-selection')?.classList.remove('hide'); $('#sel-subtitle-selection').textContent = `attached to ${target}`; })
-      .catch((error) => toast(error.message, 'err'));
+      .then((data) => {
+        $('#sel-subtitle-selection')?.classList.remove('hide');
+        $('#sel-subtitle-selection').textContent = `attached to ${target}`;
+        state.findSubtitleAttached = { ...result, language: data?.language || result.language, cues: data?.cues, check: data?.check, adjustment: data?.adjustment, attachedAt: new Date().toISOString() };
+        renderFindSubtitles();
+      })
+      .catch((error) => { toast(error.message, 'err'); button.disabled = false; });
   });
   // Series picker: season cards + episode pills + manual fallback.
   $('#sel-seasons')?.addEventListener('change', (event) => {
@@ -2922,7 +3026,7 @@ async function searchSubtitles() {
               languages: [item?.subtitleLanguage].filter(Boolean).length ? [item.subtitleLanguage] : languages,
             },
           });
-          state.subResults.push({ streamId, title: item?.title || streamId, year: item?.year || null, results: data.results || [], video: data.video || null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
+          state.subResults.push({ streamId, title: item?.title || streamId, year: item?.year || null, results: data.results || [], hidden: data.hidden || [], attached: data.attached || null, video: data.video || null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
         } catch (error) {
           state.subResults.push({ streamId, title: item?.title || streamId, results: [], error: error.message });
         }
@@ -2933,7 +3037,7 @@ async function searchSubtitles() {
         silent: true,
         body: { title: manualTitle, year: Number($('#sub-year')?.value) || null, imdb: $('#sub-imdb')?.value.trim() || null, languages },
       });
-      state.subResults.push({ streamId: null, title: manualTitle, year: Number($('#sub-year')?.value) || null, results: data.results || [], video: null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
+      state.subResults.push({ streamId: null, title: manualTitle, year: Number($('#sub-year')?.value) || null, results: data.results || [], hidden: data.hidden || [], attached: null, video: null, dropped: data.dropped || 0, droppedExamples: data.droppedExamples || [], relaxed: data.relaxed || null, attempts: data.attempts || [] });
     }
   } finally {
     $('#btn-sub-search').disabled = false;
@@ -2950,22 +3054,23 @@ function renderSubResults() {
   const blocks = (state.subResults || []).map((block) => {
     const results = (block.results || []).filter((result) => language === 'all' || (result.language || '').startsWith(language));
     total += results.length;
+    const hidden = (block.hidden || []).filter((result) => language === 'all' || (result.language || '').startsWith(language));
+    const row = (result, index, list) => {
+      const isAttached = sameSubtitle(result, block.attached);
+      const actions = `<button class="btn sm pri" data-attach="${index}" data-list="${list}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${escapeHtml(block.title)}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓ attached' : 'attach'}</button>`;
+      return subtitleRowMarkup(result, index, 'tab', { actions, attached: block.attached, list });
+    };
     return `<div class="sub-block">
       <div class="cardhead"><div><h3 style="margin:0">${escapeHtml(block.title)}${block.year ? ` <span class="mut">(${block.year})</span>` : ''}</h3>
           ${videoMetaTags(block.video)}</div>
-        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)} ${relaxedSearchNote(block)}</span></div>
+        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)} ${relaxedSearchNote(block)} ${hiddenToggleMarkup(block, 'tab', block.showHidden)}</span></div>
+      ${attachedSubtitleMarkup(block.attached)}
       ${results.length
-        ? results.slice(0, 60).map((result, index) => `<div class="pick-row">
-            <div>
-              <div>${tag(result.language || '??', 'alt')} ${tag(result.providerId || '—')}
-                ${result.downloads ? tag(`${result.downloads} downloads`) : ''}
-                ${result.rating ? tag(`★ ${result.rating}`) : ''}
-                ${subtitleNoteTags(result)}</div>
-              <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
-            </div>
-            <button class="btn sm pri" data-attach="${index}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${escapeHtml(block.title)}">attach</button>
-          </div>`).join('')
+        ? results.slice(0, 60).map((result, index) => row(result, index, 'results')).join('')
         : '<div class="meta" style="padding:10px 0">nothing in this language</div>'}
+      ${block.showHidden && hidden.length
+        ? `<div class="meta" style="padding:10px 0 4px">hidden — the title or year did not match this film:</div>${hidden.slice(0, 60).map((result, index) => row(result, index, 'hidden')).join('')}`
+        : ''}
     </div>`;
   });
   $('#sub-count').textContent = total ? `${total} result(s)` : '';
@@ -2994,10 +3099,17 @@ function wireSubtitles() {
   $('#btn-sub-search')?.addEventListener('click', searchSubtitles);
   $('#sub-lang-filter')?.addEventListener('change', renderSubResults);
   $('#sub-results')?.addEventListener('click', (event) => {
+    const toggle = event.target.closest('[data-toggle-hidden]');
+    if (toggle) {
+      const block = (state.subResults || []).find((entry) => entry.title === toggle.dataset.block);
+      if (block) { block.showHidden = !block.showHidden; renderSubResults(); }
+      return;
+    }
     const button = event.target.closest('[data-attach]');
     if (!button) return;
     const block = (state.subResults || []).find((entry) => entry.title === button.dataset.block);
-    const result = block?.results?.[Number(button.dataset.attach)];
+    const list = button.dataset.list === 'hidden' ? block?.hidden : block?.results;
+    const result = list?.[Number(button.dataset.attach)];
     if (!result) return;
     const streamId = button.dataset.stream || null;
     if (!streamId) {
@@ -3006,7 +3118,10 @@ function wireSubtitles() {
     }
     button.disabled = true;
     attachSubtitle(result, { streamId, language: result.language })
-      .then(() => { button.textContent = '✓ attached'; })
+      .then((data) => {
+        block.attached = { ...result, language: data?.language || result.language, cues: data?.cues, check: data?.check, adjustment: data?.adjustment, attachedAt: new Date().toISOString() };
+        renderSubResults();
+      })
       .catch((error) => { toast(error.message, 'err'); button.disabled = false; });
   });
 }
@@ -4112,15 +4227,25 @@ async function initMobile() {
   });
   $('#btn-mob-sub-search')?.addEventListener('click', mobileSubtitleSearch);
   $('#mob-subs')?.addEventListener('click', (event) => {
+    if (event.target.closest('[data-toggle-hidden]')) {
+      state.mobile.subShowHidden = !state.mobile.subShowHidden;
+      renderMobileSubtitles();
+      return;
+    }
     const button = event.target.closest('[data-mattach]');
     if (!button) return;
     const result = state.mobile.subs[Number(button.dataset.mattach)];
     if (!result) return;
     button.disabled = true;
     attachSubtitle(result, { streamId: $('#mob-sub-item').value })
-      .then(() => { button.textContent = '✓'; refreshMobile(); })
+      .then((data) => {
+        state.mobile.subAttached = { ...result, language: data?.language || result.language, cues: data?.cues, check: data?.check, adjustment: data?.adjustment, attachedAt: new Date().toISOString() };
+        renderMobileSubtitles();
+        refreshMobile();
+      })
       .catch((error) => { toast(error.message, 'err'); button.disabled = false; });
   });
+  $('#mob-sub-lang')?.addEventListener('change', renderMobileSubtitles);
   $('#btn-mob-generate')?.addEventListener('click', () => {
     const url = state.playlist.urls?.m3u;
     if (!url) return toast('No playlist URL yet', 'warn');
@@ -4852,18 +4977,38 @@ async function mobileSubtitleSearch() {
       method: 'POST', silent: true,
       body: { streamId, title: item?.title, year: item?.year || null, kind: item?.kind || 'movie', season: item?.season || null, episode: item?.episode || null },
     });
-    const filter = $('#mob-sub-lang')?.value || 'nl';
-    const results = (data.results || []).filter((result) => filter === 'all' || (result.language || '').startsWith(filter));
-    state.mobile.subs = results;
-    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)} ${relaxedSearchNote(data)}</div>`;
-    host.innerHTML = head + (results.length ? results.slice(0, 25).map((result, index) => `
-      <div class="mob-sub">
-        <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span> ${subtitleNoteTags(result)}
-          <div class="meta">${escapeHtml(result.release || result.title || '')}</div></div>
-        <button class="btn sm pri" data-mattach="${index}">attach</button>
-      </div>`).join('') : '<div class="meta">nothing found for this language</div>');
+    state.mobile.subAnswer = { ...data, item };
+    state.mobile.subShowHidden = false;
+    renderMobileSubtitles();
   } catch (error) {
     host.innerHTML = `<div class="meta">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderMobileSubtitles() {
+  const host = $('#mob-subs');
+  const data = state.mobile.subAnswer;
+  if (!host || !data) return;
+  const item = data.item;
+  {
+    const filter = $('#mob-sub-lang')?.value || 'nl';
+    const inLanguage = (result) => filter === 'all' || (result.language || '').startsWith(filter);
+    const results = (data.results || []).filter(inLanguage);
+    const hidden = state.mobile.subShowHidden ? (data.hidden || []).filter(inLanguage).map((result) => ({ ...result, hidden: true })) : [];
+    state.mobile.subs = results.concat(hidden);
+    const attached = state.mobile.subAttached || data.attached || null;
+    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)} ${relaxedSearchNote(data)} ${hiddenToggleMarkup(data, 'mobile', state.mobile.subShowHidden)}</div>${attachedSubtitleMarkup(attached)}`;
+    host.innerHTML = head + (state.mobile.subs.length ? state.mobile.subs.slice(0, 40).map((result, index) => {
+      const isAttached = sameSubtitle(result, attached);
+      return `
+      <div class="mob-sub${isAttached ? ' is-attached' : ''}${result.hidden ? ' is-hidden' : ''}">
+        <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span>
+          ${isAttached ? tag('✓ attached', 'ok') : ''}${result.hidden ? tag(`hidden: ${result.hiddenReason || 'did not match'}`, 'warn') : ''} ${subtitleNoteTags(result)}
+          <div class="meta">${escapeHtml(result.release || result.title || '')}</div>
+          ${subtitleMetaChips(result)}</div>
+        <button class="btn sm pri" data-mattach="${index}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓' : 'attach'}</button>
+      </div>`;
+    }).join('') : '<div class="meta">nothing found for this language</div>');
   }
 }
 
