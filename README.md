@@ -361,6 +361,23 @@ last resort the title alone with the year no longer required of the hits. The
 title check never loosens, so *Heat Wave* stays out even then. The header
 says which step found the results (`nothing matched Léon: The Professional
 (1994) exactly — searched again as "Leon"`; hover for every step tried).
+Between those steps the dotted release form is tried too —
+`Leon.The.Professional.1994`, then without the year — for providers that
+index file names rather than titles.
+
+**What you see per hit.** Every fact the provider gave is shown as chips —
+file name, format, encoding, size, CDs, the fps it was timed on, the
+uploader's video length and last cue, downloads, rating, votes, uploader and
+rank, upload date, matched-by, and the flags (exact file match, trusted,
+SDH, foreign parts only, machine/AI translated, flagged bad) — with an *all
+fields* fold-out for the raw key/value pairs and links. The subtitle that is
+**already attached** to the item is shown at the top of its block (provider,
+release, when, how its timing measured, any rescale) and marked `✓ attached
+to this title` in the list, so a second search tells you what you have
+before you replace it. The hits the title/year filter hid are one click
+away: **show N hidden subtitles** lists them dimmed with the reason (`2022 is
+not 1995`), and they can still be attached when the filter was wrong about a
+renamed release.
 
 **Picking the one that fits.** When the search runs for a playlist item the
 stream's ffprobe facts take part — its length and average frame rate — and

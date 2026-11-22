@@ -478,14 +478,26 @@ test('an empty search is run again with a looser title until something matches',
   t.after(async () => { useOnlyFakeProvider(site.base); await picky.close(); });
   useOnlyFakeProvider(picky.base);
   const found = await subs.searchSubtitlesDetailed({ title: 'Léon: The Professional', year: 1994, kind: 'movie', languages: ['nl'] });
-  assert.deepEqual(picky.queries, ['Léon: The Professional', 'Léon: The Professional', 'Leon The Professional', 'Leon']);
+  assert.deepEqual(picky.queries, ['Léon: The Professional', 'Léon: The Professional', 'Leon.The.Professional.1994', 'Leon.The.Professional', 'Leon The Professional', 'Leon']);
   assert.equal(found.relaxed, 'as "Leon"');
   assert.deepEqual(found.query, { title: 'Leon', year: null });
   assert.equal(found.results.length, 1, 'the title check still applies to the looser search');
   assert.equal(found.results[0].release, 'Leon.The.Professional.1994.1080p');
   assert.equal(found.dropped, 1);
-  assert.equal(found.attempts.length, 4);
-  assert.deepEqual(found.attempts.map((a) => a.relaxed), [null, 'without the year', 'as "Leon The Professional"', 'as "Leon"']);
+  assert.equal(found.hidden.length, 1);
+  assert.equal(found.hidden[0].release, 'Leon.2015.WEB');
+  assert.match(found.hidden[0].hiddenReason, /does not name/);
+  assert.equal(found.attempts.length, 6);
+  assert.deepEqual(found.attempts.map((a) => a.relaxed), [null, 'without the year', 'as "Leon.The.Professional.1994"', 'as "Leon.The.Professional"', 'as "Leon The Professional"', 'as "Leon"']);
+
+  // A provider that indexes file names answers the dotted release form.
+  const dotted = await pickySite({ 'Heat.1995': [{ url: '/files/d.srt', title: 'Heat', release: 'Heat.1995.1080p.BluRay', language: 'nl' }] });
+  t.after(() => dotted.close());
+  useOnlyFakeProvider(dotted.base);
+  const byDots = await subs.searchSubtitlesDetailed({ title: 'Heat', year: 1995, kind: 'movie', languages: ['nl'] });
+  assert.deepEqual(dotted.queries, ['Heat', 'Heat', 'Heat.1995']);
+  assert.equal(byDots.relaxed, 'as "Heat.1995"');
+  assert.equal(byDots.results.length, 1);
 
   // Last resort for a film: the year is no longer required of the hits.
   picky.queries.length = 0;
@@ -493,16 +505,16 @@ test('an empty search is run again with a looser title until something matches',
   t.after(() => other.close());
   useOnlyFakeProvider(other.base);
   const heat = await subs.searchSubtitlesDetailed({ title: 'Heat', year: 1995, kind: 'movie', languages: ['nl'] });
-  assert.equal(other.queries.length, 3, 'exact, without the year, year ignored — "Heat" has no looser spelling');
+  assert.deepEqual(other.queries, ['Heat', 'Heat', 'Heat.1995', 'Heat', 'Heat'], 'exact, without the year, dotted with and without the year, year ignored — "Heat" has no looser spelling');
   assert.match(heat.relaxed, /year is no longer required/);
   assert.equal(heat.results.length, 1);
   // A series never gets that step, and nothing found stays nothing found.
   other.queries.length = 0;
   const show = await subs.searchSubtitlesDetailed({ title: 'Cold Case', kind: 'series', season: 1, episode: 1, year: 2003, languages: ['nl'] });
   assert.equal(show.results.length, 0);
-  assert.deepEqual(other.queries, ['Cold Case', 'Cold Case'], 'exact and without the year; no year-ignored step for a series');
-  assert.equal(show.relaxed, 'without the year');
-  assert.equal(show.attempts.length, 2);
+  assert.deepEqual(other.queries, ['Cold Case', 'Cold Case', 'Cold.Case.2003', 'Cold.Case'], 'no year-ignored step for a series');
+  assert.equal(show.relaxed, 'as "Cold.Case"');
+  assert.equal(show.attempts.length, 4);
 });
 
 test('videoSummaryFor reads the probe into one line of facts', () => {
@@ -565,11 +577,28 @@ test('the search and attach routes use the stream\'s video facts', async (t) => 
   const drift = search.data.results.find((r) => r.release === 'b-drift');
   assert.ok(drift && Array.isArray(drift.notes));
 
+  assert.equal(search.data.attached, null, 'nothing attached yet');
+  assert.equal(search.data.hidden.length, 3, 'the hidden hits travel with the answer');
+  assert.ok(search.data.hidden.every((r) => r.hidden === true && r.hiddenReason && typeof r.score === 'number'));
+
   const attached = await post(`/api/playlist/items/${stream.id}/subtitle`, { result: drift, language: 'nl' });
   assert.equal(attached.status, 200, JSON.stringify(attached.data));
   assert.ok(attached.data.adjustment, 'the drifted file is rescaled on attach');
   assert.ok(Math.abs(attached.data.adjustment.scale - 23.976 / 25) < 1e-3);
   assert.equal(attached.data.check.verdict, 'suspect');
+
+  // The attach is remembered: the next search says which hit is on the item.
+  const again = await post('/api/subtitles/search', { streamId: stream.id, languages: ['nl'] });
+  assert.equal(again.data.attached.providerId, 'fake');
+  assert.equal(again.data.attached.release, 'b-drift');
+  assert.equal(again.data.attached.language, 'nl');
+  assert.equal(again.data.attached.check.verdict, 'suspect');
+  assert.ok(again.data.attached.adjustment?.scale);
+  assert.ok(again.data.attached.attachedAt);
+  const items = await (await fetch(`${base}/api/playlist`)).json();
+  const mine = items.items.find((i) => i.streamId === stream.id);
+  assert.equal(mine.subtitleSource.release, 'b-drift');
+  assert.equal(mine.subtitleSource.url, drift.url);
   const half = search.data.results.find((r) => r.release === 'a-half');
   const attachedHalf = await post(`/api/playlist/items/${stream.id}/subtitle`, { result: half, language: 'nl' });
   assert.equal(attachedHalf.data.check.verdict, 'bad');

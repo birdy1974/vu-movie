@@ -539,6 +539,26 @@ export async function assignTemplate(streamId, templateId, { outputType = '' } =
  * button — the browser reads the file and posts its contents, so no multipart
  * upload path is needed).
  */
+/** The provenance record kept with an attached subtitle (the hit minus its bulk). */
+export function subtitleSourceOf(result, fetched, { offsetMs = 0 } = {}) {
+  const keep = ['providerId', 'id', 'fileId', 'url', 'page', 'title', 'release', 'filename', 'year', 'language', 'format',
+    'downloads', 'rating', 'votes', 'uploader', 'uploaderRank', 'uploadedAt', 'encoding', 'sizeBytes', 'fps',
+    'videoDurationMs', 'lastTimestampMs', 'cds', 'hearingImpaired', 'foreignPartsOnly', 'machineTranslated',
+    'aiTranslated', 'trusted', 'bad', 'featured', 'hd', 'hashMatch', 'matchedBy', 'episodeMatch', 'imdb', 'comments', 'score'];
+  const source = {};
+  for (const key of keep) if (result && result[key] !== undefined && result[key] !== null && result[key] !== '') source[key] = result[key];
+  if (!source.providerId) source.providerId = fetched?.provider || 'file';
+  if (!source.release) source.release = fetched?.release || null;
+  if (Array.isArray(result?.notes) && result.notes.length) source.notes = result.notes.slice(0, 6);
+  source.language = fetched?.language || source.language || null;
+  source.cues = fetched?.cues ?? null;
+  source.attachedAt = new Date().toISOString();
+  if (Number(offsetMs)) source.offsetMs = Number(offsetMs);
+  if (fetched?.check) source.check = { verdict: fetched.check.verdict, reasons: fetched.check.reasons || [], lastMs: fetched.check.lastMs ?? null, hiShare: fetched.check.hiShare ?? null };
+  if (fetched?.adjustment) source.adjustment = fetched.adjustment;
+  return source;
+}
+
 export async function attachSubtitle(streamId, { result = null, srt = null, language = '', offsetMs = 0 } = {}) {
   const stream = await store.getStream(streamId);
   if (!stream) throw Object.assign(new Error('stream not found'), { status: 404 });
@@ -573,6 +593,9 @@ export async function attachSubtitle(streamId, { result = null, srt = null, lang
     subtitlePath: stored,
     subtitleLanguage: fetched.language === 'nl' ? 'nld' : fetched.language === 'en' ? 'eng' : fetched.language,
     subtitles: stream.profile?.subtitles && stream.profile.subtitles !== 'none' ? stream.profile.subtitles : 'soft',
+    // Where the file came from and how it measured — the search list marks
+    // this hit as "attached" and the header shows it, search after search.
+    subtitleSource: subtitleSourceOf(result, fetched, { offsetMs }),
   };
   await persistStream(stream, normaliseProfile(profile, stream.upstream?.probe || null));
   const item = await updateItem(streamId, { subtitleLanguage: fetched.language });
@@ -605,6 +628,7 @@ export async function detachSubtitle(streamId) {
   const profile = { ...(stream.profile || {}) };
   delete profile.subtitlePath;
   delete profile.subtitleLanguage;
+  delete profile.subtitleSource;
   await persistStream(stream, profile);
   relay.stopSession(stream.id, 'subtitle removed');
   log.info('playlist', `subtitle removed from "${stream.title}"`, { stream: stream.id });

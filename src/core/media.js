@@ -1665,6 +1665,9 @@ export function normaliseProfile(input = {}, probeInfo = null) {
     subtitles: input.subtitles || 'soft',               // none | soft | burn
     subtitlePath: input.subtitlePath || null,
     subtitleLanguage: input.subtitleLanguage || 'nld',
+    // Provenance of the attached file (provider hit, measurements, when) —
+    // see playlist.subtitleSourceOf(); null when none or attached before it existed.
+    subtitleSource: input.subtitlePath && input.subtitleSource && typeof input.subtitleSource === 'object' ? input.subtitleSource : null,
     deinterlace: Boolean(input.deinterlace),
     hardware: input.hardware ?? true,
     // Per-stream override of the global 1x live pacing (transcode.realtime).
