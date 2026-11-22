@@ -2532,10 +2532,24 @@ function subtitleRowMarkup(result, index, scope, { actions = null, attached = nu
 }
 
 /** The "show N hidden" toggle for a search answer with dropped hits. */
-function hiddenToggleMarkup(data, scope, shown) {
+function hiddenToggleMarkup(data, scope, shown, blockIndex = 0) {
   const n = Array.isArray(data?.hidden) ? data.hidden.length : 0;
   if (!n) return '';
-  return `<button class="btn sm ghost" data-toggle-hidden="${scope}" data-block="${escapeHtml(data.title || '')}">${shown ? 'hide' : 'show'} ${n} hidden subtitle${n > 1 ? 's' : ''}</button>`;
+  return `<button class="btn sm ghost" data-toggle-hidden="${scope}" data-block="${blockIndex}">${shown ? 'hide' : 'show'} ${n} hidden subtitle${n > 1 ? 's' : ''}</button>`;
+}
+
+/** The hidden hits as a section of their own, with a heading, so a toggle can scroll to it. */
+function hiddenSectionMarkup(rows, scope, blockIndex = 0) {
+  return `<div class="sub-hidden" id="sub-hidden-${scope}-${blockIndex}">
+    <div class="meta" style="padding:10px 0 4px">hidden — the title or year did not match this film (they can still be attached):</div>
+    ${rows.join('') || '<div class="meta" style="padding:6px 0">none in this language</div>'}
+  </div>`;
+}
+
+/** After a "show hidden" click: bring that section into view, it sits below the results. */
+function revealHiddenSection(scope, blockIndex = 0) {
+  const section = $(`#sub-hidden-${scope}-${blockIndex}`);
+  if (section && typeof section.scrollIntoView === 'function') section.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 
 function subtitleDownloadName(result, selection = {}) {
@@ -2559,8 +2573,8 @@ function renderFindSubtitles() {
       ? results.slice(0, 40).map((result, index) => subtitleRowMarkup(result, index, 'find', { attached })).join('')
       : '<div class="meta" style="padding:14px">no subtitles found</div>')
     + (state.findSubtitleShowHidden && hidden.length
-      ? `<div class="meta" style="padding:10px 0 4px">hidden — the title or year did not match this film:</div>${hidden.map((result, index) => subtitleRowMarkup(result, index, 'find', { attached, list: 'hidden' })).join('')}`
-      : '');
+      ? hiddenSectionMarkup(hidden.map((result, index) => subtitleRowMarkup(result, index, 'find', { attached, list: 'hidden' })), 'find')
+      : `<div class="row" style="padding:6px 14px">${hiddenToggleMarkup({ hidden }, 'find', false)}</div>`);
 }
 
 /** Download a provider result without requiring the title to be in the playlist. */
@@ -2799,12 +2813,16 @@ function wireFind() {
     }
   }, true);
   $('#btn-sel-subs-close')?.addEventListener('click', () => $('#sel-subtitle-panel')?.classList.add('hide'));
-  $('#sel-subtitle-count')?.addEventListener('click', (event) => {
-    if (!event.target.closest('[data-toggle-hidden]')) return;
+  const toggleFindHidden = () => {
     state.findSubtitleShowHidden = !state.findSubtitleShowHidden;
     renderFindSubtitles();
+    if (state.findSubtitleShowHidden) revealHiddenSection('find');
+  };
+  $('#sel-subtitle-count')?.addEventListener('click', (event) => {
+    if (event.target.closest('[data-toggle-hidden]')) toggleFindHidden();
   });
   $('#sel-subtitle-results')?.addEventListener('click', (event) => {
+    if (event.target.closest('[data-toggle-hidden]')) { toggleFindHidden(); return; }
     const listOf = (el) => (el.dataset.list === 'hidden' ? state.findSubtitleHidden || [] : state.findSubtitleResults || []);
     const download = event.target.closest('[data-download-sub]');
     if (download) {
@@ -3051,26 +3069,31 @@ function renderSubResults() {
   if (!host) return;
   const language = $('#sub-lang-filter')?.value || 'all';
   let total = 0;
-  const blocks = (state.subResults || []).map((block) => {
-    const results = (block.results || []).filter((result) => language === 'all' || (result.language || '').startsWith(language));
+  const inLanguage = (result) => language === 'all' || (result.language || '').startsWith(language);
+  // Blocks and rows are addressed by their position in state.subResults /
+  // block.results / block.hidden — never by title (a series' episodes all
+  // share one) and never by the position after the language filter.
+  const blocks = (state.subResults || []).map((block, blockIndex) => {
+    const results = (block.results || []).map((result, index) => ({ result, index })).filter(({ result }) => inLanguage(result));
     total += results.length;
-    const hidden = (block.hidden || []).filter((result) => language === 'all' || (result.language || '').startsWith(language));
-    const row = (result, index, list) => {
+    const hidden = (block.hidden || []).map((result, index) => ({ result, index })).filter(({ result }) => inLanguage(result));
+    const row = ({ result, index }, list) => {
       const isAttached = sameSubtitle(result, block.attached);
-      const actions = `<button class="btn sm pri" data-attach="${index}" data-list="${list}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${escapeHtml(block.title)}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓ attached' : 'attach'}</button>`;
+      const actions = `<button class="btn sm pri" data-attach="${index}" data-list="${list}" data-stream="${escapeHtml(block.streamId || '')}" data-block="${blockIndex}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓ attached' : 'attach'}</button>`;
       return subtitleRowMarkup(result, index, 'tab', { actions, attached: block.attached, list });
     };
+    const toggle = hiddenToggleMarkup(block, 'tab', block.showHidden, blockIndex);
     return `<div class="sub-block">
       <div class="cardhead"><div><h3 style="margin:0">${escapeHtml(block.title)}${block.year ? ` <span class="mut">(${block.year})</span>` : ''}</h3>
           ${videoMetaTags(block.video)}</div>
-        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)} ${relaxedSearchNote(block)} ${hiddenToggleMarkup(block, 'tab', block.showHidden)}</span></div>
+        <span class="mut">${results.length} of ${(block.results || []).length} result(s)${block.error ? ` · ${escapeHtml(block.error)}` : ''} ${droppedHitsNote(block)} ${relaxedSearchNote(block)} ${toggle}</span></div>
       ${attachedSubtitleMarkup(block.attached)}
       ${results.length
-        ? results.slice(0, 60).map((result, index) => row(result, index, 'results')).join('')
+        ? results.slice(0, 60).map((entry) => row(entry, 'results')).join('')
         : '<div class="meta" style="padding:10px 0">nothing in this language</div>'}
-      ${block.showHidden && hidden.length
-        ? `<div class="meta" style="padding:10px 0 4px">hidden — the title or year did not match this film:</div>${hidden.slice(0, 60).map((result, index) => row(result, index, 'hidden')).join('')}`
-        : ''}
+      ${block.showHidden
+        ? hiddenSectionMarkup(hidden.slice(0, 60).map((entry) => row(entry, 'hidden')), 'tab', blockIndex)
+        : (toggle ? `<div class="row" style="padding:6px 0">${toggle}</div>` : '')}
     </div>`;
   });
   $('#sub-count').textContent = total ? `${total} result(s)` : '';
@@ -3101,13 +3124,18 @@ function wireSubtitles() {
   $('#sub-results')?.addEventListener('click', (event) => {
     const toggle = event.target.closest('[data-toggle-hidden]');
     if (toggle) {
-      const block = (state.subResults || []).find((entry) => entry.title === toggle.dataset.block);
-      if (block) { block.showHidden = !block.showHidden; renderSubResults(); }
+      const blockIndex = Number(toggle.dataset.block) || 0;
+      const block = (state.subResults || [])[blockIndex];
+      if (block) {
+        block.showHidden = !block.showHidden;
+        renderSubResults();
+        if (block.showHidden) revealHiddenSection('tab', blockIndex);
+      }
       return;
     }
     const button = event.target.closest('[data-attach]');
     if (!button) return;
-    const block = (state.subResults || []).find((entry) => entry.title === button.dataset.block);
+    const block = (state.subResults || [])[Number(button.dataset.block) || 0];
     const list = button.dataset.list === 'hidden' ? block?.hidden : block?.results;
     const result = list?.[Number(button.dataset.attach)];
     if (!result) return;
@@ -4230,6 +4258,7 @@ async function initMobile() {
     if (event.target.closest('[data-toggle-hidden]')) {
       state.mobile.subShowHidden = !state.mobile.subShowHidden;
       renderMobileSubtitles();
+      if (state.mobile.subShowHidden) revealHiddenSection('mobile');
       return;
     }
     const button = event.target.closest('[data-mattach]');
@@ -4997,10 +5026,12 @@ function renderMobileSubtitles() {
     const hidden = state.mobile.subShowHidden ? (data.hidden || []).filter(inLanguage).map((result) => ({ ...result, hidden: true })) : [];
     state.mobile.subs = results.concat(hidden);
     const attached = state.mobile.subAttached || data.attached || null;
-    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)} ${relaxedSearchNote(data)} ${hiddenToggleMarkup(data, 'mobile', state.mobile.subShowHidden)}</div>${attachedSubtitleMarkup(attached)}`;
+    const toggle = hiddenToggleMarkup(data, 'mobile', state.mobile.subShowHidden);
+    const head = `<div class="meta" style="margin-bottom:6px">${escapeHtml(item?.title || '')}${item?.year ? ` (${item.year})` : ''} ${videoMetaTags(data.video)} ${droppedHitsNote(data)} ${relaxedSearchNote(data)} ${toggle}</div>${attachedSubtitleMarkup(attached)}`;
+    const firstHidden = state.mobile.subs.findIndex((result) => result.hidden);
     host.innerHTML = head + (state.mobile.subs.length ? state.mobile.subs.slice(0, 40).map((result, index) => {
       const isAttached = sameSubtitle(result, attached);
-      return `
+      return `${index === firstHidden ? '<div class="meta" id="sub-hidden-mobile-0" style="padding:10px 0 4px">hidden — the title or year did not match this film:</div>' : ''}
       <div class="mob-sub${isAttached ? ' is-attached' : ''}${result.hidden ? ' is-hidden' : ''}">
         <div><b>${escapeHtml(result.language || '??')}</b> <span class="meta">${escapeHtml(result.providerId || '')}</span>
           ${isAttached ? tag('✓ attached', 'ok') : ''}${result.hidden ? tag(`hidden: ${result.hiddenReason || 'did not match'}`, 'warn') : ''} ${subtitleNoteTags(result)}
@@ -5008,7 +5039,8 @@ function renderMobileSubtitles() {
           ${subtitleMetaChips(result)}</div>
         <button class="btn sm pri" data-mattach="${index}"${isAttached ? ' disabled' : ''}>${isAttached ? '✓' : 'attach'}</button>
       </div>`;
-    }).join('') : '<div class="meta">nothing found for this language</div>');
+    }).join('') : '<div class="meta">nothing found for this language</div>')
+      + (toggle && !state.mobile.subShowHidden ? `<div class="row" style="padding:6px 0">${toggle}</div>` : '');
   }
 }
 
